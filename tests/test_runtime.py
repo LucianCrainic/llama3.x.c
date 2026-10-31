@@ -1,0 +1,218 @@
+"""Real CLI/process tests with dependency-free synthetic FP32/Q8_0 files."""
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from fixtures import CONFIG, create
+
+BUILD = Path(sys.argv.pop(1)).resolve()
+
+
+class RuntimeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        cls.shared = create(cls.root/'shared')
+        cls.unshared = create(cls.root/'unshared', shared=False)
+        cls.zero = create(cls.root/'zero', zero=True)
+        cls.first_stop = create(cls.root/'first-stop', shared=False, stop='first')
+        cls.later_stop = create(cls.root/'later-stop', shared=False, stop='after_one')
+        cls.reference = json.loads(Path(__file__).with_name('baseline_logits.json').read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def execute(self, engine='run', *args, fixture=None, success=True, stdin=None):
+        fixture = fixture or self.shared
+        report = self.root/'result.json'
+        report.unlink(missing_ok=True)
+        model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
+        command = [str(BUILD/engine), str(model), '-z', str(fixture/'tokenizer.bin'),
+                   '-i', 'A', '--seed', '123', '-t', '0', '--json', str(report), *map(str,args)]
+        result = subprocess.run(command, input=stdin, text=True, capture_output=True, timeout=30)
+        if success:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertGreater(result.returncode, 0, result.stderr)
+            self.assertIn('[ERROR]', result.stderr)
+            self.assertNotIn('AddressSanitizer', result.stderr)
+            self.assertNotIn('runtime error:', result.stderr)
+        data = json.loads(report.read_text())
+        self.assertEqual(data['status'], 'completed' if success else 'error')
+        self.assertEqual(data['schema_version'], 1)
+        return result, data
+
+    def test_baseline_numerical_regression(self):
+        for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
+            result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            values = list(map(float,result.stdout.splitlines()))
+            self.assertEqual(len(values),48)
+            for actual, expected in zip(values,self.reference[engine]):
+                self.assertTrue(math.isclose(actual,expected,rel_tol=2e-5,abs_tol=2e-6),(engine,actual,expected))
+            for flag in ('--overflow','--add-overflow'):
+                result = subprocess.run([str(BUILD/unit),flag],capture_output=True,text=True)
+                self.assertEqual(result.returncode,1)
+                self.assertIn('overflow',result.stderr)
+
+    def test_generation_accounting(self):
+        for engine in ('run','runq'):
+            result, data = self.execute(engine,'--benchmark','--generation-length','3','--no-text')
+            self.assertEqual(result.stdout,'')
+            self.assertEqual(data['tokens'],dict(input_prompt=2,processed_prompt=2,generated_output=3,
+                                                forward_passes=4,decode_steps=2,sampled=3,sampled_stop=0))
+            times = data['timing_seconds']
+            self.assertGreaterEqual(times['total_inference'],times['prompt_tokenization']+times['prefill']+times['decode'])
+            self.assertGreaterEqual(times['time_to_first_token'],times['prompt_tokenization']+times['prefill'])
+            self.assertGreaterEqual(times['end_to_end'],times['checkpoint_load']+times['tokenizer_init']+times['runtime_init']+times['total_inference'])
+            for k,count,duration in [('prefill',2,times['prefill']),('decode',2,times['decode']),('overall_forward',4,times['total_inference'])]:
+                self.assertAlmostEqual(data['throughput_tokens_per_second'][k],count/duration,delta=max(1e-3,count/duration*1e-3))
+            mem = data['memory_bytes']
+            self.assertEqual(mem['kv_cache_allocated_peak'],2*CONFIG[2]*CONFIG[-1]*2*4)
+            self.assertEqual(mem['mapped_checkpoint'],mem['model_file'])
+            self.assertEqual(mem['model_file'],(self.shared/('fp32.bin' if engine=='run' else 'int8.bin')).stat().st_size)
+            if engine=='runq':
+                self.assertEqual(mem['dequantized_embedding_allocated_peak'],CONFIG[5]*CONFIG[0]*4)
+
+    def test_empty_one_output_zero_and_partial(self):
+        for engine in ('run','runq'):
+            _, data = self.execute(engine,'-i','','--generation-length','1')
+            self.assertEqual(data['tokens']['processed_prompt'],1)
+            self.assertEqual(data['tokens']['generated_output'],1)
+            self.assertEqual(data['tokens']['decode_steps'],0)
+            self.assertIsNone(data['timing_seconds']['decode'])
+            self.assertIsNone(data['throughput_tokens_per_second']['decode'])
+            _, data = self.execute(engine,'--generation-length','0')
+            self.assertEqual(data['tokens']['forward_passes'],0)
+            self.assertEqual(data['tokens']['input_prompt'],2)
+            self.assertIsNone(data['timing_seconds']['time_to_first_token'])
+            self.assertIsNone(data['throughput_tokens_per_second']['overall_forward'])
+            _, data = self.execute(engine,'-n','1')
+            self.assertEqual(data['tokens']['processed_prompt'],1)
+            self.assertEqual(data['tokens']['generated_output'],0)
+            self.assertEqual(data['stop_reason'],'step_limit')
+
+    def test_seeded_repeatability_and_unshared(self):
+        for engine in ('run','runq'):
+            a, _ = self.execute(engine,'--generation-length','4','-t','.8',fixture=self.unshared)
+            b, _ = self.execute(engine,'--generation-length','4','-t','.8',fixture=self.unshared)
+            self.assertEqual(a.stdout,b.stdout)
+            self.execute(engine,'--generation-length','3',fixture=self.zero)
+
+    def test_stop_token_boundaries(self):
+        for engine in ('run','runq'):
+            for fixture, output, decode in [(self.first_stop,0,0),(self.later_stop,1,1)]:
+                _, data = self.execute(engine,'--generation-length','5',fixture=fixture)
+                self.assertEqual(data['stop_reason'],'stop_token')
+                self.assertEqual(data['tokens']['processed_prompt'],2)
+                self.assertEqual(data['tokens']['generated_output'],output)
+                self.assertEqual(data['tokens']['decode_steps'],decode)
+                self.assertEqual(data['tokens']['sampled_stop'],1)
+                self.assertEqual(data['tokens']['sampled'],output+1)
+                self.assertEqual(data['tokens']['forward_passes'],2+decode)
+                self.assertEqual(data['timing_seconds']['time_to_first_token'] is None,output==0)
+
+    def test_report_cannot_overwrite_inputs(self):
+        for target in ('fp32.bin','tokenizer.bin'):
+            path=self.shared/target
+            before=path.read_bytes()
+            result=subprocess.run([str(BUILD/'run'),str(self.shared/'fp32.bin'),'-z',str(self.shared/'tokenizer.bin'),
+                                   '--json',str(path),'--generation-length','0'],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertIn('aliases input',result.stderr)
+            self.assertEqual(path.read_bytes(),before)
+        alias=self.root/'alias.json'
+        alias.symlink_to(self.shared/'fp32.bin')
+        result=subprocess.run([str(BUILD/'run'),str(self.shared/'fp32.bin'),'--json',str(alias),'-n','invalid'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,1)
+        self.assertIn('aliases input',result.stderr)
+
+    def test_nonfinite_checkpoint(self):
+        bad=self.root/'nonfinite';bad.mkdir(exist_ok=True)
+        shutil.copy(self.shared/'tokenizer.bin',bad/'tokenizer.bin')
+        for engine,filename in [('run','fp32.bin'),('runq','int8.bin')]:
+            weights=bytearray((self.shared/filename).read_bytes())
+            if engine=='run':
+                offset=28+128000*4*4
+            else:
+                offset=256 # first RMSNorm weight
+            struct.pack_into('<f',weights,offset,float('nan'))
+            (bad/filename).write_bytes(weights)
+            self.execute(engine,fixture=bad,success=False)
+
+    def test_cli_invalid(self):
+        for args in [('-n','-1'),('-n','abc'),('-s','18446744073709551616'),('-t','nan'),
+                     ('-p','2'),('-m','invalid'),('--log-level','verbose'),('--unknown','1'),
+                     ('-i','X','--prompt-file','none'),('--benchmark','-m','chat'),('--generation-length',)]:
+            self.execute('run',*args,success=False)
+
+    def test_bad_checkpoints(self):
+        bad = self.root/'bad'
+        bad.mkdir(exist_ok=True)
+        shutil.copy(self.shared/'tokenizer.bin',bad/'tokenizer.bin')
+        for engine,filename in [('run','fp32.bin'),('runq','int8.bin')]:
+            valid = bytearray((self.shared/filename).read_bytes())
+            cases = [b'',valid[:20],valid[:-1]]
+            offset=0 if engine=='run' else 8
+            for field,value in [(0,0),(3,3),(4,3),(5,-2147483648),(6,-1),(0,2147483646)]:
+                mutated=valid.copy();struct.pack_into('<i',mutated,offset+4*field,value);cases.append(mutated)
+            if engine=='runq':
+                for group in (0,3,2147483647):
+                    mutated=valid.copy();struct.pack_into('<i',mutated,37,group);cases.append(mutated)
+                mutated=valid.copy();mutated[36]=2;cases.append(mutated)
+                mutated=valid.copy();mutated[4]=1;cases.append(mutated)
+            for content in cases:
+                (bad/filename).write_bytes(content)
+                _,data=self.execute(engine,fixture=bad,success=False)
+                self.assertIsNone(data['timing_seconds']['time_to_first_token'])
+            (bad/filename).unlink()
+            self.execute(engine,fixture=bad,success=False)
+
+    def test_bad_tokenizer(self):
+        bad=self.root/'bad-tokenizer';bad.mkdir(exist_ok=True)
+        shutil.copy(self.shared/'fp32.bin',bad/'fp32.bin')
+        original=(self.shared/'tokenizer.bin').read_bytes()
+        for data in (b'',struct.pack('<I',0),struct.pack('<I',0xffffffff),original[:-1],original+b'X',
+                     original[:8]+struct.pack('<i',-1)+original[12:]):
+            (bad/'tokenizer.bin').write_bytes(data)
+            self.execute('run',fixture=bad,success=False)
+        (bad/'tokenizer.bin').unlink()
+        self.execute('run',fixture=bad,success=False)
+
+    def test_prompt_file_and_json_escaping(self):
+        prompt=self.root/'prompt.txt';prompt.write_text('A "quoted" \\ line\nè')
+        # Direct invocation avoids the default -i supplied by execute().
+        report=self.root/'unicode.json'
+        command=[str(BUILD/'run'),str(self.shared/'fp32.bin'),'-z',str(self.shared/'tokenizer.bin'),
+                 '--benchmark','--prompt-file',str(prompt),'--json',str(report),'--generation-length','0','--no-text']
+        result=subprocess.run(command,capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        data=json.loads(report.read_text())
+        self.assertEqual(data['parameters']['prompt'],prompt.read_text())
+        self.assertEqual(data['parameters']['seed'],1)
+        self.assertEqual(result.stdout,'')
+
+    def test_chat_eof_and_long_inputs(self):
+        for engine in ('run','runq'):
+            self.execute(engine,'-m','chat','-y','S','-n','28',stdin='exit\n')
+            self.execute(engine,'-m','chat','-y','S'*40000,'-i','U'*40000,'-n','1',stdin='')
+
+    def test_help_and_failed_report(self):
+        result=subprocess.run([str(BUILD/'run'),'--help'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0)
+        result=subprocess.run([str(BUILD/'run'),'missing','--json',str(self.root/'no-directory'/'x.json')],capture_output=True,text=True)
+        self.assertEqual(result.returncode,1)
+        self.assertIn('cannot create report',result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()
