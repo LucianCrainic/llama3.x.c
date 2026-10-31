@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -37,6 +38,14 @@ void log_message(LogLevel level, const char *format, ...) {
 }
 
 _Noreturn void fail(const char *format, ...) {
+  /* Attention heads can discover the same corrupt input concurrently. Exactly
+   * one thread owns fatal diagnostics and exit handlers; other failing workers
+   * wait for process termination instead of truncating the report again. */
+  static atomic_flag fatal_started = ATOMIC_FLAG_INIT;
+  if (atomic_flag_test_and_set_explicit(&fatal_started, memory_order_relaxed)) {
+    for (;;)
+      pause();
+  }
   va_list args;
   va_start(args, format);
   vsnprintf(failure_message, sizeof(failure_message), format, args);
