@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-10-31T18:27:51Z",
+  "status": "completed",
+  "error": null,
+  "stop_reason": "generation_limit",
+  "model": {
+    "identifier": "build/fixtures/fp32.bin",
+    "checkpoint_path": "build/fixtures/fp32.bin",
+    "precision": "fp32",
+    "checkpoint_format": 0,
+    "quantization_group_size": 0,
+    "configuration": {"dim": 4, "hidden_dim": 8, "n_layers": 2, "n_heads": 2, "n_kv_heads": 1, "vocab_size": 128010, "seq_len": 32, "rope_theta": 500000, "rms_norm_epsilon": 0.00001}
+  },
+  "system": {
+    "os": "Darwin",
+    "architecture": "arm64",
+    "online_cpus": 10,
+    "affinity_cpus": null,
+    "numa_online_nodes": null
+  },
+  "build": {
+    "compiler": "Apple LLVM 21.0.0 (clang-2100.1.1.101)",
+    "mode": "release",
+    "flags": "-D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -Iinclude -std=c11 -Wall -Wextra -Wpedantic -O3  -lm",
+    "openmp": false,
+    "openmp_version": null
+  },
+  "parameters": {
+    "mode": "generate",
+    "benchmark": true,
+    "seed": 1,
+    "temperature": 0,
+    "top_p": 0.899999976,
+    "max_forward_passes": 32,
+    "generation_length": 3,
+    "text_suppressed": true,
+    "tokenizer_path": "build/fixtures/tokenizer.bin",
+    "prompt": "A",
+    "prompt_file": null,
+    "system_prompt": null
+  },
+  "tokens": {
+    "input_prompt": 2,
+    "processed_prompt": 2,
+    "generated_output": 3,
+    "forward_passes": 4,
+    "decode_steps": 2,
+    "sampled": 3,
+    "sampled_stop": 0
+  },
+  "timing_seconds": {
+    "checkpoint_load": 0.000030000,
+    "tokenizer_init": 0.009201000,
+    "runtime_init": 0.000007000,
+    "prompt_tokenization": 0.008448000,
+    "prefill": 0.000379000,
+    "decode": 0.000198000,
+    "total_inference": 0.009417000,
+    "end_to_end": 0.020041000,
+    "time_to_first_token": 0.008958000,
+    "average_time_per_generated_token": 0.003139000,
+    "average_decode_step": 0.000099000
+  },
+  "throughput_tokens_per_second": {
+    "prefill": 5277.044385411,
+    "decode": 10101.010393302,
+    "overall_forward": 424.763725455,
+    "output": 318.572794092
+  },
+  "memory_bytes": {
+    "model_file": 2049676,
+    "mapped_checkpoint": 2049676,
+    "kv_cache_allocated_peak": 1024,
+    "activations_allocated_peak": 512424,
+    "dequantized_embedding_allocated_peak": 0,
+    "model_metadata_allocated_peak": 248,
+    "tokenizer_allocated_peak": 5263110,
+    "sampler_allocated_peak": 1024080,
+    "prompt_buffers_allocated_peak": 89,
+    "explicit_allocations_peak": 6800975,
+    "peak_resident": 11763712
+  }
+}

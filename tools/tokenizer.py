@@ -3,7 +3,6 @@
 # This software may be used and distributed according to the terms of the Llama 3 Community License Agreement.
 
 import argparse
-import array
 import os
 import struct
 from pathlib import Path
@@ -65,8 +64,8 @@ class Tokenizer:
         self, s: str, bos: bool, eos: bool, allowed_special, disallowed_special
     ) -> List[int]:
         assert type(s) is str
-        self.model.encode(
-            substr,
+        t = self.model.encode(
+            s,
             allowed_special=allowed_special,
             disallowed_special=disallowed_special,
         )
