@@ -61,7 +61,7 @@ def quantize_q80(w, group_size):
     # calculate the scaling factor such that float = quant * scale
     scale = wmax / 127.0
     # scale into range [-127, 127]
-    quant = w / scale[:, None]
+    quant = w / torch.where(scale > 0, scale, torch.ones_like(scale))[:, None]
     # round to nearest integer
     int8val = torch.round(quant).to(torch.int8)
     # dequantize by rescaling
@@ -87,8 +87,7 @@ def legacy_export(model, filepath):
     p = model.params
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     # legacy format uses negative/positive vocab size as a shared classifier flag
-    if not shared_classifier:
-        p.vocab_size = -p.vocab_size
+    signed_vocab_size = p.vocab_size if shared_classifier else -p.vocab_size
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
     header = struct.pack(
         "iiiiiii",
@@ -97,7 +96,7 @@ def legacy_export(model, filepath):
         p.n_layers,
         p.n_heads,
         n_kv_heads,
-        p.vocab_size,
+        signed_vocab_size,
         p.max_seq_len,
     )
     out_file.write(header)
@@ -215,7 +214,7 @@ def version2_export(model, filepath, group_size=64):
     version = 2
 
     # let's first do some validation for this export type
-    while model.params.dim % group_size != 0:
+    while model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
         group_size //= 2
         print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
     weights = [
@@ -231,7 +230,7 @@ def version2_export(model, filepath, group_size=64):
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     if not shared_classifier:
         weights.append(model.output.weight)
-    for w in weights:
+    for i, w in enumerate(weights):
         assert (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"

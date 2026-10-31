@@ -1,8 +1,7 @@
-blobfile==2.1.1
+# Runtime C binaries require none of these packages.
 numpy
-pytest==8.2.0
-Requests
-tiktoken==0.6.0
 torch
-tqdm
-wandb==0.16.6
+# Tokenizer conversion (blobfile is used by tiktoken.load).
+tiktoken==0.6.0
+blobfile==2.1.1
+# Optional Hugging Face import/export: install transformers separately.
