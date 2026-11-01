@@ -1,0 +1,168 @@
+# F2. Persistent worker teams
+
+## 1. Goal and status
+
+Add a dependency-free backend of **persistent pthread worker teams**. It runs the
+existing kernels without opening OpenMP regions. With one team, it must match the
+OpenMP path numerically and in speed. The same interface later carries:
+
+- B: two socket teams;
+- C: batched GEMM tiles;
+- D: two-socket prefill.
+
+The user decision requires that no separate scheduler be introduced for prefill, so
+this is the only scheduler the plans use.
+
+Status: **planned**. Branch: `feature/found-f2-worker-teams`.
+
+## 2. Depends on / unblocks
+
+- Depends on: nothing.
+- Unblocks:
+  - A5: owner-team first touch.
+  - B2, B3, B4: team-local kernels and the reduction.
+  - C2: GEMM tiles.
+
+## 3. Reuse
+
+| Code | Location | Note |
+| --- | --- | --- |
+| `parallel_rows` | `src/kernels_simd.c:70` | Bare `omp parallel`, contiguous `[rows*t/nt, rows*(t+1)/nt)`. Keep it as the `omp` backend. |
+| `F32Job`, `f32_range`, `f32_rows`, `f32_run` | `src/kernels_simd.c:446-481` | Row-range helpers. Already independent of the threading model. |
+| `Q8Job`, `q8_range`, `q8_rows`, `q8_run` | `src/kernels_simd.c:556-591` | Same, for Q8 |
+| Epilogue kinds | `src/kernels_simd.c:409` `enum { STORE, ADD, SWIGLU }` | B2 adds `PARTIAL` |
+| `max_threads`, `attention_chunks`, `k_attention_init` | `src/kernels_simd.c:651, 662, 675` | Must take a team size instead of `omp_get_max_threads()` |
+| `k_attention` task loop | `src/kernels_simd.c:735` | `omp for schedule(dynamic,1)` over `n_kv_heads*chunks`, then the merge |
+| Rule: OpenMP regions only in plain C drivers | `src/kernels_simd.c:1-4`, `docs/kernels.md:20-23` | The same rule applies to team entry points |
+
+## 4. Changes
+
+### 4.1 Worker API
+
+`include/workers.h` and `src/workers.c`:
+
+```c
+/* Proposed. */
+typedef struct Team Team;               /* opaque: threads, barrier, job slot */
+typedef struct {
+  int teams;                            /* 1 or 2 */
+  int threads[2];                       /* per team */
+  const int *cpus[2];                   /* pinned CPU ids, NULL = unpinned */
+} PoolConfig;
+
+void pool_start(const PoolConfig *cfg); /* threads created once, at load */
+void pool_stop(void);
+Team *pool_team(int index);
+int team_size(const Team *t);
+int team_index(const Team *t);          /* socket/team id */
+
+typedef void (*TeamFn)(const void *job, int worker, int workers);
+void team_run(Team *t, TeamFn fn, const void *job);        /* leader + workers, returns after barrier */
+void team_parallel_rows(Team *t, int rows, RowFn fn, const void *job);
+void team_barrier(Team *t);             /* usable inside a TeamFn */
+```
+
+How the pool behaves:
+
+- **Leader.** The leader (the caller) is a member of its team and does not spin as an
+  extra thread (study §9).
+- **Pinning.** Each worker is pinned with `pthread_setaffinity_np` on Linux, and its
+  affinity is read back and reported (F3). On macOS, workers are unpinned.
+- **Synchronization.** A generation-counted barrier using C11 atomics. Workers spin
+  for a bounded time, then call `sched_yield`; futex parking is deferred until
+  measurements justify it (study §9). Counters sit on separate 64-byte cache lines.
+- **Startup.** The pool starts in `engine_load_context` (`src/run.c:211`,
+  `src/runq.c:294`) when `LLAMA_BACKEND=teams`.
+- **Thread count.** `LLAMA_THREADS` gives the total; otherwise it comes from the
+  allowed CPU set (A1 makes this topology-aware). `LLAMA_TOPOLOGY=virtual:SxT` gives
+  S unpinned teams of T threads.
+
+### 4.2 Kernel changes in `src/kernels_simd.c`
+
+- **Per-segment splitting.** `f32_run` / `q8_run` stop concatenating the Q/K/V row
+  spaces (:476, :586). Each segment is divided across the team on its own, so a
+  per-team or per-socket range never straddles projections. The OpenMP path keeps
+  today's behaviour until parity is shown, and is then moved to per-segment splitting
+  too, so that the omp and teams backends compute identical rows per thread count.
+- **Team-aware attention.** `AttentionWork` stores `workers` instead of calling
+  `omp_get_max_threads()`. `attention_chunks(positions, n_kv_heads, limit, workers)`
+  takes the same input.
+- **Attention task queue.** The `k_attention` task loop becomes a team-local atomic
+  counter queue over `(kv group, chunk)` tasks, then `team_barrier`, then the merge
+  over heads split by worker.
+- **Dispatch.** `k_matmul*` and `k_attention` dispatch to `team_parallel_rows` when a
+  current team is set (`kernels_set_team(Team *)`), and to `parallel_rows` otherwise.
+  The public kernel signatures are unchanged.
+
+### 4.3 Build
+
+- The `Makefile` adds `-pthread` to `CFLAGS` and `LDLIBS`, and adds `MODE=tsan`
+  (`-fsanitize=thread -O1 -g`).
+- `workers.c` joins `COMMON`.
+- The `teams` backend works with `OPENMP=0`. Combining `OPENMP=1` with
+  `LLAMA_BACKEND=teams` is allowed, but the engine logs that OpenMP regions are unused.
+
+## 5. Local tests
+
+All of these run on macOS.
+
+- **`tests/kernels.c`:** a new loop runs every kernel with `LLAMA_BACKEND=teams` at
+  1, 2, 3 and 7 workers (odd counts stress range splitting) and checks it against the
+  double reference with the existing budget.
+- **Attention:** 1 and 5 workers on positions 0, 31, 32, 255, 256 and 4095. These
+  cover the chunk boundaries at 32 and 256 (`attention_chunks`).
+- **`tests/test_runtime.py`:** the fixture logits under `LLAMA_BACKEND=teams` match
+  `baseline_logits.json` within the existing tolerance. They are bitwise equal when the
+  omp and teams backends use the same per-segment split and thread count.
+- **`make MODE=tsan OPENMP=0 test-kernels`** shows no reports. A barrier stress test
+  runs 10⁶ generations with random worker delays.
+- **Pool lifecycle:** start/stop leaves `memory_current` at zero, and `pool_stop`
+  after a `fail()` in a worker does not hang.
+
+## 6. Cluster run
+
+`cresco8-placement.sbatch STAGE=check` (the F3 skeleton), run on the Flat node.
+**Estimated** at 30 minutes. It needs the user's go-ahead to submit.
+
+| Run | Config | Purpose |
+| --- | --- | --- |
+| `test-kernels` | teams, 1 team × {1, 56} threads, AVX-512 | ISA × backend parity on hardware |
+| `validate.py` 1B, 8B FP32 | `LLAMA_BACKEND=teams`, 56 pinned on socket 0, staged HBM | Same HF gate as today |
+| Decode benchmark 8B FP32/Q8 | omp vs teams, 56 threads, staged HBM, 3 repeats | No regression |
+| Affinity dump | per worker | Pinning read-back recorded |
+
+The workload is identical to `scripts/cresco8-kernels.sbatch:116-136` (`short.txt`,
+`--context-length 2048 --generation-length 128 -t 0 --seed 42 --chat-template`).
+
+## 7. Exit criteria
+
+- **Kernel parity:** every kernel passes at all tested worker counts, scalar and
+  AVX-512.
+- **TSAN:** clean.
+- **Real model gate:** 1B and 8B FP32 pass `validate.py` under `teams`.
+- **Speed:** one team of 56 decodes within the run-to-run range of OpenMP (**measured**
+  baseline 14.90 tok/s FP32 and 44.49 tok/s Q8_0, 8B), or the regression is understood
+  and recorded with a per-region timing breakdown.
+- **Affinity:** every worker's read-back affinity equals its assigned core.
+
+## 8. Risks and open questions
+
+- **Synchronization cost.** OpenMP already uses 5 regions per layer
+  (`docs/kernels.md:42-45`), and the 1B model is partly bound by region
+  synchronization (`docs/kernels.md:131-133`). A naive pthread barrier could be
+  slower. Measure the per-barrier cost in the `check` job before tuning.
+- **`fail()` in worker threads.** `fail` uses a single-shot flag, and other failing
+  threads `pause()` (`src/runtime.c:40-55`). The pool must not wait forever on a
+  worker that called `fail`.
+- **Changed thread-to-row mapping.** Per-segment splitting changes which thread
+  computes which rows on the OpenMP path. Results stay deterministic for a fixed
+  thread count, but logits can change in the last bits compared with the recorded
+  baseline. Re-record only if the change is understood.
+
+## 9. Not in this phase
+
+- Two teams with real placement (B).
+- Cross-socket reduction (B4).
+- GEMM tiling (C2).
+- Futex parking.
+- Overlapping communication with compute.
