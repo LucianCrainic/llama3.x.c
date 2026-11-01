@@ -269,6 +269,45 @@ run_phases() {
   done
 }
 
+# a_models PHASE_DIR [LENGTHS]: writes the prompts (short.txt, prompt-N.txt) and tokenizes short.txt per model.
+a_models() {
+  local dir=$1 entry name artifacts hf
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    make_prompt "$ROOT/build/release/probe-fp32" "$artifacts/tokenizer-v2.bin" 128256 "${2:-none}"
+    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$artifacts/tokenizer-v2.bin" 128256 "@$OUT/short.txt" \
+      > "$dir/$name-tokens.txt"
+  done
+}
+
+# tokens_of NAME PROMPT_FILE OUTPUT: the token ids of a prompt file, one per line (needs a_models' probe and tokenizer).
+tokens_of() {
+  local entry n artifacts hf
+  for entry in $MODELS; do
+    IFS=: read -r n artifacts hf <<< "$entry"
+    [[ $n == "$1" ]] || continue
+    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$artifacts/tokenizer-v2.bin" 128256 "@$2" > "$3"
+  done
+}
+
+# CMP_FLAGS and CMP_TOKENS shape a_bitwise: the gate flags (default --bitwise) and a tokens file other than the default
+# DIR/NAME-tokens.txt. Phases set them and restore the defaults afterwards.
+CMP_FLAGS=(--bitwise)
+CMP_TOKENS=
+# a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine comparison on the
+# tokens of the model (default gate: bitwise equality at every position).
+a_bitwise() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=() tokens=${CMP_TOKENS:-$1/$2-tokens.txt}
+  shift 5
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
+    shift
+  done
+  expect "compare-$name-$precision-$label" ok "$dir" -- numactl --cpunodebind=0 "$PYTHON" \
+    "$ROOT/tools/compare_engines.py" --probe "$ROOT/build/release/probe-$precision" --checkpoint "$staged" \
+    --tokens-file "$tokens" "${args[@]}" "${CMP_FLAGS[@]}" --output "$dir/compare-$name-$precision-$label.json"
+}
+
 # F2, model-free part: kernels on teams at full-socket size on the hardware ISA, the pinning read-back, and the
 # per-barrier cost. The real-model gate and the omp-versus-teams decode comparison need MODELS and a Hugging Face
 # Python environment and are not part of this phase's model-free check.

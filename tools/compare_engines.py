@@ -33,17 +33,18 @@ def parse_env(items):
     return env
 
 
-def run_probe(probe, checkpoint, tokens, env, batch=None):
-    """Raw logits at every position. batch=M runs the batched prefill path (C1) with LLAMA_PREFILL_BATCH=M."""
+def run_probe(probe, checkpoint, tokens, env, batch=None, last_only=False):
+    """Raw logits at every position. batch=M runs the batched prefill path (C1) with LLAMA_PREFILL_BATCH=M; with
+    last_only the batched path returns just the final position's row, which keeps long prompts affordable."""
     command = [str(probe)] + (['batch'] if batch else []) + [str(checkpoint), *map(str, tokens)]
     if batch:
-        env = {**env, 'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'}
+        env = {**env, 'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'last' if last_only else 'all'}
     result = subprocess.run(command, capture_output=True, env={**os.environ, **env})
     if result.returncode != 0:
         raise SystemExit(f'probe failed (exit {result.returncode}) under {env}: {result.stderr.decode(errors="replace")}')
-    size = len(tokens) * 4
-    if not result.stdout or len(result.stdout) % size:
-        raise SystemExit(f'probe wrote {len(result.stdout)} bytes, not a multiple of {len(tokens)} float32 rows')
+    rows = 1 if batch and last_only else len(tokens)
+    if not result.stdout or len(result.stdout) % (rows * 4):
+        raise SystemExit(f'probe wrote {len(result.stdout)} bytes, not a multiple of {rows} float32 rows')
     return result.stdout
 
 
@@ -93,6 +94,8 @@ def main(argv=None):
     parser.add_argument('--batch-a', type=int, metavar='M', help='run config A through the batched prefill path, microbatch M')
     parser.add_argument('--batch-b', type=int, metavar='M', help='run config B through the batched prefill path, microbatch M')
     parser.add_argument('--max-abs', type=float, default=1e-3, help='budget for max |delta logit| (default 1e-3)')
+    parser.add_argument('--last-only', action='store_true',
+                        help='compare only the final position (config B runs the batched path with LLAMA_PREFILL_LOGITS=last)')
     parser.add_argument('--bitwise', action='store_true', help='require bit-identical logits instead of the --max-abs budget')
     parser.add_argument('--output', help='write the JSON result here as well as to stdout')
     args = parser.parse_args(argv)
@@ -101,13 +104,20 @@ def main(argv=None):
     if not tokens:
         raise SystemExit('no tokens given')
     env_a, env_b = parse_env(args.env_a), parse_env(args.env_b)
-    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a)
-    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b)
+    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a, args.last_only)
+    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b, args.last_only)
+    compared = len(tokens)
+    if args.last_only:
+        row_bytes = len(blob_a) // (len(tokens) if not args.batch_a else 1)
+        blob_a, compared = blob_a[-row_bytes:], 1
+        if args.batch_a:
+            raise SystemExit('--last-only needs config A to be the per-token path')
     if len(blob_a) != len(blob_b):
         raise SystemExit('the two configurations produced logits of different sizes')
     rows = []
-    for index, row in enumerate(positions(blob_a, blob_b, len(tokens))):
-        row.update(position=index, token=tokens[index])
+    for index, row in enumerate(positions(blob_a, blob_b, compared)):
+        position = len(tokens) - 1 if args.last_only else index
+        row.update(position=position, token=tokens[position])
         row['passed'] = row['finite'] and row['argmax_match'] and (
             row['bitwise'] if args.bitwise else row['max_abs'] <= args.max_abs)
         rows.append(row)

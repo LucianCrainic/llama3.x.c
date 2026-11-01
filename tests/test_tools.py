@@ -151,6 +151,13 @@ class CompareEnginesTests(unittest.TestCase):
                 self.assertTrue(data['summary']['bitwise'])
                 self.assertEqual(data['batch_b'], int(batch))
 
+    def test_last_only_compares_the_final_position(self):
+        for engine in ('fp32', 'int8'):
+            result, data = self.compare(engine, '--batch-b', '3', '--last-only', '--bitwise')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual([row['position'] for row in data['comparisons']], [3])
+            self.assertTrue(data['summary']['bitwise'])
+
     def test_scalar_gemm_prefill_is_bitwise_equal_to_per_token(self):
         # The scalar GEMM sums each output like the GEMV (one K block, ascending k); the Q8 engine has no GEMM yet.
         for engine in ('fp32', 'int8'):
@@ -269,6 +276,19 @@ class ScriptTests(unittest.TestCase):
             with self.subTest(script=path.name):
                 result = subprocess.run(['shellcheck', '-x', '-S', 'warning', str(path)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class SummarizeGemmTests(unittest.TestCase):
+    def test_table_has_speedup_and_peak_share(self):
+        line = lambda kernel, m, gf: json.dumps(dict(kernel=kernel, isa='avx512', backend='teams', node=2, n=4096, k=4096, m=m,
+                                                     gflops_best=gf, gflops_mean=gf * .9, weight_gbs_best=100, kc=1024))
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'bench.jsonl'
+            path.write_text('\n'.join([line('gemm', 8, 2000), line('gemv_rows', 8, 500), line('gemm', 64, 4400)]) + '\n')
+            result = subprocess.run([sys.executable, str(TOOLS/'summarize_gemm.py'), str(path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('| 8 | 2000 / 1800 | 100 | 23% | 500 | 4.0x |', result.stdout)
+        self.assertIn('| 64 | 4400 / 3960 | 100 | 50% | - | - |', result.stdout)
 
 
 class CheckPlacementTests(unittest.TestCase):

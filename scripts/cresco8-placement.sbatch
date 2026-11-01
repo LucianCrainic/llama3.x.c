@@ -175,29 +175,6 @@ PY
 # Source checkpoints are staged in tmpfs on DDR node 0 (never on HBM node 2, which must have room for the owned copy).
 # The `file` baseline of the bitwise gate reads the same staged file through the mapping; where the source lives
 # dominates load time but not inference, and is recorded in the report directory.
-a_models() { # a_models PHASE_DIR: tokenizes the 86-token prompt once per model
-  local dir=$1 entry name artifacts hf
-  for entry in $MODELS; do
-    IFS=: read -r name artifacts hf <<< "$entry"
-    make_prompt "$ROOT/build/release/probe-fp32" "$artifacts/tokenizer-v2.bin" 128256 "${2:-none}"
-    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$artifacts/tokenizer-v2.bin" 128256 "@$OUT/short.txt" \
-      > "$dir/$name-tokens.txt"
-  done
-}
-
-# a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine bitwise comparison.
-a_bitwise() {
-  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=()
-  shift 5
-  while (($#)); do
-    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
-    shift
-  done
-  expect "compare-$name-$precision-$label" ok "$dir" -- numactl --cpunodebind=0 "$PYTHON" \
-    "$ROOT/tools/compare_engines.py" --probe "$ROOT/build/release/probe-$precision" --checkpoint "$staged" \
-    --tokens-file "$dir/$name-tokens.txt" "${args[@]}" --bitwise --output "$dir/compare-$name-$precision-$label.json"
-}
-
 phase_A4() {
   local dir="$OUT/A4" entry name artifacts hf precision engine staged tokenizer backend placement label benv
   if [[ -z $MODELS ]]; then
