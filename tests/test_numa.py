@@ -147,6 +147,39 @@ class TopologyTests(unittest.TestCase):
         self.assertIn('cannot read', self.probe(Path(self.temp.name)/'absent', success=False))
 
 
+class RegionTests(unittest.TestCase):
+    def run_regions(self, *args, env=None):
+        import os
+        return subprocess.run([str(BUILD/'test-regions'), *args], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, **(env or {})})
+
+    def test_unit_tests(self):
+        result = self.run_regions()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failure_during_startup_leaves_nothing_behind(self):
+        result = self.run_regions('fail3')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('[ERROR] injected startup failure after 3 regions', result.stderr)
+        self.assertEqual(result.stdout.strip(), 'live=0 current=0')
+
+    @unittest.skipUnless(Path('/sys/devices/system/node/node0').exists(), 'needs a NUMA Linux host')
+    def test_bind_to_node0_and_injected_failures(self):
+        result = self.run_regions('bind', '0', 4 << 20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('node 0', result.stdout)
+        for fault, text in [('EPERM', 'Operation not permitted'), ('ENOSYS', 'not implemented'), ('EINVAL', 'Invalid')]:
+            with self.subTest(fault=fault):
+                result = self.run_regions('bind', '0', 4 << 20, env={'LLAMA_NUMA_FAULT': fault})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('cannot bind', result.stderr)
+                self.assertIn('NUMA node 0', result.stderr)
+                self.assertIn('allowed memory nodes:', result.stderr)
+        result = self.run_regions('bind', '999', 4096)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('not a possible node', result.stderr)
+
+
 class RealMachineTests(unittest.TestCase):
     def run_probe(self, *args):
         return subprocess.run([str(BUILD/'numa_probe'), *args], capture_output=True, text=True, timeout=30)

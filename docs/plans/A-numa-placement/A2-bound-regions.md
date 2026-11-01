@@ -6,7 +6,28 @@ Add an owned-region allocator that places a large region on **exactly one** NUMA
 before any page is touched. The owning team populates it, and it is freed exactly once.
 This is the only route by which weights, KV and workspaces get explicit placement.
 
-Status: **planned**. Branch: `feature/numa-a2-bound-regions`.
+Status: **implemented, local tests pass; Linux bound backend and cluster `check` not yet
+run**. Branch: `feature/numa-a2-bound-regions` (stacked on A1).
+
+Implementation notes:
+
+- **`maxnode` is `max_node + 2`, not `max_node + 1`.** The kernel reads `maxnode - 1`
+  bits of the mask (as libnuma passes `size + 1`), so a plain bit count would drop the
+  highest node id and make `mbind` to that node fail with `EINVAL`. This corrects the
+  wording in §4.2 step 3.
+- Descriptors gain `data_bytes` (rounded extent that is bound) and `populated`. The
+  registry keeps its own copies, so it can release regions whose descriptors are gone;
+  it is registered with `atexit` on the first reservation, which makes the `fail()` path
+  (`exit`) release everything.
+- `region_reserve_try` returns a message; `region_reserve` calls `fail()`. A zero or
+  overflowing size is an error. The per-node budget is checked against the node's
+  `MemTotal` and the bytes already reserved on it.
+- `MemoryKind` gains `MEM_WEIGHTS_OWNED` and `MEM_WEIGHTS_PACKED` (report keys
+  `owned_weights_peak`, `packed_weights_peak`); `memory_track` / `memory_untrack`
+  account for memory that is not `memory_alloc`ed.
+- The Linux code compiles against stub headers (`-fsyntax-only`) but has not run.
+  `LLAMA_NUMA_FAULT` injection is tested only on Linux (`tests/test_numa.py`).
+- The report's `regions[]` list is F3's; the registry exposes `region_live_at`.
 
 ## 2. Depends on / unblocks
 

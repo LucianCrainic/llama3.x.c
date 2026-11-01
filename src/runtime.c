@@ -66,6 +66,18 @@ size_t checked_add(size_t a, size_t b) {
     fail("size addition overflow: %zu + %zu", a, b);
   return a + b;
 }
+void memory_track(MemoryKind kind, size_t bytes) {
+  memory_current[kind] = checked_add(memory_current[kind], bytes);
+  if (memory_current[kind] > memory_peak[kind])
+    memory_peak[kind] = memory_current[kind];
+  total_current = checked_add(total_current, bytes);
+  if (total_current > memory_total_peak)
+    memory_total_peak = total_current;
+}
+void memory_untrack(MemoryKind kind, size_t bytes) {
+  memory_current[kind] -= bytes;
+  total_current -= bytes;
+}
 void *memory_alloc(size_t count, size_t size, MemoryKind kind) {
   size_t bytes = checked_mul(count, size);
   if (bytes > PTRDIFF_MAX)
@@ -75,20 +87,14 @@ void *memory_alloc(size_t count, size_t size, MemoryKind kind) {
     fail("allocation failed for category %d: %zu bytes (%s)", kind, bytes, strerror(errno));
   block->allocation.bytes = bytes;
   block->allocation.kind = kind;
-  memory_current[kind] = checked_add(memory_current[kind], bytes);
-  if (memory_current[kind] > memory_peak[kind])
-    memory_peak[kind] = memory_current[kind];
-  total_current = checked_add(total_current, bytes);
-  if (total_current > memory_total_peak)
-    memory_total_peak = total_current;
+  memory_track(kind, bytes);
   return block + 1;
 }
 void memory_free(void *pointer) {
   if (!pointer)
     return;
   Allocation *block = (Allocation *)pointer - 1;
-  memory_current[block->allocation.kind] -= block->allocation.bytes;
-  total_current -= block->allocation.bytes;
+  memory_untrack(block->allocation.kind, block->allocation.bytes);
   free(block);
 }
 

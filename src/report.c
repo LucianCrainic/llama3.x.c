@@ -273,7 +273,7 @@ void write_report(void) {
   const char *names[] = {
       "kv_cache_allocated_peak",       "activations_allocated_peak", "dequantized_embedding_allocated_peak",
       "model_metadata_allocated_peak", "tokenizer_allocated_peak",   "sampler_allocated_peak",
-      "prompt_buffers_allocated_peak"};
+      "prompt_buffers_allocated_peak", "owned_weights_peak",        "packed_weights_peak"};
   for (int i = 0; i < MEM_COUNT; i++)
     fprintf(f, ",\n    \"%s\": %zu", names[i], memory_peak[i]);
   fprintf(f, ",\n    \"explicit_allocations_peak\": %zu,\n    \"peak_resident\": ", memory_total_peak);

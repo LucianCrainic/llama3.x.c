@@ -39,11 +39,16 @@ typedef enum {
   MEM_TOKENIZER,
   MEM_SAMPLER,
   MEM_PROMPT,
+  MEM_WEIGHTS_OWNED,
+  MEM_WEIGHTS_PACKED,
   MEM_COUNT
 } MemoryKind;
 extern size_t memory_current[MEM_COUNT], memory_peak[MEM_COUNT], memory_total_peak;
 void *memory_alloc(size_t count, size_t size, MemoryKind kind);
 void memory_free(void *pointer);
+/* Accounting for memory that is not allocated by memory_alloc (bound regions). Coordinator thread only. */
+void memory_track(MemoryKind kind, size_t bytes);
+void memory_untrack(MemoryKind kind, size_t bytes);
 size_t checked_mul(size_t a, size_t b);
 size_t checked_add(size_t a, size_t b);
 /* File bytes of a tensor: FP32 values, or Q8 values plus FP32 group scales (no padding). */

@@ -55,11 +55,14 @@ $(BUILD_DIR)/test-kernels: tests/kernels.c $(COMMON) $(HEADERS) $(BUILD_DIR)/con
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-manifest: tests/manifest.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/manifest.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-regions: tests/regions.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/regions.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/numa_probe: tests/numa_probe.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/numa_probe.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe
+test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions
 	$(BUILD_DIR)/test-kernels
 	$(BUILD_DIR)/test-manifest
+	$(BUILD_DIR)/test-regions
 	python3 tests/test_runtime.py $(BUILD_DIR)
 	python3 tests/test_numa.py $(BUILD_DIR)
 	python3 tests/test_tools.py

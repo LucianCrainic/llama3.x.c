@@ -57,4 +57,38 @@ const Topology *numa_topology(void);
 int numa_affinity_cpus(int *cpus, int capacity);
 int numa_online_nodes(char *buf, size_t size);
 
+/* ---- Bound memory regions (A2) --------------------------------------------------------------------------------
+ * A region is one anonymous mapping placed on exactly one node before any page is touched. The owning team
+ * populates it, the coordinator accounts for it, and it is released exactly once; the registry of live regions
+ * releases whatever is left at exit, so fail() paths and partial startups leak nothing. */
+typedef enum { BACKEND_PORTABLE, BACKEND_LINUX_BOUND } RegionBackend;
+typedef enum { ROLE_WEIGHTS, ROLE_PACKED, ROLE_EMBEDDING, ROLE_KV_K, ROLE_KV_V, ROLE_WORK, ROLE_SCRATCH } RegionRole;
+
+typedef struct {
+  void *mapping_base;
+  size_t mapping_bytes; /* what munmap receives; includes alignment slack */
+  void *data;
+  size_t logical_bytes; /* requested size */
+  size_t data_bytes;    /* logical size rounded to the page (or THP) size; the extent that is bound */
+  int socket, node;     /* node -1 = portable backend, not bound */
+  RegionRole role;
+  RegionBackend backend;
+  int thp_requested, read_only, populated;
+} NumaRegion;
+
+/* Reserve and bind. A bind failure never falls back to another node. `_try` returns -1 with a message; the plain
+ * form calls fail(). node < 0 selects the portable backend (plain mmap, no binding), the only one off Linux. */
+int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, RegionRole role, int thp, char *err,
+                       size_t err_size);
+void region_reserve(NumaRegion *r, size_t bytes, int socket, int node, RegionRole role, int thp);
+void region_mark_populated(NumaRegion *r); /* coordinator accounting after the owner filled the region */
+void region_protect(NumaRegion *r);        /* PROT_READ, for weights */
+void region_release(NumaRegion *r);        /* idempotent; zeroes the descriptor */
+void region_release_all(void);             /* also registered with atexit on the first reservation */
+int region_live_count(void);
+const NumaRegion *region_live_at(int index);
+int region_round(size_t bytes, size_t align, size_t *rounded); /* -1 on zero or overflow */
+int region_thp_default(void);                                  /* LLAMA_THP=on */
+const char *region_role_name(RegionRole role);
+
 #endif

@@ -2,14 +2,25 @@
 
 #include "runtime.h"
 #include <dirent.h>
+#include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sched.h>
 #include <sys/syscall.h>
-#include <unistd.h>
+#if defined(__has_include)
+#if __has_include(<linux/mempolicy.h>)
+#include <linux/mempolicy.h>
+#endif
+#endif
+#endif
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
 #endif
 
 enum { MAX_CPUS = 1024, MAX_NODES = 128 };
@@ -608,4 +619,233 @@ const Topology *numa_topology(void) {
 #endif
   ready = 1;
   return &topology;
+}
+
+/* ---- bound regions (A2) ---------------------------------------------------------------------------------------- */
+
+enum { REGION_LIMIT = 1024, THP_BYTES = 2 << 20 };
+static NumaRegion live[REGION_LIMIT];
+static int live_count, exit_hook;
+
+const char *region_role_name(RegionRole role) {
+  static const char *const names[] = {"weights", "packed", "embedding", "kv.k", "kv.v", "work", "scratch"};
+  return (unsigned)role < sizeof(names) / sizeof(*names) ? names[role] : "?";
+}
+
+static MemoryKind region_kind(RegionRole role) {
+  switch (role) {
+  case ROLE_WEIGHTS:
+    return MEM_WEIGHTS_OWNED;
+  case ROLE_PACKED:
+    return MEM_WEIGHTS_PACKED;
+  case ROLE_EMBEDDING:
+    return MEM_EMBEDDING;
+  case ROLE_KV_K:
+  case ROLE_KV_V:
+    return MEM_KV;
+  default:
+    return MEM_ACTIVATION;
+  }
+}
+
+int region_round(size_t bytes, size_t align, size_t *rounded) {
+  if (!bytes || !align || bytes > SIZE_MAX - (align - 1))
+    return -1;
+  *rounded = (bytes + align - 1) / align * align;
+  return 0;
+}
+
+int region_thp_default(void) {
+  const char *thp = getenv("LLAMA_THP");
+  return thp && !strcmp(thp, "on");
+}
+
+int region_live_count(void) {
+  return live_count;
+}
+const NumaRegion *region_live_at(int index) {
+  return index >= 0 && index < live_count ? &live[index] : NULL;
+}
+
+static NumaRegion *find_live(const void *mapping_base) {
+  for (int i = 0; i < live_count; i++)
+    if (live[i].mapping_base == mapping_base)
+      return &live[i];
+  return NULL;
+}
+
+static void drop_live(NumaRegion *entry) {
+  if (entry->populated)
+    memory_untrack(region_kind(entry->role), entry->logical_bytes);
+  munmap(entry->mapping_base, entry->mapping_bytes);
+  memmove(entry, entry + 1, (size_t)(&live[live_count] - (entry + 1)) * sizeof(*entry));
+  live_count--;
+}
+
+void region_release(NumaRegion *r) {
+  if (!r || !r->mapping_base)
+    return;
+  NumaRegion *entry = find_live(r->mapping_base);
+  if (entry)
+    drop_live(entry); /* an entry already released by region_release_all is not unmapped twice */
+  memset(r, 0, sizeof(*r));
+  r->node = -1;
+}
+
+void region_release_all(void) {
+  while (live_count)
+    drop_live(&live[live_count - 1]);
+}
+
+#ifdef __linux__
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+
+static int possible_max_node(void) {
+  static int cached = -2;
+  if (cached == -2) {
+    char line[512];
+    unsigned char possible[MAX_NODES];
+    cached = -1;
+    if (read_first_line("/sys/devices/system/node/possible", line, sizeof(line)) == 0 &&
+        parse_list(line, possible, MAX_NODES) == 0)
+      for (int n = 0; n < MAX_NODES; n++)
+        if (possible[n])
+          cached = n;
+  }
+  return cached;
+}
+
+static size_t node_capacity(int node) {
+  char path[128], line[256];
+  snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+  FILE *f = fopen(path, "r");
+  size_t total = 0;
+  while (f && fgets(line, sizeof(line), f)) {
+    char *at = strstr(line, "MemTotal:");
+    if (at)
+      total = (size_t)strtoull(at + 9, NULL, 10) * 1024;
+  }
+  if (f)
+    fclose(f);
+  return total;
+}
+
+/* Test-only fault injection (LLAMA_NUMA_FAULT=EPERM|ENOSYS|EINVAL), checked where the syscall would be made. */
+static int injected_fault(void) {
+  const char *fault = getenv("LLAMA_NUMA_FAULT");
+  if (!fault || !*fault)
+    return 0;
+  return !strcmp(fault, "EPERM") ? EPERM : !strcmp(fault, "ENOSYS") ? ENOSYS : !strcmp(fault, "EINVAL") ? EINVAL : EIO;
+}
+
+static int bind_memory(void *addr, size_t bytes, int node, int max_node) {
+  int fault = injected_fault();
+  if (fault)
+    return fault;
+  unsigned long mask[MAX_NODES / (8 * sizeof(unsigned long)) + 1] = {0};
+  mask[node / (8 * sizeof(unsigned long))] = 1ul << (node % (8 * sizeof(unsigned long)));
+  /* The kernel reads maxnode - 1 bits of the mask, so a node id of max_node needs maxnode = max_node + 2, as libnuma
+   * passes it. A plain bit count (max_node + 1) would silently drop the highest node. */
+  long rc = syscall(SYS_mbind, addr, bytes, MPOL_BIND, mask, (unsigned long)max_node + 2, 0u);
+  return rc == 0 ? 0 : errno;
+}
+#endif
+
+int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, RegionRole role, int thp, char *err,
+                       size_t err_size) {
+  memset(r, 0, sizeof(*r));
+  r->node = -1;
+  int bound = node >= 0;
+#ifndef __linux__
+  if (bound)
+    FAIL("cannot bind memory to NUMA node %d: explicit placement requires Linux", node);
+#endif
+  size_t page = (size_t)sysconf(_SC_PAGESIZE), align = bound && thp ? (size_t)THP_BYTES : page, rounded;
+  if (region_round(bytes, align, &rounded))
+    FAIL("invalid region size %zu bytes (zero, or overflows when rounded to %zu)", bytes, align);
+  size_t slack = align > page ? align : 0, mapping;
+  if (rounded > SIZE_MAX - slack || rounded + slack > PTRDIFF_MAX)
+    FAIL("region of %zu bytes exceeds the addressable size", bytes);
+  mapping = rounded + slack;
+#ifdef __linux__
+  int max_node = -1;
+  if (bound) {
+    max_node = possible_max_node();
+    if (max_node < 0 || node > max_node)
+      FAIL("NUMA node %d is not a possible node (highest possible: %d)", node, max_node);
+    size_t capacity = node_capacity(node), reserved = 0;
+    for (int i = 0; i < live_count; i++)
+      reserved += live[i].node == node ? live[i].data_bytes : 0;
+    if (capacity && reserved + rounded > capacity)
+      FAIL("region of %zu bytes would exceed node %d capacity (%zu bytes total, %zu already reserved)", rounded, node,
+           capacity, reserved);
+  }
+#endif
+  if (live_count == REGION_LIMIT)
+    FAIL("too many live regions (limit %d)", REGION_LIMIT);
+  /* No MAP_POPULATE and no write: the pages must not exist before the policy does. */
+  void *base = mmap(NULL, mapping, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED)
+    FAIL("cannot reserve %zu bytes: %s", mapping, strerror(errno));
+  uintptr_t start = ((uintptr_t)base + align - 1) / align * align;
+  void *data = (void *)start;
+#ifdef __linux__
+  if (bound) {
+    int status = bind_memory(data, rounded, node, max_node);
+    if (status) {
+      char allowed[512] = "unknown";
+      allowed_mems_list(allowed, sizeof(allowed));
+      munmap(base, mapping);
+      FAIL("cannot bind %zu bytes to NUMA node %d: %s (errno %d); allowed memory nodes: %s", rounded, node,
+           strerror(status), status, allowed);
+    }
+#ifdef MADV_HUGEPAGE
+    if (thp && madvise(data, rounded, MADV_HUGEPAGE) == 0)
+      r->thp_requested = 1;
+    else if (thp)
+      LOG(LOG_WARN, "madvise(MADV_HUGEPAGE) failed for a region on node %d: %s", node, strerror(errno));
+#endif
+  }
+#endif
+  *r = (NumaRegion){.mapping_base = base,
+                    .mapping_bytes = mapping,
+                    .data = data,
+                    .logical_bytes = bytes,
+                    .data_bytes = rounded,
+                    .socket = socket,
+                    .node = node,
+                    .role = role,
+                    .backend = bound ? BACKEND_LINUX_BOUND : BACKEND_PORTABLE,
+                    .thp_requested = r->thp_requested};
+  live[live_count++] = *r;
+  if (!exit_hook) {
+    exit_hook = 1;
+    atexit(region_release_all);
+  }
+  return 0;
+}
+
+void region_reserve(NumaRegion *r, size_t bytes, int socket, int node, RegionRole role, int thp) {
+  char err[512];
+  if (region_reserve_try(r, bytes, socket, node, role, thp, err, sizeof(err)))
+    fail("%s", err);
+}
+
+void region_mark_populated(NumaRegion *r) {
+  NumaRegion *entry = r->mapping_base ? find_live(r->mapping_base) : NULL;
+  if (!entry || entry->populated)
+    return;
+  entry->populated = r->populated = 1;
+  memory_track(region_kind(r->role), r->logical_bytes);
+}
+
+void region_protect(NumaRegion *r) {
+  NumaRegion *entry = r->mapping_base ? find_live(r->mapping_base) : NULL;
+  if (!entry)
+    fail("cannot protect a region that is not live");
+  if (mprotect(r->data, r->data_bytes, PROT_READ))
+    fail("cannot make region read-only: %s", strerror(errno));
+  entry->read_only = r->read_only = 1;
 }
