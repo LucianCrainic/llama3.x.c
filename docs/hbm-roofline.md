@@ -273,6 +273,12 @@ W8A8. Q8_0 exists but needs 5.1's VNNI/W8A32 kernel and requalification on 8B.
 | 6 | Batched prefill with AVX-512, then AMX BF16/INT8 tiles | Prefill / TTFT | 100–1000× prefill headroom |
 | 7 | GQA-aware split-K attention, BF16 KV, KV tiering HBM→DDR | Long context | Keeps decode bandwidth-bound past 8K |
 
+Measured outcome of E1, step 1's kernel and parts of steps 3, 4 and 7: see
+[kernels.md](kernels.md#results-on-cresco8-flat-mode). At 56 threads the
+scalar engine runs at the same speed on DDR and HBM (8B FP32: 6.9 / 7.5
+tok/s). The AVX-512 kernels reach 14.9 tok/s (447 GB/s) on HBM and 8.3 on DDR.
+8B Q8_0 reaches 44.5 tok/s (355 GB/s).
+
 For each step, report achieved GB/s, computed as bytes per token × tokens/s,
 next to the §3 roofline. Also record uncore `hbm_cas_rd`/`ddr_cas_rd`/UPI counters
 using the hw-bench perf event set, so that "HBM was used" is a measurement,
