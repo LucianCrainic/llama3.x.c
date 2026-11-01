@@ -65,6 +65,10 @@ Phase 2 Cache Mode baselines (FP32, sequential prefill):
 | llama.cpp 1B / 8 | 21.3 | 4.94 GB | 105 GB/s | 13 GB/s |
 | llama.cpp 8B / 32 | 4.84 | 30.0 GB | 145 GB/s | 4.5 GB/s |
 
+The llama.cpp rows are FP32 at commit `dde879bc4f95`, from the llama.cpp side study
+(its harness and write-up were removed from the tree; see `docs/llamacpp-comparison.md`
+in history before the cleanup merge).
+
 **The engine is bound by compute latency, not memory.** The FP32 `matmul` inner loop
 (`src/run.c`, `val += w[i*n+j] * x[j]`) is a strict floating-point reduction.
 Without `-ffast-math`/`-fassociative-math` the compiler may not reorder it. The

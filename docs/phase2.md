@@ -1,8 +1,9 @@
 # Phase 2: configuration-driven Llama 3 text inference
 
 Status and executed checks are in [phase2-validation.md](phase2-validation.md).
-README.md remains empty. Phase 1 metric definitions in [phase1.md](phase1.md)
-still apply; this document supersedes its compatibility/conversion limitations.
+README.md is intentionally empty; this document covers building, conversion,
+running and the report schema. Kernels and their measured performance are in
+[kernels.md](kernels.md).
 
 ## Architecture and limits
 
@@ -72,6 +73,92 @@ normalization/theta metadata rather than discarding it. Meta consolidated import
 preserves tensor-derived FFN size and supplied metadata, but ambiguous
 `use_scaled_rope` without an explicit scaling dictionary fails: use the HF
 snapshot for Llama 3.1/3.2. v1 output is historical and has no C reader.
+
+### Build modes
+
+Python 3.8+ is needed only for tests; Python ML packages are needed only for
+conversion and reference validation.
+
+Linux (GCC, or substitute CC=clang):
+
+```sh
+make CC=gcc
+make test CC=gcc
+make MODE=debug CC=gcc
+make MODE=profile CC=gcc
+make test MODE=sanitize CC=gcc
+make test OPENMP=1 CC=gcc
+```
+
+macOS (Apple Clang):
+
+```sh
+make CC=clang
+make test CC=clang
+make MODE=debug CC=clang
+make MODE=profile CC=clang
+make test MODE=sanitize CC=clang
+```
+
+Executables are build/<mode>/run and runq. Release uses -O3 without fast-math;
+profile uses -O2 -g -fno-omit-frame-pointer; debug uses -O0 -g3. Sanitize uses
+AddressSanitizer and UndefinedBehaviorSanitizer. Flags are recorded in reports.
+No build requires OpenMP or a CPU-specific flag: AVX-512 kernels are selected at
+run time (see [kernels.md](kernels.md)). GCC on Linux supports OPENMP=1; Apple Clang needs an
+external libomp installation and explicit flags, for example:
+
+```sh
+make CC=clang OPENMP=1 \
+  OMP_CFLAGS='-Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include' \
+  OMP_LDFLAGS='-L/opt/homebrew/opt/libomp/lib -lomp'
+```
+
+That macOS OpenMP command is an example, not a validated installation recipe;
+adjust the prefix to your installation. Optional NATIVE=1 adds -march=native.
+CFLAGS/CPPFLAGS/LDFLAGS/LDLIBS and BUILD_DIR may be overridden. A configuration
+stamp forces rebuilds when the compiler or flags change. Changing OPENMP in the
+same directory replaces those binaries; use a distinct BUILD_DIR for experiments.
+
+External affinity tools can launch the binaries normally, for example numactl
+on Linux. Reports expose online CPUs, sched_getaffinity's CPU list, and the Linux
+sysfs online NUMA node list when available. Failed/unsupported diagnostics are
+null. These are observations, not memory-tier identification. OpenMP thread
+counts and affinity policies remain controlled by external environment variables.
+
+## Running
+
+```sh
+build/release/run model-fp32.bin -z tokenizer.bin -i 'Once upon a time' -n 128
+build/release/runq model-int8.bin -z tokenizer.bin -m chat -y 'You are helpful.'
+build/debug/run --help
+```
+
+Legacy flags -t/-p/-s/-n/-i/-z/-m/-y remain. -n is a maximum number of **forward
+passes including prompt processing**, not output length; 0 selects checkpoint
+context length. A short -n may process only part of the prompt and produce no
+output. The generation-length option caps non-stop output tokens separately;
+0 tokenizes but executes no forward passes. Context and -n still take priority.
+The final prompt position can emit one output token even at the context limit.
+
+--benchmark is non-interactive, defaults to prompt `Once upon a time`, seed 1,
+and 128 output tokens (unless an explicit -n or generation length overrides that
+default). It preserves EOS/EOT stopping and never pads a completed response.
+Temperature 0 gives greedy decoding. Nonzero temperatures are reproducible with
+the same seed/build/environment; cross-platform bitwise equality is not promised.
+Seed 0 explicitly maps to state 1 because xorshift cannot use an all-zero state.
+
+--prompt-file reads a whole file, including newlines; it cannot be combined with
+-i/--prompt. Embedded NUL bytes are rejected. --no-text suppresses stdout.
+--log-level accepts error, warn, info (default), debug, trace. Diagnostics and
+interactive labels use stderr. Stdout contains prompt echo and generated text
+for generation mode, and assistant response text for chat. Prompt echo is kept
+for the original CLI behavior but excluded from generated token counts.
+
+Chat preserves the original LLaMA 3 system/user/assistant token template and uses
+dynamic buffers instead of fixed 32 KiB arrays. It stops cleanly on EOF or exit.
+End-of-turn markers are cached between turns. Counts/timings aggregate turns;
+interactive wait time is excluded from total_inference but included in end_to_end.
+Use generation/benchmark mode for comparable latency experiments.
 
 ## RoPE
 
@@ -182,39 +269,6 @@ Q8_0 requires an explicitly chosen tolerance (`--precision int8 --max-abs ...
 `rtol * abs(reference)`. It reports max absolute/RMS errors, top-1 agreement and token
 sequence divergence separately. It never treats readable prose as numerical
 validation. A failing result returns nonzero and blocks the benchmark script.
-`tools/diagnose_quantization.py` can compare a failed INT8 case against HF with
-independent weight/input fake quantization, without changing that gate.
-
-`cresco8-phase2.sbatch` runs only within Slurm. Supply the partition and a node
-whose current mode has been checked; the script additionally requires ACPI
-memory-side cache evidence on the allocated dual-Xeon-Max node. It records
-hardware, affinity, scheduler allocation, compiler/flags, source hashes, Git base
-and working diff, and Python packages. Uncommitted deployments are explicitly
-identified by base commit plus source manifest, not represented as a clean commit.
-
-Submit from a cluster checkout with authorized model files and a Python conversion
-environment. Example placeholders must be replaced with verified local values:
-
-```sh
-mkdir -p results
-export HF_MODEL=/models/snapshot ARTIFACTS=/workspace/converted/model
-export OUT=/workspace/results/unique-run PYTHON=/path/to/python
-sbatch --partition=VERIFIED_PARTITION --nodelist=VERIFIED_CACHE_NODE \
-  --exclude=VERIFIED_FLAT_NODE --exclusive \
-  -o results/job-%j.stdout -e results/job-%j.stderr scripts/cresco8-phase2.sbatch
-```
-
-Set `SMOKE_ONLY=1` for conversion/reference/smoke validation without a benchmark.
-`WORKLOADS=long` can rerun only the longer workload; `REPEATS` defaults to three.
-
-Default allocation: one node, eight CPU threads, 128 GiB requested memory,
-two-hour cap; conventional GCC -O3/OpenMP without native/fast-math flags. The
-script builds/tests, converts once, validates, executes a short greedy smoke
-request, then short/long prompts with up to 128 outputs and three repeats each.
-It writes text/stdout/stderr and JSON separately, propagates every failure, and
-uses a unique results directory. Short/long lengths are measured, not assumed.
-EOS may produce fewer than 128 outputs. The 2048 context capacity avoids a 128K
-KV allocation. No memory binding, migration or HBM-specific kernel is introduced.
 
 Reports retain schema 1 with additive model/head/RoPE/shared-weight/parameter-count
 and hostname/kernel fields. `affinity_cpus` is the reporting thread's mask; with
@@ -222,13 +276,101 @@ OpenMP binding it may contain one CPU even when worker threads use the full
 Slurm task allocation. Interpret it alongside the task CPU allocation, recorded
 OMP_PLACES/OMP_PROC_BIND settings and `openmp_max_threads`. Model count excludes quantization scales and unused
 legacy tables. Initialization, sequential prefill, executed decode passes and
-TTFT retain Phase 1 boundaries. See phase1.md for precise definitions.
-`tools/summarize.py results/run` emits means and sample standard deviations plus
-raw paths and actual token counts. By default, the script copies the converted checkpoint to a temporary node-local
-file, records copy time separately and verifies its SHA256. Validation/smoke warm
-that file before repeated benchmarks. The temporary copy is removed at job exit;
-the source artifact remains reusable. This controls filesystem effects without
-changing memory placement. Set LOCAL_STAGE=0 to measure the shared-filesystem
-path instead, with uncontrolled first-touch conditions. No cache eviction or
-cold-cache claim is made. Memory-side cache visibility establishes the mode,
-not HBM hit rates, measured bandwidth or explicit HBM allocation.
+TTFT follow the boundaries in [Benchmark reports](#benchmark-reports).
+
+The Phase 2 Cache Mode campaign (results in
+[phase2-validation.md](phase2-validation.md)) copied each converted checkpoint to
+a temporary node-local file, recorded the copy time separately and verified its
+SHA256. Validation and smoke runs warmed that file before repeated benchmarks.
+This controlled filesystem effects without changing memory placement; no
+cache-eviction or cold-cache claim was made. Memory-side cache visibility
+established the mode, not HBM hit rates, bandwidth or explicit HBM allocation.
+Flat-mode experiments stage checkpoints into `/dev/shm` under an explicit
+`numactl` policy instead (see [kernels.md](kernels.md)).
+
+## Benchmark reports
+
+```sh
+mkdir -p results
+build/release/runq model-int8.bin -z tokenizer.bin \
+  --benchmark --prompt-file prompt.txt --seed 42 -t 0 \
+  --generation-length 128 --no-text --log-level warn --json results/baseline.json
+python3 -m json.tool results/baseline.json
+```
+
+--json writes a separate file. It must not alias a checkpoint, tokenizer or
+prompt input (including hardlinks/symlinks). Parent directories must exist. JSON
+is schema version 1, with UTC completion/report timestamp; model path/config and
+precision; OS/architecture; compiler/flags; parameters; token counts; seconds;
+tokens/second; memory in bytes; completed/error status and stopping reason.
+No checkpoint hash is computed, avoiding a full weight read during startup.
+Paths identify the model but are not cryptographic model identities. UTF-8 is
+preserved in JSON, while invalid bytes are escaped as U+00xx. Prompt content is
+included for reproducibility; keep result files appropriately.
+
+Ordinary fatal errors produce status=error when a usable --json path was
+provided, and exit nonzero. Unavailable/unmeasured timing or rates are null,
+not invented zeros or nonfinite JSON numbers. OS signals, abrupt termination,
+and failures writing the report cannot guarantee a report. Initialization-only
+errors do not claim measured inference. Failed report writes also exit nonzero.
+
+All elapsed durations use CLOCK_MONOTONIC at nanosecond API resolution. Actual
+clock resolution is platform-dependent. No warm-up pass is discarded. Mapping
+is lazy: first-touch/page-fault cost belongs to the operation that incurs it.
+
+| Field under timing_seconds | Boundary/definition |
+| --- | --- |
+| checkpoint_load | Open/stat/read/validate/map plus construction of weight views; INT8 includes its embedding expansion. |
+| tokenizer_init | Vocabulary file parsing and allocations, excluding lazy lookup sorting. |
+| runtime_init | Activation/KV/scratch allocation plus sampler initialization, excluding tokenizer and weight setup. |
+| prompt_tokenization | Token buffer allocation and encode, including first-use vocabulary sort; chat includes template assembly. |
+| prefill | Sum of forward-call durations for supplied prompt/template tokens, including the last prompt position. Sequential, never represented as batched. |
+| decode | Sum of forward-call durations for previously sampled tokens; chat includes the stop-marker cache pass. Sampling and printing are excluded. |
+| total_inference | From tokenization start through generation completion, including sampling and text output; chat sums active turns plus stop-marker caching, excluding input waits. |
+| end_to_end | Main entry through final runtime cleanup before report serialization; includes file prompt reading and chat input waits. The file-prompt buffer is retained until reporting finishes. |
+| time_to_first_token | Tokenization start to availability of the first non-stop output token, before printing it. Null if none. Chat refers to the turn producing the first output. Excludes model/tokenizer setup. |
+| average_time_per_generated_token | total_inference / non-stop output count; includes prefill, tokenization, sampling and output overhead. Null for zero output. |
+| average_decode_step | decode / actual decode forward passes. Null if none. |
+
+Timing components are nested measurements: do **not** add total_inference to its
+subcomponents, or add end_to_end to anything. Forward timings deliberately omit
+sampling/printing overhead; total_inference includes them. Clock readings and
+loop bookkeeping introduce small measurement overhead.
+
+Token counts distinguish input_prompt (includes BOS and chat template),
+processed_prompt (actual prompt forward passes), generated_output (non-stop
+sampled tokens, including pieces filtered from display), sampled and sampled_stop,
+forward_passes and decode_steps. Always:
+`forward_passes = processed_prompt + decode_steps` and
+`sampled = generated_output + sampled_stop`. The first output uses final-prompt
+logits, so a three-token completion normally has two decode steps; an EOS after
+those tokens can require a further decode step. Stops are not output tokens.
+
+Throughput fields are prefill=processed_prompt/prefill seconds,
+decode=decode_steps/decode seconds, overall_forward=forward_passes/total_inference,
+and output=generated_output/total_inference. Ratios require positive measured
+time and positive counts; otherwise null. Decode throughput is based on executed
+passes, not output count. A zero-generation request has null prefill/decode/TTFT.
+
+Memory fields distinguish mapped file size from explicit allocation payloads and
+peak resident bytes. Category fields are simultaneous per-category allocation
+peaks; explicit_allocations_peak is the maximum simultaneous total, not the sum
+of category peaks. Allocator headers/alignment, libc, stdio, OpenMP internals and
+stack memory are excluded from explicit payload counts. getrusage peak RSS is a
+process-wide high-water mark (macOS bytes; Linux KiB converted to bytes), not a
+sum of mappings and allocations. Mapping size is not resident memory.
+
+`build.kernels` names the active kernel set (`scalar` or `avx512`; see
+[kernels.md](kernels.md)). With `LLAMA_PROFILE=1`, `profile_seconds` holds, per
+stage (`prefill`, `decode`), the forward time, the forward pass count, wall time
+per forward-pass phase, and `other` (forward time outside every phase);
+otherwise it is null. Phase timings use the same clock and are nested inside
+the stage's forward time.
+
+A small report can be regenerated without model downloads:
+
+```sh
+python3 tests/fixtures.py build/fixtures
+build/release/run build/fixtures/fp32.bin -z build/fixtures/tokenizer.bin \
+  --benchmark -i A -t 0 --generation-length 3 --no-text --json results/synthetic.json
+```

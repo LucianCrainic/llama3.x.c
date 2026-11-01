@@ -116,8 +116,7 @@ IDs. This indicates substantial inherent approximation loss, but does not prove
 exact grouped-integer kernel equivalence: floating reductions and activation
 rounding boundaries differ. Further per-layer/quantized-reference validation is
 needed before qualifying 8B Q8_0. The original failed budget result is retained.
-`tools/diagnose_quantization.py` reproduces this diagnostic; it never changes the
-benchmark gate or its original quality budget.
+The diagnostic did not change the benchmark gate or its original quality budget.
 The JSON labels `base`/`instruct` identify raw/instruct prompt formats using the
 same supplied Instruct weights; no Base release weights were tested.
 
