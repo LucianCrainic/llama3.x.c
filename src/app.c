@@ -1,4 +1,5 @@
 #include "app.h"
+#include "profile.h"
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -207,6 +208,7 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   float *logits = NULL;
   metrics.inference_started = 1;
   for (int i = 0; i < n && *position < options.steps; i++) {
+    profile_stage = STAGE_PREFILL;
     double start = monotonic_seconds();
     logits = engine_forward(&model, tokens[i], (*position)++);
     metrics.prefill_s += monotonic_seconds() - start;
@@ -252,6 +254,7 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       metrics.stop_reason = "step_limit";
       break;
     }
+    profile_stage = STAGE_DECODE;
     double start = monotonic_seconds();
     logits = engine_forward(&model, next, (*position)++);
     metrics.decode_s += monotonic_seconds() - start;
@@ -348,6 +351,7 @@ int main(int argc, char **argv) {
     fclose(file);
     options.prompt = owned_prompt;
   }
+  profile_init();
   engine_load_context(&model, options.checkpoint, options.context);
   if (!options.steps || options.steps > model.config.seq_len)
     options.steps = model.config.seq_len;

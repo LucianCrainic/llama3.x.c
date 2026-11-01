@@ -31,14 +31,15 @@ class RuntimeTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def execute(self, engine='run', *args, fixture=None, success=True, stdin=None):
+    def execute(self, engine='run', *args, fixture=None, success=True, stdin=None, env=None):
         fixture = fixture or self.shared
         report = self.root/'result.json'
         report.unlink(missing_ok=True)
         model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
         command = [str(BUILD/engine), str(model), '-z', str(fixture/'tokenizer.bin'),
                    '-i', 'A', '--seed', '123', '-t', '0', '--json', str(report), *map(str,args)]
-        result = subprocess.run(command, input=stdin, text=True, capture_output=True, timeout=30)
+        result = subprocess.run(command, input=stdin, text=True, capture_output=True, timeout=30,
+                                env={**os.environ, **(env or {})})
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
         else:
@@ -125,6 +126,25 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(mem['model_file'],(self.shared/('fp32.bin' if engine=='run' else 'int8.bin')).stat().st_size)
             if engine=='runq':
                 self.assertEqual(mem['dequantized_embedding_allocated_peak'],CONFIG[5]*CONFIG[0]*4)
+
+    def test_phase_profile(self):
+        phases = {'embedding','rope_table','rmsnorm','quantize','qkv','rope','kv_store','attention','wo',
+                  'w1_w3_swiglu','w2','classifier','other'}
+        for engine in ('run','runq'):
+            _, data = self.execute(engine,'--benchmark','--generation-length','3','--no-text')
+            self.assertIsNone(data['profile_seconds'])
+            _, data = self.execute(engine,'--benchmark','--generation-length','3','--no-text',env={'LLAMA_PROFILE':'1'})
+            profile = data['profile_seconds']
+            for stage, passes in [('prefill',2),('decode',2)]:
+                section = profile[stage]
+                self.assertEqual(section['forward_passes'],passes)
+                self.assertAlmostEqual(section['forward'],data['timing_seconds'][stage],delta=1e-6)
+                self.assertEqual(set(section)-{'forward_passes','forward'},phases)
+                self.assertTrue(all(section[k] >= 0 for k in phases-{'other'}))
+                self.assertAlmostEqual(sum(section[k] for k in phases),section['forward'],delta=1e-6)
+            if engine == 'run':  # tiny phases may round to 0 on a 1 us clock, so only FP32's absence is exact
+                self.assertEqual(profile['decode']['quantize'],0)
+            self.execute(engine,env={'LLAMA_PROFILE':'yes'},success=False)
 
     def test_empty_one_output_zero_and_partial(self):
         for engine in ('run','runq'):
