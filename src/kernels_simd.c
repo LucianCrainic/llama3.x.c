@@ -1020,6 +1020,12 @@ void kernels_backend_init(void) {
   }
   if (available < 1)
     available = 1;
+  const char *bind = getenv("OMP_PROC_BIND");
+  if (!(topology && *topology) && available == 1 && bind && *bind && strcmp(bind, "false") && strcmp(bind, "FALSE"))
+    LOG(LOG_WARN,
+        "only one CPU is allowed and OMP_PROC_BIND=%s is set: the OpenMP runtime pins the launching thread to one "
+        "core at load. Unset it (or set OMP_PROC_BIND=false) for LLAMA_BACKEND=teams",
+        bind);
   if (!threads)
     threads = available;
   if (cpus && threads > available) {

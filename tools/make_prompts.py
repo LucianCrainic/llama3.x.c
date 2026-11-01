@@ -72,7 +72,7 @@ def main(argv=None):
     manifest = {}
     short = SHORT_SENTENCE * 5
     files = {'short': (short, out/'short.txt')}
-    for target in map(int, args.lengths.split(',')):
+    for target in [int(n) for n in args.lengths.split(',') if n and n != 'none']:
         repeats = target * 8 // len(PARAGRAPH) + 2  # real tokenizers need ~4-5 characters per token
         files[f'prompt-{target}'] = (prefix_for(counter, PARAGRAPH * repeats, target), out/f'prompt-{target}.txt')
     for name, (text, path) in files.items():

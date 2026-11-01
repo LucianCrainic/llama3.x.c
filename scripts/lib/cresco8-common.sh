@@ -47,7 +47,10 @@ job_begin() {
   }
   trap finish EXIT
   exec > >(tee "$OUT/job.stdout") 2> >(tee "$OUT/job.stderr" >&2)
-  export OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
+  # OMP_PROC_BIND is not exported job-wide: with it set, the OpenMP runtime pins the launching thread of every
+  # process that links it to one core at load, and teams workers would inherit that single-CPU mask. run_engine sets
+  # it for omp runs only.
+  export OMP_DYNAMIC=FALSE
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -144,7 +147,7 @@ run_engine() {
   local r
   for ((r = 1; r <= repeats; r++)); do
     local prefix="$OUT/$label-$r"
-    env "$@" "${launcher[@]}" \
+    env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
       --chat-template --prompt-file "$prompt" -t 0 --seed 42 --generation-length "${GENERATION:-128}" --no-text \
       --log-level warn --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
@@ -171,15 +174,21 @@ validate_gate() {
   return "$status"
 }
 
-# make_prompt PROBE TOKENIZER VOCAB: short.txt (86 tokens) and prompt-{512,2048,8192,32768}.txt in OUT, with their
-# achieved token counts and SHA-256 in prompts.json.
+# make_prompt PROBE TOKENIZER VOCAB [LENGTHS|none]: short.txt (86 tokens) and prompt-{512,2048,8192,32768}.txt in OUT,
+# with their achieved token counts and SHA-256 in prompts.json. LENGTHS is a comma list, or none for short.txt only.
 make_prompt() {
-  python3 "$ROOT/tools/make_prompts.py" --probe "$1" --tokenizer "$2" --vocab "$3" --out "$OUT" > /dev/null
+  python3 "$ROOT/tools/make_prompts.py" --probe "$1" --tokenizer "$2" --vocab "$3" --out "$OUT" \
+    --lengths "${4:-512,2048,8192,32768}" > /dev/null
 }
 
-# validate_models: the correctness gate of every model and precision, as in the kernel campaign.
+# validate_models: the correctness gate of every model and precision, as in the kernel campaign. HF_GATE=0 skips it
+# (and records that) where no Python environment with torch and transformers exists.
 validate_models() {
   local entry name artifacts hf precision
+  if [[ ${HF_GATE:-1} == 0 ]]; then
+    echo 'HF_GATE=0: Hugging Face validation was not run (no torch/transformers environment)' | tee "$OUT/no-hf-gate.txt"
+    return 0
+  fi
   if [[ -z $MODELS ]]; then
     echo 'MODELS is empty: Hugging Face validation and model benchmarks were not run' | tee "$OUT/no-models.txt"
     return 0
@@ -260,6 +269,47 @@ PY
   fi
   expect barrier-cost ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" bench-barrier 200000 56
   expect barrier-stress ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" barrier 1000000 56
+  [[ -z $MODELS ]] || phase_F2_models
+}
+
+# stage_model NAME PRECISION ARTIFACTS: copies a checkpoint into tmpfs ($shm, created by the caller in the parent
+# shell) with its pages on HBM node 2 (socket 0's HBM) and prints the staged path.
+stage_model() {
+  local staged="$shm/$1-$2.bin"
+  [[ -e $staged ]] || stage_checkpoint "$3/$2-v3.bin" "$staged" --membind=2
+  printf '%s\n' "$staged"
+}
+
+# F2 with models, one socket (56 threads, weights staged on its HBM): the omp and teams backends agree at every
+# position of an 86-token prompt (C against C, same ISA), and decode speed of teams against omp over REPEATS runs.
+# The Hugging Face gate of a backend that agrees with the validated one is not repeated here (HF_GATE=0 records it).
+phase_F2_models() {
+  local dir="$OUT/F2" bin="$ROOT/build/release" entry name artifacts hf precision engine staged tokenizer label
+  [[ -n $shm ]] || shm=$(mktemp -d "/dev/shm/llama-campaign-$SLURM_JOB_ID-XXXXXX")
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    make_prompt "$bin/probe-fp32" "$tokenizer" 128256 none
+    "$bin/probe-fp32" tokenize "$tokenizer" 128256 "@$OUT/short.txt" > "$dir/$name-tokens.txt"
+    for precision in $PRECISIONS; do
+      engine=run
+      [[ $precision == fp32 ]] || engine=runq
+      staged=$(stage_model "$name" "$precision" "$artifacts")
+      expect "compare-$name-$precision-omp-vs-teams" ok "$dir" -- numactl --cpunodebind=0 --membind=2 "$PYTHON" \
+        "$ROOT/tools/compare_engines.py" --probe "$bin/probe-$precision" --checkpoint "$staged" \
+        --tokens-file "$dir/$name-tokens.txt" --env-a LLAMA_BACKEND=omp --env-a OMP_NUM_THREADS=56 \
+        --env-b LLAMA_BACKEND=teams --env-b LLAMA_THREADS=56 --env-b OMP_PROC_BIND=false --output "$dir/compare-$name-$precision.json"
+      export CPU_BIND=0 MEM_BIND=2
+      label=$(run_label "$name" "$precision" omp file 1 56)
+      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=omp OMP_NUM_THREADS=56
+      label=$(run_label "$name" "$precision" teams file 1 56)
+      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=teams \
+        LLAMA_THREADS=56 OMP_PROC_BIND=false
+      unset CPU_BIND MEM_BIND
+      rm -f -- "$staged" # HBM node 2 holds 64 GiB: one staged checkpoint at a time
+    done
+  done
+  "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
 }
 
 # check_stage: everything every skeleton does before a phase matrix: environment, Flat-mode check, build, tests.

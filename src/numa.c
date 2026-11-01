@@ -457,7 +457,13 @@ int numa_discover(Topology *t, const NumaInputs *in, char *err, size_t err_size)
 
   t->max_node = m->max_node;
   t->mems_words = ((size_t)m->max_node + 1 + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long));
-  t->mems_allowed = memory_alloc(t->mems_words, sizeof(unsigned long), MEM_METADATA);
+  /* Plain allocations: the cached topology lives for the whole process and must not show up as a leak in the
+   * engine's per-category accounting, which tests require to return to zero. */
+  t->mems_allowed = calloc(t->mems_words, sizeof(unsigned long));
+  if (!t->mems_allowed) {
+    free(m);
+    FAIL("out of memory");
+  }
   for (int n = 0; n <= m->max_node; n++)
     if (m->mems[n])
       t->mems_allowed[n / (8 * sizeof(unsigned long))] |= 1ul << (n % (8 * sizeof(unsigned long)));
@@ -473,7 +479,7 @@ int numa_discover(Topology *t, const NumaInputs *in, char *err, size_t err_size)
     int d = m->pkg_ddr[p], h = m->pkg_hbm[p];
     *s = (SocketTopo){.package = m->pkgs[p],
                       .ncpus = count,
-                      .cpus = memory_alloc((size_t)count, sizeof(int), MEM_METADATA),
+                      .cpus = calloc((size_t)count, sizeof(int)),
                       .ddr_node = d,
                       .hbm_node = h,
                       .ddr_allowed = d < 0 || m->mems[d],
@@ -494,8 +500,8 @@ int numa_discover(Topology *t, const NumaInputs *in, char *err, size_t err_size)
 
 void numa_topology_free(Topology *t) {
   for (int s = 0; s < 2; s++)
-    memory_free(t->socket[s].cpus);
-  memory_free(t->mems_allowed);
+    free(t->socket[s].cpus);
+  free(t->mems_allowed);
   memset(t, 0, sizeof(*t));
 }
 
@@ -926,7 +932,7 @@ size_t page_sample_plan(size_t pages, size_t extent_pages, size_t max_samples, s
     out[count++] = extent_endpoint(picks > 1 ? i * (endpoints - 1) / (picks - 1) : 0, pages, extent_pages);
   size_t fill = max_samples - picks;
   for (size_t i = 0; i < fill; i++) /* deterministic stride over the whole region */
-    out[count++] = (size_t)((unsigned __int128)i * pages / fill);
+    out[count++] = (size_t)((unsigned long long)i * pages / fill);
   qsort(out, count, sizeof(*out), compare_size);
   size_t unique = 0;
   for (size_t i = 0; i < count; i++)

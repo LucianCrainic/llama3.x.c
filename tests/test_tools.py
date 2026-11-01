@@ -161,6 +161,12 @@ class MakePromptsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return Path(out)/'prompts', json.loads((Path(out)/'prompts/prompts.json').read_text())
 
+    def test_short_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory, manifest = self.build(temp, 'none')
+            self.assertEqual(list(manifest), ['short'])
+            self.assertFalse(list(directory.glob('prompt-*.txt')))
+
     def test_prompts_have_the_requested_token_counts_and_are_reproducible(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             directory, manifest = self.build(first, '16,300')
