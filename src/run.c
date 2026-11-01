@@ -1,6 +1,7 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
 #include "kernels.h"
+#include "loader.h"
 #include "prefill.h"
 #include "profile.h"
 #include "runtime.h"
@@ -54,6 +55,7 @@ typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   TensorManifest manifest;    // where each tensor lives in the file
+  WeightStore store;          // where those bytes live now: the mapping, or owned regions (A4)
   RunState state;             // buffers for the "wave" of activations in the forward pass
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -92,14 +94,14 @@ static void free_run_state(RunState *s) {
 
 /* Weight pointers are views into the file mapping at manifest offsets. Layers of a
  * role are contiguous, so layer 0 addresses the whole array. */
-static const float *weight_view(const float *data, const TensorManifest *m, TensorRole role, int layer) {
+static const float *weight_view(const WeightStore *store, const TensorManifest *m, TensorRole role, int layer) {
   const TensorDesc *t = manifest_find(m, role, layer);
   if (!t)
     fail("tensor manifest has no %s tensor (layer %d)", manifest_role_name(role), layer);
-  return (const float *)((const char *)data + t->offset);
+  return (const float *)weights_at(store, t->offset);
 }
 
-static void memory_map_weights(TransformerWeights *w, const TensorManifest *m, const float *data) {
+static void memory_map_weights(TransformerWeights *w, const TensorManifest *m, const WeightStore *data) {
   w->token_embedding_table = weight_view(data, m, T_EMBED, -1);
   w->rms_att_weight = weight_view(data, m, T_RMS_ATT, 0);
   w->wq = weight_view(data, m, T_WQ, 0);
@@ -115,12 +117,14 @@ static void memory_map_weights(TransformerWeights *w, const TensorManifest *m, c
 }
 
 static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, TensorManifest *manifest,
-                            int *fd, float **data, size_t *file_size) {
+                            WeightStore *store, int *fd, float **data, size_t *file_size) {
   int shared, gs;
   double start = monotonic_seconds();
   checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size, manifest);
-  memory_map_weights(weights, manifest, *data);
   metrics.checkpoint_s = monotonic_seconds() - start;
+  /* Placement time is reported on its own, not as checkpoint_load. */
+  weights_open(store, *fd, data, *file_size, manifest);
+  memory_map_weights(weights, manifest, store);
   metrics.checkpoint_ready = 1;
 }
 
@@ -132,6 +136,7 @@ static void free_transformer(Transformer *t) {
   if (t->fd != -1) {
     close(t->fd);
   }
+  weights_close(&t->store);
   manifest_free(&t->manifest);
   // free the RunState buffers
   free_run_state(&t->state);
@@ -262,9 +267,10 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->implementation = t;
   kernels_init();
   kernels_backend_init();
-  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->fd, &t->data, &t->file_size);
+  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->store, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
-  model->mapped_bytes = t->file_size;
+  model->file_bytes = t->file_size;
+  model->mapped_bytes = t->data == MAP_FAILED ? 0 : t->file_size;
   if (context < 0 || context > t->config.seq_len)
     fail("requested context exceeds checkpoint context");
   t->config.seq_len = context ? context : (t->config.seq_len < 4096 ? t->config.seq_len : 4096);

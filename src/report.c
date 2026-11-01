@@ -1,5 +1,6 @@
 #include "app.h"
 #include "kernels.h"
+#include "loader.h"
 #include "numa.h"
 #include "profile.h"
 #include "workers.h"
@@ -114,7 +115,9 @@ static void write_v2_sections(FILE *f) {
   const char *thp = region_thp_default() ? "on" : "off";
   fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
   string(f, kernels_backend_name());
-  fputs(",\n    \"sockets\": 1,\n    \"placement\": \"file\",\n    \"thp\": ", f);
+  fputs(",\n    \"sockets\": 1,\n    \"placement\": ", f);
+  string(f, placement_active());
+  fputs(",\n    \"thp\": ", f);
   string(f, thp);
   fputs(",\n    \"precision_mode\": ", f);
   string(f, engine_precision());
@@ -364,10 +367,10 @@ void write_report(void) {
          metrics.output_tokens > 0, 1);
   timing(f, "average_decode_step", metrics.decode_steps ? metrics.decode_s / metrics.decode_steps : 0,
          metrics.decode_steps > 0, 1);
-  /* Producers of these arrive with weight packing (C5), the owned loader (A4) and its verification. */
+  /* weight_pack arrives with weight packing (C5); the placement timings come from the owned loader (A4). */
   timing(f, "weight_pack", 0, 0, 1);
-  timing(f, "placement_populate", 0, 0, 1);
-  timing(f, "placement_verify", 0, 0, 0);
+  timing(f, "placement_populate", metrics.placement_populate_s, metrics.placement_owned, 1);
+  timing(f, "placement_verify", metrics.placement_verify_s, metrics.placement_owned, 0);
   fputs("  },\n  \"throughput_tokens_per_second\": {\n    \"prefill\": ", f);
   rate(f, metrics.processed_tokens, metrics.prefill_s);
   fputs(",\n    \"decode\": ", f);
@@ -381,7 +384,7 @@ void write_report(void) {
   write_v2_sections(f);
   fputs(",\n  \"memory_bytes\": {\n    \"model_file\": ", f);
   if (metrics.checkpoint_ready)
-    fprintf(f, "%zu", model.mapped_bytes);
+    fprintf(f, "%zu", model.file_bytes);
   else
     fputs("null", f);
   fputs(",\n    \"mapped_checkpoint\": ", f);

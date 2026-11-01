@@ -1,6 +1,7 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
 #include "kernels.h"
+#include "loader.h"
 #include "prefill.h"
 #include "profile.h"
 #include "runtime.h"
@@ -23,8 +24,7 @@ typedef struct {
 
 typedef struct {
   // token embedding table
-  QuantizedTensor *q_tokens;    // (vocab_size, dim)
-  float *token_embedding_table; // same, but dequantized
+  QuantizedTensor *q_tokens; // (vocab_size, dim); rows are dequantized on demand
 
   // weights for rmsnorms
   float *rms_att_weight; // (layer, dim) rmsnorm weights
@@ -68,6 +68,7 @@ typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
   TensorManifest manifest;    // where each tensor lives in the file
+  WeightStore store;          // where those bytes live now: the mapping, or owned regions (A4)
   RunState state;             // buffers for the "wave" of activations in the forward pass
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -120,10 +121,10 @@ static void free_run_state(RunState *s) {
 // ----------------------------------------------------------------------------
 // Quantization functions
 
-static void dequantize(const QuantizedTensor *qx, float *x, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    x[i] = qx->q[i] * qx->s[i / GS];
-  }
+/* Elements [first, first + n) of a tensor as FP32: value times its group scale. */
+static void dequantize_row(const QuantizedTensor *qx, float *x, size_t first, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    x[i] = qx->q[first + i] * qx->s[(first + i) / GS];
 }
 
 /* Activations for one matmul input: quantized (W8A8) unless FP32 activations
@@ -147,26 +148,24 @@ static const TensorDesc *find_tensor(const TensorManifest *m, TensorRole role, i
 }
 
 /* Views of quantized tensors of one role: `n` layers, or the single global tensor when n < 0. */
-static QuantizedTensor *init_quantized_tensors(const char *data, const TensorManifest *m, TensorRole role, int n) {
+static QuantizedTensor *init_quantized_tensors(const WeightStore *data, const TensorManifest *m, TensorRole role, int n) {
   int count = n < 0 ? 1 : n;
   QuantizedTensor *res = memory_alloc(count, sizeof(QuantizedTensor), MEM_METADATA);
   for (int i = 0; i < count; i++) {
     const TensorDesc *t = find_tensor(m, role, n < 0 ? -1 : i);
-    res[i].q = (int8_t *)(data + t->offset);
-    res[i].s = (float *)(data + t->scale_offset);
+    res[i].q = (int8_t *)weights_at(data, t->offset);
+    res[i].s = (float *)weights_at(data, t->scale_offset);
   }
   return res;
 }
 
-static void memory_map_weights(TransformerWeights *w, const Config *p, const TensorManifest *m, const char *data) {
-  w->rms_att_weight = (float *)(data + find_tensor(m, T_RMS_ATT, 0)->offset);
-  w->rms_ffn_weight = (float *)(data + find_tensor(m, T_RMS_FFN, 0)->offset);
-  w->rms_final_weight = (float *)(data + find_tensor(m, T_RMS_FINAL, -1)->offset);
+static void memory_map_weights(TransformerWeights *w, const Config *p, const TensorManifest *m,
+                               const WeightStore *data) {
+  w->rms_att_weight = (float *)weights_at(data, find_tensor(m, T_RMS_ATT, 0)->offset);
+  w->rms_ffn_weight = (float *)weights_at(data, find_tensor(m, T_RMS_FFN, 0)->offset);
+  w->rms_final_weight = (float *)weights_at(data, find_tensor(m, T_RMS_FINAL, -1)->offset);
 
   w->q_tokens = init_quantized_tensors(data, m, T_EMBED, -1);
-  // dequantize token embedding table
-  w->token_embedding_table = memory_alloc((size_t)p->vocab_size * p->dim, sizeof(float), MEM_EMBEDDING);
-  dequantize(w->q_tokens, w->token_embedding_table, (size_t)p->vocab_size * p->dim);
 
   w->wq = init_quantized_tensors(data, m, T_WQ, p->n_layers);
   w->wk = init_quantized_tensors(data, m, T_WK, p->n_layers);
@@ -181,19 +180,20 @@ static void memory_map_weights(TransformerWeights *w, const Config *p, const Ten
 }
 
 static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, TensorManifest *manifest,
-                            int *fd, float **data, size_t *file_size) {
+                            WeightStore *store, int *fd, float **data, size_t *file_size) {
   int shared, gs;
   double start = monotonic_seconds();
   checkpoint_map(path, 1, config, &shared, &gs, fd, data, file_size, manifest);
   GS = gs;
-  memory_map_weights(weights, config, manifest, (const char *)*data);
   metrics.checkpoint_s = monotonic_seconds() - start;
+  /* Placement time is reported on its own, not as checkpoint_load. */
+  weights_open(store, *fd, data, *file_size, manifest);
+  memory_map_weights(weights, config, manifest, store);
   metrics.checkpoint_ready = 1;
 }
 
 static void free_transformer(Transformer *t) {
   // free QuantizedTensors
-  memory_free(t->weights.token_embedding_table);
   memory_free(t->weights.wq);
   memory_free(t->weights.wk);
   memory_free(t->weights.wv);
@@ -205,6 +205,7 @@ static void free_transformer(Transformer *t) {
     memory_free(t->weights.wcls);
   }
   memory_free(t->weights.q_tokens);
+  weights_close(&t->store);
   manifest_free(&t->manifest);
   // close the memory mapping
   if (t->data != MAP_FAILED) {
@@ -242,7 +243,8 @@ static RunState row_state(RunState *s, const Config *p, int i) {
 static void forward_embedding(Transformer *t, RunState *s, int token, int pos) {
   Config *p = &t->config;
   TransformerWeights *w = &t->weights;
-  PROFILE(PHASE_EMBED, memcpy(s->x, w->token_embedding_table + (size_t)token * p->dim, p->dim * sizeof(float)));
+  /* The embedding row is dequantized on demand; no FP32 copy of the table exists. */
+  PROFILE(PHASE_EMBED, dequantize_row(w->q_tokens, s->x, (size_t)token * p->dim, p->dim));
   PROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, s->rope));
 }
 
@@ -361,9 +363,10 @@ void engine_load_context(Model *model, const char *path, int context) {
   if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
     fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
   fp32_activations = activations && !strcmp(activations, "fp32");
-  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->fd, &t->data, &t->file_size);
+  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->store, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
-  model->mapped_bytes = t->file_size;
+  model->file_bytes = t->file_size;
+  model->mapped_bytes = t->data == MAP_FAILED ? 0 : t->file_size;
   if (context < 0 || context > t->config.seq_len)
     fail("requested context exceeds checkpoint context");
   t->config.seq_len = context ? context : (t->config.seq_len < 4096 ? t->config.seq_len : 4096);

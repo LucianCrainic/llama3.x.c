@@ -1,4 +1,5 @@
 #include "app.h"
+#include "loader.h"
 #include "profile.h"
 #include <errno.h>
 #include <limits.h>
@@ -379,8 +380,8 @@ int main(int argc, char **argv) {
   start = monotonic_seconds();
   build_sampler(&s, model.config.vocab_size, options.temperature, options.topp, options.seed);
   metrics.runtime_s += monotonic_seconds() - start;
-  LOG(LOG_INFO, "%s: dim=%d layers=%d context=%d; mapped=%zu bytes; seed=%llu", engine_precision(), model.config.dim,
-      model.config.n_layers, model.config.seq_len, model.mapped_bytes, options.seed);
+  LOG(LOG_INFO, "%s: dim=%d layers=%d context=%d; mapped=%zu of %zu bytes; placement=%s; seed=%llu", engine_precision(), model.config.dim,
+      model.config.n_layers, model.config.seq_len, model.mapped_bytes, model.file_bytes, placement_active(), options.seed);
   if (!strcmp(options.mode, "chat"))
     chat(&t, &s);
   else

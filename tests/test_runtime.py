@@ -274,8 +274,74 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(mem['kv_cache_allocated_peak'],2*CONFIG[2]*CONFIG[-1]*2*4)
             self.assertEqual(mem['mapped_checkpoint'],mem['model_file'])
             self.assertEqual(mem['model_file'],(self.shared/('fp32.bin' if engine=='run' else 'int8.bin')).stat().st_size)
-            if engine=='runq':
-                self.assertEqual(mem['dequantized_embedding_allocated_peak'],CONFIG[5]*CONFIG[0]*4)
+            if engine=='runq':  # embedding rows are dequantized on demand since A4: no FP32 table exists
+                self.assertEqual(mem['dequantized_embedding_allocated_peak'],0)
+
+    # ---- A4: owned weight placement ----------------------------------------------------------------------------
+    OWNED = {'LLAMA_PLACEMENT': 'ddr', 'LLAMA_PLACEMENT_STRICT': '0'}  # portable regions: no NUMA needed
+
+    def logits(self, engine, fixture, tokens, env, batch=None):
+        probe = BUILD/('probe-fp32' if engine == 'run' else 'probe-int8')
+        model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
+        command = [str(probe)] + (['batch'] if batch else []) + [str(model), *map(str, tokens)]
+        extra = {'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'} if batch else {}
+        result = subprocess.run(command, capture_output=True, timeout=60, env={**os.environ, **extra, **env})
+        self.assertEqual(result.returncode, 0, result.stderr.decode())  # exit 3 would mean a leak
+        return result.stdout
+
+    def test_owned_placement_is_bitwise_equal_to_the_file_mapping(self):
+        tokens = [65, 66, 67, 68, 69, 70, 71]
+        variants = [{}, {'LLAMA_LOADER_CHUNK': '7', 'LLAMA_LOADER_MAX_READ': '5'},
+                    {'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3', 'LLAMA_LOADER_CHUNK': '4096'}]
+        for fixture in (self.shared, self.unshared):
+            for engine in ('run', 'runq'):
+                for batch in (None, 3):
+                    expected = self.logits(engine, fixture, tokens, {}, batch)
+                    self.assertEqual(len(expected), len(tokens) * 128010 * 4)
+                    for extra in variants:
+                        actual = self.logits(engine, fixture, tokens, {**self.OWNED, **extra}, batch)
+                        self.assertEqual(actual, expected, (fixture.name, engine, batch, extra))
+
+    def test_owned_placement_report_and_accounting(self):
+        for engine, name in (('run', 'fp32.bin'), ('runq', 'int8.bin')):
+            for fixture in (self.shared, self.unshared):
+                _, data = self.execute(engine, '--benchmark', '--generation-length', '2', '--no-text', fixture=fixture,
+                                       env=self.OWNED)
+                self.assertEqual(data['runtime']['placement'], 'ddr')
+                mem, file_size = data['memory_bytes'], (fixture/name).stat().st_size
+                self.assertEqual((mem['model_file'], mem['mapped_checkpoint']), (file_size, 0))
+                regions = data['regions']
+                roles = sorted(r['role'] for r in regions)
+                self.assertEqual(roles, ['weights'] if fixture is self.shared else ['embedding', 'weights'])
+                self.assertTrue(all(r['node'] is None and r['verified'] == 'unverified' for r in regions))
+                total = sum(r['bytes'] for r in regions)
+                header = 28 if engine == 'run' else 256
+                # Everything after the header is copied; padding keeps each range's alignment modulo 64.
+                self.assertGreaterEqual(total, file_size - header)
+                self.assertLess(total, file_size - header + 3 * 64)
+                self.assertEqual(mem['owned_weights_peak'] + mem['dequantized_embedding_allocated_peak'], total)
+                for key in ('placement_populate', 'placement_verify'):
+                    self.assertGreaterEqual(data['timing_seconds'][key], 0)
+                self.assertLess(data['timing_seconds']['checkpoint_load'], 5)
+        _, data = self.execute('run', '--benchmark', '--no-text')
+        self.assertEqual((data['runtime']['placement'], data['regions']), ('file', []))
+        self.assertIsNone(data['timing_seconds']['placement_populate'])
+        self.assertEqual(data['memory_bytes']['owned_weights_peak'], 0)
+
+    def test_placement_configuration_errors(self):
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'bogus'}, success=False)
+        self.assertIn('LLAMA_PLACEMENT must be file, ddr or hbm', data['error'])
+        _, data = self.execute('run', env={**self.OWNED, 'LLAMA_LOADER_CHUNK': '0'}, success=False)
+        self.assertIn('LLAMA_LOADER_CHUNK', data['error'])
+        # hbm needs a real HBM node; without one it must fail rather than silently use DDR (strict is the default).
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2'}, success=False)
+        self.assertIn('LLAMA_PLACEMENT=hbm cannot be honoured', data['error'])
+        _, data = self.execute('run', '--benchmark', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2',
+                                                          'LLAMA_PLACEMENT_STRICT': '0'})
+        self.assertEqual(data['runtime']['placement'], 'hbm')  # explicit opt-out: unbound memory, still correct
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2',
+                                           'LLAMA_PLACEMENT_STRICT': '0', 'LLAMA_HBM_BUDGET_GIB': '-1'}, success=False)
+        self.assertIn('LLAMA_HBM_BUDGET_GIB', data['error'])
 
     def test_phase_profile(self):
         phases = {'embedding','rope_table','rmsnorm','quantize','qkv','rope','kv_store','attention','wo',

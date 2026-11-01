@@ -71,7 +71,8 @@ typedef enum { LOGITS_NONE, LOGITS_LAST, LOGITS_ALL } LogitsWanted;
 typedef struct {
   Config config;
   void *implementation;
-  size_t mapped_bytes;
+  size_t file_bytes;   /* checkpoint size */
+  size_t mapped_bytes; /* still mapped from the file: 0 once the owned loader has unmapped it */
   int max_batch; /* LLAMA_PREFILL_BATCH, capped at the allocated context. */
   LogitsWanted prefill_logits;
 } Model;
@@ -139,6 +140,8 @@ typedef struct {
   size_t input_tokens, processed_tokens, output_tokens, forward_passes, decode_steps;
   size_t sampled_tokens, stop_tokens, turns;
   size_t prefill_microbatches, prefill_logits_rows;
+  double placement_populate_s, placement_verify_s;
+  int placement_owned; /* the checkpoint was copied into engine-owned regions */
   int checkpoint_ready, tokenizer_ready, runtime_ready, inference_started;
   int has_first_token, completed;
   const char *stop_reason;

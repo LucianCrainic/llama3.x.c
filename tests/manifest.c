@@ -2,6 +2,7 @@
  * loaders produced. The oracle below is that arithmetic, kept here only.
  *   test-manifest                    synthetic configs, no files
  *   test-manifest fp32|int8 <file>   checkpoint_map + manifest against the oracle */
+#include "loader.h"
 #include "runtime.h"
 #include "shards.h"
 #include <assert.h>
@@ -179,6 +180,31 @@ static Config make_config(int format, int shared, int dim, int heads, int kv_hea
   return p;
 }
 
+/* A4 layout: segments tile the non-alias tensors exactly, in file order, per class, keeping the offset modulo 64. */
+static void check_plan(const TensorManifest *m, int quantized, int shared) {
+  WeightSegment seg[WEIGHT_SEGMENTS];
+  size_t weights, embedding;
+  int n = weights_plan(m, seg, &weights, &embedding);
+  /* FP32 embedding leads the file; Q8 puts the norms before it, so an untied Q8 embedding splits the weights. */
+  assert(n == (shared ? 1 : quantized ? 3 : 2));
+  assert((embedding > 0) == !shared);
+  size_t covered = 0, last_end[2] = {0, 0}, expected_end = seg[0].src_begin;
+  size_t tensors = 0;
+  for (int i = 0; i < m->count; i++)
+    tensors += m->t[i].alias_of < 0 ? m->t[i].bytes : 0;
+  for (int i = 0; i < n; i++) {
+    assert(seg[i].src_begin == expected_end);
+    expected_end = seg[i].src_begin + seg[i].bytes;
+    assert(seg[i].dst_offset % 64 == seg[i].src_begin % 64);
+    assert(seg[i].dst_offset >= last_end[seg[i].embedding]);
+    last_end[seg[i].embedding] = seg[i].dst_offset + seg[i].bytes;
+    covered += seg[i].bytes;
+  }
+  assert(covered == tensors && expected_end == m->file_bytes);
+  assert(weights == last_end[0] && embedding == last_end[1]);
+  assert(weights + embedding < tensors + (size_t)n * 64);
+}
+
 static void synthetic(void) {
   const int formats[] = {0, 2, 3};
   for (int f = 0; f < 3; f++)
@@ -189,12 +215,14 @@ static void synthetic(void) {
         TensorManifest m;
         manifest_build(&m, &p, 0, 0, header);
         compare_f32(&m, &p, shared, header);
+        check_plan(&m, 0, shared);
         manifest_free(&m);
         if (formats[f] == 0)
           continue; /* Q8 exists only as ak42 versions 2 and 3 */
         int gs = shape ? 8 : 2;
         manifest_build(&m, &p, 1, gs, header);
         compare_q8(&m, &p, shared, gs, header);
+        check_plan(&m, 1, shared);
         manifest_free(&m);
       }
   assert(!manifest_find(&(TensorManifest){0}, T_EMBED, -1));
