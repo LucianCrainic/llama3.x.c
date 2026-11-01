@@ -20,7 +20,6 @@ set -euo pipefail
 source "$ROOT/scripts/lib/cresco8-common.sh"
 require_env
 job_begin
-check_stage
 
 # ---- A1: topology discovery -------------------------------------------------------------------------------------
 # On hbm14: S0 = cores 0-55, DDR 0, HBM 2; S1 = cores 56-111, DDR 1, HBM 3 (explicit map C/H/D = package/HBM/DDR).
@@ -172,6 +171,251 @@ PY
   fi
 }
 
-validate_models
+# ---- A4: owned weight loader --------------------------------------------------------------------------------------
+# Source checkpoints are staged in tmpfs on DDR node 0 (never on HBM node 2, which must have room for the owned copy).
+# The `file` baseline of the bitwise gate reads the same staged file through the mapping; where the source lives
+# dominates load time but not inference, and is recorded in the report directory.
+a_models() { # a_models PHASE_DIR: tokenizes the 86-token prompt once per model
+  local dir=$1 entry name artifacts hf
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    make_prompt "$ROOT/build/release/probe-fp32" "$artifacts/tokenizer-v2.bin" 128256 "${2:-none}"
+    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$artifacts/tokenizer-v2.bin" 128256 "@$OUT/short.txt" \
+      > "$dir/$name-tokens.txt"
+  done
+}
+
+# a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine bitwise comparison.
+a_bitwise() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=()
+  shift 5
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
+    shift
+  done
+  expect "compare-$name-$precision-$label" ok "$dir" -- numactl --cpunodebind=0 "$PYTHON" \
+    "$ROOT/tools/compare_engines.py" --probe "$ROOT/build/release/probe-$precision" --checkpoint "$staged" \
+    --tokens-file "$dir/$name-tokens.txt" "${args[@]}" --bitwise --output "$dir/compare-$name-$precision-$label.json"
+}
+
+phase_A4() {
+  local dir="$OUT/A4" entry name artifacts hf precision engine staged tokenizer backend placement label benv
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no A4 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  a_models "$dir"
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      engine=run
+      [[ $precision == fp32 ]] || engine=runq
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      # 1. bitwise logits at every prompt position: file against hbm and ddr, on each backend.
+      for backend in omp teams; do
+        read -r -a benv <<< "$(backend_env "$backend" 56 | tr '\n' ' ')"
+        for placement in hbm ddr; do
+          a_bitwise "$dir" "$name" "$precision" "$staged" "$backend-file-vs-$placement" "${benv[@]}" \
+            LLAMA_PLACEMENT=file -- "${benv[@]}" LLAMA_PLACEMENT=$placement
+        done
+      done
+      if [[ $precision == int8 ]]; then # W8A32 takes the same placement code through different kernels
+        read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+        a_bitwise "$dir" "$name" "$precision" "$staged" teams-w8a32-file-vs-hbm "${benv[@]}" LLAMA_PLACEMENT=file \
+          LLAMA_Q8_ACTIVATIONS=fp32 -- "${benv[@]}" LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32
+      fi
+      # 2. startup breakdown and full verification, one launch per placement; memory before and after.
+      for placement in hbm ddr; do
+        snapshot_memory "$dir/$name-$precision-$placement.meminfo-before"
+        export CPU_BIND=0
+        label=$(run_label "$name" "$precision" teams "$placement" 1 56 x=startup)
+        GENERATION=8 CONTEXT=2048 REP=1 run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" 1 0 \
+          LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=$placement
+        unset CPU_BIND
+        snapshot_memory "$dir/$name-$precision-$placement.meminfo-after"
+        if dry_run; then continue; fi
+        if [[ $placement == hbm ]]; then
+          if "$PYTHON" "$ROOT/tools/check_placement.py" "$OUT/$label-1.json" --placement hbm --weights-node 2 \
+            --embedding-node 0 > "$dir/placement-$name-$precision-$placement.txt"; then
+            record_result "placement-$name-$precision-hbm" PASS
+          else
+            record_result "placement-$name-$precision-hbm" FAIL "$(grep ^FAIL "$dir/placement-$name-$precision-$placement.txt" | head -3)"
+          fi
+        else
+          if "$PYTHON" "$ROOT/tools/check_placement.py" "$OUT/$label-1.json" --placement ddr --weights-node 0 \
+            --embedding-node 0 > "$dir/placement-$name-$precision-$placement.txt"; then
+            record_result "placement-$name-$precision-ddr" PASS
+          else
+            record_result "placement-$name-$precision-ddr" FAIL "$(grep ^FAIL "$dir/placement-$name-$precision-$placement.txt" | head -3)"
+          fi
+        fi
+      done
+      # 3. the Hugging Face gate with the engine under LLAMA_PLACEMENT=hbm (FP32 gated, INT8 recorded), when available.
+      if [[ ${HF_GATE:-1} != 0 && $precision == fp32 ]]; then
+        validate_gate "$name" "$artifacts" "$hf" fp32 fp32-hbm LLAMA_PLACEMENT=hbm && record_result "hf-$name-fp32-hbm" PASS ||
+          record_result "hf-$name-fp32-hbm" FAIL
+      elif [[ ${HF_GATE:-1} != 0 ]]; then
+        validate_gate "$name" "$artifacts" "$hf" int8 w8a8-hbm LLAMA_PLACEMENT=hbm || true
+        validate_gate "$name" "$artifacts" "$hf" int8 w8a32-hbm LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32 || true
+      else
+        echo "HF_GATE=0: the Hugging Face gate under LLAMA_PLACEMENT=hbm was not run for $name $precision" |
+          tee -a "$dir/no-hf-gate.txt"
+      fi
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+}
+
+# ---- A5: KV cache and workspace placement -------------------------------------------------------------------------
+# 8B with a 32768-token context, a 2048-token prompt and 128 generated tokens on HBM: KV pages must be on node 2 after
+# the prompt and at the end, and the batched path (C1) must stay bitwise equal under owned placement.
+phase_A5() {
+  local dir="$OUT/A5" entry name artifacts hf precision engine staged tokenizer label thp benv layers
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no A5 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    make_prompt "$ROOT/build/release/probe-fp32" "$tokenizer" 128256 2048
+    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$tokenizer" 128256 "@$OUT/short.txt" > "$dir/$name-tokens.txt"
+    for precision in $PRECISIONS; do
+      engine=run
+      [[ $precision == fp32 ]] || engine=runq
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+      # Owned KV and work regions change nothing a kernel computes: bitwise against the mapping, per token and batched.
+      a_bitwise "$dir" "$name" "$precision" "$staged" teams-file-vs-hbm "${benv[@]}" LLAMA_PLACEMENT=file -- \
+        "${benv[@]}" LLAMA_PLACEMENT=hbm
+      a_bitwise "$dir" "$name" "$precision" "$staged" teams-file-vs-hbm-m32 "${benv[@]}" LLAMA_PLACEMENT=file -- \
+        "${benv[@]}" LLAMA_PLACEMENT=hbm LLAMA_PREFILL_BATCH=32
+      for thp in off on; do
+        export CPU_BIND=0
+        label=$(run_label "$name" "$precision" teams hbm 1 56 p=2048 c=32768 "x=kv$thp")
+        CONTEXT=32768 GENERATION=128 REP=1 run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/prompt-2048.txt" 1 0 \
+          LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_THP=$thp
+        unset CPU_BIND
+        if dry_run; then continue; fi
+        layers=$("$PYTHON" -c "import json,sys; print(json.load(open(sys.argv[1]))['model']['layers'])" "$OUT/$label-1.json" 2> /dev/null || echo 0)
+        if "$PYTHON" "$ROOT/tools/check_placement.py" "$OUT/$label-1.json" --placement hbm --weights-node 2 \
+          --embedding-node 0 --kv-node 2 --layers "$layers" > "$dir/placement-$name-$precision-thp$thp.txt"; then
+          record_result "kv-placement-$name-$precision-thp$thp" PASS
+        else
+          record_result "kv-placement-$name-$precision-thp$thp" FAIL "$(grep ^FAIL "$dir/placement-$name-$precision-thp$thp.txt" | head -3)"
+        fi
+      done
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+}
+
+# ---- A6: one-socket placement campaign ---------------------------------------------------------------------------
+# Bench phase: 1B and 8B on socket 0, teams backend, REPEATS interleaved passes over every configuration. The `file`
+# baselines read a copy staged on HBM node 2 and are created and removed in each pass, because the owned HBM copy needs
+# the room; the anon runs load from a copy staged on DDR node 0. Gate first: a failed correctness check stops the benchmark.
+a6_run() { # a6_run NAME PRECISION ENGINE SOURCE TOKENIZER REP LABELKEY PLACEMENT THREADS ENVWORDS...
+  local name=$1 precision=$2 engine=$3 source=$4 tokenizer=$5 rep=$6 key=$7 placement=$8 threads=$9 label
+  shift 9
+  case $key in
+    file) label=$(run_label "$name" "$precision" teams file 1 "$threads") ;;
+    omp-file) label=$(run_label "$name" "$precision" omp file 1 "$threads") ;;
+    ddr) label=$(run_label "$name" "$precision" teams ddr 1 "$threads") ;;
+    hbm) label=$(run_label "$name" "$precision" teams hbm 1 "$threads") ;;
+    hbm-thp) label=$(run_label "$name" "$precision" teams hbm 1 "$threads" x=thp) ;;
+    remote) label=$(run_label "$name" "$precision" teams hbm 1 "$threads" x=remote) ;;
+    w8a32) label=$(run_label "$name" w8a32 teams hbm 1 "$threads") ;;
+    long) label=$(run_label "$name" "$precision" teams hbm 1 "$threads" p=8192 c=8448) ;;
+    *) die "unknown A6 configuration $key" ;;
+  esac
+  REP=$rep run_engine "$label" "$engine" "$source" "$tokenizer" "${PROMPT:-$OUT/short.txt}" 1 "$PERF" "$@"
+}
+
+phase_A6() {
+  local dir="$OUT/A6" entry name artifacts hf precision engine tokenizer src0 src2 rep gate=1 benv
+  if [[ $STAGE != bench ]] && ! dry_run; then
+    echo 'A6 is a bench phase: run it with STAGE=bench' | tee "$dir/not-bench.txt"
+    return 0
+  fi
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no A6 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  a_models "$dir" 8192
+  # Correctness gate: anon-hbm against the staged baseline, bitwise, before any timing.
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    for precision in $PRECISIONS; do
+      src0=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+      a_bitwise "$dir" "$name" "$precision" "$src0" gate-file-vs-hbm "${benv[@]}" LLAMA_PLACEMENT=file -- \
+        "${benv[@]}" LLAMA_PLACEMENT=hbm
+      if ! dry_run && grep -q "^FAIL compare-$name-$precision-gate-file-vs-hbm " "$OUT/phase-results.txt"; then
+        gate=0
+      fi
+    done
+  done
+  if [[ $gate == 0 ]]; then
+    echo 'A6 correctness gate failed: no benchmark was run' | tee "$dir/gate-failed.txt"
+    return 0
+  fi
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      engine=run
+      [[ $precision == fp32 ]] || engine=runq
+      src0=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        # Staged-file baselines (HBM node 2 holds the copy only for the duration of these two runs).
+        src2=$(stage_model_on 2 "$name" "$precision" "$artifacts")
+        export CPU_BIND=0 MEM_BIND=2
+        a6_run "$name" "$precision" "$engine" "$src2" "$tokenizer" "$rep" file file 56 LLAMA_BACKEND=teams \
+          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=file
+        a6_run "$name" "$precision" "$engine" "$src2" "$tokenizer" "$rep" omp-file file 56 LLAMA_BACKEND=omp \
+          OMP_NUM_THREADS=56
+        unset CPU_BIND MEM_BIND
+        unstage_model_on 2 "$name" "$precision"
+        # Engine-owned placements: no job-wide memory policy.
+        export CPU_BIND=0
+        a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" ddr ddr 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 \
+          OMP_PROC_BIND=false LLAMA_PLACEMENT=ddr
+        a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 \
+          OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+        a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm-thp hbm 56 LLAMA_BACKEND=teams \
+          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_THP=on
+        # Remote control: socket 0's threads read HBM node 3 (an explicit map points socket 0 at it).
+        a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" remote hbm 56 LLAMA_BACKEND=teams \
+          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1
+        for threads in 14 28; do
+          a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm hbm "$threads" LLAMA_BACKEND=teams \
+            LLAMA_THREADS=$threads OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+        done
+        if [[ $precision == int8 ]]; then # W8A32 on the owned HBM placement only
+          a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" w8a32 hbm 56 LLAMA_BACKEND=teams \
+            LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32
+        fi
+        if [[ $precision == fp32 && $name == 8B ]]; then # the long-context point
+          CONTEXT=8448 PROMPT="$OUT/prompt-8192.txt" a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" \
+            long hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+        fi
+        unset CPU_BIND
+      done
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+}
+
+if ! dry_run; then
+  check_stage
+  validate_models
+fi
 run_phases
 exit "$OVERALL"

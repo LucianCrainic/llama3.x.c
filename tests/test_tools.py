@@ -261,5 +261,58 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout)
 
 
+class CheckPlacementTests(unittest.TestCase):
+    """tools/check_placement.py judges the evidence in a report; it must fail loudly on any wrong or missing page."""
+
+    @staticmethod
+    def report(**changes):
+        region = lambda role, node, **kw: dict(role=role, node=node, verified='full', pages_queried=100,
+                                               pages_mismatched=0, pages_missing=0, thp_bytes=0, bytes=409600, **kw)
+        snapshot = dict(verified=True, node=2, pages_wrong_node=0, pages_queried=50, pages_missing=10, full=True,
+                        active_bytes=1000, resident_bytes=4096, reserved_bytes=8192)
+        report = dict(status='completed', runtime=dict(placement='hbm'),
+                      regions=[region('weights', 2), region('embedding', 0), region('kv.k', 2), region('kv.v', 2),
+                               region('work', 2)],
+                      kv=dict(snapshot, after_prompt=dict(snapshot)), memory_bytes={}, timing_seconds={})
+        report.update(changes)
+        return report
+
+    def run_tool(self, report, *args):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'report.json'
+            path.write_text(json.dumps(report))
+            result = subprocess.run([sys.executable, str(TOOLS/'check_placement.py'), str(path), *args],
+                                    capture_output=True, text=True)
+        return result.returncode, result.stdout
+
+    ARGS = ('--placement', 'hbm', '--weights-node', '2', '--embedding-node', '0', '--kv-node', '2', '--layers', '2')
+
+    def test_accepts_a_fully_verified_run(self):
+        code, out = self.run_tool(self.report(), *self.ARGS)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('FAIL', out)
+
+    def test_rejects_every_kind_of_wrong_placement(self):
+        base = self.report()
+        for name, mutate in {
+            'page elsewhere': lambda r: r['regions'][0].update(pages_mismatched=1),
+            'missing page': lambda r: r['regions'][0].update(pages_missing=1),
+            'wrong node': lambda r: r['regions'][0].update(node=3),
+            'sampled': lambda r: r['regions'][0].update(verified='sampled'),
+            'embedding on hbm': lambda r: r['regions'][1].update(node=2),
+            'kv elsewhere': lambda r: r['kv'].update(pages_wrong_node=2),
+            'kv unverified': lambda r: r['kv']['after_prompt'].update(verified=False),
+            'resident below active': lambda r: r['kv'].update(resident_bytes=10),
+            'resident above reserved': lambda r: r['kv'].update(resident_bytes=10 ** 9),
+            'failed run': lambda r: r.update(status='error'),
+            'wrong placement': lambda r: r['runtime'].update(placement='ddr'),
+        }.items():
+            report = json.loads(json.dumps(base))
+            mutate(report)
+            code, out = self.run_tool(report, *self.ARGS)
+            self.assertEqual(code, 1, (name, out))
+            self.assertIn('FAIL', out, name)
+
+
 if __name__ == '__main__':
     unittest.main()

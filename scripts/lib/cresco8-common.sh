@@ -9,6 +9,11 @@ die() {
   exit 1
 }
 
+# DRY_RUN=1 prints every command a phase would run instead of running it, so a run matrix can be checked on a laptop.
+dry_run() {
+  [[ ${DRY_RUN:-0} == 1 ]]
+}
+
 # Required: ROOT (tree under test), OUT (must not exist yet), PYTHON. Optional: MODELS (without it the Hugging Face
 # gate and every model-based run is skipped and recorded as such), STAGE=check|bench (default bench), REPEATS
 # (default 3), PRECISIONS (default "fp32 int8"), PHASE (default none): a space-separated list of phase ids.
@@ -22,6 +27,8 @@ require_env() {
   REPEATS=${REPEATS:-3}
   PRECISIONS=${PRECISIONS:-"fp32 int8"}
   PHASE=${PHASE:-none}
+  DRY_RUN=${DRY_RUN:-0}
+  [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || die "DRY_RUN must be 0 or 1, got '$DRY_RUN'"
   [[ $STAGE == check || $STAGE == bench ]] || die "STAGE must be check or bench, got '$STAGE'"
   [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || die "REPEATS must be a positive integer, got '$REPEATS'"
   local phase
@@ -32,7 +39,7 @@ require_env() {
   for entry in $MODELS; do
     [[ $entry =~ ^[^:]+:[^:]+:[^:]+$ ]] || die "MODELS entry '$entry' is not NAME:ARTIFACTS:HF"
   done
-  export STAGE REPEATS PRECISIONS PHASE MODELS
+  export STAGE REPEATS PRECISIONS PHASE MODELS DRY_RUN
 }
 
 # Creates OUT, records the exit status, removes the staging directory, and tees job output into OUT.
@@ -117,13 +124,14 @@ stage_checkpoint() {
   numactl -H > "$destination.numa.txt"
 }
 
-# run_label MODEL PRECISION BACKEND PLACEMENT SOCKETS THREADS [m=M] [p=PROMPT] [c=CTX] [k=KERNEL]
-#   {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}][-k{kernel}]
-# (the repeat suffix -{rep} is added by run_engine; tools/summarize_campaign.py parses these labels).
+# run_label MODEL PRECISION BACKEND PLACEMENT SOCKETS THREADS [m=M] [p=PROMPT] [c=CTX] [k=KERNEL] [x=TAG]
+#   {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}][-k{kernel}][-x{tag}]
+# (the repeat suffix -{rep} is added by run_engine; tools/summarize_campaign.py parses these labels). TAG tells apart
+# runs that differ in something the label has no field for (THP, a remote-node control, a startup probe).
 run_label() {
   local label="$1-$2-$3-$4-s$5-t$6" extra
   shift 6
-  for extra in m p c k; do
+  for extra in m p c k x; do
     local value
     for arg in "$@"; do
       [[ $arg == "$extra="* ]] && value=${arg#*=} && label+="-$extra$value"
@@ -144,15 +152,22 @@ run_engine() {
   [[ -z ${MEM_BIND:-} ]] || binding+=(--membind="$MEM_BIND")
   local launcher=()
   [[ ${#binding[@]} -eq 0 ]] || launcher=(numactl "${binding[@]}")
-  local r
-  for ((r = 1; r <= repeats; r++)); do
+  # REP=n runs only repetition n of this label, so a caller can interleave configurations across repeats.
+  local r first=1 last=$repeats
+  [[ -z ${REP:-} ]] || first=$REP last=$REP
+  if dry_run; then
+    printf 'RUN %s reps=%s-%s cpu=%s mem=%s ctx=%s gen=%s env=%s\n' "$label" "$first" "$last" "${CPU_BIND:-}" \
+      "${MEM_BIND:-}" "${CONTEXT:-2048}" "${GENERATION:-128}" "$*" | tee -a "$OUT/dry-run.txt"
+    return 0
+  fi
+  for ((r = first; r <= last; r++)); do
     local prefix="$OUT/$label-$r"
     env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
       --chat-template --prompt-file "$prompt" -t 0 --seed 42 --generation-length "${GENERATION:-128}" --no-text \
       --log-level warn --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
     local pid=$!
-    if [[ $perf == 1 && $r == 1 ]]; then perf_attach "$pid" "$prefix"; fi
+    if [[ $perf == 1 && $r == "$first" ]]; then perf_attach "$pid" "$prefix"; fi
     wait "$pid"
   done
 }
@@ -163,6 +178,10 @@ run_engine() {
 validate_gate() {
   local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
   shift 5
+  if dry_run; then
+    printf 'VALIDATE %s %s %s env=%s\n' "$name" "$precision" "$label" "$*" | tee -a "$OUT/dry-run.txt"
+    return 0
+  fi
   local extra=()
   [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
   (cd "$ROOT" && env "$@" OMP_PROC_BIND=false OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 \
@@ -177,6 +196,7 @@ validate_gate() {
 # make_prompt PROBE TOKENIZER VOCAB [LENGTHS|none]: short.txt (86 tokens) and prompt-{512,2048,8192,32768}.txt in OUT,
 # with their achieved token counts and SHA-256 in prompts.json. LENGTHS is a comma list, or none for short.txt only.
 make_prompt() {
+  dry_run && return 0
   python3 "$ROOT/tools/make_prompts.py" --probe "$1" --tokenizer "$2" --vocab "$3" --out "$OUT" \
     --lengths "${4:-512,2048,8192,32768}" > /dev/null
 }
@@ -221,6 +241,10 @@ record_result() {
 expect() {
   local name=$1 want=$2 dir=$3 rc=0
   shift 4
+  if dry_run; then
+    printf 'EXPECT %s (%s): %s\n' "$name" "$want" "$*" | tee -a "$OUT/dry-run.txt"
+    return 0
+  fi
   "$@" > "$dir/$name.out" 2> "$dir/$name.err" || rc=$?
   if [[ $want == any ]] || [[ $want == ok && $rc -eq 0 ]] || [[ $want == fail && $rc -ne 0 ]]; then
     record_result "$name" PASS "exit=$rc expected=$want"
@@ -275,9 +299,47 @@ PY
 # stage_model NAME PRECISION ARTIFACTS: copies a checkpoint into tmpfs ($shm, created by the caller in the parent
 # shell) with its pages on HBM node 2 (socket 0's HBM) and prints the staged path.
 stage_model() {
-  local staged="$shm/$1-$2.bin"
-  [[ -e $staged ]] || stage_checkpoint "$3/$2-v3.bin" "$staged" --membind=2
+  stage_model_on 2 "$@"
+}
+
+# stage_model_on NODE NAME PRECISION ARTIFACTS: the same on any node (its tag keeps copies on two nodes apart).
+stage_model_on() {
+  local node=$1 staged="$shm/$2-$3-node$1.bin"
+  if dry_run; then
+    printf '%s\n' "$staged"
+    return 0
+  fi
+  [[ -e $staged ]] || stage_checkpoint "$4/$3-v3.bin" "$staged" --membind="$node"
   printf '%s\n' "$staged"
+}
+
+# unstage_model_on NODE NAME PRECISION: frees the tmpfs copy (HBM node 2 holds 64 GiB, so copies must not accumulate).
+unstage_model_on() {
+  dry_run || rm -f -- "$shm/$2-$3-node$1.bin" "$shm/$2-$3-node$1.bin.numa.txt"
+}
+
+# snapshot_memory FILE: /proc/meminfo and every node's meminfo, to show page-cache and per-node memory before/after.
+snapshot_memory() {
+  dry_run && return 0
+  { date -u +%FT%TZ; cat /proc/meminfo; for f in /sys/devices/system/node/node[0-9]*/meminfo; do echo "== $f"; cat "$f"; done; } > "$1"
+}
+
+# need_shm: creates the tmpfs staging directory in the caller's shell (finish() removes it).
+need_shm() {
+  if dry_run; then
+    shm=/dev/shm/dry-run
+  elif [[ -z $shm ]]; then
+    shm=$(mktemp -d "/dev/shm/llama-campaign-$SLURM_JOB_ID-XXXXXX")
+  fi
+}
+
+# backend_env omp|teams THREADS: the environment words that select a backend (same shape on both sides of a comparison).
+backend_env() {
+  if [[ $1 == teams ]]; then
+    printf '%s\n' LLAMA_BACKEND=teams "LLAMA_THREADS=$2" OMP_PROC_BIND=false
+  else
+    printf '%s\n' LLAMA_BACKEND=omp "OMP_NUM_THREADS=$2" OMP_PROC_BIND=close OMP_PLACES=cores
+  fi
 }
 
 # F2 with models, one socket (56 threads, weights staged on its HBM): the omp and teams backends agree at every
@@ -285,7 +347,7 @@ stage_model() {
 # The Hugging Face gate of a backend that agrees with the validated one is not repeated here (HF_GATE=0 records it).
 phase_F2_models() {
   local dir="$OUT/F2" bin="$ROOT/build/release" entry name artifacts hf precision engine staged tokenizer label
-  [[ -n $shm ]] || shm=$(mktemp -d "/dev/shm/llama-campaign-$SLURM_JOB_ID-XXXXXX")
+  need_shm
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
     tokenizer="$artifacts/tokenizer-v2.bin"
@@ -306,7 +368,7 @@ phase_F2_models() {
       run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=teams \
         LLAMA_THREADS=56 OMP_PROC_BIND=false
       unset CPU_BIND MEM_BIND
-      rm -f -- "$staged" # HBM node 2 holds 64 GiB: one staged checkpoint at a time
+      unstage_model_on 2 "$name" "$precision" # HBM node 2 holds 64 GiB: one staged checkpoint at a time
     done
   done
   "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"

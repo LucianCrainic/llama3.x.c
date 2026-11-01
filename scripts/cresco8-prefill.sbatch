@@ -20,7 +20,9 @@ set -euo pipefail
 source "$ROOT/scripts/lib/cresco8-common.sh"
 require_env
 job_begin
-check_stage
-validate_models
+if ! dry_run; then
+  check_stage
+  validate_models
+fi
 run_phases
 exit "$OVERALL"

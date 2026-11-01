@@ -1,7 +1,7 @@
 """Summarize a campaign directory of schema-v2 reports as Markdown.
 
 Run labels follow {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}]
-[-k{kernel}]-{rep}.json. Repeats of one label are reported as the median with the full range. Schema-v1 reports
+[-k{kernel}][-x{tag}]-{rep}.json. Repeats of one label are reported as the median with the full range. Schema-v1 reports
 and unknown fields give '-' instead of failing. summarize_kernels.py stays for old campaigns.
 """
 import json
@@ -12,7 +12,7 @@ import sys
 
 LABEL = re.compile(r'^(?P<model>.+?)-(?P<precision>fp32|bf16|int8|w8a32)-(?P<backend>omp|teams)-'
                    r'(?P<placement>file|ddr|hbm)-s(?P<sockets>[12])-t(?P<threads>\d+)(?:-m(?P<m>\d+))?'
-                   r'(?:-p(?P<prompt>\d+))?(?:-c(?P<ctx>\d+))?(?:-k(?P<kernel>[a-z0-9_]+))?-(?P<rep>\d+)$')
+                   r'(?:-p(?P<prompt>\d+))?(?:-c(?P<ctx>\d+))?(?:-k(?P<kernel>[a-z0-9_]+))?(?:-x(?P<tag>[a-z0-9_]+))?-(?P<rep>\d+)$')
 CAS_LINE = 64  # bytes per uncore CAS
 
 

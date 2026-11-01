@@ -317,7 +317,12 @@ class RuntimeTests(unittest.TestCase):
                 regions = [r for r in everything if r['role'] in ('weights', 'embedding')]
                 roles = sorted(r['role'] for r in regions)
                 self.assertEqual(roles, ['weights'] if fixture is self.shared else ['embedding', 'weights'])
-                self.assertTrue(all(r['node'] is None and r['verified'] == 'unverified' for r in regions))
+                # Portable regions (no NUMA nodes here) carry no evidence; bound ones on Linux must be fully verified.
+                for r in everything:
+                    if r['node'] is None:
+                        self.assertEqual(r['verified'], 'unverified')
+                    elif r['role'] in ('weights', 'embedding'):
+                        self.assertEqual((r['verified'], r['pages_mismatched'], r['pages_missing']), ('full', 0, 0))
                 total = sum(r['bytes'] for r in regions)
                 header = 28 if engine == 'run' else 256
                 # Everything after the header is copied; padding keeps each range's alignment modulo 64.
@@ -345,13 +350,19 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(kv['active_bytes'], 2 * layers * position * kv_dim * 4)
                 self.assertEqual(kv['after_prompt']['active_bytes'], 2 * layers * tokens['processed_prompt'] * kv_dim * 4)
                 self.assertLessEqual(kv['active_bytes'], kv['reserved_bytes'])
-                self.assertFalse(kv['verified'])  # no NUMA query on this platform; residency is never invented
-                self.assertIsNone(kv['resident_bytes'])
+                if env and kv['node'] is not None:  # bound KV on Linux: every queried page on the requested node
+                    self.assertTrue(kv['verified'] and kv['pages_wrong_node'] == 0)
+                    self.assertGreaterEqual(kv['resident_bytes'], kv['active_bytes'])
+                    self.assertLessEqual(kv['resident_bytes'], kv['reserved_bytes'])
+                else:  # residency is never invented
+                    self.assertFalse(kv['verified'])
+                    self.assertIsNone(kv['resident_bytes'])
                 self.assertEqual(data['memory_bytes']['kv_cache_allocated_peak'], kv['reserved_bytes'])
 
     def test_kv_verification_is_untimed_and_can_be_disabled(self):
         _, data = self.execute('run', '--benchmark', '--no-text', env={**self.OWNED, 'LLAMA_KV_VERIFY': '0'})
         self.assertFalse(data['kv']['verified'])
+        self.assertIsNone(data['kv']['resident_bytes'])
 
     def test_owned_placement_runs_to_the_context_limit(self):
         for engine in ('run', 'runq'):
