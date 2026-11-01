@@ -31,9 +31,9 @@ ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
 LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
-COMMON = src/runtime.c src/kernels.c src/tokenizer.c src/sampler.c
+COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
-HEADERS = include/runtime.h include/app.h
+HEADERS = include/runtime.h include/app.h include/kernels.h
 # Regenerate the configuration stamp only when flags change; changing OPENMP or
 # CC must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE
@@ -51,7 +51,10 @@ $(BUILD_DIR)/test-fp32: tests/unit.c src/run.c $(COMMON) $(HEADERS) $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-int8: tests/unit.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8
+$(BUILD_DIR)/test-kernels: tests/kernels.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels
+	$(BUILD_DIR)/test-kernels
 	python3 tests/test_runtime.py $(BUILD_DIR)
 	python3 tests/test_tools.py
 clean:

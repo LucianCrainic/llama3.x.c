@@ -1,4 +1,5 @@
 #include "app.h"
+#include "kernels.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +195,11 @@ void write_report(void) {
 #else
   fputs(",\n    \"openmp\": false,\n    \"openmp_version\": null", f);
 #endif
+  fputs(",\n    \"kernels\": ", f);
+  if (kernels_name())
+    string(f, kernels_name());
+  else
+    fputs("null", f);
   fputs(",\n    \"openmp_max_threads\": ", f);
 #ifdef _OPENMP
   fprintf(f, "%d", omp_get_max_threads());

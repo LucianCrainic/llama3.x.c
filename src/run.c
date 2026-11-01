@@ -1,5 +1,6 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
+#include "kernels.h"
 #include "runtime.h"
 #include <math.h>
 #include <stdlib.h>
@@ -32,14 +33,14 @@ typedef struct {
   // current wave of activations
   float *x;      // activation at current time stamp (dim,)
   float *xb;     // same, but inside a residual branch (dim,)
-  float *xb2;    // an additional buffer just for convenience (dim,)
   float *hb;     // buffer for hidden dimension in the ffn (hidden_dim,)
-  float *hb2;    // buffer for hidden dimension in the ffn (hidden_dim,)
   float *q;      // query (dim,)
   float *k;      // key (dim,)
   float *v;      // value (dim,)
   float *att;    // buffer for scores/attention values (n_heads, seq_len)
   float *logits; // output logits
+  float *rope;   // RoPE cosines and signed sines for the current position (2 * head_size,)
+  AttentionWork attention; // split-K attention partials
   // kv cache
   float *key_cache;   // (layer, seq_len, kv_dim); cache persists for this sequence
   float *value_cache; // (layer, seq_len, kv_dim); cache persists for this sequence
@@ -60,27 +61,27 @@ static void malloc_run_state(RunState *s, Config *p) {
   int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
   s->x = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
   s->xb = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
-  s->xb2 = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
   s->hb = memory_alloc(p->hidden_dim, sizeof(float), MEM_ACTIVATION);
-  s->hb2 = memory_alloc(p->hidden_dim, sizeof(float), MEM_ACTIVATION);
   s->q = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
   s->key_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
   s->value_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
   s->att = memory_alloc((size_t)p->n_heads * p->seq_len, sizeof(float), MEM_ACTIVATION);
   s->logits = memory_alloc(p->vocab_size, sizeof(float), MEM_ACTIVATION);
+  s->rope = memory_alloc(2 * (size_t)p->head_dim, sizeof(float), MEM_ACTIVATION);
+  k_attention_init(&s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
 }
 
 static void free_run_state(RunState *s) {
   memory_free(s->x);
   memory_free(s->xb);
-  memory_free(s->xb2);
   memory_free(s->hb);
-  memory_free(s->hb2);
   memory_free(s->q);
   memory_free(s->att);
   memory_free(s->logits);
   memory_free(s->key_cache);
   memory_free(s->value_cache);
+  memory_free(s->rope);
+  k_attention_free(&s->attention);
 }
 
 static void memory_map_weights(TransformerWeights *w, const Config *p, const float *ptr, int shared_weights) {
@@ -139,22 +140,6 @@ static void free_transformer(Transformer *t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-static void matmul(float *xout, const float *x, const float *w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  int i;
-#ifdef _OPENMP
-#pragma omp parallel for private(i)
-#endif
-  for (i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += w[(size_t)i * n + j] * x[j];
-    }
-    xout[i] = val;
-  }
-}
-
 /* One autoregressive position: embeddings -> attention/RoPE over cached prefix
  * -> SwiGLU FFN per layer -> normalized vocabulary logits. Cache rows are
  * [layer][position][KV head * head_size]; GQA query heads share KV heads. */
@@ -167,114 +152,55 @@ static float *forward(Transformer *transformer, int token, int pos) {
   float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
-  int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int hidden_dim = p->hidden_dim;
   int head_size = dim / p->n_heads;
 
   // copy the token embedding into x
   const float *content_row = w->token_embedding_table + (size_t)token * dim;
   memcpy(x, content_row, dim * sizeof(*x));
+  // RoPE angles depend only on the position: compute them once for all layers
+  k_rope_table(p, pos, s->rope);
 
   // forward all the layers
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
 
     // attention rmsnorm
-    rmsnorm_eps(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
+    k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
 
     // key and value point to the kv cache
     size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
     s->k = s->key_cache + loff + (size_t)pos * kv_dim;
     s->v = s->value_cache + loff + (size_t)pos * kv_dim;
 
-    // qkv matmuls for this position
-    matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
-    matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
-    matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+    // qkv matmuls for this position, in one parallel region
+    k_matmul_qkv(s->q, s->k, s->v, s->xb, w->wq + l * dim * dim, w->wk + l * dim * kv_dim, w->wv + l * dim * kv_dim, dim,
+                 dim, kv_dim);
 
-    apply_rope(s->q, s->k, p, pos);
+    k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size);
 
-    // multihead attention. iterate over all heads
-    int h;
-#ifdef _OPENMP
-#pragma omp parallel for private(h)
-#endif
-    for (h = 0; h < p->n_heads; h++) {
-      // get the query vector for this head
-      float *q = s->q + h * head_size;
-      // attention scores for this head
-      float *att = s->att + (size_t)h * p->seq_len;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float *k = s->key_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-        }
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
-        att[t] = score;
-      }
+    // multihead attention over positions 0..pos, output into xb
+    k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, &s->attention, p->n_heads,
+                p->n_kv_heads, head_size, p->seq_len, pos);
 
-      // softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float *xb = s->xb + h * head_size;
-      memset(xb, 0, head_size * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float *v = s->value_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into xb
-        for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-        }
-      }
-    }
-
-    // final matmul to get the output of the attention
-    matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
-
-    // residual connection back into x
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb2[i];
-    }
+    // final matmul to get the output of the attention, with the residual connection back into x
+    k_matmul_add(x, s->xb, w->wo + l * dim * dim, dim, dim);
 
     // ffn rmsnorm
-    rmsnorm_eps(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
+    k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-    // first calculate self.w1(x) and self.w3(x)
-    matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
-    matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+    // w1 and w3 share one pass that applies the SwiGLU non-linearity
+    k_matmul_swiglu(s->hb, s->xb, w->w1 + l * dim * hidden_dim, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
-    // SwiGLU non-linearity
-    for (int i = 0; i < hidden_dim; i++) {
-      float val = s->hb[i];
-      // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-      val *= (1.0f / (1.0f + expf(-val)));
-      // elementwise multiply with w3(x)
-      val *= s->hb2[i];
-      s->hb[i] = val;
-    }
-
-    // final matmul to get the output of the ffn
-    matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
-
-    // residual connection
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb[i];
-    }
+    // final matmul to get the output of the ffn, with the residual connection
+    k_matmul_add(x, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
   }
 
   // final rmsnorm
-  rmsnorm_eps(x, x, w->rms_final_weight, dim, p->norm_eps);
+  k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps);
 
   // classifier into logits
-  matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+  k_matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
   return s->logits;
 }
 
@@ -286,6 +212,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   Transformer *t = memory_alloc(1, sizeof(*t), MEM_METADATA);
   t->fd = -1;
   model->implementation = t;
+  kernels_init();
   read_checkpoint(path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
   model->mapped_bytes = t->file_size;

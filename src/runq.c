@@ -1,5 +1,6 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
+#include "kernels.h"
 #include "runtime.h"
 #include <math.h>
 #include <stdlib.h>
@@ -8,6 +9,9 @@
 #include <unistd.h>
 
 static int GS; /* One model per CLI process; v2 checkpoint group size. */
+/* LLAMA_Q8_ACTIVATIONS=fp32 multiplies dequantized weights by FP32 activations
+ * (W8A32) instead of quantizing activations (the default W8A8 Q8_0 rule). */
+static int fp32_activations;
 
 typedef struct {
   int8_t *q; // quantized values
@@ -41,9 +45,7 @@ typedef struct {
   // current wave of activations
   float *x;           // activation at current time stamp (dim,)
   float *xb;          // same, but inside a residual branch (dim,)
-  float *xb2;         // an additional buffer just for convenience (dim,)
   float *hb;          // buffer for hidden dimension in the ffn (hidden_dim,)
-  float *hb2;         // buffer for hidden dimension in the ffn (hidden_dim,)
   QuantizedTensor xq; // quantized x (dim,)
   QuantizedTensor hq; // quantized hb (hidden_dim,)
   float *q;           // query (dim,)
@@ -51,6 +53,8 @@ typedef struct {
   float *v;           // value (dim,)
   float *att;         // buffer for scores/attention values (n_heads, seq_len)
   float *logits;      // output logits
+  float *rope;        // RoPE cosines and signed sines for the current position (2 * head_size,)
+  AttentionWork attention; // split-K attention partials
   // kv cache
   float *key_cache;   // (layer, seq_len, kv_dim); cache persists for this sequence
   float *value_cache; // (layer, seq_len, kv_dim); cache persists for this sequence
@@ -71,9 +75,7 @@ static void malloc_run_state(RunState *s, Config *p) {
   int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
   s->x = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
   s->xb = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
-  s->xb2 = memory_alloc(p->dim, sizeof(float), MEM_ACTIVATION);
   s->hb = memory_alloc(p->hidden_dim, sizeof(float), MEM_ACTIVATION);
-  s->hb2 = memory_alloc(p->hidden_dim, sizeof(float), MEM_ACTIVATION);
   s->xq = (QuantizedTensor){.q = memory_alloc(p->dim, sizeof(int8_t), MEM_ACTIVATION),
                             .s = memory_alloc(p->dim / GS, sizeof(float), MEM_ACTIVATION)};
   s->hq = (QuantizedTensor){.q = memory_alloc(p->hidden_dim, sizeof(int8_t), MEM_ACTIVATION),
@@ -85,14 +87,14 @@ static void malloc_run_state(RunState *s, Config *p) {
   s->logits = memory_alloc(p->vocab_size, sizeof(float), MEM_ACTIVATION);
   s->key_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
   s->value_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
+  s->rope = memory_alloc(2 * (size_t)p->head_dim, sizeof(float), MEM_ACTIVATION);
+  k_attention_init(&s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
 }
 
 static void free_run_state(RunState *s) {
   memory_free(s->x);
   memory_free(s->xb);
-  memory_free(s->xb2);
   memory_free(s->hb);
-  memory_free(s->hb2);
   memory_free(s->xq.q);
   memory_free(s->xq.s);
   memory_free(s->hq.q);
@@ -104,6 +106,8 @@ static void free_run_state(RunState *s) {
   memory_free(s->logits);
   memory_free(s->key_cache);
   memory_free(s->value_cache);
+  memory_free(s->rope);
+  k_attention_free(&s->attention);
 }
 
 // ----------------------------------------------------------------------------
@@ -115,35 +119,17 @@ static void dequantize(const QuantizedTensor *qx, float *x, size_t n) {
   }
 }
 
-static void quantize(QuantizedTensor *qx, const float *x, int n) {
-  int num_groups = n / GS;
-  float Q_MAX = 127.0f;
+/* Activations for one matmul input: quantized (W8A8) unless FP32 activations
+ * were selected, in which case the FP32 vector is used directly (W8A32). */
+static K8Input prepare_input(QuantizedTensor *qx, const float *x, int n) {
+  if (fp32_activations)
+    return (K8Input){NULL, NULL, x};
+  k_quantize(qx->q, qx->s, x, n, GS);
+  return (K8Input){qx->q, qx->s, x};
+}
 
-  for (int group = 0; group < num_groups; group++) {
-
-    // find the max absolute value in the current group
-    float wmax = 0.0;
-    for (int i = 0; i < GS; i++) {
-      if (!isfinite(x[group * GS + i]))
-        fail("nonfinite activation during INT8 quantization");
-      float val = fabsf(x[group * GS + i]);
-      if (val > wmax) {
-        wmax = val;
-      }
-    }
-
-    // calculate and write the scaling factor
-    float scale = wmax / Q_MAX;
-    qx->s[group] = scale;
-
-    // calculate and write the quantized values
-    for (int i = 0; i < GS; i++) {
-      float quant_value = scale == 0.0f ? 0.0f : x[group * GS + i] / scale; // scale
-      /* Clamp also handles subnormal-scale rounding without float-to-int UB. */
-      int8_t quantized = (int8_t)roundf(fmaxf(-127.0f, fminf(127.0f, quant_value)));
-      qx->q[group * GS + i] = quantized;
-    }
-  }
+static K8Weight weight(const QuantizedTensor *t) {
+  return (K8Weight){t->q, t->s};
 }
 
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
@@ -231,35 +217,6 @@ static void free_transformer(Transformer *t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-static void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
-  // W (d,n) @ x (n,) -> xout (d,)
-  // by far the most amount of time is spent inside this little function
-  // inputs to this function are both quantized
-
-  int i;
-#ifdef _OPENMP
-#pragma omp parallel for private(i)
-#endif
-  for (i = 0; i < d; i++) {
-
-    float val = 0.0f;
-    int32_t ival = 0;
-    size_t in = (size_t)i * n;
-
-    // do the matmul in groups of GS
-    int j;
-    for (j = 0; j <= n - GS; j += GS) {
-      for (int k = 0; k < GS; k++) {
-        ival += ((int32_t)x->q[j + k]) * ((int32_t)w->q[in + j + k]);
-      }
-      val += ((float)ival) * w->s[(in + j) / GS] * x->s[j / GS];
-      ival = 0;
-    }
-
-    xout[i] = val;
-  }
-}
-
 /* One autoregressive position: embeddings -> attention/RoPE over cached prefix
  * -> SwiGLU FFN per layer -> normalized vocabulary logits. Cache rows are
  * [layer][position][KV head * head_size]; GQA query heads share KV heads. */
@@ -272,26 +229,26 @@ static float *forward(Transformer *transformer, int token, int pos) {
   float *x = s->x;
   int dim = p->dim;
   int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
-  int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
   int hidden_dim = p->hidden_dim;
   int head_size = dim / p->n_heads;
 
   // copy the token embedding into x
   memcpy(x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float));
+  // RoPE angles depend only on the position: compute them once for all layers
+  k_rope_table(p, pos, s->rope);
 
   // forward all the layers
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
 
     // attention rmsnorm
-    rmsnorm_eps(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
+    k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
 
-    // qkv matmuls for this position
-    quantize(&s->xq, s->xb, dim);
-    matmul(s->q, &s->xq, w->wq + l, dim, dim);
-    matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);
-    matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);
+    // qkv matmuls for this position, in one parallel region
+    K8Input in = prepare_input(&s->xq, s->xb, dim);
+    k_matmul_q8_qkv(s->q, s->k, s->v, &in, weight(w->wq + l), weight(w->wk + l), weight(w->wv + l), dim, dim, kv_dim,
+                    GS);
 
-    apply_rope(s->q, s->k, p, pos);
+    k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size);
 
     // save key,value at this time step (pos) to our kv cache
     size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -300,92 +257,33 @@ static float *forward(Transformer *transformer, int token, int pos) {
     memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
     memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
 
-    // multihead attention. iterate over all heads
-    int h;
-#ifdef _OPENMP
-#pragma omp parallel for private(h)
-#endif
-    for (h = 0; h < p->n_heads; h++) {
-      // get the query vector for this head
-      float *q = s->q + h * head_size;
-      // attention scores for this head
-      float *att = s->att + (size_t)h * p->seq_len;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float *k = s->key_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-        }
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
-        att[t] = score;
-      }
+    // multihead attention over positions 0..pos, output into xb
+    k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, &s->attention, p->n_heads,
+                p->n_kv_heads, head_size, p->seq_len, pos);
 
-      // softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float *xb = s->xb + h * head_size;
-      memset(xb, 0, head_size * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float *v = s->value_cache + loff + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into xb
-        for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-        }
-      }
-    }
-
-    // final matmul to get the output of the attention
-    quantize(&s->xq, s->xb, dim);
-    matmul(s->xb2, &s->xq, w->wo + l, dim, dim);
-
-    // residual connection back into x
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb2[i];
-    }
+    // final matmul to get the output of the attention, with the residual connection back into x
+    in = prepare_input(&s->xq, s->xb, dim);
+    k_matmul_q8_add(x, &in, weight(w->wo + l), dim, dim, GS);
 
     // ffn rmsnorm
-    rmsnorm_eps(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
+    k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-    // first calculate self.w1(x) and self.w3(x)
-    quantize(&s->xq, s->xb, dim);
-    matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
-    matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+    // w1 and w3 share one pass that applies the SwiGLU non-linearity
+    in = prepare_input(&s->xq, s->xb, dim);
+    k_matmul_q8_swiglu(s->hb, &in, weight(w->w1 + l), weight(w->w3 + l), dim, hidden_dim, GS);
 
-    // SwiGLU non-linearity
-    for (int i = 0; i < hidden_dim; i++) {
-      float val = s->hb[i];
-      // silu(x)=x*s(x), where s(x) is the logistic sigmoid
-      val *= (1.0f / (1.0f + expf(-val)));
-      // elementwise multiply with w3(x)
-      val *= s->hb2[i];
-      s->hb[i] = val;
-    }
-
-    // final matmul to get the output of the ffn
-    quantize(&s->hq, s->hb, hidden_dim);
-    matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);
-
-    // residual connection
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb[i];
-    }
+    // final matmul to get the output of the ffn, with the residual connection
+    in = prepare_input(&s->hq, s->hb, hidden_dim);
+    k_matmul_q8_add(x, &in, weight(w->w2 + l), hidden_dim, dim, GS);
   }
 
   // final rmsnorm
-  rmsnorm_eps(x, x, w->rms_final_weight, dim, p->norm_eps);
+  k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps);
 
   // classifier into logits
-  quantize(&s->xq, x, dim);
-  matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+  K8Input in = prepare_input(&s->xq, x, dim);
+  k_matmul_q8(s->logits, &in, weight(w->wcls), dim, p->vocab_size, GS);
   return s->logits;
 }
 
@@ -397,6 +295,11 @@ void engine_load_context(Model *model, const char *path, int context) {
   Transformer *t = memory_alloc(1, sizeof(*t), MEM_METADATA);
   t->fd = -1;
   model->implementation = t;
+  kernels_init();
+  const char *activations = getenv("LLAMA_Q8_ACTIVATIONS");
+  if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
+    fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
+  fp32_activations = activations && !strcmp(activations, "fp32");
   read_checkpoint(path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
   model->mapped_bytes = t->file_size;
@@ -422,7 +325,7 @@ void engine_free(Model *model) {
   }
 }
 const char *engine_precision(void) {
-  return "int8_q8_0";
+  return fp32_activations ? "int8_q8_0_w8a32" : "int8_q8_0";
 }
 int engine_group_size(void) {
   return GS;
