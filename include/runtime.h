@@ -46,11 +46,15 @@ void *memory_alloc(size_t count, size_t size, MemoryKind kind);
 void memory_free(void *pointer);
 size_t checked_mul(size_t a, size_t b);
 size_t checked_add(size_t a, size_t b);
+/* File bytes of a tensor: FP32 values, or Q8 values plus FP32 group scales (no padding). */
+size_t tensor_bytes(size_t count, int quantized, int gs);
 double monotonic_seconds(void);
 
-/* Validation precedes pointer construction. The mapping owns no heap weights. */
+/* Validation precedes pointer construction. The mapping owns no heap weights;
+ * the caller owns `manifest` (manifest_free) once the call succeeds. */
+struct TensorManifest;
 void checkpoint_map(const char *path, int quantized, Config *config, int *shared, int *group_size, int *fd,
-                    float **data, size_t *bytes);
+                    float **data, size_t *bytes, struct TensorManifest *manifest);
 void rmsnorm(float *out, const float *x, const float *weight, int size);
 void rmsnorm_eps(float *out, const float *x, const float *weight, int size, float epsilon);
 float rope_frequency(const Config *config, int pair_dimension);

@@ -20,7 +20,19 @@ scheduler or descriptor family (see the user decision in the [README](../README.
 Inference behaviour does not change: weights are still read from the file mapping, at
 exactly the pointers used today.
 
-Status: **planned**. Branch: `feature/found-f1-tensor-manifest`.
+Status: **implemented, local tests pass** (not yet merged). Branch:
+`feature/found-f1-tensor-manifest`.
+
+Implementation notes (deviations from the proposal above):
+
+- `checkpoint_map` takes a `TensorManifest *` and builds it after its own size
+  arithmetic; `manifest_build`'s end offset is compared with that arithmetic and a
+  mismatch fails. `tensor_bytes` is now non-static so the builder reuses it.
+- The oracle test is `tests/manifest.c` (`test-manifest`), driven from
+  `tests/test_runtime.py::test_manifest_matches_layouts`, because the old pointer
+  code is static inside `run.c`/`runq.c`.
+- The trace dump is enabled with the existing `--log-level trace`; there is no
+  `LLAMA_LOG` variable.
 
 ## 2. Depends on / unblocks
 

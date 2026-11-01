@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "profile.h"
 #include "runtime.h"
+#include "shards.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,7 @@ typedef struct {
 typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
+  TensorManifest manifest;    // where each tensor lives in the file
   RunState state;             // buffers for the "wave" of activations in the forward pass
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -133,59 +135,54 @@ static K8Weight weight(const QuantizedTensor *t) {
   return (K8Weight){t->q, t->s};
 }
 
-/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
-static QuantizedTensor *init_quantized_tensors(void **ptr, int n, size_t size_each) {
-  void *p = *ptr;
-  QuantizedTensor *res = memory_alloc(n, sizeof(QuantizedTensor), MEM_METADATA);
-  for (int i = 0; i < n; i++) {
-    /* map quantized int8 values*/
-    res[i].q = (int8_t *)p;
-    p = (int8_t *)p + size_each;
-    /* map scale factors */
-    res[i].s = (float *)p;
-    p = (float *)p + size_each / GS;
+static const TensorDesc *find_tensor(const TensorManifest *m, TensorRole role, int layer) {
+  const TensorDesc *t = manifest_find(m, role, layer);
+  if (!t)
+    fail("tensor manifest has no %s tensor (layer %d)", manifest_role_name(role), layer);
+  return t;
+}
+
+/* Views of quantized tensors of one role: `n` layers, or the single global tensor when n < 0. */
+static QuantizedTensor *init_quantized_tensors(const char *data, const TensorManifest *m, TensorRole role, int n) {
+  int count = n < 0 ? 1 : n;
+  QuantizedTensor *res = memory_alloc(count, sizeof(QuantizedTensor), MEM_METADATA);
+  for (int i = 0; i < count; i++) {
+    const TensorDesc *t = find_tensor(m, role, n < 0 ? -1 : i);
+    res[i].q = (int8_t *)(data + t->offset);
+    res[i].s = (float *)(data + t->scale_offset);
   }
-  *ptr = p; // advance ptr to current position
   return res;
 }
 
-static void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t shared_classifier) {
-  int head_size = p->dim / p->n_heads;
-  // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights)
-  float *fptr = (float *)ptr; // cast our pointer to float*
-  w->rms_att_weight = fptr;
-  fptr += (size_t)p->n_layers * p->dim;
-  w->rms_ffn_weight = fptr;
-  fptr += (size_t)p->n_layers * p->dim;
-  w->rms_final_weight = fptr;
-  fptr += p->dim;
+static void memory_map_weights(TransformerWeights *w, const Config *p, const TensorManifest *m, const char *data) {
+  w->rms_att_weight = (float *)(data + find_tensor(m, T_RMS_ATT, 0)->offset);
+  w->rms_ffn_weight = (float *)(data + find_tensor(m, T_RMS_FFN, 0)->offset);
+  w->rms_final_weight = (float *)(data + find_tensor(m, T_RMS_FINAL, -1)->offset);
 
-  // now read all the quantized weights
-  ptr = (void *)fptr; // now cast the pointer back to void*
-  w->q_tokens = init_quantized_tensors(&ptr, 1, (size_t)p->vocab_size * p->dim);
+  w->q_tokens = init_quantized_tensors(data, m, T_EMBED, -1);
   // dequantize token embedding table
   w->token_embedding_table = memory_alloc((size_t)p->vocab_size * p->dim, sizeof(float), MEM_EMBEDDING);
   dequantize(w->q_tokens, w->token_embedding_table, (size_t)p->vocab_size * p->dim);
 
-  w->wq = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->dim * (p->n_heads * head_size));
-  w->wk = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->dim * (p->n_kv_heads * head_size));
-  w->wv = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->dim * (p->n_kv_heads * head_size));
-  w->wo = init_quantized_tensors(&ptr, p->n_layers, (size_t)(p->n_heads * head_size) * p->dim);
+  w->wq = init_quantized_tensors(data, m, T_WQ, p->n_layers);
+  w->wk = init_quantized_tensors(data, m, T_WK, p->n_layers);
+  w->wv = init_quantized_tensors(data, m, T_WV, p->n_layers);
+  w->wo = init_quantized_tensors(data, m, T_WO, p->n_layers);
 
-  w->w1 = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->dim * p->hidden_dim);
-  w->w2 = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->hidden_dim * p->dim);
-  w->w3 = init_quantized_tensors(&ptr, p->n_layers, (size_t)p->dim * p->hidden_dim);
+  w->w1 = init_quantized_tensors(data, m, T_W1, p->n_layers);
+  w->w2 = init_quantized_tensors(data, m, T_W2, p->n_layers);
+  w->w3 = init_quantized_tensors(data, m, T_W3, p->n_layers);
 
-  w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, (size_t)p->dim * p->vocab_size);
+  w->wcls = find_tensor(m, T_WCLS, -1)->alias_of >= 0 ? w->q_tokens : init_quantized_tensors(data, m, T_WCLS, -1);
 }
 
-static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, int *fd, float **data,
-                            size_t *file_size) {
+static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, TensorManifest *manifest,
+                            int *fd, float **data, size_t *file_size) {
   int shared, gs;
   double start = monotonic_seconds();
-  checkpoint_map(path, 1, config, &shared, &gs, fd, data, file_size);
+  checkpoint_map(path, 1, config, &shared, &gs, fd, data, file_size, manifest);
   GS = gs;
-  memory_map_weights(weights, config, (void *)((char *)*data + 256), shared);
+  memory_map_weights(weights, config, manifest, (const char *)*data);
   metrics.checkpoint_s = monotonic_seconds() - start;
   metrics.checkpoint_ready = 1;
 }
@@ -204,6 +201,7 @@ static void free_transformer(Transformer *t) {
     memory_free(t->weights.wcls);
   }
   memory_free(t->weights.q_tokens);
+  manifest_free(&t->manifest);
   // close the memory mapping
   if (t->data != MAP_FAILED) {
     munmap(t->data, t->file_size);
@@ -303,7 +301,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
     fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
   fp32_activations = activations && !strcmp(activations, "fp32");
-  read_checkpoint(path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
   model->mapped_bytes = t->file_size;
   if (context < 0 || context > t->config.seq_len)

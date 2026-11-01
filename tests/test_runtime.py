@@ -66,6 +66,18 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIn('overflow',result.stderr)
 
     @unittest.skipUnless('-DLLAMA_PCRE2' in (BUILD/'config').read_text(), 'new tokenizer requires PCRE2')
+    def test_manifest_matches_layouts(self):
+        """Manifest offsets equal the old pointer-bumping layout (oracle in tests/manifest.c)."""
+        def check(*args):
+            result = subprocess.run([str(BUILD/'test-manifest'), *map(str, args)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        check()
+        v3 = upgrade_v3(create(self.root/'v3-manifest', shared=False))
+        v3_shared = upgrade_v3(create(self.root/'v3-manifest-shared'))
+        for fixture in (self.shared, self.unshared, v3, v3_shared):
+            check('fp32', fixture/'fp32.bin')
+            check('int8', fixture/'int8.bin')
+
     def test_v3_metadata_context_and_stopping(self):
         fixture = upgrade_v3(create(self.root/'v3'))
         for engine in ('run', 'runq'):

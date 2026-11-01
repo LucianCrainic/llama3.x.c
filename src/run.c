@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "profile.h"
 #include "runtime.h"
+#include "shards.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,7 @@ typedef struct {
 typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
+  TensorManifest manifest;    // where each tensor lives in the file
   RunState state;             // buffers for the "wave" of activations in the forward pass
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -85,43 +87,36 @@ static void free_run_state(RunState *s) {
   k_attention_free(&s->attention);
 }
 
-static void memory_map_weights(TransformerWeights *w, const Config *p, const float *ptr, int shared_weights) {
-  int head_size = p->dim / p->n_heads;
-  // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
-  size_t n_layers = (size_t)p->n_layers;
-  w->token_embedding_table = ptr;
-  ptr += (size_t)p->vocab_size * p->dim;
-  w->rms_att_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->wq = ptr;
-  ptr += n_layers * (size_t)p->dim * (p->n_heads * head_size);
-  w->wk = ptr;
-  ptr += n_layers * (size_t)p->dim * (p->n_kv_heads * head_size);
-  w->wv = ptr;
-  ptr += n_layers * (size_t)p->dim * (p->n_kv_heads * head_size);
-  w->wo = ptr;
-  ptr += n_layers * (size_t)(p->n_heads * head_size) * p->dim;
-  w->rms_ffn_weight = ptr;
-  ptr += n_layers * p->dim;
-  w->w1 = ptr;
-  ptr += n_layers * (size_t)p->dim * p->hidden_dim;
-  w->w2 = ptr;
-  ptr += n_layers * (size_t)p->hidden_dim * p->dim;
-  w->w3 = ptr;
-  ptr += n_layers * (size_t)p->dim * p->hidden_dim;
-  w->rms_final_weight = ptr;
-  ptr += p->dim;
-  if (p->format == 0)
-    ptr += (size_t)p->seq_len * head_size; // legacy unused RoPE tables
-  w->wcls = shared_weights ? w->token_embedding_table : ptr;
+/* Weight pointers are views into the file mapping at manifest offsets. Layers of a
+ * role are contiguous, so layer 0 addresses the whole array. */
+static const float *weight_view(const float *data, const TensorManifest *m, TensorRole role, int layer) {
+  const TensorDesc *t = manifest_find(m, role, layer);
+  if (!t)
+    fail("tensor manifest has no %s tensor (layer %d)", manifest_role_name(role), layer);
+  return (const float *)((const char *)data + t->offset);
 }
 
-static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, int *fd, float **data,
-                            size_t *file_size) {
+static void memory_map_weights(TransformerWeights *w, const TensorManifest *m, const float *data) {
+  w->token_embedding_table = weight_view(data, m, T_EMBED, -1);
+  w->rms_att_weight = weight_view(data, m, T_RMS_ATT, 0);
+  w->wq = weight_view(data, m, T_WQ, 0);
+  w->wk = weight_view(data, m, T_WK, 0);
+  w->wv = weight_view(data, m, T_WV, 0);
+  w->wo = weight_view(data, m, T_WO, 0);
+  w->rms_ffn_weight = weight_view(data, m, T_RMS_FFN, 0);
+  w->w1 = weight_view(data, m, T_W1, 0);
+  w->w2 = weight_view(data, m, T_W2, 0);
+  w->w3 = weight_view(data, m, T_W3, 0);
+  w->rms_final_weight = weight_view(data, m, T_RMS_FINAL, -1);
+  w->wcls = weight_view(data, m, T_WCLS, -1);
+}
+
+static void read_checkpoint(const char *path, Config *config, TransformerWeights *weights, TensorManifest *manifest,
+                            int *fd, float **data, size_t *file_size) {
   int shared, gs;
   double start = monotonic_seconds();
-  checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size);
-  memory_map_weights(weights, config, (void *)((char *)*data + (config->format == 3 ? 256 : 28)), shared);
+  checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size, manifest);
+  memory_map_weights(weights, manifest, *data);
   metrics.checkpoint_s = monotonic_seconds() - start;
   metrics.checkpoint_ready = 1;
 }
@@ -134,6 +129,7 @@ static void free_transformer(Transformer *t) {
   if (t->fd != -1) {
     close(t->fd);
   }
+  manifest_free(&t->manifest);
   // free the RunState buffers
   free_run_state(&t->state);
 }
@@ -215,7 +211,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   t->fd = -1;
   model->implementation = t;
   kernels_init();
-  read_checkpoint(path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+  read_checkpoint(path, &t->config, &t->weights, &t->manifest, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
   model->mapped_bytes = t->file_size;
   if (context < 0 || context > t->config.seq_len)
