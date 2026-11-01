@@ -78,8 +78,9 @@ class RuntimeTests(unittest.TestCase):
             'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None})
         self.assertIsNone(data['teams'])
         self.assertEqual(data['regions'], [])
-        for key in ('kv', 'phase_seconds'):
-            self.assertIsNone(data[key])
+        self.assertIsNone(data['phase_seconds'])
+        self.assertEqual(set(data['kv']), {'reserved_bytes', 'resident_bytes', 'active_bytes', 'node', 'verified', 'full',
+                                           'pages_queried', 'pages_wrong_node', 'pages_missing', 'after_prompt'})
         self.assertEqual(set(data['prefill']), {'microbatches', 'tokens', 'seconds', 'logits_rows'})
         for key in ('weight_pack', 'placement_populate', 'placement_verify'):
             self.assertIsNone(data['timing_seconds'][key])
@@ -310,7 +311,10 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(data['runtime']['placement'], 'ddr')
                 mem, file_size = data['memory_bytes'], (fixture/name).stat().st_size
                 self.assertEqual((mem['model_file'], mem['mapped_checkpoint']), (file_size, 0))
-                regions = data['regions']
+                everything = data['regions']
+                self.assertEqual(sorted(r['role'] for r in everything if r['role'].startswith('kv') or r['role'] == 'work'),
+                                 ['kv.k', 'kv.v', 'work'])
+                regions = [r for r in everything if r['role'] in ('weights', 'embedding')]
                 roles = sorted(r['role'] for r in regions)
                 self.assertEqual(roles, ['weights'] if fixture is self.shared else ['embedding', 'weights'])
                 self.assertTrue(all(r['node'] is None and r['verified'] == 'unverified' for r in regions))
@@ -320,6 +324,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertGreaterEqual(total, file_size - header)
                 self.assertLess(total, file_size - header + 3 * 64)
                 self.assertEqual(mem['owned_weights_peak'] + mem['dequantized_embedding_allocated_peak'], total)
+                self.assertEqual(data['kv']['reserved_bytes'], mem['kv_cache_allocated_peak'])
                 for key in ('placement_populate', 'placement_verify'):
                     self.assertGreaterEqual(data['timing_seconds'][key], 0)
                 self.assertLess(data['timing_seconds']['checkpoint_load'], 5)
@@ -327,6 +332,33 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((data['runtime']['placement'], data['regions']), ('file', []))
         self.assertIsNone(data['timing_seconds']['placement_populate'])
         self.assertEqual(data['memory_bytes']['owned_weights_peak'], 0)
+
+    # ---- A5: KV cache and workspace placement ------------------------------------------------------------------
+    def test_kv_accounting_matches_the_formula(self):
+        layers, kv_dim, seq = CONFIG[2], CONFIG[0] // CONFIG[3] * CONFIG[4], CONFIG[-1]
+        for env in ({}, self.OWNED):
+            for engine in ('run', 'runq'):
+                _, data = self.execute(engine, '--benchmark', '--generation-length', '5', '--no-text', env=env)
+                kv, tokens = data['kv'], data['tokens']
+                self.assertEqual(kv['reserved_bytes'], 2 * layers * seq * kv_dim * 4)
+                position = tokens['processed_prompt'] + tokens['decode_steps']
+                self.assertEqual(kv['active_bytes'], 2 * layers * position * kv_dim * 4)
+                self.assertEqual(kv['after_prompt']['active_bytes'], 2 * layers * tokens['processed_prompt'] * kv_dim * 4)
+                self.assertLessEqual(kv['active_bytes'], kv['reserved_bytes'])
+                self.assertFalse(kv['verified'])  # no NUMA query on this platform; residency is never invented
+                self.assertIsNone(kv['resident_bytes'])
+                self.assertEqual(data['memory_bytes']['kv_cache_allocated_peak'], kv['reserved_bytes'])
+
+    def test_kv_verification_is_untimed_and_can_be_disabled(self):
+        _, data = self.execute('run', '--benchmark', '--no-text', env={**self.OWNED, 'LLAMA_KV_VERIFY': '0'})
+        self.assertFalse(data['kv']['verified'])
+
+    def test_owned_placement_runs_to_the_context_limit(self):
+        for engine in ('run', 'runq'):
+            for env in ({}, self.OWNED):
+                _, data = self.execute(engine, '--benchmark', '--no-text', '--context-length', '16', env=env)
+                self.assertEqual(data['tokens']['processed_prompt'] + data['tokens']['decode_steps'], 16)
+                self.assertEqual(data['kv']['active_bytes'], data['kv']['reserved_bytes'])
 
     def test_placement_configuration_errors(self):
         _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'bogus'}, success=False)

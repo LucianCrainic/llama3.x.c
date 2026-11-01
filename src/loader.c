@@ -35,6 +35,25 @@ size_t placement_hbm_budget(void) {
   return (size_t)(gib * (double)(1 << 30));
 }
 
+/* HBM bytes this process has claimed against LLAMA_HBM_BUDGET_GIB: weights, KV caches and the work region. */
+static size_t hbm_claimed;
+
+static size_t budget_claim(const char *mode, int node, size_t bytes, const char *what) {
+  size_t budget = placement_hbm_budget(); /* parsed even when unused, so a bad value never goes unnoticed */
+  if (strcmp(mode, "hbm") || node < 0)
+    return 0;
+  if (bytes > budget || hbm_claimed > budget - bytes)
+    fail("%s need %zu bytes of HBM but LLAMA_HBM_BUDGET_GIB leaves %zu of %zu", what, bytes,
+         budget > hbm_claimed ? budget - hbm_claimed : 0, budget);
+  hbm_claimed += bytes;
+  return bytes;
+}
+
+static void budget_release(size_t *claimed) {
+  hbm_claimed -= *claimed;
+  *claimed = 0;
+}
+
 /* ---- layout ----------------------------------------------------------------------------------------------------- */
 
 int weights_plan(const TensorManifest *m, WeightSegment *seg, size_t *weights_bytes, size_t *embedding_bytes) {
@@ -208,10 +227,8 @@ void weights_open(WeightStore *ws, int fd, float **mapped, size_t file_bytes, co
   size_t total = 0;
   for (int i = 0; i < ws->nseg; i++)
     total += ws->seg[i].bytes;
-  size_t budget = placement_hbm_budget(); /* parsed even when unused, so a bad value never goes unnoticed */
   Nodes nodes = choose_nodes(mode, embedding_bytes > 0);
-  if (!strcmp(mode, "hbm") && nodes.weights_node >= 0 && weights_bytes > budget)
-    fail("weights need %zu bytes of HBM but LLAMA_HBM_BUDGET_GIB allows %zu", weights_bytes, budget);
+  ws->budget_claimed = budget_claim(mode, nodes.weights_node, weights_bytes, "the weights");
   if (weights_bytes)
     reserve(&ws->region[0], weights_bytes, nodes.weights_node, ROLE_WEIGHTS, mode);
   if (embedding_bytes)
@@ -264,5 +281,132 @@ void weights_open(WeightStore *ws, int fd, float **mapped, size_t file_bytes, co
 void weights_close(WeightStore *ws) {
   for (int i = 0; i < 2; i++)
     region_release(&ws->region[i]);
+  budget_release(&ws->budget_claimed);
   ws->nseg = 0;
+}
+
+/* ---- run state (A5) ----------------------------------------------------------------------------------------------- */
+
+void runmem_init(RunMemory *rm, size_t kv_bytes_each) {
+  const char *mode = placement_mode();
+  *rm = (RunMemory){.mode = mode, .node = -1, .kv_bytes = kv_bytes_each};
+  placement_hbm_budget();
+  if (!strcmp(mode, "file"))
+    return;
+  rm->phase = RUNMEM_SIZING;
+  rm->node = choose_nodes(mode, 0).weights_node;
+  /* The caches are reserved now; the budget also counts the work region once it is sized (runmem_seal). */
+  rm->budget_claimed = budget_claim(mode, rm->node, checked_mul(2, kv_bytes_each), "the KV caches");
+  reserve(&rm->kv[0], kv_bytes_each, rm->node, ROLE_KV_K, mode);
+  reserve(&rm->kv[1], kv_bytes_each, rm->node, ROLE_KV_V, mode);
+  /* Reserved, not resident: accounting follows the extent, residency follows the first write at each position. */
+  region_mark_populated(&rm->kv[0]);
+  region_mark_populated(&rm->kv[1]);
+}
+
+int runmem_sizing(const RunMemory *rm) {
+  return rm->phase == RUNMEM_SIZING;
+}
+
+void *runmem_alloc(RunMemory *rm, size_t count, size_t size) {
+  if (rm->phase == RUNMEM_HEAP)
+    return memory_alloc(count, size, MEM_ACTIVATION);
+  size_t bytes = checked_mul(count, size), at = checked_add(rm->used, (size_t)(CACHE_LINE - 1)) / CACHE_LINE * CACHE_LINE;
+  rm->used = checked_add(at, bytes);
+  return rm->phase == RUNMEM_SIZING ? NULL : (char *)rm->work.data + at;
+}
+
+void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+  if (rm->phase == RUNMEM_HEAP) {
+    k_attention_init(work, n_heads, n_kv_heads, head_dim, seq_len);
+    return;
+  }
+  void *memory = runmem_alloc(rm, k_attention_bytes(n_heads, n_kv_heads, head_dim, seq_len), 1);
+  if (!runmem_sizing(rm))
+    k_attention_init_in(work, n_heads, n_kv_heads, head_dim, seq_len, memory);
+}
+
+static void zero_slice(const void *job, int worker, int workers) {
+  const NumaRegion *r = job;
+  size_t lo = (size_t)((unsigned long long)r->logical_bytes * (unsigned)worker / (unsigned)workers);
+  size_t hi = (size_t)((unsigned long long)r->logical_bytes * (unsigned)(worker + 1) / (unsigned)workers);
+  memset((char *)r->data + lo, 0, hi - lo);
+}
+
+void runmem_seal(RunMemory *rm) {
+  if (rm->phase != RUNMEM_SIZING)
+    return;
+  size_t bytes = rm->used ? rm->used : 1;
+  rm->budget_claimed += budget_claim(rm->mode, rm->node, bytes, "the run-state buffers");
+  reserve(&rm->work, bytes, rm->node, ROLE_WORK, rm->mode);
+  /* The owning team writes the region once, so its pages exist on the socket that uses them. */
+  Team *team = pool_team(0);
+  if (team)
+    team_run(team, zero_slice, &rm->work);
+  else
+    zero_slice(&rm->work, 0, 1);
+  region_mark_populated(&rm->work);
+  rm->used = 0; /* the second allocation pass starts over */
+  rm->phase = RUNMEM_CARVE;
+}
+
+float *runmem_cache(RunMemory *rm, int which) {
+  if (rm->phase == RUNMEM_HEAP)
+    return memory_alloc(rm->kv_bytes / sizeof(float), sizeof(float), MEM_KV);
+  return rm->kv[which].data;
+}
+
+static int inside(const NumaRegion *r, const void *p) {
+  return r->mapping_base && (const char *)p >= (const char *)r->data && (const char *)p < (const char *)r->data + r->data_bytes;
+}
+
+void runmem_free(RunMemory *rm, void *pointer) {
+  /* Region buffers die with their region; anything else (heap mode, the lazy batch logits) is a plain allocation. */
+  if (inside(&rm->work, pointer) || inside(&rm->kv[0], pointer) || inside(&rm->kv[1], pointer))
+    return;
+  memory_free(pointer);
+}
+
+void runmem_release(RunMemory *rm) {
+  region_release(&rm->work);
+  region_release(&rm->kv[0]);
+  region_release(&rm->kv[1]);
+  budget_release(&rm->budget_claimed);
+  rm->phase = RUNMEM_HEAP;
+}
+
+void runmem_kv_stats(const RunMemory *rm, size_t active_bytes, int verify, KvStats *out) {
+  *out = (KvStats){.reserved_bytes = checked_mul(2, rm->kv_bytes), .active_bytes = active_bytes, .node = -1};
+  if (rm->phase == RUNMEM_HEAP || rm->kv[0].node < 0)
+    return;
+  out->node = rm->kv[0].node;
+  if (!verify)
+    return;
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  out->full = 1;
+  double resident = 0;
+  for (int i = 0; i < 2; i++) {
+    PageCheck check = {0};
+    if (region_verify(&rm->kv[i], region_verify_samples_default(), &check) != 0) {
+      if (placement_strict(rm->mode))
+        fail("page placement of the KV caches on node %d cannot be verified on this system", rm->kv[i].node);
+      *out = (KvStats){.reserved_bytes = out->reserved_bytes, .active_bytes = active_bytes, .node = out->node};
+      return;
+    }
+    size_t thp = 0;
+    if (region_thp_bytes(&rm->kv[i], &thp) != 0)
+      thp = 0;
+    region_record_verification(&rm->kv[i], &check, thp);
+    out->full &= check.full;
+    out->pages_queried += check.queried;
+    out->pages_wrong_node += check.wrong_node;
+    out->pages_missing += check.missing;
+    size_t pages = (rm->kv[i].logical_bytes + page - 1) / page, present = check.queried - check.missing - check.errors;
+    resident += check.queried ? (double)present / (double)check.queried * (double)pages * (double)page : 0;
+    if ((check.wrong_node || check.errors) && placement_strict(rm->mode))
+      fail("KV cache: %zu of %zu queried pages are not on node %d (%zu elsewhere, %zu errors)", check.queried - check.on_node - check.missing,
+           check.queried, rm->kv[i].node, check.wrong_node, check.errors);
+  }
+  out->verified = 1;
+  out->resident_bytes = (size_t)(resident + 0.5);
 }

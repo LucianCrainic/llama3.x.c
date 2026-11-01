@@ -198,6 +198,20 @@ static int *tokenize(Tokenizer *t, const char *text, int bos, int *n) {
 /* Microbatched prefill: every supplied token, including the last prompt token,
  * is forwarded. Only the final prompt logits are sampled. A decode step
  * forwards the previously generated token. EOS/EOT are sampled but not emitted. */
+/* KV accounting and, in an owned placement, a page-placement query of the caches. It runs between timed regions: its
+ * duration is added to verify_excluded_s, which the callers take out of TTFT and inference time. */
+static int kv_position;
+static void kv_snapshot(KvStats *out, int *ready, int position) {
+  const char *verify = getenv("LLAMA_KV_VERIFY");
+  double start = monotonic_seconds();
+  engine_kv_stats(&model, position, !(verify && !strcmp(verify, "0")), out);
+  double spent = monotonic_seconds() - start;
+  metrics.verify_excluded_s += spent;
+  if (metrics.placement_owned)
+    metrics.placement_verify_s += spent;
+  *ready = 1;
+}
+
 static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n, int *position, int generation_limit,
                         int echo_prompt, double turn_start) {
   metrics.input_tokens += (size_t)n;
@@ -240,6 +254,11 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   if (!logits) {
     metrics.stop_reason = "step_limit";
     return -1;
+  }
+  if (!metrics.kv_prompt_ready) {
+    double before = metrics.verify_excluded_s;
+    kv_snapshot(&metrics.kv_prompt, &metrics.kv_prompt_ready, *position);
+    turn_start += metrics.verify_excluded_s - before;
   }
   int output_count = 0;
   for (;;) {
@@ -287,10 +306,12 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
                     : tokenize(t, prompt ? prompt : "", 1, &n);
   metrics.tokenization_s += monotonic_seconds() - start;
   int pos = 0;
+  double excluded = metrics.verify_excluded_s;
   run_sequence(t, s, tokens, n, &pos, options.generation_length, !options.chat_template, start);
+  kv_position = pos;
   if (!options.no_text)
     putchar('\n');
-  metrics.inference_s += monotonic_seconds() - start;
+  metrics.inference_s += monotonic_seconds() - start - (metrics.verify_excluded_s - excluded);
   memory_free(tokens);
 }
 
@@ -325,10 +346,11 @@ static void chat(Tokenizer *t, Sampler *s) {
     int *tokens = chat_prompt(t, system, user, pos == 0, &n);
     metrics.tokenization_s += monotonic_seconds() - start;
     fputs("Assistant: ", stderr);
+    double excluded = metrics.verify_excluded_s;
     int stop = run_sequence(t, s, tokens, n, &pos, -1, 0, start);
     if (!options.no_text)
       putchar('\n');
-    metrics.inference_s += monotonic_seconds() - start;
+    metrics.inference_s += monotonic_seconds() - start - (metrics.verify_excluded_s - excluded);
     /* Cache the end-of-turn marker before consuming the next user template. */
     if (stop == t->eot_id && pos < options.steps) {
       profile_stage = STAGE_DECODE;
@@ -345,6 +367,7 @@ static void chat(Tokenizer *t, Sampler *s) {
     if (stop != t->eot_id)
       break;
   }
+  kv_position = pos;
   memory_free(owned_system);
 }
 
@@ -386,6 +409,7 @@ int main(int argc, char **argv) {
     chat(&t, &s);
   else
     generate(&t, &s, options.prompt);
+  kv_snapshot(&metrics.kv_final, &metrics.kv_final_ready, kv_position);
   if (!options.no_text && fflush(stdout))
     fail("cannot flush generated text: %s", strerror(errno));
   if (ferror(stdout))

@@ -56,6 +56,7 @@ typedef struct {
   TransformerWeights weights; // the weights of the model
   TensorManifest manifest;    // where each tensor lives in the file
   WeightStore store;          // where those bytes live now: the mapping, or owned regions (A4)
+  RunMemory mem;              // where the run state and KV caches live (A5)
   RunState state;             // buffers for the "wave" of activations in the forward pass
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -63,33 +64,43 @@ typedef struct {
   size_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
-static void malloc_run_state(RunState *s, Config *p, int max_batch) {
-  // Zeroed activations and cache are owned for the lifetime of this model.
-  int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
-  s->x = memory_alloc(checked_mul(max_batch, p->dim), sizeof(float), MEM_ACTIVATION);
-  s->xb = memory_alloc(checked_mul(max_batch, p->dim), sizeof(float), MEM_ACTIVATION);
-  s->hb = memory_alloc(checked_mul(max_batch, p->hidden_dim), sizeof(float), MEM_ACTIVATION);
-  s->q = memory_alloc(checked_mul(max_batch, p->dim), sizeof(float), MEM_ACTIVATION);
-  s->key_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
-  s->value_cache = memory_alloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float), MEM_KV);
-  s->att = memory_alloc((size_t)p->n_heads * p->seq_len, sizeof(float), MEM_ACTIVATION);
-  s->logits = memory_alloc(p->vocab_size, sizeof(float), MEM_ACTIVATION);
-  s->rope = memory_alloc(checked_mul(max_batch, 2 * (size_t)p->head_dim), sizeof(float), MEM_ACTIVATION);
-  k_attention_init(&s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
+static void alloc_buffers(RunState *s, const Config *p, int max_batch, RunMemory *rm) {
+  // Zeroed activations are owned for the lifetime of this model.
+  s->x = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
+  s->xb = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
+  s->hb = runmem_alloc(rm, checked_mul(max_batch, p->hidden_dim), sizeof(float));
+  s->q = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
+  s->att = runmem_alloc(rm, checked_mul((size_t)p->n_heads, p->seq_len), sizeof(float));
+  s->logits = runmem_alloc(rm, p->vocab_size, sizeof(float));
+  s->rope = runmem_alloc(rm, checked_mul(max_batch, 2 * (size_t)p->head_dim), sizeof(float));
+  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
 }
 
-static void free_run_state(RunState *s) {
-  memory_free(s->x);
-  memory_free(s->xb);
-  memory_free(s->hb);
-  memory_free(s->q);
-  memory_free(s->att);
-  memory_free(s->logits);
-  memory_free(s->batch_logits);
-  memory_free(s->key_cache);
-  memory_free(s->value_cache);
-  memory_free(s->rope);
+static void malloc_run_state(RunState *s, Config *p, int max_batch, RunMemory *rm) {
+  int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
+  runmem_init(rm, checked_mul(checked_mul((size_t)p->n_layers, (size_t)p->seq_len), (size_t)kv_dim * sizeof(float)));
+  alloc_buffers(s, p, max_batch, rm);
+  if (runmem_sizing(rm)) { // owned placement: the first pass only measured; carve the work region now
+    runmem_seal(rm);
+    alloc_buffers(s, p, max_batch, rm);
+  }
+  s->key_cache = runmem_cache(rm, 0);
+  s->value_cache = runmem_cache(rm, 1);
+}
+
+static void free_run_state(RunState *s, RunMemory *rm) {
+  runmem_free(rm, s->x);
+  runmem_free(rm, s->xb);
+  runmem_free(rm, s->hb);
+  runmem_free(rm, s->q);
+  runmem_free(rm, s->att);
+  runmem_free(rm, s->logits);
+  runmem_free(rm, s->batch_logits);
+  runmem_free(rm, s->key_cache);
+  runmem_free(rm, s->value_cache);
+  runmem_free(rm, s->rope);
   k_attention_free(&s->attention);
+  runmem_release(rm);
 }
 
 /* Weight pointers are views into the file mapping at manifest offsets. Layers of a
@@ -139,7 +150,7 @@ static void free_transformer(Transformer *t) {
   weights_close(&t->store);
   manifest_free(&t->manifest);
   // free the RunState buffers
-  free_run_state(&t->state);
+  free_run_state(&t->state, &t->mem);
 }
 
 // ----------------------------------------------------------------------------
@@ -277,9 +288,15 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->config = t->config;
   double start = monotonic_seconds();
   prefill_configure(model);
-  malloc_run_state(&t->state, &t->config, model->max_batch);
+  malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
   metrics.runtime_s = monotonic_seconds() - start;
   metrics.runtime_ready = 1;
+}
+void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
+  Transformer *t = model->implementation;
+  size_t kv_dim = (size_t)t->config.head_dim * t->config.n_kv_heads;
+  size_t active = checked_mul(checked_mul(checked_mul(2, (size_t)t->config.n_layers), (size_t)position), kv_dim * sizeof(float));
+  runmem_kv_stats(&t->mem, active, verify, out);
 }
 float *engine_forward(Model *model, int token, int position) {
   if (token < 0 || token >= model->config.vocab_size || position < 0 || position >= model->config.seq_len)

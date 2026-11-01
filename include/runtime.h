@@ -68,6 +68,16 @@ void softmax(float *x, int size);
 
 typedef enum { LOGITS_NONE, LOGITS_LAST, LOGITS_ALL } LogitsWanted;
 
+/* KV cache accounting (A5). reserved is the virtual extent of both caches, active the bytes positions [0, position)
+ * occupy, resident the bytes of pages that exist, known only after a move_pages query (verified). */
+typedef struct {
+  size_t reserved_bytes, active_bytes, resident_bytes;
+  int node;     /* the node both caches are bound to; -1 for heap or unbound memory */
+  int verified; /* resident_bytes and the page counts come from a placement query */
+  int full;     /* that query covered every page of both caches rather than a sample */
+  size_t pages_queried, pages_wrong_node, pages_missing;
+} KvStats;
+
 typedef struct {
   Config config;
   void *implementation;
@@ -86,6 +96,9 @@ float *engine_forward(Model *model, int token, int position);
  * ALL is available irrespective of the CLI policy; its storage is allocated lazily. */
 float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want);
 int engine_max_batch(const Model *model);
+/* Accounting for the first `position` cache positions; verify=1 also queries where the cache pages live. Fails when
+ * strict placement is on and a cache page sits on the wrong node. Call it outside timed regions. */
+void engine_kv_stats(Model *model, int position, int verify, KvStats *out);
 void engine_free(Model *model);
 const char *engine_precision(void);
 int engine_group_size(void);
@@ -140,7 +153,9 @@ typedef struct {
   size_t input_tokens, processed_tokens, output_tokens, forward_passes, decode_steps;
   size_t sampled_tokens, stop_tokens, turns;
   size_t prefill_microbatches, prefill_logits_rows;
-  double placement_populate_s, placement_verify_s;
+  double placement_populate_s, placement_verify_s, verify_excluded_s;
+  KvStats kv_prompt, kv_final;
+  int kv_prompt_ready, kv_final_ready;
   int placement_owned; /* the checkpoint was copied into engine-owned regions */
   int checkpoint_ready, tokenizer_ready, runtime_ready, inference_started;
   int has_first_token, completed;

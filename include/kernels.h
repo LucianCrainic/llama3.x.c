@@ -66,8 +66,12 @@ void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, 
 typedef struct {
   float *partial;
   int max_chunks, n_heads, head_dim, workers;
+  int external; /* partial was supplied by the caller (a placement region) and is not freed here */
 } AttentionWork;
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
+/* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
+size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
+void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory);
 void k_attention_free(AttentionWork *work);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);

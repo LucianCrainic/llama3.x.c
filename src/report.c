@@ -110,6 +110,41 @@ static void int_list(FILE *f, const int *values, int n) {
   fputc(']', f);
 }
 
+static void kv_fields(FILE *f, const KvStats *k) {
+  fprintf(f, "\"reserved_bytes\": %zu, \"resident_bytes\": ", k->reserved_bytes);
+  if (k->verified)
+    fprintf(f, "%zu", k->resident_bytes);
+  else
+    fputs("null", f);
+  fprintf(f, ", \"active_bytes\": %zu, \"node\": ", k->active_bytes);
+  if (k->node >= 0)
+    fprintf(f, "%d", k->node);
+  else
+    fputs("null", f);
+  fprintf(f, ", \"verified\": %s, \"full\": %s, \"pages_queried\": %zu, \"pages_wrong_node\": %zu, "
+             "\"pages_missing\": %zu",
+          k->verified ? "true" : "false", k->full ? "true" : "false", k->pages_queried, k->pages_wrong_node,
+          k->pages_missing);
+}
+
+/* The final state, with the snapshot taken when the prompt had been processed nested as after_prompt. */
+static void kv_object(FILE *f) {
+  if (!metrics.kv_final_ready) {
+    fputs("null", f);
+    return;
+  }
+  fputc('{', f);
+  kv_fields(f, &metrics.kv_final);
+  fputs(", \"after_prompt\": ", f);
+  if (metrics.kv_prompt_ready) {
+    fputc('{', f);
+    kv_fields(f, &metrics.kv_prompt);
+    fputc('}', f);
+  } else
+    fputs("null", f);
+  fputc('}', f);
+}
+
 /* Schema v2: runtime, topology, teams, regions and placeholders for producers that do not exist yet (null). */
 static void write_v2_sections(FILE *f) {
   const char *thp = region_thp_default() ? "on" : "off";
@@ -207,7 +242,9 @@ static void write_v2_sections(FILE *f) {
             f);
   }
   fputs(region_history_count() ? "\n  ]" : "]", f);
-  fprintf(f, ",\n  \"kv\": null,\n  \"phase_seconds\": null,\n  \"prefill\": {\"microbatches\": %zu, \"tokens\": %zu, \"seconds\": %.9f, \"logits_rows\": %zu}",
+  fputs(",\n  \"kv\": ", f);
+  kv_object(f);
+  fprintf(f, ",\n  \"phase_seconds\": null,\n  \"prefill\": {\"microbatches\": %zu, \"tokens\": %zu, \"seconds\": %.9f, \"logits_rows\": %zu}",
           metrics.prefill_microbatches, metrics.processed_tokens, metrics.prefill_s, metrics.prefill_logits_rows);
 }
 

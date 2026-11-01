@@ -788,19 +788,36 @@ static int attention_chunks(int positions, int n_kv_heads, int limit, int worker
 }
 #endif
 
-void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+static int attention_max_chunks(int n_kv_heads, int seq_len, int workers) {
+  int by_threads = (workers + n_kv_heads - 1) / n_kv_heads, by_length = (seq_len + 255) / 256;
+  return by_threads > by_length ? by_threads : by_length;
+}
+
+size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+  int chunks = attention_max_chunks(n_kv_heads, seq_len, max_threads());
+  return checked_mul(checked_mul(checked_mul((size_t)n_heads, (size_t)chunks), (size_t)head_dim + 2), sizeof(float));
+}
+
+void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory) {
   /* The team (or OpenMP thread count) must be set before this: it sizes the split-K workspace. */
   work->workers = max_threads();
-  int by_threads = (work->workers + n_kv_heads - 1) / n_kv_heads, by_length = (seq_len + 255) / 256;
-  work->max_chunks = by_threads > by_length ? by_threads : by_length;
+  work->max_chunks = attention_max_chunks(n_kv_heads, seq_len, work->workers);
   work->n_heads = n_heads;
   work->head_dim = head_dim;
-  work->partial = memory_alloc(checked_mul(checked_mul((size_t)n_heads, (size_t)work->max_chunks), (size_t)head_dim + 2),
-                               sizeof(float), MEM_ACTIVATION);
+  work->external = memory != NULL;
+  work->partial = memory ? memory
+                         : memory_alloc(checked_mul(checked_mul((size_t)n_heads, (size_t)work->max_chunks),
+                                                    (size_t)head_dim + 2),
+                                        sizeof(float), MEM_ACTIVATION);
+}
+
+void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+  k_attention_init_in(work, n_heads, n_kv_heads, head_dim, seq_len, NULL);
 }
 
 void k_attention_free(AttentionWork *work) {
-  memory_free(work->partial);
+  if (!work->external)
+    memory_free(work->partial);
   work->partial = NULL;
 }
 
