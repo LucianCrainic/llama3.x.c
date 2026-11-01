@@ -361,8 +361,9 @@ class RuntimeTests(unittest.TestCase):
                 self.assertLessEqual(kv['active_bytes'], kv['reserved_bytes'])
                 if env and kv['node'] is not None:  # bound KV on Linux: every queried page on the requested node
                     self.assertTrue(kv['verified'] and kv['pages_wrong_node'] == 0)
+                    # Residency is counted in whole pages: a page per cache beyond the logical extent is legitimate.
                     self.assertGreaterEqual(kv['resident_bytes'], kv['active_bytes'])
-                    self.assertLessEqual(kv['resident_bytes'], kv['reserved_bytes'])
+                    self.assertLessEqual(kv['resident_bytes'], kv['reserved_bytes'] + 2 * os.sysconf('SC_PAGE_SIZE'))
                 else:  # residency is never invented
                     self.assertFalse(kv['verified'])
                     self.assertIsNone(kv['resident_bytes'])
