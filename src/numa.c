@@ -902,8 +902,8 @@ void page_check_classify(const int *status, size_t n, int node, PageCheck *out) 
     out->queried++;
     if (status[i] >= 0)
       status[i] == node ? out->on_node++ : out->wrong_node++;
-    else if (status[i] == -ENOENT)
-      out->missing++; /* not populated */
+    else if (status[i] == -ENOENT || status[i] == -EFAULT)
+      out->missing++; /* not populated: untouched anonymous pages report -EFAULT on current kernels */
     else
       out->errors++;
   }

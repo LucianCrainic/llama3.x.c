@@ -81,12 +81,13 @@ static void unit_portable_regions(void) {
 }
 
 static void unit_page_check(void) {
-  int status[] = {0, 0, 1, -ENOENT, -EFAULT, 2};
+  int status[] = {0, 0, 1, -ENOENT, -EFAULT, 2, -EACCES};
   PageCheck check = {0};
-  page_check_classify(status, 6, 0, &check);
-  assert(check.queried == 6 && check.on_node == 2 && check.wrong_node == 2 && check.missing == 1 && check.errors == 1);
+  page_check_classify(status, 7, 0, &check);
+  /* -ENOENT and -EFAULT (what an untouched anonymous page reports) are unpopulated pages; anything else is an error. */
+  assert(check.queried == 7 && check.on_node == 2 && check.wrong_node == 2 && check.missing == 2 && check.errors == 1);
   page_check_classify(status, 0, 0, &check);
-  assert(check.queried == 6);
+  assert(check.queried == 7);
 
   size_t plan[100], again[100];
   size_t count = page_sample_plan(10000, 512, 100, plan);

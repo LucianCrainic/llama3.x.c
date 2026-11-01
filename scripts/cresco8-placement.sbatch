@@ -34,10 +34,12 @@ phase_A1() {
   expect topology-srun-cpu-bind ok "$dir" -- srun --ntasks=1 --cpus-per-task=112 --cpu-bind=cores "$probe" \
     --topology "$EXPLICIT"
   expect topology-membind-0-2 ok "$dir" -- numactl --membind=0,2 "$probe" --topology "$EXPLICIT"
-  expect two-sockets-hbm-needs-node3 fail "$dir" -- numactl --membind=0,2 "$probe" --topology "$EXPLICIT" --sockets 2 \
+  # numactl --membind sets a task memory policy; it does not change the cpuset-allowed nodes that
+  # get_mempolicy(MPOL_F_MEMS_ALLOWED) reports, so the allowed set (and a two-socket hbm request) are unchanged.
+  expect two-sockets-hbm-under-membind ok "$dir" -- numactl --membind=0,2 "$probe" --topology "$EXPLICIT" --sockets 2 \
     --placement hbm
   expect two-sockets-hbm-full-set ok "$dir" -- "$probe" --topology "$EXPLICIT" --sockets 2 --placement hbm
-  python3 - "$dir" "$OUT/flat-mode.json" << 'PY' | tee "$dir/summary.txt"
+  if python3 - "$dir" "$OUT/flat-mode.json" << 'PY' | tee "$dir/summary.txt"; then
 import json, re, sys
 from pathlib import Path
 d = Path(sys.argv[1])
@@ -82,12 +84,13 @@ t = load('topology-srun-cpu-bind')
 print('INFO srun --cpu-bind=cores allowed cpus:', [len(s['cpus']) for s in t['sockets']], 'sockets', t['nsockets'])
 check('srun step: every reported CPU belongs to its socket', all(set(s['cpus']) <= set(full[i if t['nsockets'] == 2 else s['package']]) for i, s in enumerate(t['sockets'])))
 t = load('topology-membind-0-2')
-check('membind 0,2: allowed nodes [0, 2]', t['mems_allowed'] == [0, 2] and t['sockets'][0]['hbm_allowed'] and not t['sockets'][1]['ddr_allowed'] and not t['sockets'][1]['hbm_allowed'])
-err = (d / 'two-sockets-hbm-needs-node3.err').read_text()
-check('membind 0,2: two-socket hbm refused naming node 1 or 3', 'not in this job' in err, err.strip()[:160])
+check('numactl --membind=0,2 leaves the cpuset-allowed set unchanged', t['mems_allowed'] == [0, 1, 2, 3] and t['proc_mems_allowed_list'] == '0-3')
 sys.exit(1 if bad else 0)
 PY
-  [[ ${PIPESTATUS[0]} -eq 0 ]] && record_result A1-summary PASS || record_result A1-summary FAIL
+    record_result A1-summary PASS
+  else
+    record_result A1-summary FAIL
+  fi
 }
 
 # ---- A2: bound regions --------------------------------------------------------------------------------------------
@@ -96,14 +99,11 @@ phase_A2() {
   for n in 0 1 2 3; do
     expect "bind-1GiB-node$n" ok "$dir" -- numactl --cpunodebind=0 "$regions" bind "$n" 1073741824
   done
-  for n in 0 2; do
+  # numactl --membind is a task policy; a VMA policy set by mbind takes precedence, so every node still binds. A node
+  # outside the cpuset-allowed set is refused only by the kernel (not reproducible here without a cpuset); the
+  # refusal text is exercised through fault injection below.
+  for n in 0 1 2 3; do
     expect "membind02-bind-node$n" ok "$dir" -- numactl --cpunodebind=0 --membind=0,2 "$regions" bind "$n" 1073741824
-  done
-  for n in 1 3; do
-    expect "membind02-bind-node$n-refused" fail "$dir" -- numactl --cpunodebind=0 --membind=0,2 "$regions" bind "$n" \
-      1073741824
-    grep -q 'allowed memory nodes: 0,2' "$dir/membind02-bind-node$n-refused.err" &&
-      record_result "membind02-node$n-message" PASS || record_result "membind02-node$n-message" FAIL
   done
   expect thp-node2 ok "$dir" -- numactl --cpunodebind=0 "$regions" bind 2 1073741824 thp
   grep -q 'thp_requested=1' "$dir/thp-node2.out" && record_result thp-node2-madvise PASS ||
@@ -131,8 +131,10 @@ phase_A3() {
   expect verify-8GiB-node2-from-socket1 ok "$dir" -- numactl --cpunodebind=1 "$regions" verify 2 "$gib8" all threads=56
   expect verify-control-membind0-expect2 ok "$dir" -- numactl --cpunodebind=0 --membind=0 "$regions" verify -1 "$gib8" \
     all threads=56 expect=2
+  expect verify-bound-node1-under-membind0 ok "$dir" -- numactl --cpunodebind=0 --membind=0 "$regions" verify 1 "$gib8" \
+    all threads=56
   expect verify-sampled-node2 ok "$dir" -- numactl --cpunodebind=0 "$regions" verify 2 "$gib8" all threads=56 samples=4096
-  python3 - "$dir" << 'PY' | tee "$dir/summary.txt"
+  if python3 - "$dir" << 'PY' | tee "$dir/summary.txt"; then
 import json, sys
 from pathlib import Path
 d = Path(sys.argv[1])
@@ -159,9 +161,15 @@ check('negative control: portable region under membind=0 is reported off node 2'
       f"numa_maps={v['numa_maps_node_pages']}" if v else '')
 v = load('verify-sampled-node2')
 check('sampled check is not labelled full', v and v['full'] == 0 and v['scheme'] == 'stride+extent-endpoints' and v['on_node'] == v['queried'], f"queried={v['queried']}" if v else '')
+v = load('verify-bound-node1-under-membind0')
+check('mbind wins over a job-wide numactl --membind=0', v and v['on_node'] == v['queried'] > 0 and v['missing'] == 0,
+      f"policy={v['numa_maps_policy']} numa_maps={v['numa_maps_node_pages']}" if v else '')
 sys.exit(1 if bad else 0)
 PY
-  [[ ${PIPESTATUS[0]} -eq 0 ]] && record_result A3-summary PASS || record_result A3-summary FAIL
+    record_result A3-summary PASS
+  else
+    record_result A3-summary FAIL
+  fi
 }
 
 validate_models

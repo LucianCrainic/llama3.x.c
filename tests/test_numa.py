@@ -150,7 +150,7 @@ class TopologyTests(unittest.TestCase):
 class RegionTests(unittest.TestCase):
     def run_regions(self, *args, env=None):
         import os
-        return subprocess.run([str(BUILD/'test-regions'), *args], capture_output=True, text=True, timeout=60,
+        return subprocess.run([str(BUILD/'test-regions'), *map(str, args)], capture_output=True, text=True, timeout=60,
                               env={**os.environ, **(env or {})})
 
     def test_unit_tests(self):
