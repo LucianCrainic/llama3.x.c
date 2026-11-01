@@ -23,13 +23,13 @@ export OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
 cat > "$OUT/fork-join.c" <<'EOF'
 #include <omp.h>
 #include <stdio.h>
+volatile int touched[256 * 16]; // one line per thread keeps the region from being elided
 int main(void) {
   for (int pass = 0; pass < 2; pass++) {
     double t0 = omp_get_wtime();
     for (int i = 0; i < 100000; i++) {
 #pragma omp parallel
-      {
-      }
+      touched[omp_get_thread_num() * 16]++;
     }
     if (pass)
       printf("threads=%d parallel-region=%.2f us\n", omp_get_max_threads(), (omp_get_wtime() - t0) * 10.0);

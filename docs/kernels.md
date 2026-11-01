@@ -209,11 +209,87 @@ before and after (3,390 GB for 8B), so the gain is from overlap, not from fewer
 bytes. Accuracy is unchanged in kind: W8A32 passes, W8A8 fails as described
 below, and `test-kernels` passes at 1, 56 and 112 threads.
 
-The remaining gap at a full socket (31% for 8B Q8_0, 19% for 8B FP32) is not
-yet attributed between the GEMVs and the rest of each token. That rest
-includes attention, RMSNorm, single-threaded activation quantization and six
-OpenMP regions per layer (about 190 per 8B token). A per-phase timing breakdown would be the next
+The remaining gap at a full socket (31% for 8B Q8_0, 19% for 8B FP32) is
+broken down in [Decode phase profile](#decode-phase-profile).
+
+### Decode phase profile
+
+`LLAMA_PROFILE=1` times every forward-pass phase on the calling thread.
+Every phase is either serial or ends at an OpenMP barrier, so that thread's
+wall time is the phase's time. Reports gain `profile_seconds` per stage, and
+"other" is forward time outside all phases.
+[tools/summarize_profile.py](../tools/summarize_profile.py) converts the
+reports into per-token tables, and
+[scripts/cresco8-profile.sbatch](../scripts/cresco8-profile.sbatch) runs the
 measurement.
+
+The measurement used job 5621239 (`328760c`) on hbm14. Weights were on HBM
+node 2, with 56 threads on socket 0, 2 runs, and 127 decode steps after an
+86-token prompt. Unprofiled runs of the same configurations land within ±1.5%,
+so the profiler's own cost is in the noise.
+
+Decode, ms per token (GEMV phases with effective weight GB/s):
+
+| Phase | 8B FP32 | 8B Q8_0 | 1B Q8_0 |
+| --- | ---: | ---: | ---: |
+| QKV | 7.15 (450) | 2.22 (385) | 0.42 (254) |
+| Wo + residual | 4.78 (449) | 1.61 (354) | 0.34 (212) |
+| W1/W3 + SwiGLU | 34.19 (440) | 9.37 (426) | 1.18 (483) |
+| W2 + residual | 15.60 (482) | 4.59 (435) | 0.72 (397) |
+| Classifier | 4.16 (506) | 1.08 (516) | 0.46 (612) |
+| Attention | 1.34 | 1.20 | 0.46 |
+| Activation quantization | – | 0.73 | 0.20 |
+| RMSNorm | 0.36 | 0.28 | 0.08 |
+| RoPE, embedding, KV store, other | 0.21 | 0.24 | 0.07 |
+| **Token** | **67.77** (443) | **21.32** (374) | **3.92** (335) |
+| GEMV share of the token | 97.2% | 88.5% | 79.5% |
+
+An empty parallel region costs 10.3 µs at 56 threads, with either OpenMP wait
+policy (job 5621240). At 14 threads it costs 3.5–8.2 µs. Each forward pass
+runs five regions per layer plus the classifier: 161 for 8B and 81 for 1B.
+
+- **The kernels nearly reach full bandwidth on a large matrix.** The classifier
+  is one call over 0.5 GB (8B) and reaches 506–516 GB/s. 1B's classifier
+  reaches 612 GB/s, above the 552 GB/s stream-read reference, so that
+  reference is not a hard bound for this access pattern.
+- **Smaller matrices lose a fixed cost per call.** Modelling each GEMV call as
+  bytes ÷ 516 GB/s + c gives c ≈ 16 µs for Wo, 18 µs for QKV and 24 µs for W2
+  (8B Q8_0). About 10 µs of that is the region's fork/join, and the rest is
+  load imbalance and prefetch ramp-up as every thread starts its range cold.
+  For 8B Q8_0, fork/join alone is about 1.7 ms, or 8% of the token. For 1B
+  Q8_0 it is about 0.8 ms, or 21%.
+- **W1/W3 runs below the per-call model.** Its fixed cost fits c ≈ 53 µs. The
+  fused kernel alternates 4-row blocks of two separate matrices, so each thread
+  keeps eight weight streams open instead of four.
+- **Non-GEMV work is 11.5% of an 8B Q8_0 token.** Activation quantization is
+  serial and takes 0.73 ms. Attention takes 1.20 ms at roughly 150 cached
+  positions and grows linearly with context.
+
+Where the 8B Q8_0 gap goes, against reading every weight at the classifier's
+516 GB/s (15.45 ms per token):
+
+| Loss | ms per token | Share of the 5.87 ms gap |
+| --- | ---: | ---: |
+| GEMV calls below 516 GB/s (fork/join, imbalance, ramp-up, W1/W3 streams) | 3.43 | 58% |
+| Attention | 1.20 | 20% |
+| Serial activation quantization | 0.73 | 12% |
+| RMSNorm, RoPE and the rest | 0.51 | 9% |
+
+For 8B FP32, 11.5 of the 13.4 ms gap to 552 GB/s is in the GEMV calls,
+mostly W1/W3.
+
+Next steps, in order of expected payoff for 8B Q8_0:
+
+1. **One persistent parallel region per forward pass.** Phases would be
+   separated by barriers instead of separate fork/joins, with RMSNorm and
+   quantization run inside the region in parallel. This attacks fork/join
+   (about 1.7 ms) and serial quantization (0.73 ms), and matters most for 1B.
+2. **W1/W3 with four streams per thread.** Each thread would compute its W1
+   range, then its W3 range, then the SwiGLU gate. That needs an A/B against
+   the current interleaved blocks; the potential is up to 1.6 ms if W1/W3
+   reaches the classifier's rate.
+3. **Attention for longer contexts.** It is 5.6% of the token at this short
+   prompt, and it scales with the number of cached positions.
 
 ### Accuracy against Hugging Face FP32
 
