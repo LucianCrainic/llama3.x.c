@@ -11,7 +11,25 @@ the label "local HBM". The check distinguishes between:
 
 It also records actual huge-page backing (study §5.5, §10.2).
 
-Status: **planned**. Branch: `feature/numa-a3-verification`.
+Status: **implemented; cluster check passed** (see Cluster results). Branch:
+`feature/numa-a3-verification` (stacked on A2).
+
+Implementation notes:
+
+- `region_verify` queries `ceil(logical_bytes / page)` pages, so the unpopulated tail of a THP-rounded region is not
+  counted as missing. It returns -1 for a portable region or when `move_pages` is blocked (then use
+  `region_numa_maps` and label the run `unverified-numa_maps`).
+- `smaps` `AnonHugePages` is per VMA and VMAs merge, so a partly overlapping VMA contributes in proportion to the
+  overlap: `thp_bytes` is an estimate there and exact where the region covers whole VMAs.
+- Sampling: both ends of every 2 MiB extent (evenly thinned when `max_samples` is smaller than the endpoint count),
+  then a deterministic stride; `PageCheck.scheme` records it and a sampled check has `full = 0`.
+- `LLAMA_VERIFY_SAMPLES` and `LLAMA_PLACEMENT_STRICT` are read through `region_verify_samples_default` and
+  `placement_strict`; the callers (A4 onwards) own the timing split and the fatal path.
+- `test-regions verify NODE BYTES none|half|all [thp] [samples=N] [expect=M] [threads=T]` is the cluster probe: it
+  reports populate bandwidth (optionally from a pinned team), verification cost, `thp_bytes` and the `numa_maps`
+  policy and per-node pages. `expect=M` is the negative control.
+- Local tests cover status classification, sampling, and the `smaps`/`numa_maps` parsers on fixture text; the 64 MiB
+  half-touched region test runs on Linux only.
 
 ## 2. Depends on / unblocks
 
@@ -94,6 +112,28 @@ the user's go-ahead to submit.
 | Deliberately wrong policy (control): `numactl --membind=0` around a portable allocation | Verification reports node 0, not 2 |
 | 8 GiB on node 2 populated by a socket-1 team | Still node 2. Binding wins over first touch, and the region is remote for S1. |
 
+### Cluster results (2026-11-01)
+
+cresco8-hbm14, job 5622320, commit `7faa81d` (`results/m1-check-20261101-3/A3`). 8 GiB per region, populated by a
+56-thread team pinned to socket 0, every page queried (2,097,152 pages, `move_pages` in batches of 4096).
+
+| Node | On node | Missing | Populate GB/s (**measured**) | Verify s | `numa_maps` policy |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 0 (DDR, local) | 100% | 0 | 95.6 | 0.12 | bind:0 |
+| 1 (DDR, remote) | 100% | 0 | 33.5 | 0.12 | bind:1 |
+| 2 (HBM, local) | 100% | 0 | 190.7 | 0.12 | bind:2 |
+| 3 (HBM, remote) | 100% | 0 | 45.7 | 0.12 | bind:3 |
+
+- With THP requested: the same 100% on node, populate 102 / 27 / 189 / 63 GB/s, `thp_bytes` 8 GiB. Transparent huge
+  pages are `[always]` on this node, so the runs without the request also report 8 GiB huge-page backing; `madvise`
+  success alone is never taken as evidence.
+- Node 2 populated by a **socket-1** team: still 100% node 2, populate 62.4 GB/s (binding wins over first touch).
+- **Negative control:** a portable region first-touched under `numactl --membind=0` and checked against node 2 is
+  reported 100% off node 2 (`numa_maps` N0 = 2,097,152 pages).
+- **mbind beats a job-wide membind:** `numactl --membind=0` around a region bound to node 1 leaves all pages on node 1.
+- Sampling (4096 pages) is labelled `stride+extent-endpoints`, not full.
+- **Kernel detail found here:** untouched anonymous pages report `-EFAULT` from `move_pages`, not `-ENOENT`; both now
+  count as `missing`. The full 8 GiB query costs about 0.12 s, so full verification is affordable in `bench` runs too.
 ## 7. Exit criteria
 
 - Full verification of 8 GiB per node reports 100% on the requested node.

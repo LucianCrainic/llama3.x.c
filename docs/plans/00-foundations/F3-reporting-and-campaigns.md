@@ -13,7 +13,7 @@ This phase delivers the evidence plumbing that every later campaign needs:
 
 Each phase then adds only the run matrix for its own experiments.
 
-Status: **implemented, local tests pass; cluster `check` not yet run**. Branch:
+Status: **implemented; cluster check run (acceptance comparison pending)**. Branch:
 `feature/found-f3-reporting-campaigns` (stacked on F2).
 
 Implementation notes:
@@ -173,6 +173,14 @@ records the environment and runs `make test`, with no benchmarks. **Estimated** 
 Acceptance: the outputs (`environment.txt`, `flat-mode.json`, `test.log`) are identical
 in content to a `cresco8-kernels.sbatch STAGE=check` run of the same commit.
 
+### Cluster results (2026-11-01)
+
+The library, `check_stage`, the Flat-mode check, `make test` and the F2/A phases ran in jobs 5622314 and 5622320 on
+cresco8-hbm14 (`environment.txt`, `flat-mode.json`, `test.log`, `phase-results.txt`, `build-config-*.txt` per job);
+the Flat-mode check passed and the v2 reports of the 24 benchmark runs were summarized by `summarize_campaign.py`
+(`F2/summary.md`). `PHASE` lists, `expect`, `HF_GATE` and the optional `MODELS` came out of these runs. Not done: the
+acceptance comparison with a `cresco8-kernels.sbatch STAGE=check` run of the same commit, and a re-run showing
+`make test` green on Linux after the last test fix.
 ## 7. Exit criteria
 
 - Schema v2 is emitted and the v1 consumers are updated.

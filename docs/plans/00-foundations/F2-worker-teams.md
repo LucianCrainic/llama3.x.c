@@ -13,8 +13,7 @@ OpenMP path numerically and in speed. The same interface later carries:
 The user decision requires that no separate scheduler be introduced for prefill, so
 this is the only scheduler the plans use.
 
-Status: **implemented, local tests pass; AVX-512 team paths, pinning and the cluster `check`
-not yet run**. Branch: `feature/found-f2-worker-teams` (stacked on A3).
+Status: **implemented; cluster check done except the Hugging Face gate** (see Cluster results). Branch: `feature/found-f2-worker-teams` (stacked on A3).
 
 Implementation notes:
 
@@ -170,6 +169,30 @@ All of these run on macOS.
 The workload is identical to `scripts/cresco8-kernels.sbatch:116-136` (`short.txt`,
 `--context-length 2048 --generation-length 128 -t 0 --seed 42 --chat-template`).
 
+### Cluster results (2026-11-01)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`. Job 5622314, commit `58f091a`,
+`results/m1-check-20261101-1..-3` under `~/PFS/lpor` (first job 5622296 failed and is kept as the record of two bugs:
+an `OMP_PROC_BIND` launcher pin and a topology allocation counted as a leak, both fixed). Weights staged in `/dev/shm`
+on HBM node 2, `numactl --cpunodebind=0`, 56 threads, `short.txt`, 128 generated tokens, 3 launches (median [range]).
+
+| Model, precision | omp decode tok/s | teams decode tok/s | teams / omp |
+| --- | ---: | ---: | ---: |
+| 8B FP32 | 15.37 [15.32-15.37] | 15.96 [15.82-15.97] | +3.8% |
+| 8B Q8_0 | 45.24 [45.18-45.47] | 50.04 [50.00-50.17] | +10.6% |
+| 1B FP32 | 86.97 [86.12-87.69] | 90.82 [90.70-91.23] | +4.4% |
+| 1B Q8_0 | 249.99 [249.97-252.81] | 268.75 [265.68-268.90] | +7.5% |
+
+- **Kernel parity on hardware.** `test-kernels` passes scalar and AVX-512 on teams of 1, 2, 3, 5, 7 (`make test`)
+  and 1 and 56 (`LLAMA_TEST_TEAMS=1,56`): 0 failures.
+- **Agreement, C against C** (`tools/compare_engines.py`, 53 positions, omp vs teams): FP32 max |Δlogit| 9.5e-6 (1B) and
+  2.5e-5 (8B), argmax 100%; Q8_0 bitwise identical on both models.
+- **Pinning.** 56 workers pinned to cores 0-55; every read-back equals its assignment (`affinity_verified`).
+- **Barrier cost** (unpinned team, 200000 rounds): 0.36 µs at 2 threads, 1.1 at 4, 2.1 at 8, 2.6 at 16, 4.7 at 32,
+  3.5 at 56. `barrier 1000000 56` (random delays) passes.
+- **Not run.** The Hugging Face gate (`validate.py`) under `teams`: there is no torch/transformers environment on the
+  cluster any more, so `HF_GATE=0` skipped it. The transitive argument (teams agrees with omp within 2.5e-5, and omp
+  passed the gate in the earlier campaign) is recorded, not substituted for the gate. TSAN is clean locally only.
 ## 7. Exit criteria
 
 - **Kernel parity:** every kernel passes at all tested worker counts, scalar and

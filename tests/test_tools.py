@@ -118,7 +118,7 @@ class CompareEnginesTests(unittest.TestCase):
 
     def test_identical_configurations_agree_exactly(self):
         for engine in ('fp32', 'int8'):
-            result, data = self.compare(engine, '--env-b', 'LLAMA_KERNELS=scalar')
+            result, data = self.compare(engine, '--env-b', 'LLAMA_UNRELATED=1')  # same ISA and backend: bitwise equal
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(data['passed'])
             self.assertEqual(len(data['comparisons']), 4)

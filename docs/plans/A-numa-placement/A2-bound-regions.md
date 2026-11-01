@@ -6,8 +6,7 @@ Add an owned-region allocator that places a large region on **exactly one** NUMA
 before any page is touched. The owning team populates it, and it is freed exactly once.
 This is the only route by which weights, KV and workspaces get explicit placement.
 
-Status: **implemented, local tests pass; Linux bound backend and cluster `check` not yet
-run**. Branch: `feature/numa-a2-bound-regions` (stacked on A1).
+Status: **implemented; cluster check passed**. Branch: `feature/numa-a2-bound-regions` (stacked on A1).
 
 Implementation notes:
 
@@ -133,6 +132,18 @@ the user's go-ahead to submit.
 | THP request on node 2 | `madvise` returns 0. Actual backing is checked in A3. |
 | Startup failure injection | No leaked mappings (`/proc/self/maps` before and after) |
 
+### Cluster results (2026-11-01)
+
+cresco8-hbm14, job 5622320, commit `7faa81d` (`results/m1-check-20261101-3/A2`).
+
+- `mbind` returns 0 for 1 GiB on each of nodes 0, 1, 2 and 3 from a socket-0-pinned process.
+- **Under `numactl --membind=0,2` nodes 1 and 3 also bind**: a VMA policy set by `mbind` overrides the task policy, so
+  the plan's expectation that they fail was wrong (A3 confirms the pages land on node 1). The consequence is good for
+  A4: a job-wide `--membind` cannot misplace a region. A node outside the cpuset-allowed set is refused by the kernel,
+  which this check cannot reproduce; the documented message is exercised through `LLAMA_NUMA_FAULT=EPERM`.
+- THP request on node 2: `madvise(MADV_HUGEPAGE)` succeeds (`thp_requested=1`).
+- Startup failure injection: after a failed second reservation and `region_release_all`, `/proc/self/maps` has the same
+  number of mappings and the same total mapped bytes as before (no leak).
 ## 7. Exit criteria
 
 - Regions bind on every allowed node, and a disallowed node fails clearly.

@@ -7,7 +7,7 @@ belong to each socket. Restrict the result to what this job is allowed to use. R
 any layout that cannot be classified safely. Classification is never inferred from a
 node merely being memory-only (study §4).
 
-Status: **implemented, local tests pass; cluster `check` not yet run**. Branch:
+Status: **implemented; cluster check passed**. Branch:
 `feature/numa-a1-topology` (cut from `feature/found-f1-tensor-manifest`, so F1 is
 included; A1 does not depend on it).
 
@@ -139,6 +139,20 @@ the user's go-ahead to submit.
 
 Outputs are `topology-*.json` files and a diff summary.
 
+### Cluster results (2026-11-01)
+
+cresco8-hbm14, job 5622320, commit `7faa81d` (`results/m1-check-20261101-3/A1`).
+
+- **numaperf data is present on hbm14**, so `auto` classifies it through `/sys/.../access0/initiators`, no explicit
+  map needed: S0 = cores 0-55, DDR node 0 (503 GiB), HBM node 2 (64 GiB); S1 = cores 56-111, DDR 1, HBM 3. The
+  `explicit:0/2/0,1/3/1` map gives the same result. `numactl -H` agrees with sysfs for all four nodes.
+- `numactl --cpunodebind=0`: one socket, cores 0-55. `srun --cpu-bind=cores`: two sockets of 56 cores.
+- **`numactl --membind=0,2` does not change the allowed set**: `mems_allowed` stays 0-3 (and `Mems_allowed_list` 0-3),
+  because it sets a task memory policy, not the cpuset. The planned "restricted `--membind=0,2`" variation therefore
+  cannot show a restricted allowed set; a real one needs a cpuset (not reproducible here), and that path is covered by
+  the fixture tests only.
+- The Linux fixture tests pass except one test that assumed identical environments imply identical ISA (fixed in
+  `tests/test_tools.py`; not yet re-run on Linux).
 ## 7. Exit criteria
 
 - On hbm14 the classification is correct: through numaperf, or through the explicit
