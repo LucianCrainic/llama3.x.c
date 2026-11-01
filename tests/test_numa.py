@@ -179,6 +179,34 @@ class RegionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('not a possible node', result.stderr)
 
+    def verify(self, *args):
+        result = self.run_regions('verify', *map(str, args))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_portable_region_has_nothing_to_verify(self):
+        v = self.verify(-1, 1 << 20, 'half')
+        self.assertEqual((v['verify_status'], v['queried'], v['populated_bytes']), (-1, 0, 1 << 19))
+
+    @unittest.skipUnless(Path('/sys/devices/system/node/node0').exists(), 'needs a NUMA Linux host')
+    def test_verify_counts_unpopulated_and_correct_pages(self):
+        v = self.verify(0, 64 << 20, 'half')
+        self.assertEqual(v['verify_status'], 0)
+        self.assertTrue(v['full'])
+        self.assertEqual(v['wrong_node'] + v['errors'], 0)
+        self.assertAlmostEqual(v['missing'] / v['queried'], 0.5, delta=0.02)
+        self.assertAlmostEqual(v['on_node'] / v['queried'], 0.5, delta=0.02)
+        self.assertEqual(v['numa_maps_policy'], 'bind:0')
+        v = self.verify(0, 64 << 20, 'all')
+        self.assertEqual((v['on_node'], v['missing']), (v['queried'], 0))
+        v = self.verify(0, 64 << 20, 'all', 'samples=64')
+        self.assertFalse(v['full'])
+        self.assertLessEqual(v['queried'], 64)
+        self.assertEqual(v['scheme'], 'stride+extent-endpoints')
+        self.assertEqual(v['on_node'], v['queried'])
+        v = self.verify(0, 64 << 20, 'all', 'expect=1')            # wrong expectation is reported, not hidden
+        self.assertEqual((v['on_node'], v['wrong_node']), (0, v['queried']))
+
 
 class RealMachineTests(unittest.TestCase):
     def run_probe(self, *args):

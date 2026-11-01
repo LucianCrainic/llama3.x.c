@@ -849,3 +849,229 @@ void region_protect(NumaRegion *r) {
     fail("cannot make region read-only: %s", strerror(errno));
   entry->read_only = r->read_only = 1;
 }
+
+/* ---- placement verification (A3) -------------------------------------------------------------------------------- */
+
+void page_check_classify(const int *status, size_t n, int node, PageCheck *out) {
+  for (size_t i = 0; i < n; i++) {
+    out->queried++;
+    if (status[i] >= 0)
+      status[i] == node ? out->on_node++ : out->wrong_node++;
+    else if (status[i] == -ENOENT)
+      out->missing++; /* not populated */
+    else
+      out->errors++;
+  }
+}
+
+/* Endpoint j of the extent list: even j is the first page of extent j/2, odd j its last. */
+static size_t extent_endpoint(size_t j, size_t pages, size_t extent_pages) {
+  size_t extent = j / 2, first = extent * extent_pages,
+         end = first + extent_pages < pages ? first + extent_pages : pages;
+  return j % 2 ? end - 1 : first;
+}
+
+static int compare_size(const void *a, const void *b) {
+  size_t x = *(const size_t *)a, y = *(const size_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+size_t page_sample_plan(size_t pages, size_t extent_pages, size_t max_samples, size_t *out) {
+  if (!pages || !max_samples)
+    return 0;
+  if (!extent_pages)
+    extent_pages = 1;
+  size_t endpoints = 2 * ((pages + extent_pages - 1) / extent_pages), count = 0;
+  size_t picks = endpoints < max_samples ? endpoints : max_samples;
+  for (size_t i = 0; i < picks; i++) /* evenly spaced endpoints, always including the first and the last page */
+    out[count++] = extent_endpoint(picks > 1 ? i * (endpoints - 1) / (picks - 1) : 0, pages, extent_pages);
+  size_t fill = max_samples - picks;
+  for (size_t i = 0; i < fill; i++) /* deterministic stride over the whole region */
+    out[count++] = (size_t)((unsigned __int128)i * pages / fill);
+  qsort(out, count, sizeof(*out), compare_size);
+  size_t unique = 0;
+  for (size_t i = 0; i < count; i++)
+    if (!unique || out[i] != out[unique - 1])
+      out[unique++] = out[i];
+  return unique;
+}
+
+static int hex_range(const char *line, uintptr_t *lo, uintptr_t *hi) {
+  char *end;
+  unsigned long long a = strtoull(line, &end, 16);
+  if (end == line || *end != '-')
+    return -1;
+  unsigned long long b = strtoull(end + 1, &end, 16);
+  if (*end != ' ')
+    return -1;
+  *lo = (uintptr_t)a;
+  *hi = (uintptr_t)b;
+  return 0;
+}
+
+/* AnonHugePages is per VMA and VMAs merge, so a VMA that only partly overlaps the region contributes
+ * proportionally: an estimate there, exact where the region covers whole VMAs. */
+size_t smaps_thp_bytes(const char *text, uintptr_t lo, uintptr_t hi) {
+  double total = 0;
+  uintptr_t start = 0, end = 0;
+  int inside = 0;
+  for (const char *line = text; *line;) {
+    uintptr_t a, b;
+    if (hex_range(line, &a, &b) == 0) {
+      start = a;
+      end = b;
+      inside = b > a;
+    } else if (inside && !strncmp(line, "AnonHugePages:", 14)) {
+      double bytes = (double)strtoull(line + 14, NULL, 10) * 1024;
+      uintptr_t from = start > lo ? start : lo, to = end < hi ? end : hi;
+      if (to > from)
+        total += bytes * (double)(to - from) / (double)(end - start);
+    }
+    const char *next = strchr(line, '\n');
+    if (!next)
+      break;
+    line = next + 1;
+  }
+  return (size_t)(total + 0.5);
+}
+
+/* numa_maps lines start at the VMA's first address: the VMA holding `addr` is the last line starting at or below it. */
+int numa_maps_lookup(const char *text, uintptr_t addr, char *policy, size_t policy_size, size_t *node_pages,
+                     int nodes) {
+  const char *best = NULL;
+  for (const char *line = text; *line;) {
+    char *end;
+    unsigned long long start = strtoull(line, &end, 16);
+    if (end != line && *end == ' ' && (uintptr_t)start <= addr)
+      best = line;
+    const char *next = strchr(line, '\n');
+    if (!next)
+      break;
+    line = next + 1;
+  }
+  if (!best)
+    return -1;
+  for (int i = 0; i < nodes; i++)
+    node_pages[i] = 0;
+  size_t length = strcspn(best, "\n");
+  char copy[1024];
+  snprintf(copy, sizeof(copy), "%.*s", (int)(length < sizeof(copy) - 1 ? length : sizeof(copy) - 1), best);
+  char *save, *token = strtok_r(copy, " ", &save);
+  token = strtok_r(NULL, " ", &save);
+  snprintf(policy, policy_size, "%s", token ? token : "");
+  while ((token = strtok_r(NULL, " ", &save)))
+    if (token[0] == 'N' && token[1] >= '0' && token[1] <= '9') {
+      char *eq;
+      long node = strtol(token + 1, &eq, 10);
+      if (*eq == '=' && node < nodes)
+        node_pages[node] = (size_t)strtoull(eq + 1, NULL, 10);
+    }
+  return 0;
+}
+
+size_t region_verify_samples_default(void) {
+  const char *value = getenv("LLAMA_VERIFY_SAMPLES");
+  return value ? (size_t)strtoull(value, NULL, 10) : 0;
+}
+
+int placement_strict(const char *placement) {
+  const char *value = getenv("LLAMA_PLACEMENT_STRICT");
+  if (value && *value)
+    return strcmp(value, "0") != 0;
+  return placement && (!strcmp(placement, "hbm") || !strcmp(placement, "ddr"));
+}
+
+#ifdef __linux__
+static char *read_whole_file(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return NULL;
+  size_t size = 0, capacity = 1 << 16;
+  char *text = malloc(capacity);
+  while (text) {
+    size += fread(text + size, 1, capacity - size - 1, f);
+    if (size < capacity - 1)
+      break;
+    char *grown = realloc(text, capacity *= 2);
+    if (!grown)
+      free(text);
+    text = grown;
+  }
+  fclose(f);
+  if (text)
+    text[size] = 0;
+  return text;
+}
+#endif
+
+int region_thp_bytes(const NumaRegion *r, size_t *bytes) {
+#ifdef __linux__
+  char *text = read_whole_file("/proc/self/smaps");
+  if (!text)
+    return -1;
+  *bytes = smaps_thp_bytes(text, (uintptr_t)r->data, (uintptr_t)r->data + r->data_bytes);
+  free(text);
+  return 0;
+#else
+  (void)r;
+  (void)bytes;
+  return -1;
+#endif
+}
+
+int region_numa_maps(const NumaRegion *r, char *policy, size_t policy_size, size_t *node_pages, int nodes) {
+#ifdef __linux__
+  char *text = read_whole_file("/proc/self/numa_maps");
+  if (!text)
+    return -1;
+  int status = numa_maps_lookup(text, (uintptr_t)r->data, policy, policy_size, node_pages, nodes);
+  free(text);
+  return status;
+#else
+  (void)r;
+  (void)policy;
+  (void)policy_size;
+  (void)node_pages;
+  (void)nodes;
+  return -1;
+#endif
+}
+
+int region_verify(const NumaRegion *r, size_t max_samples, PageCheck *out) {
+  *out = (PageCheck){.scheme = "full"};
+#ifdef __linux__
+  if (!r->mapping_base || r->node < 0)
+    return -1;
+  enum { BATCH = 4096 };
+  size_t page = (size_t)sysconf(_SC_PAGESIZE), pages = (r->logical_bytes + page - 1) / page;
+  void *addresses[BATCH];
+  int status[BATCH];
+  size_t *plan = NULL, plan_count = 0;
+  out->full = max_samples == 0 || pages <= max_samples;
+  if (!out->full) {
+    out->scheme = "stride+extent-endpoints";
+    plan = memory_alloc(max_samples, sizeof(*plan), MEM_METADATA);
+    plan_count = page_sample_plan(pages, (size_t)(2 << 20) / page, max_samples, plan);
+  }
+  size_t total = out->full ? pages : plan_count;
+  for (size_t done = 0; done < total;) {
+    size_t n = total - done < BATCH ? total - done : BATCH;
+    for (size_t i = 0; i < n; i++)
+      addresses[i] = (char *)r->data + (out->full ? done + i : plan[done + i]) * page;
+    long rc = syscall(SYS_move_pages, 0, (unsigned long)n, addresses, NULL, status, 0);
+    if (rc != 0) {
+      memory_free(plan);
+      *out = (PageCheck){.scheme = "unavailable", .errors = n};
+      return -1;
+    }
+    page_check_classify(status, n, r->node, out);
+    done += n;
+  }
+  memory_free(plan);
+  return 0;
+#else
+  (void)r;
+  (void)max_samples;
+  return -1;
+#endif
+}

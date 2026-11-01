@@ -2,6 +2,7 @@
 #define LLAMA_NUMA_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Socket/NUMA topology discovered in C from sysfs and the job's allowed sets, with
  * no numactl or lscpu. A node is never classified as HBM merely because it is
@@ -87,6 +88,31 @@ void region_release(NumaRegion *r);        /* idempotent; zeroes the descriptor 
 void region_release_all(void);             /* also registered with atexit on the first reservation */
 int region_live_count(void);
 const NumaRegion *region_live_at(int index);
+/* ---- Placement verification (A3) -------------------------------------------------------------------------------
+ * Where do the populated pages actually live? move_pages(2) queried without migrating, in batches. */
+typedef struct {
+  size_t queried, on_node, wrong_node, missing, errors;
+  int full;           /* every populated page was queried */
+  const char *scheme; /* "full" or "stride+extent-endpoints" */
+} PageCheck;
+
+/* max_samples == 0 queries every page; otherwise a region with more pages than max_samples is sampled (first and
+ * last page of every 2 MiB extent, then a deterministic stride) and is never reported as full. Returns -1 when the
+ * region has no requested node or the query is unavailable (non-Linux, or move_pages blocked): then use
+ * region_numa_maps and label the run unverified. */
+int region_verify(const NumaRegion *r, size_t max_samples, PageCheck *out);
+int region_thp_bytes(const NumaRegion *r, size_t *bytes); /* AnonHugePages overlapping the region, from smaps */
+int region_numa_maps(const NumaRegion *r, char *policy, size_t policy_size, size_t *node_pages, int nodes);
+size_t region_verify_samples_default(void);  /* LLAMA_VERIFY_SAMPLES, 0 = full */
+int placement_strict(const char *placement); /* LLAMA_PLACEMENT_STRICT, default on for hbm and ddr */
+
+/* Pure pieces, exposed for tests. */
+void page_check_classify(const int *status, size_t n, int node, PageCheck *out);
+/* Sorted page indices to query, at most max_samples of them; `extent_pages` pages per 2 MiB extent. */
+size_t page_sample_plan(size_t pages, size_t extent_pages, size_t max_samples, size_t *out);
+size_t smaps_thp_bytes(const char *text, uintptr_t lo, uintptr_t hi);
+int numa_maps_lookup(const char *text, uintptr_t addr, char *policy, size_t policy_size, size_t *node_pages, int nodes);
+
 int region_round(size_t bytes, size_t align, size_t *rounded); /* -1 on zero or overflow */
 int region_thp_default(void);                                  /* LLAMA_THP=on */
 const char *region_role_name(RegionRole role);

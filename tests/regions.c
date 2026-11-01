@@ -6,6 +6,7 @@
 #include "numa.h"
 #include "runtime.h"
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,60 @@ static void unit_portable_regions(void) {
 #endif
 }
 
+static void unit_page_check(void) {
+  int status[] = {0, 0, 1, -ENOENT, -EFAULT, 2};
+  PageCheck check = {0};
+  page_check_classify(status, 6, 0, &check);
+  assert(check.queried == 6 && check.on_node == 2 && check.wrong_node == 2 && check.missing == 1 && check.errors == 1);
+  page_check_classify(status, 0, 0, &check);
+  assert(check.queried == 6);
+
+  size_t plan[100], again[100];
+  size_t count = page_sample_plan(10000, 512, 100, plan);
+  assert(count > 40 && count <= 100 && plan[0] == 0 && plan[count - 1] == 9999);
+  for (size_t i = 1; i < count; i++)
+    assert(plan[i - 1] < plan[i] && plan[i] < 10000);
+  for (size_t extent = 0; extent < 20; extent++) { /* both ends of every 2 MiB extent are always sampled */
+    size_t first = extent * 512, last = first + 511 < 10000 ? first + 511 : 9999, seen = 0;
+    for (size_t i = 0; i < count; i++)
+      seen += plan[i] == first || plan[i] == last;
+    assert(seen == (first == last ? 1 : 2));
+  }
+  assert(page_sample_plan(10000, 512, 100, again) == count && !memcmp(plan, again, count * sizeof(*plan)));
+  count = page_sample_plan(10000, 512, 10, plan); /* fewer samples than endpoints: spread over the region */
+  assert(count > 5 && count <= 10 && plan[0] == 0 && plan[count - 1] == 9999);
+  assert(page_sample_plan(10000, 512, 1, plan) == 1 && plan[0] == 0);
+  assert(page_sample_plan(1, 512, 8, plan) == 1 && plan[0] == 0);
+  assert(page_sample_plan(0, 512, 8, plan) == 0 && page_sample_plan(8, 512, 0, plan) == 0);
+}
+
+static void unit_proc_parsers(void) {
+  /* Two adjacent VMAs, each with one 2 MiB huge page; the first is 4 MiB long. */
+  const char *smaps = "7f0000000000-7f0000400000 rw-p 00000000 00:00 0 \n"
+                      "Size:               4096 kB\nAnonymous:          2048 kB\nAnonHugePages:      2048 kB\n"
+                      "VmFlags: rd wr mr mw me ac hg\n"
+                      "7f0000400000-7f0000600000 rw-p 00000000 00:00 0 \n"
+                      "Size:               2048 kB\nAnonHugePages:      2048 kB\nVmFlags: rd wr\n"
+                      "7f0000700000-7f0000800000 r--p 00000000 00:00 0 \nAnonHugePages:         0 kB\n";
+  assert(smaps_thp_bytes(smaps, 0x7f0000000000, 0x7f0000400000) == (size_t)2 << 20); /* whole VMA */
+  assert(smaps_thp_bytes(smaps, 0x7f0000200000, 0x7f0000500000) == (size_t)2 << 20); /* two half overlaps */
+  assert(smaps_thp_bytes(smaps, 0x7f0000000000, 0x7f0000600000) == (size_t)4 << 20); /* merged extent */
+  assert(smaps_thp_bytes(smaps, 0x7f0000600000, 0x7f0000700000) == 0);               /* gap */
+  assert(smaps_thp_bytes("", 0, ~(uintptr_t)0) == 0 && smaps_thp_bytes("garbage\nAnonHugePages: 4 kB", 0, 1) == 0);
+
+  const char *maps = "7f0000000000 default anon=4 dirty=4 N0=4 kernelpagesize_kB=4\n"
+                     "7f0000400000 bind:2 anon=1024 dirty=1024 N2=1000 N3=24 kernelpagesize_kB=4\n"
+                     "7f0000800000 default file=/lib/x mapped=1 N0=1\n";
+  size_t pages[4];
+  char policy[32];
+  assert(numa_maps_lookup(maps, 0x7f0000500000, policy, sizeof(policy), pages, 4) == 0);
+  assert(!strcmp(policy, "bind:2") && pages[2] == 1000 && pages[3] == 24 && pages[0] == 0);
+  assert(numa_maps_lookup(maps, 0x7f0000000010, policy, sizeof(policy), pages, 4) == 0);
+  assert(!strcmp(policy, "default") && pages[0] == 4);
+  assert(numa_maps_lookup(maps, 0x7e0000000000, policy, sizeof(policy), pages, 4) == -1);
+  assert(numa_maps_lookup("", 1, policy, sizeof(policy), pages, 4) == -1);
+}
+
 static void report_at_exit(void) {
   size_t current = 0;
   for (int i = 0; i < MEM_COUNT; i++)
@@ -107,14 +162,76 @@ static void bind_region(int node, size_t bytes) {
   region_release(&r);
 }
 
+/* verify NODE BYTES none|half|all [thp] [samples=N] [expect=M]
+ * Reserve on NODE (-1: portable), populate part of it from this thread, and report where the pages are. expect=M
+ * checks against M instead of NODE (a negative control for a portable region under an external policy). */
+static void verify(int argc, char **argv) {
+  int node = atoi(argv[2]), thp = 0, expect = node;
+  size_t bytes = (size_t)strtoull(argv[3], NULL, 10), samples = 0;
+  const char *touch = argv[4];
+  for (int i = 5; i < argc; i++) {
+    if (!strcmp(argv[i], "thp"))
+      thp = 1;
+    else if (!strncmp(argv[i], "samples=", 8))
+      samples = (size_t)strtoull(argv[i] + 8, NULL, 10);
+    else if (!strncmp(argv[i], "expect=", 7))
+      expect = atoi(argv[i] + 7);
+  }
+  NumaRegion r;
+  region_reserve(&r, bytes, 0, node, ROLE_WORK, thp);
+  size_t populated = !strcmp(touch, "all") ? r.logical_bytes : !strcmp(touch, "half") ? r.logical_bytes / 2 : 0;
+  double start = monotonic_seconds();
+  memset(r.data, 1, populated);
+  double populate_s = monotonic_seconds() - start;
+  region_mark_populated(&r);
+  NumaRegion check = r;
+  check.node = expect;
+  PageCheck pc;
+  start = monotonic_seconds();
+  int status = region_verify(&check, samples, &pc);
+  double verify_s = monotonic_seconds() - start;
+  size_t thp_bytes = 0, pages[64] = {0};
+  char policy[64] = "";
+  int have_thp = region_thp_bytes(&r, &thp_bytes) == 0,
+      have_maps = region_numa_maps(&r, policy, sizeof(policy), pages, 64) == 0;
+  printf("{\"node\": %d, \"expect\": %d, \"bytes\": %zu, \"populated_bytes\": %zu, \"populate_seconds\": %.6f, "
+         "\"populate_gbps\": %.3f, \"verify_status\": %d, \"verify_seconds\": %.6f, \"full\": %d, \"scheme\": \"%s\", "
+         "\"queried\": %zu, \"on_node\": %zu, \"wrong_node\": %zu, \"missing\": %zu, \"errors\": %zu, "
+         "\"thp_requested\": %d, \"thp_bytes\": %s",
+         node, expect, r.logical_bytes, populated, populate_s, populate_s > 0 ? populated / populate_s / 1e9 : 0.0,
+         status, verify_s, pc.full, pc.scheme, pc.queried, pc.on_node, pc.wrong_node, pc.missing, pc.errors,
+         r.thp_requested, have_thp ? "" : "null");
+  if (have_thp)
+    printf("%zu", thp_bytes);
+  printf(", \"numa_maps_policy\": ");
+  if (have_maps) {
+    printf("\"%s\", \"numa_maps_node_pages\": {", policy);
+    for (int i = 0, first = 1; i < 64; i++)
+      if (pages[i]) {
+        printf("%s\"%d\": %zu", first ? "" : ", ", i, pages[i]);
+        first = 0;
+      }
+    printf("}");
+  } else
+    printf("null");
+  printf("}\n");
+  region_release(&r);
+}
+
 int main(int argc, char **argv) {
   if (argc == 1) {
     unit_rounding();
     unit_portable_regions();
+    unit_page_check();
+    unit_proc_parsers();
     return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "fail3"))
     fail_during_startup();
+  if (argc >= 5 && !strcmp(argv[1], "verify")) {
+    verify(argc, argv);
+    return 0;
+  }
   if (argc == 4 && !strcmp(argv[1], "bind")) {
     bind_region(atoi(argv[2]), (size_t)strtoull(argv[3], NULL, 10));
     return 0;
