@@ -1,0 +1,611 @@
+#include "numa.h"
+
+#include "runtime.h"
+#include <dirent.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+enum { MAX_CPUS = 1024, MAX_NODES = 128 };
+
+#define FAIL(...)                                                                                                      \
+  do {                                                                                                                 \
+    snprintf(err, err_size, __VA_ARGS__);                                                                              \
+    return -1;                                                                                                         \
+  } while (0)
+
+const char *numa_class_name(TopologyClass c) {
+  switch (c) {
+  case CLASS_NUMAPERF:
+    return "numaperf";
+  case CLASS_EXPLICIT:
+    return "explicit";
+  case CLASS_VIRTUAL:
+    return "virtual";
+  case CLASS_DDR_ONLY:
+    return "ddr-only";
+  }
+  return "?";
+}
+
+/* ---- list parsing: "0-3,8,10-11" into a byte-per-id set -------------------------------------------------------- */
+
+static int parse_list(const char *s, unsigned char *bits, int nbits) {
+  memset(bits, 0, (size_t)nbits);
+  for (;;) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+      s++;
+    if (!*s)
+      return 0;
+    char *end;
+    long a = strtol(s, &end, 10), b;
+    if (end == s || a < 0)
+      return -1;
+    b = a;
+    s = end;
+    if (*s == '-') {
+      b = strtol(++s, &end, 10);
+      if (end == s || b < a)
+        return -1;
+      s = end;
+    }
+    if (b >= nbits)
+      return -1;
+    for (long i = a; i <= b; i++)
+      bits[i] = 1;
+    while (*s == ' ' || *s == '\t')
+      s++;
+    if (*s == ',')
+      s++;
+    else if (*s && *s != '\n' && *s != '\r')
+      return -1;
+  }
+}
+
+static void format_list(const unsigned char *bits, int n, char *out, size_t size) {
+  size_t used = 0;
+  out[0] = 0;
+  for (int i = 0; i < n; i++) {
+    if (!bits[i])
+      continue;
+    int j = i;
+    while (j + 1 < n && bits[j + 1])
+      j++;
+    int w = j > i ? snprintf(out + used, size - used, "%s%d-%d", used ? "," : "", i, j)
+                  : snprintf(out + used, size - used, "%s%d", used ? "," : "", i);
+    if (w < 0 || (size_t)w >= size - used) {
+      out[size - 1] = 0;
+      return;
+    }
+    used += (size_t)w;
+    i = j;
+  }
+}
+
+static int read_first_line(const char *path, char *buf, size_t size) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+  char *got = fgets(buf, (int)size, f);
+  fclose(f);
+  if (!got)
+    buf[0] = 0;
+  buf[strcspn(buf, "\r\n")] = 0;
+  return 0;
+}
+
+static int path_f(char *out, size_t size, const char *root, const char *format, ...) {
+  size_t n = (size_t)snprintf(out, size, "%s", root);
+  va_list args;
+  va_start(args, format);
+  int w = vsnprintf(out + n, size - n, format, args);
+  va_end(args);
+  return w < 0 || (size_t)w >= size - n ? -1 : 0;
+}
+
+typedef struct {
+  int online, package; /* package: of a CPU-bearing node, else -1 */
+  int cpu_bearing;
+  size_t mem_total;
+} Node;
+
+typedef struct {
+  const char *root;
+  unsigned char cpu_online[MAX_CPUS], cpu_allowed[MAX_CPUS], cpu_rep[MAX_CPUS];
+  int cpu_pkg[MAX_CPUS];
+  Node node[MAX_NODES];
+  unsigned short dist[MAX_NODES][MAX_NODES];
+  unsigned char possible[MAX_NODES], mems[MAX_NODES];
+  int max_node;
+  int pkgs[2], npkgs;
+  int pkg_ddr[2], pkg_hbm[2]; /* indexed like pkgs */
+} Machine;
+
+static int pkg_index(const Machine *m, int package) {
+  for (int i = 0; i < m->npkgs; i++)
+    if (m->pkgs[i] == package)
+      return i;
+  return -1;
+}
+
+/* ---- sysfs enumeration ---------------------------------------------------------------------------------------- */
+
+static int read_cpus(Machine *m, const char *allowed_cpus, char *err, size_t err_size) {
+  char path[512], line[4096];
+  if (path_f(path, sizeof(path), m->root, "/devices/system/cpu/online") || read_first_line(path, line, sizeof(line)))
+    FAIL("cannot read %s", path);
+  if (parse_list(line, m->cpu_online, MAX_CPUS))
+    FAIL("unsupported online CPU list '%s' (at most %d CPUs)", line, MAX_CPUS);
+  if (allowed_cpus) {
+    if (parse_list(allowed_cpus, m->cpu_allowed, MAX_CPUS))
+      FAIL("invalid allowed CPU list '%s'", allowed_cpus);
+    for (int i = 0; i < MAX_CPUS; i++)
+      m->cpu_allowed[i] &= m->cpu_online[i];
+  } else
+    memcpy(m->cpu_allowed, m->cpu_online, sizeof(m->cpu_allowed));
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (!m->cpu_online[c])
+      continue;
+    if (path_f(path, sizeof(path), m->root, "/devices/system/cpu/cpu%d/topology/physical_package_id", c) ||
+        read_first_line(path, line, sizeof(line)))
+      FAIL("cannot read %s", path);
+    char *end;
+    m->cpu_pkg[c] = (int)strtol(line, &end, 10);
+    if (end == line || m->cpu_pkg[c] < 0)
+      FAIL("%s: invalid physical package id '%s'", path, line);
+    if (!m->cpu_allowed[c])
+      continue;
+    /* One CPU per physical core: the lowest allowed SMT sibling represents the core. */
+    if (path_f(path, sizeof(path), m->root, "/devices/system/cpu/cpu%d/topology/thread_siblings_list", c) ||
+        read_first_line(path, line, sizeof(line)))
+      FAIL("cannot read %s", path);
+    unsigned char siblings[MAX_CPUS];
+    if (parse_list(line, siblings, MAX_CPUS))
+      FAIL("%s: invalid sibling list '%s'", path, line);
+    int lowest = c;
+    for (int s = 0; s < c; s++)
+      if (siblings[s] && m->cpu_allowed[s]) {
+        lowest = s;
+        break;
+      }
+    m->cpu_rep[c] = lowest == c;
+  }
+  return 0;
+}
+
+static int read_nodes(Machine *m, const char *allowed_mems, char *err, size_t err_size) {
+  char path[512], line[4096];
+  unsigned char online[MAX_NODES], cpus[MAX_CPUS];
+  if (path_f(path, sizeof(path), m->root, "/devices/system/node/possible") || read_first_line(path, line, sizeof(line)))
+    FAIL("cannot read %s", path);
+  if (parse_list(line, m->possible, MAX_NODES))
+    FAIL("unsupported possible node list '%s' (at most %d node ids)", line, MAX_NODES);
+  m->max_node = -1;
+  for (int n = 0; n < MAX_NODES; n++)
+    if (m->possible[n])
+      m->max_node = n;
+  if (m->max_node < 0)
+    FAIL("%s lists no possible nodes", path);
+  if (path_f(path, sizeof(path), m->root, "/devices/system/node/online") || read_first_line(path, line, sizeof(line)))
+    FAIL("cannot read %s", path);
+  if (parse_list(line, online, MAX_NODES))
+    FAIL("invalid online node list '%s'", line);
+  int row[MAX_NODES], count = 0;
+  for (int n = 0; n < MAX_NODES; n++)
+    count += online[n];
+  for (int n = 0; n < MAX_NODES; n++) {
+    if (!online[n])
+      continue;
+    if (!m->possible[n])
+      FAIL("node %d is online but not possible", n);
+    Node *node = &m->node[n];
+    node->online = 1;
+    node->package = -1;
+    if (path_f(path, sizeof(path), m->root, "/devices/system/node/node%d/cpulist", n) ||
+        read_first_line(path, line, sizeof(line)) || parse_list(line, cpus, MAX_CPUS))
+      FAIL("cannot read a valid CPU list from %s", path);
+    for (int c = 0; c < MAX_CPUS; c++) {
+      if (!cpus[c] || !m->cpu_online[c])
+        continue;
+      node->cpu_bearing = 1;
+      if (node->package >= 0 && node->package != m->cpu_pkg[c])
+        FAIL("node %d spans physical packages %d and %d", n, node->package, m->cpu_pkg[c]);
+      node->package = m->cpu_pkg[c];
+    }
+    FILE *f;
+    if (path_f(path, sizeof(path), m->root, "/devices/system/node/node%d/meminfo", n) || !(f = fopen(path, "r")))
+      FAIL("cannot read %s", path);
+    while (fgets(line, sizeof(line), f)) {
+      char *at = strstr(line, "MemTotal:");
+      if (at)
+        node->mem_total = (size_t)strtoull(at + 9, NULL, 10) * 1024;
+    }
+    fclose(f);
+    if (path_f(path, sizeof(path), m->root, "/devices/system/node/node%d/distance", n) ||
+        read_first_line(path, line, sizeof(line)))
+      FAIL("cannot read %s", path);
+    int got = 0;
+    for (char *s = line, *end; got < MAX_NODES; s = end, got++) {
+      long v = strtol(s, &end, 10);
+      if (end == s)
+        break;
+      row[got] = (int)v;
+    }
+    if (got != count)
+      FAIL("%s lists %d distances for %d online nodes", path, got, count);
+    int col = 0;
+    for (int o = 0; o < MAX_NODES; o++)
+      if (online[o])
+        m->dist[n][o] = (unsigned short)row[col++];
+  }
+  if (allowed_mems) {
+    if (parse_list(allowed_mems, m->mems, MAX_NODES))
+      FAIL("invalid allowed memory node list '%s'", allowed_mems);
+    for (int n = 0; n < MAX_NODES; n++)
+      m->mems[n] &= m->possible[n];
+  } else
+    memcpy(m->mems, online, sizeof(m->mems));
+  return 0;
+}
+
+/* Group nodes by package; refuse what this engine does not implement. */
+static int read_packages(Machine *m, char *err, size_t err_size) {
+  for (int c = 0; c < MAX_CPUS; c++) {
+    if (!m->cpu_online[c] || pkg_index(m, m->cpu_pkg[c]) >= 0)
+      continue;
+    if (m->npkgs == 2)
+      FAIL("more than two sockets (physical packages) are not supported");
+    m->pkgs[m->npkgs++] = m->cpu_pkg[c];
+  }
+  if (m->npkgs == 2 && m->pkgs[0] > m->pkgs[1]) {
+    int swap = m->pkgs[0];
+    m->pkgs[0] = m->pkgs[1];
+    m->pkgs[1] = swap;
+  }
+  if (!m->npkgs)
+    FAIL("no online CPUs");
+  for (int i = 0; i < 2; i++)
+    m->pkg_ddr[i] = m->pkg_hbm[i] = -1;
+  for (int n = 0; n < MAX_NODES; n++) {
+    if (!m->node[n].online || !m->node[n].cpu_bearing)
+      continue;
+    int p = pkg_index(m, m->node[n].package);
+    if (m->pkg_ddr[p] >= 0)
+      FAIL("package %d has more than one CPU-bearing node (%d and %d): sub-NUMA clustering is not supported",
+           m->pkgs[p], m->pkg_ddr[p], n);
+    m->pkg_ddr[p] = n;
+  }
+  for (int p = 0; p < m->npkgs; p++)
+    if (m->pkg_ddr[p] < 0)
+      FAIL("package %d has no CPU-bearing NUMA node", m->pkgs[p]);
+  return 0;
+}
+
+/* ---- classification ------------------------------------------------------------------------------------------- */
+
+static int attribute(const Machine *m, int node, const char *name, long *value) {
+  char path[512], line[64];
+  if (path_f(path, sizeof(path), m->root, "/devices/system/node/node%d/access0/initiators/%s", node, name) ||
+      read_first_line(path, line, sizeof(line)) || !line[0])
+    return -1;
+  char *end;
+  *value = strtol(line, &end, 10);
+  return end == line ? -1 : 0;
+}
+
+/* Initiator nodes of `node` (entries named node<k>). Returns their count, or -1 without the directory. */
+static int initiators(const Machine *m, int node, int *out, int capacity) {
+  char path[512];
+  if (path_f(path, sizeof(path), m->root, "/devices/system/node/node%d/access0/initiators", node))
+    return -1;
+  DIR *d = opendir(path);
+  if (!d)
+    return -1;
+  int count = 0, k;
+  char tail;
+  for (struct dirent *e; (e = readdir(d));)
+    if (sscanf(e->d_name, "node%d%c", &k, &tail) == 1 && count < capacity)
+      out[count++] = k;
+  closedir(d);
+  return count;
+}
+
+/* 0 = classified, 1 = numaperf data missing or incomplete, -1 = error. */
+static int classify_numaperf(Machine *m, char *err, size_t err_size) {
+  long bw[MAX_NODES] = {0};
+  for (int n = 0; n < MAX_NODES; n++)
+    if (m->node[n].online && (m->node[n].cpu_bearing || m->node[n].mem_total) &&
+        attribute(m, n, "read_bandwidth", &bw[n]))
+      return 1;
+  for (int n = 0; n < MAX_NODES; n++) {
+    if (!m->node[n].online || m->node[n].cpu_bearing || !m->node[n].mem_total)
+      continue;
+    int init[MAX_NODES], count = initiators(m, n, init, MAX_NODES), owner = -1;
+    if (count <= 0)
+      return 1;
+    for (int i = 0; i < count; i++) {
+      if (init[i] >= MAX_NODES || !m->node[init[i]].online || !m->node[init[i]].cpu_bearing)
+        return 1;
+      int p = pkg_index(m, m->node[init[i]].package);
+      if (owner >= 0 && owner != p)
+        FAIL("memory-only node %d has initiators in more than one socket: ambiguous", n);
+      owner = p;
+    }
+    if (bw[n] <= bw[m->pkg_ddr[owner]])
+      continue; /* memory-only but not faster than DDR: not HBM */
+    if (m->pkg_hbm[owner] >= 0)
+      FAIL("socket %d has more than one candidate HBM node (%d and %d): ambiguous", owner, m->pkg_hbm[owner], n);
+    m->pkg_hbm[owner] = n;
+  }
+  return 0;
+}
+
+static int classify_explicit(Machine *m, const char *list, char *err, size_t err_size) {
+  int c[2], h[2], d[2], count = 0, used;
+  const char *s = list;
+  while (*s) {
+    if (count == 2)
+      FAIL("explicit topology lists more than two sockets: '%s'", list);
+    if (sscanf(s, "%d/%d/%d%n", &c[count], &h[count], &d[count], &used) != 3)
+      FAIL("invalid explicit topology '%s': expected explicit:C0/H0/D0,C1/H1/D1 (package/hbm node/ddr node)", list);
+    s += used;
+    count++;
+    if (*s == ',')
+      s++;
+    else if (*s)
+      FAIL("invalid explicit topology '%s': expected a comma between sockets", list);
+  }
+  if (count != m->npkgs)
+    FAIL("explicit topology describes %d socket(s) but the machine has %d package(s)", count, m->npkgs);
+  for (int i = 0; i < count; i++) {
+    int p = pkg_index(m, c[i]);
+    if (p < 0)
+      FAIL("explicit topology: package %d does not exist", c[i]);
+    if (d[i] < 0 || d[i] >= MAX_NODES || !m->node[d[i]].online || !m->node[d[i]].cpu_bearing ||
+        m->node[d[i]].package != c[i])
+      FAIL("explicit topology: node %d is not the CPU-bearing DDR node of package %d", d[i], c[i]);
+    if (h[i] < 0 || h[i] >= MAX_NODES || !m->node[h[i]].online || m->node[h[i]].cpu_bearing)
+      FAIL("explicit topology: node %d is not an online CPU-less memory node", h[i]);
+    m->pkg_ddr[p] = d[i];
+    m->pkg_hbm[p] = h[i];
+  }
+  if (count == 2 && (m->pkg_hbm[0] == m->pkg_hbm[1] || m->pkg_ddr[0] == m->pkg_ddr[1]))
+    FAIL("explicit topology: the two sockets share a node");
+  /* Each socket's DDR must be nearer to its own HBM than to the other socket's. */
+  for (int p = 0; p < count && count == 2; p++)
+    if (m->dist[m->pkg_ddr[p]][m->pkg_hbm[p]] >= m->dist[m->pkg_ddr[p]][m->pkg_hbm[1 - p]])
+      FAIL("explicit topology: node %d is not nearer to HBM node %d than to node %d", m->pkg_ddr[p], m->pkg_hbm[p],
+           m->pkg_hbm[1 - p]);
+  return 0;
+}
+
+/* ---- discovery ------------------------------------------------------------------------------------------------ */
+
+static int discover_virtual(Topology *t, const char *shape, char *err, size_t err_size) {
+  int sockets, threads, used = 0;
+  if (sscanf(shape, "%dx%d%n", &sockets, &threads, &used) != 2 || shape[used] || sockets < 1 || sockets > 2 ||
+      threads < 1)
+    FAIL("invalid virtual topology 'virtual:%s': expected virtual:SxT with S in 1..2 and T >= 1", shape);
+  t->classification = CLASS_VIRTUAL;
+  t->max_node = -1;
+  t->nsockets = sockets;
+  for (int s = 0; s < sockets; s++)
+    t->socket[s] = (SocketTopo){
+        .package = -1, .ncpus = threads, .ddr_node = -1, .hbm_node = -1, .ddr_allowed = 1, .hbm_allowed = 1};
+  return 0;
+}
+
+int numa_discover(Topology *t, const NumaInputs *in, char *err, size_t err_size) {
+  memset(t, 0, sizeof(*t));
+  t->max_node = -1;
+  const char *spec = in->spec && *in->spec ? in->spec : "auto";
+  if (!strncmp(spec, "virtual:", 8))
+    return discover_virtual(t, spec + 8, err, err_size);
+  int explicit_spec = !strncmp(spec, "explicit:", 9);
+  if (!explicit_spec && strcmp(spec, "auto"))
+    FAIL("invalid topology '%s': expected auto, virtual:SxT or explicit:C0/H0/D0,C1/H1/D1", spec);
+
+  Machine *m = calloc(1, sizeof(*m));
+  if (!m)
+    FAIL("out of memory");
+  m->root = in->sysfs_root && *in->sysfs_root ? in->sysfs_root : "/sys";
+  int status = read_cpus(m, in->allowed_cpus, err, err_size) || read_nodes(m, in->allowed_mems, err, err_size) ||
+               read_packages(m, err, err_size);
+  int memory_only = 0;
+  for (int n = 0; !status && n < MAX_NODES; n++)
+    memory_only += m->node[n].online && !m->node[n].cpu_bearing && m->node[n].mem_total;
+  if (!status) {
+    if (explicit_spec) {
+      status = classify_explicit(m, spec + 9, err, err_size);
+      t->classification = CLASS_EXPLICIT;
+    } else if (!memory_only) {
+      t->classification = CLASS_DDR_ONLY;
+    } else {
+      int result = classify_numaperf(m, err, err_size);
+      status = result;
+      if (result == 1) {
+        snprintf(err, err_size,
+                 "cannot classify memory-only NUMA nodes: no numaperf bandwidth data in sysfs; set "
+                 "LLAMA_TOPOLOGY=explicit:C0/H0/D0,C1/H1/D1 (package/HBM node/DDR node per socket, e.g. "
+                 "explicit:0/2/0,1/3/1)");
+        status = -1;
+      }
+      t->classification = CLASS_NUMAPERF;
+    }
+  }
+  if (status) {
+    free(m);
+    return -1;
+  }
+
+  t->max_node = m->max_node;
+  t->mems_words = ((size_t)m->max_node + 1 + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long));
+  t->mems_allowed = memory_alloc(t->mems_words, sizeof(unsigned long), MEM_METADATA);
+  for (int n = 0; n <= m->max_node; n++)
+    if (m->mems[n])
+      t->mems_allowed[n / (8 * sizeof(unsigned long))] |= 1ul << (n % (8 * sizeof(unsigned long)));
+  format_list(m->mems, MAX_NODES, t->mems_allowed_list, sizeof(t->mems_allowed_list));
+
+  for (int p = 0; p < m->npkgs; p++) {
+    int count = 0;
+    for (int c = 0; c < MAX_CPUS; c++)
+      count += m->cpu_online[c] && m->cpu_rep[c] && m->cpu_pkg[c] == m->pkgs[p];
+    if (!count)
+      continue; /* this job has no CPU in this socket */
+    SocketTopo *s = &t->socket[t->nsockets++];
+    int d = m->pkg_ddr[p], h = m->pkg_hbm[p];
+    *s = (SocketTopo){.package = m->pkgs[p],
+                      .ncpus = count,
+                      .cpus = memory_alloc((size_t)count, sizeof(int), MEM_METADATA),
+                      .ddr_node = d,
+                      .hbm_node = h,
+                      .ddr_allowed = d < 0 || m->mems[d],
+                      .hbm_allowed = h < 0 || m->mems[h],
+                      .ddr_bytes = d >= 0 ? m->node[d].mem_total : 0,
+                      .hbm_bytes = h >= 0 ? m->node[h].mem_total : 0};
+    for (int c = 0, i = 0; c < MAX_CPUS; c++)
+      if (m->cpu_online[c] && m->cpu_rep[c] && m->cpu_pkg[c] == m->pkgs[p])
+        s->cpus[i++] = c;
+  }
+  free(m);
+  if (!t->nsockets) {
+    numa_topology_free(t);
+    FAIL("this job has no allowed CPU");
+  }
+  return 0;
+}
+
+void numa_topology_free(Topology *t) {
+  for (int s = 0; s < 2; s++)
+    memory_free(t->socket[s].cpus);
+  memory_free(t->mems_allowed);
+  memset(t, 0, sizeof(*t));
+}
+
+int numa_check_placement(const Topology *t, int sockets, const char *placement, char *err, size_t err_size) {
+  if (!placement || !*placement)
+    placement = "file";
+  if (strcmp(placement, "file") && strcmp(placement, "ddr") && strcmp(placement, "hbm"))
+    FAIL("invalid placement '%s': expected file, ddr or hbm", placement);
+  if (sockets < 1 || sockets > 2)
+    FAIL("invalid socket count %d: expected 1 or 2", sockets);
+  if (t->nsockets < sockets)
+    FAIL("%d socket(s) requested but this job has allowed CPUs in only %d", sockets, t->nsockets);
+  if (!strcmp(placement, "file"))
+    return 0;
+  int hbm = !strcmp(placement, "hbm");
+  for (int s = 0; s < sockets; s++) {
+    const SocketTopo *k = &t->socket[s];
+    int node = hbm ? k->hbm_node : k->ddr_node, allowed = hbm ? k->hbm_allowed : k->ddr_allowed;
+    if (t->classification == CLASS_VIRTUAL)
+      FAIL("placement %s needs real NUMA nodes, but the topology is virtual", placement);
+    if (node < 0)
+      FAIL("placement %s requested but socket %d (package %d) has no %s node (classification: %s)", placement, s,
+           k->package, hbm ? "HBM" : "DDR", numa_class_name(t->classification));
+    if (!allowed)
+      FAIL("placement %s requested but node %d (socket %d %s) is not in this job's allowed memory nodes (%s)",
+           placement, node, s, hbm ? "HBM" : "DDR", t->mems_allowed_list);
+  }
+  return 0;
+}
+
+/* ---- the job's real allowed sets and the process-wide topology ----------------------------------------------- */
+
+int numa_affinity_cpus(int *cpus, int capacity) {
+#ifdef __linux__
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof(set), &set))
+    return -1;
+  int n = 0;
+  for (int i = 0; i < CPU_SETSIZE && n < capacity; i++)
+    if (CPU_ISSET(i, &set))
+      cpus[n++] = i;
+  return n;
+#else
+  (void)cpus;
+  (void)capacity;
+  return -1;
+#endif
+}
+
+int numa_online_nodes(char *buf, size_t size) {
+#ifdef __linux__
+  return read_first_line("/sys/devices/system/node/online", buf, size);
+#else
+  (void)buf;
+  (void)size;
+  return -1;
+#endif
+}
+
+#ifdef __linux__
+#ifndef MPOL_F_MEMS_ALLOWED
+#define MPOL_F_MEMS_ALLOWED (1 << 2)
+#endif
+/* Allowed memory nodes of the calling thread as a list, from get_mempolicy with a mask sized for every
+ * possible node (offline ids included); falls back to /proc/self/status. */
+static int allowed_mems_list(char *out, size_t size) {
+  enum { BITS = 1024 };
+  unsigned long mask[BITS / (8 * sizeof(unsigned long))] = {0};
+  if (syscall(SYS_get_mempolicy, NULL, mask, (unsigned long)BITS, NULL, (unsigned long)MPOL_F_MEMS_ALLOWED) == 0) {
+    unsigned char bits[MAX_NODES];
+    for (int n = 0; n < MAX_NODES; n++)
+      bits[n] = (mask[n / (8 * sizeof(unsigned long))] >> (n % (8 * sizeof(unsigned long)))) & 1;
+    format_list(bits, MAX_NODES, out, size);
+    return 0;
+  }
+  return -1;
+}
+
+static void proc_mems_allowed(char *out, size_t size) {
+  out[0] = 0;
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f)
+    return;
+  char line[512];
+  while (fgets(line, sizeof(line), f))
+    if (!strncmp(line, "Mems_allowed_list:", 18)) {
+      snprintf(out, size, "%s", line + 18 + strspn(line + 18, " \t"));
+      out[strcspn(out, "\r\n")] = 0;
+    }
+  fclose(f);
+}
+#endif
+
+const Topology *numa_topology(void) {
+  static Topology topology;
+  static int ready;
+  if (ready)
+    return &topology;
+  NumaInputs in = {.sysfs_root = getenv("LLAMA_SYSFS_ROOT"), .spec = getenv("LLAMA_TOPOLOGY")};
+#ifdef __linux__
+  /* Capture the full allowed sets before anything is pinned. A fixture root replaces them (tests only). */
+  static char cpus[8192], mems[512];
+  if (!in.sysfs_root) {
+    cpu_set_t set;
+    unsigned char bits[MAX_CPUS] = {0};
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      for (int i = 0; i < CPU_SETSIZE && i < MAX_CPUS; i++)
+        bits[i] = CPU_ISSET(i, &set) != 0;
+      format_list(bits, MAX_CPUS, cpus, sizeof(cpus));
+      in.allowed_cpus = cpus;
+    }
+    if (allowed_mems_list(mems, sizeof(mems)) == 0)
+      in.allowed_mems = mems;
+  }
+#endif
+  char err[512];
+  if (numa_discover(&topology, &in, err, sizeof(err)))
+    fail("topology discovery failed: %s", err);
+#ifdef __linux__
+  proc_mems_allowed(topology.proc_mems_allowed_list, sizeof(topology.proc_mems_allowed_list));
+#endif
+  ready = 1;
+  return &topology;
+}

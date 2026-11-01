@@ -1,5 +1,6 @@
 #include "app.h"
 #include "kernels.h"
+#include "numa.h"
 #include "profile.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -12,9 +13,8 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#ifdef __linux__
-#include <sched.h>
-#endif
+/* Matches CPU_SETSIZE, the most CPUs an affinity mask can name. */
+#define CPU_LIMIT 1024
 #ifndef BUILD_MODE
 #define BUILD_MODE "custom"
 #endif
@@ -178,36 +178,18 @@ void write_report(void) {
   else
     fputs("null", f);
   fputs(",\n    \"affinity_cpus\": ", f);
-#ifdef __linux__
-  cpu_set_t affinity;
-  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+  int affinity[CPU_LIMIT];
+  int affinity_count = numa_affinity_cpus(affinity, CPU_LIMIT);
+  if (affinity_count >= 0) {
     fputc('[', f);
-    int comma = 0;
-    for (int i = 0; i < CPU_SETSIZE; i++)
-      if (CPU_ISSET(i, &affinity)) {
-        fprintf(f, "%s%d", comma ? ", " : "", i);
-        comma = 1;
-      }
+    for (int i = 0; i < affinity_count; i++)
+      fprintf(f, "%s%d", i ? ", " : "", affinity[i]);
     fputc(']', f);
   } else
     fputs("null", f);
-#else
-  fputs("null", f);
-#endif
   fputs(",\n    \"numa_online_nodes\": ", f);
-#ifdef __linux__
-  FILE *nodes = fopen("/sys/devices/system/node/online", "r");
   char topology[256];
-  if (nodes && fgets(topology, sizeof(topology), nodes)) {
-    topology[strcspn(topology, "\r\n")] = 0;
-    string(f, topology);
-  } else
-    fputs("null", f);
-  if (nodes)
-    fclose(nodes);
-#else
-  fputs("null", f);
-#endif
+  string(f, numa_online_nodes(topology, sizeof(topology)) == 0 ? topology : NULL);
   fputs("\n  },\n  \"build\": {\n    \"compiler\": ", f);
   string(f, __VERSION__);
   fputs(",\n    \"mode\": ", f);
