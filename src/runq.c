@@ -1,6 +1,7 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
 #include "kernels.h"
+#include "profile.h"
 #include "runtime.h"
 #include <math.h>
 #include <stdlib.h>
@@ -233,57 +234,59 @@ static float *forward(Transformer *transformer, int token, int pos) {
   int head_size = dim / p->n_heads;
 
   // copy the token embedding into x
-  memcpy(x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float));
+  PROFILE(PHASE_EMBED, memcpy(x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float)));
   // RoPE angles depend only on the position: compute them once for all layers
-  k_rope_table(p, pos, s->rope);
+  PROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, s->rope));
 
   // forward all the layers
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
 
     // attention rmsnorm
-    k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps));
 
     // qkv matmuls for this position, in one parallel region
-    K8Input in = prepare_input(&s->xq, s->xb, dim);
-    k_matmul_q8_qkv(s->q, s->k, s->v, &in, weight(w->wq + l), weight(w->wk + l), weight(w->wv + l), dim, dim, kv_dim,
-                    GS);
+    K8Input in;
+    PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->xq, s->xb, dim));
+    PROFILE(PHASE_QKV, k_matmul_q8_qkv(s->q, s->k, s->v, &in, weight(w->wq + l), weight(w->wk + l), weight(w->wv + l),
+                                       dim, dim, kv_dim, GS));
 
-    k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size);
+    PROFILE(PHASE_ROPE, k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size));
 
     // save key,value at this time step (pos) to our kv cache
     size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
     float *key_cache_row = s->key_cache + loff + (size_t)pos * kv_dim;
     float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
-    memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
-    memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
+    PROFILE(PHASE_KV_STORE, memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
+            memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row)));
 
     // multihead attention over positions 0..pos, output into xb
-    k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, &s->attention, p->n_heads,
-                p->n_kv_heads, head_size, p->seq_len, pos);
+    PROFILE(PHASE_ATTENTION, k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att,
+                                         &s->attention, p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos));
 
     // final matmul to get the output of the attention, with the residual connection back into x
-    in = prepare_input(&s->xq, s->xb, dim);
-    k_matmul_q8_add(x, &in, weight(w->wo + l), dim, dim, GS);
+    PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->xq, s->xb, dim));
+    PROFILE(PHASE_WO, k_matmul_q8_add(x, &in, weight(w->wo + l), dim, dim, GS));
 
     // ffn rmsnorm
-    k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps));
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // w1 and w3 share one pass that applies the SwiGLU non-linearity
-    in = prepare_input(&s->xq, s->xb, dim);
-    k_matmul_q8_swiglu(s->hb, &in, weight(w->w1 + l), weight(w->w3 + l), dim, hidden_dim, GS);
+    PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->xq, s->xb, dim));
+    PROFILE(PHASE_W1_W3, k_matmul_q8_swiglu(s->hb, &in, weight(w->w1 + l), weight(w->w3 + l), dim, hidden_dim, GS));
 
     // final matmul to get the output of the ffn, with the residual connection
-    in = prepare_input(&s->hq, s->hb, hidden_dim);
-    k_matmul_q8_add(x, &in, weight(w->w2 + l), hidden_dim, dim, GS);
+    PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->hq, s->hb, hidden_dim));
+    PROFILE(PHASE_W2, k_matmul_q8_add(x, &in, weight(w->w2 + l), hidden_dim, dim, GS));
   }
 
   // final rmsnorm
-  k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps);
+  PROFILE(PHASE_RMSNORM, k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps));
 
   // classifier into logits
-  K8Input in = prepare_input(&s->xq, x, dim);
-  k_matmul_q8(s->logits, &in, weight(w->wcls), dim, p->vocab_size, GS);
+  K8Input in;
+  PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->xq, x, dim));
+  PROFILE(PHASE_CLASSIFIER, k_matmul_q8(s->logits, &in, weight(w->wcls), dim, p->vocab_size, GS));
   return s->logits;
 }
 

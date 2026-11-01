@@ -1,5 +1,6 @@
 #include "app.h"
 #include "kernels.h"
+#include "profile.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,29 @@ static void timing(FILE *f, const char *key, double value, int available, int co
   number(f, value, available);
   fputs(comma ? ",\n" : "\n", f);
 }
+/* Per-stage phase totals; "other" is forward time outside every phase. */
+static void profile_report(FILE *f) {
+  if (!profile_enabled) {
+    fputs("null", f);
+    return;
+  }
+  const char *stages[STAGE_COUNT] = {"prefill", "decode"};
+  const double forward[STAGE_COUNT] = {metrics.prefill_s, metrics.decode_s};
+  const size_t passes[STAGE_COUNT] = {metrics.processed_tokens, metrics.decode_steps};
+  fputs("{", f);
+  for (int stage = 0; stage < STAGE_COUNT; stage++) {
+    double phases = 0.0;
+    fprintf(f, "%s\n    \"%s\": {\n      \"forward_passes\": %zu,\n      \"forward\": %.9g", stage ? "," : "",
+            stages[stage], passes[stage], forward[stage]);
+    for (int phase = 0; phase < PHASE_COUNT; phase++) {
+      phases += profile.seconds[stage][phase];
+      fprintf(f, ",\n      \"%s\": %.9g", profile_phase_name((Phase)phase), profile.seconds[stage][phase]);
+    }
+    fprintf(f, ",\n      \"other\": %.9g\n    }", forward[stage] - phases);
+  }
+  fputs("\n  }", f);
+}
+
 void write_report(void) {
   if (!options.json)
     return;
@@ -252,7 +276,9 @@ void write_report(void) {
   rate(f, metrics.forward_passes, metrics.inference_s);
   fputs(",\n    \"output\": ", f);
   rate(f, metrics.output_tokens, metrics.inference_s);
-  fputs("\n  },\n  \"memory_bytes\": {\n    \"model_file\": ", f);
+  fputs("\n  },\n  \"profile_seconds\": ", f);
+  profile_report(f);
+  fputs(",\n  \"memory_bytes\": {\n    \"model_file\": ", f);
   if (metrics.checkpoint_ready)
     fprintf(f, "%zu", model.mapped_bytes);
   else

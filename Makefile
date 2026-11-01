@@ -31,9 +31,9 @@ ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
 LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
-COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/tokenizer.c src/sampler.c
+COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/profile.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
-HEADERS = include/runtime.h include/app.h include/kernels.h
+HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h
 # Regenerate the configuration stamp only when flags change; changing OPENMP or
 # CC must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE
