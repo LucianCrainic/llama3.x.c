@@ -74,7 +74,7 @@ static void alloc_buffers(RunState *s, const Config *p, int max_batch, RunMemory
   s->att = runmem_alloc(rm, checked_mul((size_t)p->n_heads, p->seq_len), sizeof(float));
   s->logits = runmem_alloc(rm, p->vocab_size, sizeof(float));
   s->rope = runmem_alloc(rm, checked_mul(max_batch, 2 * (size_t)p->head_dim), sizeof(float));
-  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
+  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len, max_batch);
 }
 
 static void malloc_run_state(RunState *s, Config *p, int max_batch, RunMemory *rm) {
@@ -242,9 +242,8 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
   for (int i = 0; i < count; i++)
     PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
                                      s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_ATTENTION, k_attention(s->xb + (size_t)i * dim, s->q + (size_t)i * dim, kc, vc, s->att, &s->attention,
-                                         p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos0 + i));
+  PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
+                                             head_size, p->seq_len, pos0, count));
   GemmSegment wo = {.c = s->x, .ldc = dim, .w = w->wo + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_ADD};
   PROFILE(PHASE_WO, k_gemm_f32(s->xb, dim, count, dim, &wo, 1));
 

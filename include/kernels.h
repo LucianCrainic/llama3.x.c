@@ -73,12 +73,28 @@ void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, 
 typedef struct {
   float *partial;
   int max_chunks, n_heads, head_dim, workers;
-  int external; /* partial was supplied by the caller (a placement region) and is not freed here */
+  int external;    /* partial was supplied by the caller (a placement region) and is not freed here */
+  size_t capacity; /* floats in partial; batched attention processes as many rows per wave as fit */
 } AttentionWork;
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
 void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory);
+/* The same for batched prefill of up to `rows` rows per call: room for as many rows of split-K partials as the budget
+ * LLAMA_ATTN_WORKSPACE_MIB (default 32) allows, never less than one row. Longer batches run in waves of that many rows. */
+size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows);
+void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
+                           float *memory);
+/* Causal attention for `m` query rows at positions pos0..pos0+m-1 whose K/V rows are already in the cache. Row i
+ * attends to positions 0..pos0+i and is computed exactly like k_attention at that position, so results are bitwise
+ * equal to the per-row calls; the rows of one task share K/V loads. out and q hold m rows of n_heads*head_dim floats;
+ * att is the per-row scratch of the fallback path. */
+void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m);
+/* Test hook: the same driver with a portable chunk kernel, on any host. */
+void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
+                                int m);
 void k_attention_free(AttentionWork *work);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);

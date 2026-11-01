@@ -284,6 +284,77 @@ static void test_attention(void) {
   }
 }
 
+/* C3: batched causal attention. Row i attends to 0..pos0+i and equals the per-row call; K/V beyond a row never matter. */
+static void test_attention_batch(void) {
+  const int configs[][3] = {{4, 4, 64}, {8, 2, 64}, {8, 2, 128}, {6, 2, 40}};
+  const int ms[] = {1, 2, 7, 32}, starts[] = {0, 31, 250, 4000};
+  for (size_t c = 0; c < sizeof(configs) / sizeof(*configs); c++)
+    for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++)
+      for (size_t pi = 0; pi < sizeof(starts) / sizeof(*starts); pi++) {
+        int heads = configs[c][0], kv_heads = configs[c][1], hd = configs[c][2], m = ms[mi], pos0 = starts[pi];
+        if (pos0 == 4000 && (m == 2 || hd == 40 || kv_heads == heads))
+          continue; /* keep the long-context cases to a few shapes */
+        int seq = pos0 + m; /* the last row sits exactly on the context limit */
+        size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+        float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+        float *vc = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+        float *want = zeroed(m * dim, sizeof(float)), *got = zeroed(m * dim, sizeof(float));
+        float *again = zeroed(m * dim, sizeof(float)), *port = zeroed(m * dim, sizeof(float));
+        fill(q, m * dim, 2), fill(kc, seq * kv_dim, 2), fill(vc, seq * kv_dim, 1);
+        AttentionWork work;
+        k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
+        for (int i = 0; i < m; i++)
+          k_attention(want + i * dim, q + i * dim, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0 + i);
+        size_t full_capacity = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
+        for (int pass = 0; pass < 2; pass++) {
+          /* pass 1: room for only two rows, so a long batch runs in several waves */
+          work.capacity = pass ? (2 * one_row < full_capacity ? 2 * one_row : full_capacity) : full_capacity;
+          memset(got, 0xAB, m * dim * sizeof(float)); /* poison: every row must be written by this call */
+          k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+          checks++;
+          if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
+            fprintf(stderr, "attention_batch [%s] heads=%d kv=%d hd=%d m=%d pos0=%d pass=%d: differs from per-row\n",
+                    current, heads, kv_heads, hd, m, pos0, pass);
+          if (m > 1) {
+            memset(port, 0xAB, m * dim * sizeof(float));
+            k_attention_batch_portable(port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
+            for (size_t i = 0; i < m * dim; i++)
+              check("attention_batch.portable", port[i], want[i], 2e-5);
+          }
+        }
+        work.capacity = full_capacity;
+        /* Causality: change every K/V row after the last position row i may see; row i must not move, bit for bit. */
+        const int probes[] = {0, m / 2, m - 1};
+        for (size_t pr = 0; pr < 3; pr++) {
+          int i = probes[pr], first = pos0 + i + 1;
+          if (first >= seq)
+            continue;
+          float *kp = zeroed(seq * kv_dim, sizeof(float)), *vp = zeroed(seq * kv_dim, sizeof(float));
+          memcpy(kp, kc, seq * kv_dim * sizeof(float)), memcpy(vp, vc, seq * kv_dim * sizeof(float));
+          for (size_t t = (size_t)first * kv_dim; t < seq * kv_dim; t++)
+            kp[t] += 3 * uniform(), vp[t] += 3 * uniform();
+          memset(again, 0xAB, m * dim * sizeof(float));
+          k_attention_batch(again, q, kp, vp, att, &work, heads, kv_heads, hd, seq, pos0, m);
+          checks++;
+          if (memcmp(again + i * dim, got + i * dim, dim * sizeof(float)) && failures++ < 20)
+            fprintf(stderr, "attention_batch causality [%s] m=%d pos0=%d row=%d: later K/V changed the row\n", current,
+                    m, pos0, i);
+          if (m > 1) {
+            float *port2 = zeroed(m * dim, sizeof(float));
+            memset(port2, 0xAB, m * dim * sizeof(float));
+            k_attention_batch_portable(port2, q, kp, vp, &work, heads, kv_heads, hd, seq, pos0, m);
+            checks++;
+            if (memcmp(port2 + i * dim, port + i * dim, dim * sizeof(float)) && failures++ < 20)
+              fprintf(stderr, "attention_batch portable causality [%s] m=%d pos0=%d row=%d\n", current, m, pos0, i);
+            free(port2);
+          }
+          free(kp), free(vp);
+        }
+        k_attention_free(&work);
+        free(q), free(kc), free(vc), free(att), free(want), free(got), free(again), free(port);
+      }
+}
+
 int main(void) {
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
   float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
@@ -305,6 +376,7 @@ int main(void) {
     test_norm();
     rope_used = test_rope(rope[i]);
     test_attention();
+    test_attention_batch();
     rng = seed; /* identical inputs for every instruction set */
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
@@ -348,6 +420,7 @@ int main(void) {
       test_q8(scratch_q, scratch_s);
       test_norm();
       test_attention();
+      test_attention_batch();
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();

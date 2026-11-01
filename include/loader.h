@@ -69,8 +69,9 @@ void runmem_init(RunMemory *rm, size_t kv_bytes_each);
 int runmem_sizing(const RunMemory *rm);
 void *runmem_alloc(RunMemory *rm, size_t count, size_t size); /* zeroed; 64-byte aligned in a region */
 void runmem_seal(RunMemory *rm);
-/* The split-K attention workspace, in the arena when there is one. */
-void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
+/* The split-K attention workspace for batches of up to `rows` rows, in the arena when there is one. */
+void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
+                      int rows);
 float *runmem_cache(RunMemory *rm, int which); /* 0 = keys, 1 = values; zero-filled */
 void runmem_free(RunMemory *rm, void *pointer);
 void runmem_release(RunMemory *rm);

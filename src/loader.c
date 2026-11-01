@@ -316,14 +316,15 @@ void *runmem_alloc(RunMemory *rm, size_t count, size_t size) {
   return rm->phase == RUNMEM_SIZING ? NULL : (char *)rm->work.data + at;
 }
 
-void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
+                      int rows) {
   if (rm->phase == RUNMEM_HEAP) {
-    k_attention_init(work, n_heads, n_kv_heads, head_dim, seq_len);
+    k_attention_init_rows(work, n_heads, n_kv_heads, head_dim, seq_len, rows, NULL);
     return;
   }
-  void *memory = runmem_alloc(rm, k_attention_bytes(n_heads, n_kv_heads, head_dim, seq_len), 1);
+  void *memory = runmem_alloc(rm, k_attention_bytes_rows(n_heads, n_kv_heads, head_dim, seq_len, rows), 1);
   if (!runmem_sizing(rm))
-    k_attention_init_in(work, n_heads, n_kv_heads, head_dim, seq_len, memory);
+    k_attention_init_rows(work, n_heads, n_kv_heads, head_dim, seq_len, rows, memory);
 }
 
 static void zero_slice(const void *job, int worker, int workers) {

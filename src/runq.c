@@ -93,7 +93,7 @@ static void alloc_buffers(RunState *s, const Config *p, int max_batch, RunMemory
   s->att = runmem_alloc(rm, checked_mul((size_t)p->n_heads, p->seq_len), sizeof(float));
   s->logits = runmem_alloc(rm, p->vocab_size, sizeof(float));
   s->rope = runmem_alloc(rm, checked_mul(max_batch, 2 * (size_t)p->head_dim), sizeof(float));
-  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len);
+  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len, 1);
 }
 
 static void malloc_run_state(RunState *s, Config *p, int max_batch, RunMemory *rm) {
