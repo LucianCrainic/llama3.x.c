@@ -173,7 +173,9 @@ static void bench_fn(const void *p, int worker, int workers) {
 }
 
 static void bench_barrier(int rounds, int max_threads) {
-  for (int threads = 2; threads <= max_threads; threads *= 2) {
+  for (int threads = 2;; threads *= 2) {
+    if (threads > max_threads)
+      threads = max_threads;
     PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {NULL, NULL}};
     pool_start(&config);
     BenchJob job = {rounds, pool_team(0)};
@@ -183,6 +185,8 @@ static void bench_barrier(int rounds, int max_threads) {
     double seconds = monotonic_seconds() - start;
     printf("{\"threads\": %d, \"rounds\": %d, \"ns_per_barrier\": %.1f}\n", threads, rounds, seconds / rounds * 1e9);
     pool_stop();
+    if (threads == max_threads)
+      break;
   }
 }
 

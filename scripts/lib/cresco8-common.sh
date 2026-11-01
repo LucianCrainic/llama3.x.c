@@ -9,26 +9,30 @@ die() {
   exit 1
 }
 
-# Required: ROOT (tree under test), OUT (must not exist yet), PYTHON, MODELS. Optional: STAGE=check|bench (default
-# bench), REPEATS (default 3), PRECISIONS (default "fp32 int8"), PHASE (default none).
+# Required: ROOT (tree under test), OUT (must not exist yet), PYTHON. Optional: MODELS (without it the Hugging Face
+# gate and every model-based run is skipped and recorded as such), STAGE=check|bench (default bench), REPEATS
+# (default 3), PRECISIONS (default "fp32 int8"), PHASE (default none): a space-separated list of phase ids.
 require_env() {
   : "${SLURM_JOB_ID:?submit through Slurm}"
   : "${ROOT:?tree under test required}"
   : "${OUT:?unique results directory required}"
   : "${PYTHON:?validation Python required}"
-  : "${MODELS:?NAME:ARTIFACTS:HF entries required}"
+  MODELS=${MODELS:-}
   STAGE=${STAGE:-bench}
   REPEATS=${REPEATS:-3}
   PRECISIONS=${PRECISIONS:-"fp32 int8"}
   PHASE=${PHASE:-none}
   [[ $STAGE == check || $STAGE == bench ]] || die "STAGE must be check or bench, got '$STAGE'"
   [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || die "REPEATS must be a positive integer, got '$REPEATS'"
-  [[ $PHASE =~ ^(none|[A-D][0-9]+)$ ]] || die "PHASE must be none or a phase id such as A3, got '$PHASE'"
+  local phase
+  for phase in $PHASE; do
+    [[ $phase =~ ^(none|[A-DF][0-9]+)$ ]] || die "PHASE must be none or phase ids such as 'A1 A3 F2', got '$PHASE'"
+  done
   [[ ! -e $OUT ]] || die "OUT '$OUT' already exists"
   for entry in $MODELS; do
     [[ $entry =~ ^[^:]+:[^:]+:[^:]+$ ]] || die "MODELS entry '$entry' is not NAME:ARTIFACTS:HF"
   done
-  export STAGE REPEATS PRECISIONS PHASE
+  export STAGE REPEATS PRECISIONS PHASE MODELS
 }
 
 # Creates OUT, records the exit status, removes the staging directory, and tees job output into OUT.
@@ -176,6 +180,10 @@ make_prompt() {
 # validate_models: the correctness gate of every model and precision, as in the kernel campaign.
 validate_models() {
   local entry name artifacts hf precision
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: Hugging Face validation and model benchmarks were not run' | tee "$OUT/no-models.txt"
+    return 0
+  fi
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
     for precision in $PRECISIONS; do
@@ -189,11 +197,79 @@ validate_models() {
   done
 }
 
+# OVERALL is the job's exit status: any failed expectation or unit test makes it non-zero, but the evidence that is
+# still collectable is collected.
+OVERALL=0
+
+# record_result NAME PASS|FAIL [detail]: one line in phase-results.txt.
+record_result() {
+  printf '%s %s %s\n' "$2" "$1" "${3:-}" >> "$OUT/phase-results.txt"
+  [[ $2 == PASS ]] || OVERALL=1
+}
+
+# expect NAME ok|fail|any DIR -- COMMAND...: runs the command with output in DIR/NAME.{out,err} and checks its exit
+# status against the expectation ("any" records whatever happened); the command never stops the job.
+expect() {
+  local name=$1 want=$2 dir=$3 rc=0
+  shift 4
+  "$@" > "$dir/$name.out" 2> "$dir/$name.err" || rc=$?
+  if [[ $want == any ]] || [[ $want == ok && $rc -eq 0 ]] || [[ $want == fail && $rc -ne 0 ]]; then
+    record_result "$name" PASS "exit=$rc expected=$want"
+  else
+    record_result "$name" FAIL "exit=$rc expected=$want"
+  fi
+  return 0
+}
+
+# run_phases: runs phase_<ID> for each id in PHASE; phase_none does nothing. An unknown phase is an error.
+run_phases() {
+  local phase
+  for phase in $PHASE; do
+    if [[ $phase == none ]]; then
+      continue
+    elif declare -F "phase_$phase" > /dev/null; then
+      mkdir -p "$OUT/$phase"
+      "phase_$phase"
+    else
+      die "phase $phase has no run matrix in $(basename "${BASH_SOURCE[1]:-this script}") yet"
+    fi
+  done
+}
+
+# F2, model-free part: kernels on teams at full-socket size on the hardware ISA, the pinning read-back, and the
+# per-barrier cost. The real-model gate and the omp-versus-teams decode comparison need MODELS and a Hugging Face
+# Python environment and are not part of this phase's model-free check.
+phase_F2() {
+  local dir="$OUT/F2" bin="$ROOT/build/release"
+  expect kernels-teams ok "$dir" -- numactl --cpunodebind=0 env LLAMA_TEST_TEAMS=1,56 "$bin/test-kernels"
+  if grep -q 'avx512 teams:56 ok' "$dir/kernels-teams.out"; then
+    record_result kernels-teams-avx512-56 PASS
+  else
+    record_result kernels-teams-avx512-56 FAIL 'avx512 teams:56 was not exercised'
+  fi
+  expect affinity ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" affinity 56
+  if python3 - "$dir/affinity.out" << 'PY'; then
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data['supported'] and data['verified'] == 1 and len(data['workers']) == 56, data
+assert all(w['assigned'] == w['observed'] for w in data['workers'])
+PY
+    record_result affinity-readback PASS 'every worker read back as assigned'
+  else
+    record_result affinity-readback FAIL
+  fi
+  expect barrier-cost ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" bench-barrier 200000 56
+  expect barrier-stress ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" barrier 1000000 56
+}
+
 # check_stage: everything every skeleton does before a phase matrix: environment, Flat-mode check, build, tests.
 check_stage() {
   record_environment
   check_flat_mode
   build_tree 1 release build/release/probe-fp32 build/release/probe-int8
-  (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1
+  local status=0
+  (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1 ||
+    status=$?
+  if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
   perf_available
 }

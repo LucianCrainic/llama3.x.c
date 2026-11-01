@@ -321,7 +321,15 @@ int main(void) {
   }
   /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
    * against the same double-precision references as the OpenMP path. */
-  const int team_sizes[] = {1, 2, 3, 5, 7};
+  int team_sizes[8] = {1, 2, 3, 5, 7};
+  size_t team_size_count = 5;
+  const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "1,56" for a full socket on the cluster */
+  if (override && *override) {
+    team_size_count = 0;
+    for (char *copy = strdup(override), *token = strtok(copy, ","); token && team_size_count < 8;
+         token = strtok(NULL, ","))
+      team_sizes[team_size_count++] = atoi(token);
+  }
   int8_t *scratch_q = zeroed(Q8_VALUES, 1);
   float *scratch_s = zeroed(Q8_VALUES, sizeof(float));
   static char label[64];
@@ -329,7 +337,7 @@ int main(void) {
     if (!ran[i])
       continue;
     kernels_select(isas[i]);
-    for (size_t t = 0; t < sizeof(team_sizes) / sizeof(*team_sizes); t++) {
+    for (size_t t = 0; t < team_size_count; t++) {
       PoolConfig config = {.teams = 1, .threads = {team_sizes[t], 0}, .cpus = {NULL, NULL}};
       pool_start(&config);
       kernels_set_team(pool_team(0));

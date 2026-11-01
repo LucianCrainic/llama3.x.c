@@ -205,6 +205,23 @@ class ScriptTests(unittest.TestCase):
                     self.assertIn(text, result.stderr)
             result = self.lib('require_env', {k: v for k, v in {**base, 'OUT': out}.items() if k != 'ROOT'})
             self.assertIn('tree under test required', result.stderr)
+            # MODELS is optional, and PHASE is a list.
+            result = self.lib('require_env; printf "[%s] [%s]" "$MODELS" "$PHASE"',
+                              {**{k: v for k, v in base.items() if k != 'MODELS'}, 'OUT': out, 'PHASE': 'A1 A3 F2'})
+            self.assertEqual((result.returncode, result.stdout), (0, '[] [A1 A3 F2]'), result.stderr)
+
+    def test_expect_and_unknown_phases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script = (f'OUT={temp}; PHASE="A9"; expect good ok {temp} -- true; expect bad fail {temp} -- false; '
+                      f'expect wrong ok {temp} -- false; expect free any {temp} -- false; '
+                      f'expect talk ok {temp} -- echo hello; cat {temp}/phase-results.txt; echo "overall=$OVERALL"; '
+                      f'cat {temp}/talk.out; run_phases')
+            result = self.lib(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.splitlines(), [
+                'PASS good exit=0 expected=ok', 'PASS bad exit=1 expected=fail', 'FAIL wrong exit=1 expected=ok',
+                'PASS free exit=1 expected=any', 'PASS talk exit=0 expected=ok', 'overall=1', 'hello'])
+            self.assertIn('phase A9 has no run matrix', result.stderr)
 
     def test_run_labels_match_the_summarizer(self):
         import summarize_campaign as sc

@@ -5,6 +5,7 @@
  *   test-regions probe ...          see probe() */
 #include "numa.h"
 #include "runtime.h"
+#include "workers.h"
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
@@ -151,22 +152,69 @@ static void fail_during_startup(void) {
   fail("injected startup failure after %d regions", region_live_count());
 }
 
-static void bind_region(int node, size_t bytes) {
+static void bind_region(int node, size_t bytes, int thp) {
   NumaRegion r;
   char err[512];
-  if (region_reserve_try(&r, bytes, 0, node, ROLE_WORK, 0, err, sizeof(err))) {
+  if (region_reserve_try(&r, bytes, 0, node, ROLE_WORK, thp, err, sizeof(err))) {
     fprintf(stderr, "[ERROR] %s\n", err);
     exit(1);
   }
-  printf("bound %zu bytes to node %d\n", r.data_bytes, r.node);
+  printf("bound %zu bytes to node %d thp_requested=%d\n", r.data_bytes, r.node, r.thp_requested);
   region_release(&r);
 }
 
-/* verify NODE BYTES none|half|all [thp] [samples=N] [expect=M]
+/* Total size and count of the process's mappings, to show that a failed startup leaves none behind. */
+static void mapping_totals(size_t *count, size_t *bytes) {
+  *count = *bytes = 0;
+  FILE *f = fopen("/proc/self/maps", "r");
+  char line[1024];
+  while (f && fgets(line, sizeof(line), f)) {
+    unsigned long long lo, hi;
+    if (sscanf(line, "%llx-%llx", &lo, &hi) == 2) {
+      (*count)++;
+      *bytes += (size_t)(hi - lo);
+    }
+  }
+  if (f)
+    fclose(f);
+}
+
+/* maps NODE: reserve and bind a region, then fail a second reservation (injected EPERM), then release everything. */
+static void leak_check(int node) {
+  size_t count0, bytes0, count1, bytes1;
+  mapping_totals(&count0, &bytes0);
+  NumaRegion a, b;
+  char err[512];
+  if (region_reserve_try(&a, (size_t)64 << 20, 0, node, ROLE_WORK, 0, err, sizeof(err)))
+    fail("first reservation failed: %s", err);
+  setenv("LLAMA_NUMA_FAULT", "EPERM", 1);
+  int failed = region_reserve_try(&b, (size_t)64 << 20, 0, node, ROLE_WORK, 0, err, sizeof(err));
+  unsetenv("LLAMA_NUMA_FAULT");
+  region_release_all();
+  mapping_totals(&count1, &bytes1);
+  printf("{\"second_failed\": %d, \"live_regions\": %d, \"maps_before\": %zu, \"maps_after\": %zu, "
+         "\"mapped_bytes_before\": %zu, \"mapped_bytes_after\": %zu, \"error\": \"%s\"}\n",
+         failed != 0, region_live_count(), count0, count1, bytes0, bytes1, err);
+}
+
+typedef struct {
+  unsigned char *data;
+  size_t bytes;
+} FillJob;
+
+static void fill_slice(const void *p, int worker, int workers) {
+  const FillJob *job = p;
+  size_t lo = job->bytes / (size_t)workers * (size_t)worker,
+         hi = worker + 1 == workers ? job->bytes : lo + job->bytes / (size_t)workers;
+  memset(job->data + lo, 1, hi - lo);
+}
+
+/* verify NODE BYTES none|half|all [thp] [samples=N] [expect=M] [threads=T]
  * Reserve on NODE (-1: portable), populate part of it from this thread, and report where the pages are. expect=M
- * checks against M instead of NODE (a negative control for a portable region under an external policy). */
+ * checks against M instead of NODE (a negative control for a portable region under an external policy).
+ * threads=T populates from a team of T workers pinned to the first T CPUs this process may run on. */
 static void verify(int argc, char **argv) {
-  int node = atoi(argv[2]), thp = 0, expect = node;
+  int node = atoi(argv[2]), thp = 0, expect = node, threads = 1;
   size_t bytes = (size_t)strtoull(argv[3], NULL, 10), samples = 0;
   const char *touch = argv[4];
   for (int i = 5; i < argc; i++) {
@@ -176,13 +224,27 @@ static void verify(int argc, char **argv) {
       samples = (size_t)strtoull(argv[i] + 8, NULL, 10);
     else if (!strncmp(argv[i], "expect=", 7))
       expect = atoi(argv[i] + 7);
+    else if (!strncmp(argv[i], "threads=", 8))
+      threads = atoi(argv[i] + 8);
   }
   NumaRegion r;
   region_reserve(&r, bytes, 0, node, ROLE_WORK, thp);
   size_t populated = !strcmp(touch, "all") ? r.logical_bytes : !strcmp(touch, "half") ? r.logical_bytes / 2 : 0;
+  int cpus[1024], allowed = numa_affinity_cpus(cpus, 1024);
   double start = monotonic_seconds();
-  memset(r.data, 1, populated);
+  if (threads > 1) {
+    if (allowed >= 0 && threads > allowed)
+      threads = allowed;
+    PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {allowed > 0 ? cpus : NULL, NULL}};
+    pool_start(&config);
+    start = monotonic_seconds();
+    FillJob job = {r.data, populated};
+    team_run(pool_team(0), fill_slice, &job);
+  } else
+    memset(r.data, 1, populated);
   double populate_s = monotonic_seconds() - start;
+  if (threads > 1)
+    pool_stop();
   region_mark_populated(&r);
   NumaRegion check = r;
   check.node = expect;
@@ -195,12 +257,13 @@ static void verify(int argc, char **argv) {
   int have_thp = region_thp_bytes(&r, &thp_bytes) == 0,
       have_maps = region_numa_maps(&r, policy, sizeof(policy), pages, 64) == 0;
   printf("{\"node\": %d, \"expect\": %d, \"bytes\": %zu, \"populated_bytes\": %zu, \"populate_seconds\": %.6f, "
-         "\"populate_gbps\": %.3f, \"verify_status\": %d, \"verify_seconds\": %.6f, \"full\": %d, \"scheme\": \"%s\", "
+         "\"populate_threads\": %d, \"populate_gbps\": %.3f, \"verify_status\": %d, \"verify_seconds\": %.6f, "
+         "\"full\": %d, \"scheme\": \"%s\", "
          "\"queried\": %zu, \"on_node\": %zu, \"wrong_node\": %zu, \"missing\": %zu, \"errors\": %zu, "
          "\"thp_requested\": %d, \"thp_bytes\": %s",
-         node, expect, r.logical_bytes, populated, populate_s, populate_s > 0 ? populated / populate_s / 1e9 : 0.0,
-         status, verify_s, pc.full, pc.scheme, pc.queried, pc.on_node, pc.wrong_node, pc.missing, pc.errors,
-         r.thp_requested, have_thp ? "" : "null");
+         node, expect, r.logical_bytes, populated, populate_s, threads,
+         populate_s > 0 ? populated / populate_s / 1e9 : 0.0, status, verify_s, pc.full, pc.scheme, pc.queried,
+         pc.on_node, pc.wrong_node, pc.missing, pc.errors, r.thp_requested, have_thp ? "" : "null");
   if (have_thp)
     printf("%zu", thp_bytes);
   printf(", \"numa_maps_policy\": ");
@@ -232,8 +295,12 @@ int main(int argc, char **argv) {
     verify(argc, argv);
     return 0;
   }
-  if (argc == 4 && !strcmp(argv[1], "bind")) {
-    bind_region(atoi(argv[2]), (size_t)strtoull(argv[3], NULL, 10));
+  if ((argc == 4 || argc == 5) && !strcmp(argv[1], "bind")) {
+    bind_region(atoi(argv[2]), (size_t)strtoull(argv[3], NULL, 10), argc == 5 && !strcmp(argv[4], "thp"));
+    return 0;
+  }
+  if (argc == 3 && !strcmp(argv[1], "maps")) {
+    leak_check(atoi(argv[2]));
     return 0;
   }
   return 2;
