@@ -2,6 +2,7 @@ CC ?= cc
 MODE ?= release
 OPENMP ?= 0
 NATIVE ?= 0
+PCRE2 ?= 1
 BUILD_DIR ?= build/$(MODE)
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic
@@ -25,6 +26,10 @@ LDFLAGS += $(if $(OMP_LDFLAGS),$(OMP_LDFLAGS),-fopenmp)
 endif
 ifeq ($(NATIVE),1)
 CFLAGS += -march=native
+endif
+ifeq ($(PCRE2),1)
+CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
+LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
 COMMON = src/runtime.c src/kernels.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
@@ -51,3 +56,11 @@ test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8
 	python3 tests/test_tools.py
 clean:
 	rm -rf build
+
+$(BUILD_DIR)/probe-fp32: tests/probe.c src/run.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/probe.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/probe-int8: tests/probe.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/probe.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+.PHONY: test-reference
+test-reference: all $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
+	$(if $(PYTHON),$(PYTHON),python3) tests/test_reference.py $(BUILD_DIR)

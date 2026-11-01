@@ -10,7 +10,7 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
-    # default hyperparameters for the Llama 7B model
+    # Legacy training defaults; importers replace architecture fields from metadata.
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32
@@ -21,6 +21,14 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+    rope_theta: float = 500000.0
+    rope_scaling: Optional[dict] = None
+    tie_word_embeddings: bool = True
+    bos_token_id: int = 128000
+    eos_token_id: int = 128001
+    eot_token_id: int = 128009
+    eom_token_id: int = -1
+    model_name: str = "unknown"
 
 
 class RMSNorm(torch.nn.Module):
@@ -37,8 +45,18 @@ class RMSNorm(torch.nn.Module):
         return output * self.weight
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(dim: int, end: int, theta: float = 500000.0, scaling=None):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    if scaling and scaling.get("rope_type", scaling.get("type", "default")) != "default":
+        if scaling.get("rope_type", scaling.get("type")) != "llama3":
+            raise ValueError("only default and llama3 RoPE are supported")
+        wavelength = 2 * math.pi / freqs
+        low, high = scaling["low_freq_factor"], scaling["high_freq_factor"]
+        original, factor = scaling["original_max_position_embeddings"], scaling["factor"]
+        smooth = (original / wavelength - low) / (high - low)
+        freqs = torch.where(wavelength > original / low, freqs / factor,
+                            torch.where(wavelength < original / high, freqs,
+                                        (1 - smooth) * freqs / factor + smooth * freqs))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cos = torch.cos(freqs)  # real part
@@ -232,13 +250,13 @@ class Transformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = (
-            self.output.weight
-        )  # https://paperswithcode.com/method/weight-tying
+        if params.tie_word_embeddings:
+            self.tok_embeddings.weight = self.output.weight  # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len
+            self.params.dim // self.params.n_heads, self.params.max_seq_len,
+            self.params.rope_theta, self.params.rope_scaling
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)

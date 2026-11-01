@@ -21,12 +21,14 @@ static void usage(void) {
         "  -t FLOAT          temperature >= 0 (default 1; 0 = greedy)\n"
         "  -p FLOAT          top-p in [0,1] (default .9; 0 or 1 disables)\n"
         "  -s, --seed INT    nonnegative seed (0 maps to RNG state 1)\n"
+        "  --context-length INT  KV-cache capacity (default min(model context, 4096))\n"
         "  -n INT            maximum forward passes (default 4096; 0 = context)\n"
         "  -i, --prompt TEXT prompt (default empty; benchmark: Once upon a time)\n"
         "  --prompt-file PATH read UTF-8 prompt from file\n"
         "  -z PATH           matching tokenizer binary (default tokenizer.bin)\n"
         "  -m MODE           generate or chat\n"
         "  -y TEXT           chat system prompt\n"
+        "  --chat-template   format a single instruct request (also in benchmark mode)\n"
         "  --benchmark       non-interactive; fixed default prompt and seed 1\n"
         "  --generation-length INT  cap generated tokens; 0 skips inference\n"
         "                    benchmark default: 128; -n/context still cap passes\n"
@@ -67,8 +69,8 @@ static void parse(int argc, char **argv) {
   options.checkpoint = argv[1];
   /* Find report destination before validating options so CLI failures can be recorded. */
   for (int i = 2; i < argc; i++) {
-    if (!strcmp(argv[i], "--benchmark") || !strcmp(argv[i], "--no-text") || !strcmp(argv[i], "--help") ||
-        !strcmp(argv[i], "-h"))
+    if (!strcmp(argv[i], "--chat-template") || !strcmp(argv[i], "--benchmark") || !strcmp(argv[i], "--no-text") ||
+        !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
       continue;
     if (!strcmp(argv[i], "--json") && i + 1 < argc)
       options.json = argv[i + 1];
@@ -76,6 +78,10 @@ static void parse(int argc, char **argv) {
   }
   for (int i = 2; i < argc; i++) {
     const char *flag = argv[i];
+    if (!strcmp(flag, "--chat-template")) {
+      options.chat_template = 1;
+      continue;
+    }
     if (!strcmp(flag, "--benchmark")) {
       options.benchmark = 1;
       continue;
@@ -102,7 +108,9 @@ static void parse(int argc, char **argv) {
     } else if (!strcmp(flag, "-n")) {
       options.steps = (int)integer(value, flag, INT_MAX);
       steps_set = 1;
-    } else if (!strcmp(flag, "--generation-length"))
+    } else if (!strcmp(flag, "--context-length"))
+      options.context = (int)integer(value, flag, INT_MAX);
+    else if (!strcmp(flag, "--generation-length"))
       options.generation_length = (int)integer(value, flag, INT_MAX);
     else if (!strcmp(flag, "-i") || !strcmp(flag, "--prompt"))
       options.prompt = value;
@@ -205,7 +213,7 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
     metrics.processed_tokens++;
     metrics.forward_passes++;
     if (echo_prompt && i + 1 < n && !options.no_text) {
-      safe_printf(decode(t, tokens[i + 1]));
+      print_token(t, tokens[i + 1]);
       fflush(stdout);
     }
     if (i + 1 < n && *position == options.steps) {
@@ -221,7 +229,7 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   for (;;) {
     int next = sample(sampler, logits);
     metrics.sampled_tokens++;
-    if (next == EOS_ID || next == EOT_ID) {
+    if (tokenizer_stop(t, next)) {
       metrics.stop_tokens++;
       metrics.stop_reason = "stop_token";
       return next;
@@ -233,7 +241,7 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       metrics.has_first_token = 1;
     }
     if (!options.no_text) {
-      safe_printf(decode(t, next));
+      print_token(t, next);
       fflush(stdout);
     }
     if (generation_limit >= 0 && output_count >= generation_limit) {
@@ -257,10 +265,12 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
   metrics.turns++;
   double start = monotonic_seconds();
   int n = 0;
-  int *tokens = tokenize(t, prompt ? prompt : "", 1, &n);
+  int *tokens = options.chat_template
+                    ? chat_prompt(t, options.system_prompt ? options.system_prompt : "", prompt ? prompt : "", 1, &n)
+                    : tokenize(t, prompt ? prompt : "", 1, &n);
   metrics.tokenization_s += monotonic_seconds() - start;
   int pos = 0;
-  run_sequence(t, s, tokens, n, &pos, options.generation_length, 1, start);
+  run_sequence(t, s, tokens, n, &pos, options.generation_length, !options.chat_template, start);
   if (!options.no_text)
     putchar('\n');
   metrics.inference_s += monotonic_seconds() - start;
@@ -273,8 +283,6 @@ static char *input_line(const char *guide, int *ok) {
   return read_text(stdin, 1, ok);
 }
 static void chat(Tokenizer *t, Sampler *s) {
-  if (t->vocab_size <= EOT_ID)
-    fail("chat requires the original LLaMA 3 vocabulary");
   int ok = 1, pos = 0;
   char *owned_system = NULL;
   const char *system = options.system_prompt;
@@ -296,32 +304,8 @@ static void chat(Tokenizer *t, Sampler *s) {
     }
     metrics.turns++;
     double start = monotonic_seconds();
-    int ns = 0, nu = 0;
-    int *st = NULL;
-    if (pos == 0)
-      st = tokenize(t, system, 0, &ns);
-    int *ut = tokenize(t, user, 0, &nu);
-    size_t count = checked_add(checked_add((size_t)ns, (size_t)nu), 32);
-    if (count > INT_MAX)
-      fail("chat prompt is too long");
-    int *tokens = memory_alloc(count, sizeof(int), MEM_PROMPT);
-    int n = 0;
-    if (pos == 0) {
-      const int header[] = {BOS_ID, 128006, 9125, 128007, 271};
-      for (size_t i = 0; i < 5; i++)
-        tokens[n++] = header[i];
-      for (int i = 0; i < ns; i++)
-        tokens[n++] = st[i];
-      tokens[n++] = EOT_ID;
-    }
-    const int uh[] = {128006, 882, 128007, 271};
-    for (size_t i = 0; i < 4; i++)
-      tokens[n++] = uh[i];
-    for (int i = 0; i < nu; i++)
-      tokens[n++] = ut[i];
-    const int ah[] = {EOT_ID, 128006, 78191, 128007, 271};
-    for (size_t i = 0; i < 5; i++)
-      tokens[n++] = ah[i];
+    int n;
+    int *tokens = chat_prompt(t, system, user, pos == 0, &n);
     metrics.tokenization_s += monotonic_seconds() - start;
     fputs("Assistant: ", stderr);
     int stop = run_sequence(t, s, tokens, n, &pos, -1, 0, start);
@@ -329,7 +313,7 @@ static void chat(Tokenizer *t, Sampler *s) {
       putchar('\n');
     metrics.inference_s += monotonic_seconds() - start;
     /* Cache the end-of-turn marker before consuming the next user template. */
-    if (stop >= 0 && pos < options.steps) {
+    if (stop == t->eot_id && pos < options.steps) {
       double tick = monotonic_seconds();
       engine_forward(&model, stop, pos++);
       double elapsed = monotonic_seconds() - tick;
@@ -339,9 +323,9 @@ static void chat(Tokenizer *t, Sampler *s) {
       metrics.forward_passes++;
     }
     memory_free(tokens);
-    memory_free(st);
-    memory_free(ut);
     memory_free(owned_user);
+    if (stop != t->eot_id)
+      break;
   }
   memory_free(owned_system);
 }
@@ -364,12 +348,13 @@ int main(int argc, char **argv) {
     fclose(file);
     options.prompt = owned_prompt;
   }
-  engine_load(&model, options.checkpoint);
+  engine_load_context(&model, options.checkpoint, options.context);
   if (!options.steps || options.steps > model.config.seq_len)
     options.steps = model.config.seq_len;
   Tokenizer t = {0};
   double start = monotonic_seconds();
   build_tokenizer(&t, options.tokenizer, model.config.vocab_size);
+  tokenizer_check_model(&t, &model.config);
   metrics.tokenizer_s = monotonic_seconds() - start;
   metrics.tokenizer_ready = 1;
   Sampler s = {0};

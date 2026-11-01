@@ -71,6 +71,39 @@ def create(root, shared=True, zero=False, stop=None):
     return root
 
 
+def upgrade_v3(root, *, epsilon=1e-5, theta=500000., scaling=False):
+    """Upgrade an already generated legacy fixture without ML dependencies."""
+    root = Path(root)
+    d, h, layers, heads, kvheads, vocab, seq = CONFIG
+    fp = (root/'fp32.bin').read_bytes()
+    shared = struct.unpack_from('<i', fp, 20)[0] > 0
+    def header(precision, gs):
+        data = bytearray(256)
+        struct.pack_into('<9I', data, 0, 0x616b3432, 3, *CONFIG)
+        struct.pack_into('<3I2fI3f3I4i', data, 36, precision, shared, gs, epsilon, theta,
+                         int(scaling), 32., 1., 4., 8192, seq, d//heads, 128000, 128001, 128009, 128008)
+        data[100:116] = b'synthetic-phase2'
+        return data
+    # The v0 unused frequency arrays precede an optional classifier.
+    before_tables = len(fp) - seq*(d//heads)*4 - (0 if shared else vocab*d*4)
+    payload = fp[28:before_tables] + fp[before_tables+seq*(d//heads)*4:]
+    (root/'fp32.bin').write_bytes(header(0, 0) + payload)
+    quant = (root/'int8.bin').read_bytes()
+    (root/'int8.bin').write_bytes(header(1, 2) + quant[256:])
+    original = (root/'tokenizer.bin').read_bytes()
+    data = bytearray(struct.pack('<4I7iI', 0x336b6f74, 2, vocab, 128000, 24,
+                                128000, 128001, 128009, 128008, 128006, 128007, 0))
+    offset = 4
+    for rank in range(vocab):
+        _, length = struct.unpack_from('<fi', original, offset)
+        offset += 8
+        data.extend(struct.pack('<fI', rank, length))
+        data.extend(original[offset:offset+length])
+        offset += length
+    (root/'tokenizer.bin').write_bytes(data)
+    return root
+
+
 if __name__ == '__main__':
     import sys
     create(sys.argv[1])

@@ -1,5 +1,8 @@
 # CPU inference baseline
 
+Historical Phase 1 record. See [phase2.md](phase2.md) for the current formats,
+conversion, tokenizer, context handling and compatibility status.
+
 README.md is intentionally empty. See audit.md for removals and provenance.
 
 ## Layout and ownership

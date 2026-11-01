@@ -104,6 +104,17 @@ static void validate_config(Config *p, int quantized, int gs) {
   if (p->dim % p->n_heads || p->n_heads % p->n_kv_heads || (p->dim / p->n_heads) % 2)
     fail("unsupported attention dimensions: dim must be divisible by heads, heads must be divisible by KV heads, head "
          "size must be even");
+  if (!isfinite(p->norm_eps) || p->norm_eps <= 0 || !isfinite(p->rope_theta) || p->rope_theta <= 1 ||
+      p->head_dim != p->dim / p->n_heads || p->max_seq_len != p->seq_len)
+    fail("invalid RMSNorm, RoPE theta, head dimension or context metadata");
+  if (p->rope_type != 0 && p->rope_type != 1)
+    fail("unsupported RoPE scaling type %d", p->rope_type);
+  if (!isfinite(p->rope_factor) || !isfinite(p->rope_low) || !isfinite(p->rope_high) || p->rope_factor < 1 ||
+      p->rope_low <= 0 || p->rope_high <= p->rope_low || p->rope_original <= 0)
+    fail("invalid RoPE scaling metadata");
+  if (p->format == 3 && (p->bos_id < 0 || p->bos_id >= p->vocab_size || p->eos_id < 0 || p->eos_id >= p->vocab_size ||
+                         p->eot_id < -1 || p->eot_id >= p->vocab_size || p->eom_id < -1 || p->eom_id >= p->vocab_size))
+    fail("invalid special token metadata");
   if (quantized && (gs <= 0 || gs > 131071 || p->dim % gs || p->hidden_dim % gs))
     fail("unsupported INT8 group size %d: must divide dim and hidden_dim and fit int32 accumulation", gs);
 }
@@ -119,7 +130,7 @@ static size_t tensor_bytes(size_t count, int quantized, int gs) {
 
 void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int *gs, int *fd, float **data,
                     size_t *bytes) {
-  _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(Config) == 28,
+  _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(int32_t) == 4 && offsetof(Config, format) == 28,
                  "checkpoint ABI requires 32-bit int/float and seven packed ints");
   const uint32_t endian = 1;
   if (*(const unsigned char *)&endian != 1)
@@ -136,6 +147,17 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
   if ((uintmax_t)st.st_size > SIZE_MAX || (uintmax_t)st.st_size > PTRDIFF_MAX)
     fail("checkpoint '%s' is too large for this address space", path);
   *bytes = (size_t)st.st_size;
+  memset(p, 0, sizeof(*p));
+  p->norm_eps = 1e-5f;
+  p->rope_theta = ROPE_THETA;
+  p->rope_factor = 1;
+  p->rope_low = 1;
+  p->rope_high = 4;
+  p->rope_original = 8192;
+  p->bos_id = BOS_ID;
+  p->eos_id = EOS_ID;
+  p->eot_id = EOT_ID;
+  p->eom_id = -1;
   unsigned char header[256];
   size_t header_size = quantized ? 256 : 28;
   ssize_t got = pread(*fd, header, header_size, 0);
@@ -143,25 +165,66 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
     fail("cannot read checkpoint header '%s': %s", path, got < 0 ? strerror(errno) : "truncated read");
   uint32_t magic;
   memcpy(&magic, header, 4);
-  if (quantized) {
+  if (magic == 0x616b3432) {
+    if (*bytes < 256 || pread(*fd, header, 256, 0) != 256)
+      fail("truncated versioned checkpoint header");
+    header_size = 256;
     int version;
     memcpy(&version, header + 4, 4);
-    if (magic != 0x616b3432 || version != 2)
-      fail("unsupported INT8 checkpoint '%s': expected ak42 version 2", path);
-    memcpy(p, header + 8, sizeof(*p));
-    *shared = header[36];
-    memcpy(gs, header + 37, 4);
-    if (*shared > 1)
+    if (version == 3) {
+      int precision;
+      memcpy(&precision, header + 36, 4);
+      if (precision < 0 || precision > 1)
+        fail("unsupported checkpoint precision %d", precision);
+      if (precision != quantized)
+        fail("checkpoint precision requires %s executable", precision == 0 ? "run" : "runq");
+      memcpy(p, header + 8, 28);
+      memcpy(shared, header + 40, 4);
+      memcpy(gs, header + 44, 4);
+      memcpy(&p->norm_eps, header + 48, 4);
+      memcpy(&p->rope_theta, header + 52, 4);
+      memcpy(&p->rope_type, header + 56, 4);
+      memcpy(&p->rope_factor, header + 60, 4);
+      memcpy(&p->rope_low, header + 64, 4);
+      memcpy(&p->rope_high, header + 68, 4);
+      memcpy(&p->rope_original, header + 72, 4);
+      memcpy(&p->max_seq_len, header + 76, 4);
+      memcpy(&p->head_dim, header + 80, 4);
+      memcpy(&p->bos_id, header + 84, 4);
+      memcpy(&p->eos_id, header + 88, 4);
+      memcpy(&p->eot_id, header + 92, 4);
+      memcpy(&p->eom_id, header + 96, 4);
+      memcpy(p->name, header + 100, 128);
+      if (!memchr(p->name, 0, 128))
+        fail("unterminated model name");
+      for (int i = 228; i < 256; i++)
+        if (header[i])
+          fail("unsupported nonzero reserved checkpoint metadata");
+      if (!quantized && *gs != 0)
+        fail("FP32 checkpoint must have group size zero");
+    } else if (version == 2 && quantized) {
+      memcpy(p, header + 8, 28);
+      *shared = header[36];
+      memcpy(gs, header + 37, 4);
+    } else
+      fail("unsupported checkpoint version %d for this executable", version);
+    p->format = version;
+    if (*shared < 0 || *shared > 1)
       fail("invalid classifier flag in '%s'", path);
   } else {
-    if (magic == 0x616b3432)
-      fail("unsupported FP32 checkpoint '%s': use legacy --version 0 export", path);
-    memcpy(p, header, sizeof(*p));
+    if (quantized)
+      fail("unsupported INT8 checkpoint: expected ak42 version 2 or 3");
+    memcpy(p, header, 28);
     if (p->vocab_size == INT_MIN)
       fail("invalid vocabulary size in '%s'", path);
     *shared = p->vocab_size > 0;
     p->vocab_size = abs(p->vocab_size);
     *gs = 0;
+  }
+  p->shared = *shared;
+  if (p->format != 3) {
+    p->max_seq_len = p->seq_len;
+    p->head_dim = p->n_heads > 0 ? p->dim / p->n_heads : 0;
   }
   validate_config(p, quantized, *gs);
   size_t d = p->dim, h = p->hidden_dim, l = p->n_layers;
@@ -174,12 +237,14 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
                      checked_mul(d, h), checked_mul(h, d),  checked_mul(d, h)};
   for (size_t i = 0; i < 7; i++)
     needed = checked_add(needed, checked_mul(l, tensor_bytes(shapes[i], quantized, *gs)));
-  if (!quantized)
+  if (!quantized && p->format == 0)
     needed = checked_add(needed, checked_mul(checked_mul((size_t)p->seq_len, d / p->n_heads), sizeof(float)));
   if (!*shared)
     needed = checked_add(needed, tensor_bytes(embedding, quantized, *gs));
   if (needed > *bytes)
     fail("truncated checkpoint '%s': need %zu bytes, found %zu", path, needed, *bytes);
+  if (p->format == 3 && needed != *bytes)
+    fail("version 3 checkpoint has unexpected trailing bytes");
   if (needed != *bytes)
     LOG(LOG_WARN, "checkpoint '%s' has %zu trailing bytes", path, *bytes - needed);
   /* Validate allocation extents too, before making the read-only mapping. */

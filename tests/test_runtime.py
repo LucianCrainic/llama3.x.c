@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-from fixtures import CONFIG, create
+from fixtures import CONFIG, create, upgrade_v3
 
 BUILD = Path(sys.argv.pop(1)).resolve()
 
@@ -63,6 +63,49 @@ class RuntimeTests(unittest.TestCase):
                 result = subprocess.run([str(BUILD/unit),flag],capture_output=True,text=True)
                 self.assertEqual(result.returncode,1)
                 self.assertIn('overflow',result.stderr)
+
+    @unittest.skipUnless('-DLLAMA_PCRE2' in (BUILD/'config').read_text(), 'new tokenizer requires PCRE2')
+    def test_v3_metadata_context_and_stopping(self):
+        fixture = upgrade_v3(create(self.root/'v3'))
+        for engine in ('run', 'runq'):
+            _, report = self.execute(engine, '--context-length', '8', '--generation-length', '3', fixture=fixture)
+            self.assertEqual(report['model']['checkpoint_format'], 3)
+            config = report['model']['configuration']
+            self.assertEqual(config['seq_len'], 8)
+            self.assertEqual(config['max_position_embeddings'], 32)
+            self.assertEqual(config['head_dim'], 2)
+            self.assertTrue(config['shared_embeddings'])
+            self.assertEqual(report['memory_bytes']['kv_cache_allocated_peak'], 2*CONFIG[2]*8*2*4)
+            self.execute(engine, '--context-length', '33', fixture=fixture, success=False)
+            self.execute(engine, '--context-length', '-1', fixture=fixture, success=False)
+            _, report = self.execute(engine, '--benchmark', '--chat-template', '--generation-length', '1', fixture=fixture)
+            self.assertTrue(report['parameters']['chat_template'])
+        # Force each of EOS, EOT and EOM as the first sampled token.
+        for stop in (128001, 128009, 128008):
+            fixture = upgrade_v3(create(self.root/f'v3-stop-{stop}', shared=False, stop='first'))
+            if stop != 128001:
+                for filename, item_size in [('fp32.bin', 4), ('int8.bin', 1)]:
+                    data = bytearray((fixture/filename).read_bytes())
+                    classifier_bytes = CONFIG[5]*CONFIG[0]*item_size
+                    if filename == 'int8.bin':
+                        # INT8 matrix data is followed by per-group scales.
+                        scale_bytes = CONFIG[5]*CONFIG[0]//2*4
+                        start = len(data) - classifier_bytes - scale_bytes
+                        scale_start = len(data) - scale_bytes
+                        for base, width in ((start, CONFIG[0]), (scale_start, CONFIG[0]//2*4)):
+                            data[base+stop*width:base+(stop+1)*width] = data[base+128001*width:base+128002*width]
+                            data[base+128001*width:base+128002*width] = bytes(width)
+                    else:
+                        start = len(data) - classifier_bytes
+                        width = CONFIG[0]*4
+                        data[start+stop*width:start+(stop+1)*width] = data[start+128001*width:start+128002*width]
+                        data[start+128001*width:start+128002*width] = bytes(width)
+                    (fixture/filename).write_bytes(data)
+            for engine in ('run', 'runq'):
+                _, report = self.execute(engine, '--generation-length', '5', fixture=fixture)
+                self.assertEqual(report['tokens']['generated_output'], 0)
+                self.assertEqual(report['tokens']['sampled_stop'], 1)
+                self.assertEqual(report['stop_reason'], 'stop_token')
 
     def test_generation_accounting(self):
         for engine in ('run','runq'):

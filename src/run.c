@@ -109,8 +109,8 @@ static void memory_map_weights(TransformerWeights *w, const Config *p, const flo
   ptr += n_layers * (size_t)p->dim * p->hidden_dim;
   w->rms_final_weight = ptr;
   ptr += p->dim;
-  ptr += (size_t)p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
-  ptr += (size_t)p->seq_len * head_size / 2; // skip what used to be freq_cis_imag (for RoPE)
+  if (p->format == 0)
+    ptr += (size_t)p->seq_len * head_size; // legacy unused RoPE tables
   w->wcls = shared_weights ? w->token_embedding_table : ptr;
 }
 
@@ -119,7 +119,7 @@ static void read_checkpoint(const char *path, Config *config, TransformerWeights
   int shared, gs;
   double start = monotonic_seconds();
   checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size);
-  memory_map_weights(weights, config, (void *)((char *)*data + 28), shared);
+  memory_map_weights(weights, config, (void *)((char *)*data + (config->format == 3 ? 256 : 28)), shared);
   metrics.checkpoint_s = monotonic_seconds() - start;
   metrics.checkpoint_ready = 1;
 }
@@ -179,7 +179,7 @@ static float *forward(Transformer *transformer, int token, int pos) {
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
 
     // attention rmsnorm
-    rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
+    rmsnorm_eps(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
 
     // key and value point to the kv cache
     size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -191,25 +191,7 @@ static float *forward(Transformer *transformer, int token, int pos) {
     matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
     matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
 
-    // RoPE relative positional encoding: complex-valued rotate q and k in each head
-    for (int i = 0; i < p->n_heads; i++) {
-      for (int j = 0; j < head_size; j += 2) {
-        float freq = 1.0f / powf(ROPE_THETA, (float)j / (float)head_size);
-        float val = pos * freq;
-        float fcr = cosf(val);
-        float fci = sinf(val);
-        float q0 = s->q[i * head_size + j];
-        float q1 = s->q[i * head_size + j + 1];
-        s->q[i * head_size + j] = q0 * fcr - q1 * fci;
-        s->q[i * head_size + j + 1] = q0 * fci + q1 * fcr;
-        if (i < p->n_kv_heads) {
-          float k0 = s->k[i * head_size + j];
-          float k1 = s->k[i * head_size + j + 1];
-          s->k[i * head_size + j] = k0 * fcr - k1 * fci;
-          s->k[i * head_size + j + 1] = k0 * fci + k1 * fcr;
-        }
-      }
-    }
+    apply_rope(s->q, s->k, p, pos);
 
     // multihead attention. iterate over all heads
     int h;
@@ -262,7 +244,7 @@ static float *forward(Transformer *transformer, int token, int pos) {
     }
 
     // ffn rmsnorm
-    rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
+    rmsnorm_eps(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // first calculate self.w1(x) and self.w3(x)
@@ -289,7 +271,7 @@ static float *forward(Transformer *transformer, int token, int pos) {
   }
 
   // final rmsnorm
-  rmsnorm(x, x, w->rms_final_weight, dim);
+  rmsnorm_eps(x, x, w->rms_final_weight, dim, p->norm_eps);
 
   // classifier into logits
   matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
@@ -298,12 +280,19 @@ static float *forward(Transformer *transformer, int token, int pos) {
 
 /* CLI adapter: each executable links exactly one numerical implementation. */
 void engine_load(Model *model, const char *path) {
+  engine_load_context(model, path, 0);
+}
+void engine_load_context(Model *model, const char *path, int context) {
   Transformer *t = memory_alloc(1, sizeof(*t), MEM_METADATA);
   t->fd = -1;
   model->implementation = t;
   read_checkpoint(path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
   model->config = t->config;
   model->mapped_bytes = t->file_size;
+  if (context < 0 || context > t->config.seq_len)
+    fail("requested context exceeds checkpoint context");
+  t->config.seq_len = context ? context : (t->config.seq_len < 4096 ? t->config.seq_len : 4096);
+  model->config = t->config;
   double start = monotonic_seconds();
   malloc_run_state(&t->state, &t->config);
   metrics.runtime_s = monotonic_seconds() - start;
