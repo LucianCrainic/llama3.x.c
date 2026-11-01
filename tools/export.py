@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from model import ModelArgs, Transformer
+from model import ModelArgs, Transformer, precompute_freqs_cis
 
 # -----------------------------------------------------------------------------
 # common utilities
@@ -36,14 +36,14 @@ from model import ModelArgs, Transformer
 def serialize_fp32(file, tensor):
     """writes one fp32 tensor to file that is open in wb mode"""
     d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
-    b = struct.pack(f"{len(d)}f", *d)
+    b = d.astype("<f4", copy=False).tobytes()
     file.write(b)
 
 
 def serialize_int8(file, tensor):
     """writes one int8 tensor to file that is open in wb mode"""
     d = tensor.detach().cpu().view(-1).numpy().astype(np.int8)
-    b = struct.pack(f"{len(d)}b", *d)
+    b = d.tobytes()
     file.write(b)
 
 
@@ -74,11 +74,75 @@ def quantize_q80(w, group_size):
     return int8val, scale, maxerr
 
 
+def validate_model(model):
+    p = model.params
+    kv = p.n_kv_heads or p.n_heads
+    if p.hidden_dim is None:
+        p.hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
+    if min(p.dim, p.hidden_dim, p.n_layers, p.n_heads, kv, p.vocab_size, p.max_seq_len) <= 0:
+        raise ValueError("architecture dimensions must be positive")
+    if p.dim % p.n_heads or p.n_heads % kv or (p.dim // p.n_heads) % 2:
+        raise ValueError("unsupported attention dimensions")
+    if not np.isfinite(p.norm_eps) or p.norm_eps <= 0 or not np.isfinite(p.rope_theta) or p.rope_theta <= 1:
+        raise ValueError("invalid normalization or RoPE metadata")
+    expected = {"tok_embeddings.weight": (p.vocab_size, p.dim),
+                "output.weight": (p.vocab_size, p.dim), "norm.weight": (p.dim,)}
+    kd = p.dim // p.n_heads * kv
+    shapes = {"attention_norm.weight": (p.dim,), "ffn_norm.weight": (p.dim,),
+              "attention.wq.weight": (p.dim, p.dim), "attention.wk.weight": (kd, p.dim),
+              "attention.wv.weight": (kd, p.dim), "attention.wo.weight": (p.dim, p.dim),
+              "feed_forward.w1.weight": (p.hidden_dim, p.dim),
+              "feed_forward.w2.weight": (p.dim, p.hidden_dim),
+              "feed_forward.w3.weight": (p.hidden_dim, p.dim)}
+    for i in range(p.n_layers):
+        expected.update({f"layers.{i}.{k}": v for k, v in shapes.items()})
+    state = model.state_dict()
+    for key, shape in expected.items():
+        if key not in state or tuple(state[key].shape) != shape:
+            raise ValueError(f"invalid tensor {key}: expected {shape}")
+        if not torch.isfinite(state[key]).all():
+            raise ValueError(f"nonfinite tensor {key}")
+    if p.tie_word_embeddings and not torch.equal(model.tok_embeddings.weight, model.output.weight):
+        raise ValueError("tied embedding metadata disagrees with output weights")
+
+
+def version3_header(model, precision, group_size):
+    p = model.params
+    scaling = p.rope_scaling or {}
+    kind = scaling.get("rope_type", scaling.get("type", "default"))
+    if kind not in ("default", "llama3"):
+        raise ValueError(f"unsupported RoPE type {kind}")
+    factor = scaling.get("factor", 1.0)
+    low, high = scaling.get("low_freq_factor", 1.0), scaling.get("high_freq_factor", 4.0)
+    original = scaling.get("original_max_position_embeddings", 8192)
+    if not all(np.isfinite(v) for v in (factor, low, high)) or factor < 1 or low <= 0 or high <= low or original <= 0:
+        raise ValueError("invalid RoPE scaling parameters")
+    for value in (p.bos_token_id, p.eos_token_id):
+        if not 0 <= value < p.vocab_size:
+            raise ValueError("invalid BOS/EOS metadata")
+    for value in (p.eot_token_id, p.eom_token_id):
+        if not -1 <= value < p.vocab_size:
+            raise ValueError("invalid EOT/EOM metadata")
+    header = bytearray(256)
+    struct.pack_into("<9I", header, 0, 0x616b3432, 3, p.dim, p.hidden_dim, p.n_layers,
+                     p.n_heads, p.n_kv_heads or p.n_heads, p.vocab_size, p.max_seq_len)
+    struct.pack_into("<3I2fI3f3I4i", header, 36, precision,
+                     int(torch.equal(model.tok_embeddings.weight, model.output.weight)), group_size,
+                     p.norm_eps, p.rope_theta, int(kind == "llama3"), factor, low, high,
+                     original, p.max_seq_len, p.dim // p.n_heads,
+                     p.bos_token_id, p.eos_token_id, p.eot_token_id, p.eom_token_id)
+    name = p.model_name.encode("utf-8")
+    if len(name) > 127:
+        raise ValueError("model name must fit 127 UTF-8 bytes")
+    header[100:100+len(name)] = name
+    return header
+
+
 # -----------------------------------------------------------------------------
 # legacy
 
 
-def legacy_export(model, filepath):
+def legacy_export(model, filepath, version=0):
     """Original export of llama2.c bin files, i.e. version v0"""
     out_file = open(filepath, "wb")
 
@@ -99,7 +163,7 @@ def legacy_export(model, filepath):
         signed_vocab_size,
         p.max_seq_len,
     )
-    out_file.write(header)
+    out_file.write(version3_header(model, 0, 0) if version == 3 else header)
 
     # next write out the embedding weights
     serialize_fp32(out_file, model.tok_embeddings.weight)
@@ -128,8 +192,10 @@ def legacy_export(model, filepath):
     # final rmsnorm
     serialize_fp32(out_file, model.norm.weight)
     # freqs_cis
-    serialize_fp32(out_file, model.freqs_cos[: p.max_seq_len])
-    serialize_fp32(out_file, model.freqs_sin[: p.max_seq_len])
+    if version == 0:
+        cos, sin = precompute_freqs_cis(p.dim // p.n_heads, p.max_seq_len, p.rope_theta)
+        serialize_fp32(out_file, cos)
+        serialize_fp32(out_file, sin)
 
     # final classifier weights
     if not shared_classifier:
@@ -203,7 +269,7 @@ def version1_export(model, filepath):
     print(f"wrote {filepath}")
 
 
-def version2_export(model, filepath, group_size=64):
+def version2_export(model, filepath, group_size=64, version=2):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
     That is:
@@ -211,8 +277,8 @@ def version2_export(model, filepath, group_size=64):
     - all other tensors (the rmsnorm params) are kept and exported in fp32
     - quantization is done in groups of group_size to reduce the effects of any outliers
     """
-    version = 2
-
+    if group_size <= 0 or group_size > 131071:
+        raise ValueError("group size must be 1..131071")
     # let's first do some validation for this export type
     while model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
         group_size //= 2
@@ -231,6 +297,8 @@ def version2_export(model, filepath, group_size=64):
     if not shared_classifier:
         weights.append(model.output.weight)
     for i, w in enumerate(weights):
+        if w.numel() % 4:
+            raise ValueError(f"weight {i} requires aligned FP32 scales (element count must be divisible by 4)")
         assert (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
@@ -263,6 +331,9 @@ def version2_export(model, filepath, group_size=64):
     pad = 256 - out_file.tell()  # pad rest with zeros; tell returns current pos
     assert pad >= 0
     out_file.write(b"\0" * pad)
+    if version == 3:
+        out_file.seek(0)
+        out_file.write(version3_header(model, 1, group_size))
     # now that the header is done, let's write out the model
 
     # first let's write out all the params that we are keeping in fp32: the norms
@@ -401,7 +472,11 @@ def hf_export(llama_model, filepath, group_size=64, dtype=torch.float32):
         max_position_embeddings=max_position_embeddings,
         rms_norm_eps=rms_norm_eps,
         tie_word_embeddings=_embeddings_are_tied,
-        # Manual
+        rope_theta=llama_model.params.rope_theta,
+        rope_scaling=llama_model.params.rope_scaling,
+        bos_token_id=llama_model.params.bos_token_id,
+        eos_token_id=llama_model.params.eos_token_id,
+        # Text-only architecture
         architectures=["LlamaForCausalLM"],
         hidden_act="silu",
     )
@@ -442,7 +517,9 @@ def load_meta_model(model_path):
         print(params)
 
     model_paths = sorted(list(Path(model_path).glob("consolidated.*.pth")))
-    models = [torch.load(p, map_location="cpu") for p in model_paths]
+    if not model_paths:
+        raise ValueError("no consolidated.*.pth checkpoints found")
+    models = [torch.load(p, map_location="cpu", weights_only=True) for p in model_paths]
 
     def concat_weights(models):
         state_dict = {}
@@ -475,10 +552,18 @@ def load_meta_model(model_path):
     config.norm_eps = params["norm_eps"]
 
     config.vocab_size = state_dict["tok_embeddings.weight"].shape[0]
-    config.max_seq_len = 2048
+    config.hidden_dim = state_dict["layers.0.feed_forward.w1.weight"].shape[0]
+    config.rope_theta = params.get("rope_theta", 500000.0)
+    config.rope_scaling = params.get("rope_scaling")
+    if params.get("use_scaled_rope") and not config.rope_scaling:
+        raise ValueError("Meta use_scaled_rope requires explicit rope_scaling metadata; use an HF config/export")
+    config.max_seq_len = params.get("max_seq_len", params.get("max_position_embeddings", 8192))
+    config.tie_word_embeddings = params.get("tie_word_embeddings", False)
+    config.model_name = Path(model_path).name
 
     # create a new Transformer object and set weights
-    model = Transformer(config)
+    with torch.device("meta"):
+        model = Transformer(config)
 
     model.tok_embeddings.weight = nn.Parameter(state_dict["tok_embeddings.weight"])
     model.norm.weight = nn.Parameter(state_dict["norm.weight"])
@@ -512,7 +597,7 @@ def load_meta_model(model_path):
         )
 
     # final classifier
-    model.output.weight = nn.Parameter(state_dict["output.weight"])
+    model.output.weight = nn.Parameter(state_dict.get("output.weight", state_dict["tok_embeddings.weight"]))
     model.eval()
     return model
 
@@ -520,14 +605,25 @@ def load_meta_model(model_path):
 def load_hf_model(model_path):
 
     try:
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoConfig, AutoModelForCausalLM
     except ImportError:
         print("Error: transformers package is required to load huggingface models")
         print("Please run `pip install transformers` to install it")
         return None
 
-    # load HF model
-    hf_model = AutoModelForCausalLM.from_pretrained(model_path)
+    if not Path(model_path).is_dir():
+        raise ValueError("HF conversion requires a local snapshot directory")
+    hc = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
+    if getattr(hc, "quantization_config", None):
+        raise ValueError("external quantization formats cannot be imported; provide original FP32/FP16/BF16 weights")
+    if hc.model_type != "llama" or hc.hidden_act != "silu" or getattr(hc, "attention_bias", False) or getattr(hc, "mlp_bias", False):
+        raise ValueError("only bias-free text-only Llama with SwiGLU is supported")
+    if (getattr(hc, "head_dim", None) or hc.hidden_size // hc.num_attention_heads) != hc.hidden_size // hc.num_attention_heads:
+        raise ValueError("independent head_dim is not supported")
+    if getattr(hc, "partial_rotary_factor", 1.0) != 1.0:
+        raise ValueError("partial rotary embeddings are not supported")
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path, config=hc, torch_dtype=torch.float32,
+        local_files_only=True, attn_implementation="eager", trust_remote_code=False)
     hf_dict = hf_model.state_dict()
 
     # convert LlamaConfig to ModelArgs
@@ -535,14 +631,35 @@ def load_hf_model(model_path):
     config.dim = hf_model.config.hidden_size
     config.n_layers = hf_model.config.num_hidden_layers
     config.n_heads = hf_model.config.num_attention_heads
-    config.n_kv_heads = hf_model.config.num_attention_heads
+    config.n_kv_heads = hf_model.config.num_key_value_heads
     config.vocab_size = hf_model.config.vocab_size
     config.hidden_dim = hf_model.config.intermediate_size
     config.norm_eps = hf_model.config.rms_norm_eps
     config.max_seq_len = hf_model.config.max_position_embeddings
 
-    # create a new Transformer object and set weights
-    model = Transformer(config)
+    config.rope_theta = hc.rope_theta
+    config.rope_scaling = hc.rope_scaling
+    config.tie_word_embeddings = hc.tie_word_embeddings
+    config.bos_token_id = hc.bos_token_id
+    eos = hc.eos_token_id
+    config.eos_token_id = eos[0] if isinstance(eos, list) else eos
+    tokenizer_path = Path(model_path) / "tokenizer.json"
+    specials = {}
+    if tokenizer_path.exists():
+        tokenizer_data = json.loads(tokenizer_path.read_text())
+        specials = {t["content"]: t["id"] for t in tokenizer_data["added_tokens"] if t["special"]}
+    elif hc.vocab_size >= 128000:
+        raise ValueError("real Llama conversion requires tokenizer.json for special-token metadata")
+    config.bos_token_id = specials.get("<|begin_of_text|>", config.bos_token_id)
+    config.eos_token_id = specials.get("<|end_of_text|>", config.eos_token_id)
+    config.eot_token_id = specials.get("<|eot_id|>", -1)
+    config.eom_token_id = specials.get("<|eom_id|>", -1)
+    source = Path(str(model_path))
+    cached_repo = source.parent.parent.name
+    config.model_name = cached_repo[len("models--"):].replace("--", "/") if cached_repo.startswith("models--") else source.name
+    # Allocate shape-only modules; imported tensors supply all actual storage.
+    with torch.device("meta"):
+        model = Transformer(config)
 
     model.tok_embeddings.weight = nn.Parameter(hf_dict["model.embed_tokens.weight"])
     model.norm.weight = nn.Parameter(hf_dict["model.norm.weight"])
@@ -564,7 +681,7 @@ def load_hf_model(model_path):
             permute_reverse(hf_dict[f"model.layers.{i}.self_attn.q_proj.weight"])
         )
         layer.attention.wk.weight = nn.Parameter(
-            permute_reverse(hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"])
+            permute_reverse(hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"], config.n_kv_heads, config.dim // config.n_heads * config.n_kv_heads)
         )
         layer.attention.wv.weight = nn.Parameter(
             hf_dict[f"model.layers.{i}.self_attn.v_proj.weight"]
@@ -604,14 +721,20 @@ def model_export(model, filepath, version, dtype=torch.float32):
     v2: int8 quantized Q8_0 export, similar to llama.cpp, in groups
     # TODO: add dtype export support for other versions (?)
     """
-    if version == 0:
+    validate_model(model)
+    if version in (0, 1, 2) and (model.params.rope_scaling or model.params.rope_theta != 500000.0 or model.params.norm_eps != 1e-5):
+        raise ValueError("legacy formats cannot represent model metadata; use --version 3")
+    if version == 3:
+        version3_header(model, 0, 0)  # validate all metadata before opening output
+        legacy_export(model, filepath, version=3)
+    elif version == 0:
         legacy_export(model, filepath)
     elif version == 1:
         version1_export(model, filepath)
     elif version == 2:
         version2_export(model, filepath)
     elif version == -1:
-        hf_export(model, filepath, dtype)
+        hf_export(model, filepath, dtype=dtype)
     else:
         raise ValueError(f"unknown version {version}")
 
@@ -653,11 +776,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("filepath", type=str, help="the output filepath")
     parser.add_argument(
-        "--version", default=0, type=int, help="the version to export with"
+        "--version", default=3, type=int, help="the version to export with"
     )
     parser.add_argument(
         "--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32"
     )
+    parser.add_argument("--int8", action="store_true", help="Q8_0 payload for version 3")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
@@ -676,4 +800,13 @@ if __name__ == "__main__":
         parser.error("Can't load input model!")
 
     # export
-    model_export(model, args.filepath, args.version, args.dtype)
+    if args.int8:
+        if args.version != 3:
+            parser.error("--int8 requires --version 3")
+        validate_model(model)
+        version3_header(model, 1, 64)
+        version2_export(model, args.filepath, version=3)
+    else:
+        if args.dtype != "fp32" and args.version != -1:
+            parser.error("C checkpoints require --dtype fp32 (or --int8)")
+        model_export(model, args.filepath, args.version, dtype)

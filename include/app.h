@@ -3,7 +3,7 @@
 #include "runtime.h"
 typedef struct {
   const char *checkpoint, *tokenizer, *prompt, *prompt_file, *mode, *system_prompt, *json;
-  int steps, generation_length, benchmark, no_text;
+  int chat_template, context, steps, generation_length, benchmark, no_text;
   unsigned long long seed;
   float temperature, topp;
 } Options;

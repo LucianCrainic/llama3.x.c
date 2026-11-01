@@ -5,9 +5,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
-/* On-disk v0/v2 architecture. No implicit padding or extended RoPE metadata. */
+/* First seven fields are the legacy disk dimensions; never serialize sizeof(Config). */
 typedef struct {
   int dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len;
+  int format, max_seq_len, shared, head_dim;
+  float norm_eps, rope_theta, rope_factor, rope_low, rope_high;
+  int rope_type, rope_original;
+  int bos_id, eos_id, eot_id, eom_id;
+  char name[128];
 } Config;
 
 enum { BOS_ID = 128000, EOS_ID = 128001, EOT_ID = 128009 };
@@ -47,6 +52,9 @@ double monotonic_seconds(void);
 void checkpoint_map(const char *path, int quantized, Config *config, int *shared, int *group_size, int *fd,
                     float **data, size_t *bytes);
 void rmsnorm(float *out, const float *x, const float *weight, int size);
+void rmsnorm_eps(float *out, const float *x, const float *weight, int size, float epsilon);
+float rope_frequency(const Config *config, int pair_dimension);
+void apply_rope(float *query, float *key, const Config *config, int position);
 void softmax(float *x, int size);
 
 typedef struct {
@@ -55,6 +63,7 @@ typedef struct {
   size_t mapped_bytes;
 } Model;
 void engine_load(Model *model, const char *path);
+void engine_load_context(Model *model, const char *path, int context);
 float *engine_forward(Model *model, int token, int position);
 void engine_free(Model *model);
 const char *engine_precision(void);
@@ -63,19 +72,28 @@ int engine_group_size(void);
 typedef struct {
   char *str;
   int id;
+  size_t length;
 } TokenIndex;
 typedef struct {
   char **vocab;
   float *vocab_scores;
   TokenIndex *sorted_vocab;
   int vocab_size;
+  int version, base_tokens, bos_id, eos_id, eot_id, eom_id, start_header_id, end_header_id;
+  int *lengths;
+  void *regex;
+  char *chat_prefix;
   unsigned int max_token_length;
   unsigned char byte_pieces[512];
 } Tokenizer;
 void build_tokenizer(Tokenizer *t, const char *path, int vocab_size);
 void free_tokenizer(Tokenizer *t);
+void tokenizer_check_model(const Tokenizer *t, const Config *p);
+int tokenizer_stop(const Tokenizer *t, int token);
+int *chat_prompt(Tokenizer *t, const char *system, const char *user, int first, int *count);
 const char *decode(Tokenizer *t, int token);
 void safe_printf(const char *piece);
+void print_token(Tokenizer *t, int token);
 /* tokens must hold strlen(text)+2 elements (at most one token per byte + BOS/EOS). */
 void encode(Tokenizer *t, const char *text, int8_t bos, int8_t eos, int *tokens, int *count);
 

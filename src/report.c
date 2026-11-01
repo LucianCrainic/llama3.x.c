@@ -7,6 +7,9 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef __linux__
 #include <sched.h>
 #endif
@@ -108,18 +111,39 @@ void write_report(void) {
   string(f, options.checkpoint);
   fputs(",\n    \"precision\": ", f);
   string(f, engine_precision());
-  fprintf(f, ",\n    \"checkpoint_format\": %d,\n    \"quantization_group_size\": %d,\n    \"configuration\": ",
-          !strcmp(engine_precision(), "fp32") ? 0 : 2, engine_group_size());
+  fputs(",\n    \"checkpoint_format\": ", f);
+  if (metrics.checkpoint_ready)
+    fprintf(f, "%d", model.config.format);
+  else
+    fputs("null", f);
+  fprintf(f, ",\n    \"quantization_group_size\": %d,\n    \"configuration\": ", engine_group_size());
   if (metrics.checkpoint_ready) {
     Config *p = &model.config;
     fprintf(f,
             "{\"dim\": %d, \"hidden_dim\": %d, \"n_layers\": %d, \"n_heads\": %d, \"n_kv_heads\": %d, \"vocab_size\": "
-            "%d, \"seq_len\": %d, \"rope_theta\": 500000, \"rms_norm_epsilon\": 0.00001}",
-            p->dim, p->hidden_dim, p->n_layers, p->n_heads, p->n_kv_heads, p->vocab_size, p->seq_len);
+            "%d, \"seq_len\": %d, \"max_position_embeddings\": %d, \"head_dim\": %d, \"rope_theta\": %.9g, "
+            "\"rms_norm_epsilon\": %.9g, \"shared_embeddings\": %s, \"rope_type\": \"%s\", "
+            "\"rope_factor\": %.9g, \"rope_low_freq_factor\": %.9g, \"rope_high_freq_factor\": %.9g, "
+            "\"rope_original_context\": %d, \"bos_id\": %d, \"eos_id\": %d, \"eot_id\": %d, \"eom_id\": %d}",
+            p->dim, p->hidden_dim, p->n_layers, p->n_heads, p->n_kv_heads, p->vocab_size, p->seq_len, p->max_seq_len,
+            p->head_dim, p->rope_theta, p->norm_eps, p->shared ? "true" : "false", p->rope_type ? "llama3" : "default",
+            p->rope_factor, p->rope_low, p->rope_high, p->rope_original, p->bos_id, p->eos_id, p->eot_id, p->eom_id);
+    fputs(",\n    \"name\": ", f);
+    string(f, p->name[0] ? p->name : NULL);
+    /* Counts refer to stored model parameters, excluding legacy RoPE tables and
+     * quantization scales; a tied classifier is counted once. */
+    uint64_t d = p->dim, h = p->hidden_dim, l = p->n_layers, kv = (uint64_t)p->head_dim * p->n_kv_heads;
+    uint64_t count =
+        (uint64_t)p->vocab_size * d * (p->shared ? 1 : 2) + (2 * l + 1) * d + l * (2 * d * d + 2 * d * kv + 3 * d * h);
+    fprintf(f, ",\n    \"parameter_count\": %llu", (unsigned long long)count);
   } else
     fputs("null", f);
   fputs("\n  },\n  \"system\": {\n    \"os\": ", f);
   string(f, system_ok ? system.sysname : NULL);
+  fputs(",\n    \"hostname\": ", f);
+  string(f, system_ok ? system.nodename : NULL);
+  fputs(",\n    \"kernel\": ", f);
+  string(f, system_ok ? system.release : NULL);
   fputs(",\n    \"architecture\": ", f);
   string(f, system_ok ? system.machine : NULL);
   long cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -170,8 +194,15 @@ void write_report(void) {
 #else
   fputs(",\n    \"openmp\": false,\n    \"openmp_version\": null", f);
 #endif
+  fputs(",\n    \"openmp_max_threads\": ", f);
+#ifdef _OPENMP
+  fprintf(f, "%d", omp_get_max_threads());
+#else
+  fputs("1", f);
+#endif
   fputs("\n  },\n  \"parameters\": {\n    \"mode\": ", f);
   string(f, options.mode);
+  fprintf(f, ",\n    \"chat_template\": %s", options.chat_template ? "true" : "false");
   fprintf(f,
           ",\n    \"benchmark\": %s,\n    \"seed\": %llu,\n    \"temperature\": %.9g,\n    \"top_p\": %.9g,\n    "
           "\"max_forward_passes\": %d,\n    \"generation_length\": ",
