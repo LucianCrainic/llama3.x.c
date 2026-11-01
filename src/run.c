@@ -1,6 +1,7 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
 #include "kernels.h"
+#include "profile.h"
 #include "runtime.h"
 #include <math.h>
 #include <stdlib.h>
@@ -157,15 +158,15 @@ static float *forward(Transformer *transformer, int token, int pos) {
 
   // copy the token embedding into x
   const float *content_row = w->token_embedding_table + (size_t)token * dim;
-  memcpy(x, content_row, dim * sizeof(*x));
+  PROFILE(PHASE_EMBED, memcpy(x, content_row, dim * sizeof(*x)));
   // RoPE angles depend only on the position: compute them once for all layers
-  k_rope_table(p, pos, s->rope);
+  PROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, s->rope));
 
   // forward all the layers
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
 
     // attention rmsnorm
-    k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps);
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, p->norm_eps));
 
     // key and value point to the kv cache
     size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -173,34 +174,35 @@ static float *forward(Transformer *transformer, int token, int pos) {
     s->v = s->value_cache + loff + (size_t)pos * kv_dim;
 
     // qkv matmuls for this position, in one parallel region
-    k_matmul_qkv(s->q, s->k, s->v, s->xb, w->wq + l * dim * dim, w->wk + l * dim * kv_dim, w->wv + l * dim * kv_dim, dim,
-                 dim, kv_dim);
+    PROFILE(PHASE_QKV, k_matmul_qkv(s->q, s->k, s->v, s->xb, w->wq + l * dim * dim, w->wk + l * dim * kv_dim,
+                                    w->wv + l * dim * kv_dim, dim, dim, kv_dim));
 
-    k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size);
+    PROFILE(PHASE_ROPE, k_rope_apply(s->q, s->k, s->rope, p->n_heads, p->n_kv_heads, head_size));
 
     // multihead attention over positions 0..pos, output into xb
-    k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, &s->attention, p->n_heads,
-                p->n_kv_heads, head_size, p->seq_len, pos);
+    PROFILE(PHASE_ATTENTION, k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att,
+                                         &s->attention, p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos));
 
     // final matmul to get the output of the attention, with the residual connection back into x
-    k_matmul_add(x, s->xb, w->wo + l * dim * dim, dim, dim);
+    PROFILE(PHASE_WO, k_matmul_add(x, s->xb, w->wo + l * dim * dim, dim, dim));
 
     // ffn rmsnorm
-    k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps);
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, p->norm_eps));
 
     // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     // w1 and w3 share one pass that applies the SwiGLU non-linearity
-    k_matmul_swiglu(s->hb, s->xb, w->w1 + l * dim * hidden_dim, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
+    PROFILE(PHASE_W1_W3, k_matmul_swiglu(s->hb, s->xb, w->w1 + l * dim * hidden_dim, w->w3 + l * dim * hidden_dim,
+                                         dim, hidden_dim));
 
     // final matmul to get the output of the ffn, with the residual connection
-    k_matmul_add(x, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
+    PROFILE(PHASE_W2, k_matmul_add(x, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim));
   }
 
   // final rmsnorm
-  k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps);
+  PROFILE(PHASE_RMSNORM, k_rmsnorm(x, x, w->rms_final_weight, dim, p->norm_eps));
 
   // classifier into logits
-  k_matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+  PROFILE(PHASE_CLASSIFIER, k_matmul(s->logits, x, w->wcls, p->dim, p->vocab_size));
   return s->logits;
 }
 
