@@ -61,14 +61,25 @@ float rope_frequency(const Config *config, int pair_dimension);
 void apply_rope(float *query, float *key, const Config *config, int position);
 void softmax(float *x, int size);
 
+typedef enum { LOGITS_NONE, LOGITS_LAST, LOGITS_ALL } LogitsWanted;
+
 typedef struct {
   Config config;
   void *implementation;
   size_t mapped_bytes;
+  int max_batch; /* LLAMA_PREFILL_BATCH, capped at the allocated context. */
+  LogitsWanted prefill_logits;
 } Model;
 void engine_load(Model *model, const char *path);
 void engine_load_context(Model *model, const char *path, int context);
 float *engine_forward(Model *model, int token, int position);
+/* Append count tokens at pos0; the caller must have populated the prefix [0,pos0).
+ * count must be 1..engine_max_batch(), and the complete range must fit the context.
+ * LAST returns vocab floats, ALL returns count*vocab floats in row order, NONE
+ * returns NULL. Storage belongs to the model and is invalidated by the next forward.
+ * ALL is available irrespective of the CLI policy; its storage is allocated lazily. */
+float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want);
+int engine_max_batch(const Model *model);
 void engine_free(Model *model);
 const char *engine_precision(void);
 int engine_group_size(void);
@@ -122,6 +133,7 @@ typedef struct {
   double inference_s, end_to_end_s, ttft_s;
   size_t input_tokens, processed_tokens, output_tokens, forward_passes, decode_steps;
   size_t sampled_tokens, stop_tokens, turns;
+  size_t prefill_microbatches;
   int checkpoint_ready, tokenizer_ready, runtime_ready, inference_started;
   int has_first_token, completed;
   const char *stop_reason;

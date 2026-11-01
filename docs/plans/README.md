@@ -1,8 +1,16 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
-Plan date: 1 November 2026. Status: **planned**. No phase has started.
+Plan date: 1 November 2026. Status in this branch: **Track C in progress**;
+C1 is implemented and locally validated, with its real-model cluster gate pending.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
+
+Track C development starts from `develop` at `446b680` in a separate worktree,
+on `codex/prefill-c1-batch-api`, as requested on 1 November. It reuses the plan
+commit `35cb518` and F1 implementation `962dc11` by cherry-pick. It does not include
+Track A's topology/placement changes. This overrides the original branch-base
+convention in §6.6 for Track C; subsequent phases should reuse the shared F2/F3
+implementations rather than create another scheduler or campaign framework.
 
 This folder turns three features into phases that can each be implemented and reviewed
 on their own:
@@ -134,7 +142,7 @@ Milestone status:
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M1 | planned | — |
-| M2 | planned | — |
+| M2 | in progress (C1 local portion) | [C1 validation](../../prefill-c1-validation.md); A6 and C2/C3 gates still pending in this branch |
 | M3 | planned | — |
 | M4 | planned | — |
 | M5 | planned | — |

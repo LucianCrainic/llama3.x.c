@@ -10,7 +10,30 @@ The first implementation is a **reference** that calls today's single-token kern
 once per row. Its logits at the final position must be **bitwise** equal to the
 per-token path, so all later kernel phases have an exact oracle.
 
-Status: **planned**. Branch: `feature/prefill-c1-batch-api`.
+Status: **implemented, local gates pass; cluster gate pending**.
+Branch: `codex/prefill-c1-batch-api`, based on `develop` at `446b680` with F1
+reused from `962dc11`. See [validation](../../prefill-c1-validation.md).
+
+Implementation notes:
+
+- Both precision engines use layer-major, row-by-row execution. Decode retains
+  token-major execution; both orders call the same numerical layer helpers.
+- Existing activation buffers are sized for M rows. Fused SwiGLU does not need
+  the proposed `HB2`. Serial attention scratch is shared across rows and stays
+  bounded independently of M; C3 will introduce parallel batched attention.
+- M is capped at allocated context. `LOGITS_ALL` storage is allocated lazily
+  when requested through the API, regardless of the CLI policy, and is freed
+  with the model. `LOGITS_NONE` skips final normalization and the classifier.
+- `LLAMA_PREFILL_BATCH=1` keeps single-row execution, but prompt classifier
+  skipping also applies at this default. `LLAMA_PREFILL_LOGITS=all` restores
+  per-position classifier work for diagnostics.
+- JSON adds `parameters.prefill_batch` (effective capacity),
+  `parameters.prefill_logits`, and `prefill.microbatches`; existing token
+  accounting is unchanged. Chat EOT caching is explicitly profiled as decode.
+- `tests/prefill.c` checks bitwise logits, decode continuation, classifier calls,
+  invalid ranges, and allocation cleanup. The binary probe's `batch` mode and
+  `tools/compare_engines.py` provide an independent-build comparison gate.
+- F3's shared campaign script and the C1 cluster submission remain pending.
 
 ## 2. Depends on / unblocks
 

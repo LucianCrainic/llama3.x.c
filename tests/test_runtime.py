@@ -65,6 +65,99 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(result.returncode,1)
                 self.assertIn('overflow',result.stderr)
 
+    def test_prefill_bitwise_and_classifier_calls(self):
+        for shared in (True, False):
+            fixture = create(self.root/f'prefill-{shared}', shared=shared, seq_len=64)
+            for binary, filename, activations in (
+                ('test-prefill-fp32', 'fp32.bin', 'int8'),
+                ('test-prefill-int8', 'int8.bin', 'int8'),
+                ('test-prefill-int8', 'int8.bin', 'fp32'),
+            ):
+                for batch in (1, 2, 3, 7, 32):
+                    with self.subTest(shared=shared, binary=binary, activations=activations, batch=batch):
+                        result = subprocess.run([str(BUILD/binary), str(fixture/filename)],
+                                                capture_output=True, text=True, timeout=120,
+                                                env={**os.environ, 'LLAMA_PREFILL_BATCH': str(batch),
+                                                     'LLAMA_Q8_ACTIVATIONS': activations})
+                        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prefill_invalid_inputs_and_configuration(self):
+        for engine, binary, filename in (('run', 'test-prefill-fp32', 'fp32.bin'),
+                                          ('runq', 'test-prefill-int8', 'int8.bin')):
+            for value in ('0', '-1', '+1', ' 2', '2 ', '2x', '1.5', '2147483648', '9'*40):
+                _, data = self.execute(engine, success=False, env={'LLAMA_PREFILL_BATCH': value})
+                self.assertIn('LLAMA_PREFILL_BATCH', data['error'])
+            self.execute(engine, success=False, env={'LLAMA_PREFILL_LOGITS': 'none'})
+            _, data = self.execute(engine, '--context-length', '8', '--generation-length', '1',
+                                   env={'LLAMA_PREFILL_BATCH': '2147483647'})
+            self.assertEqual(data['parameters']['prefill_batch'], 8)
+            for case in ('null', 'zero', 'negative-count', 'large-count', 'negative-pos',
+                         'large-pos', 'context', 'token', 'negative-token', 'policy'):
+                result = subprocess.run([str(BUILD/binary), str(self.shared/filename), case],
+                                        capture_output=True, text=True,
+                                        env={**os.environ, 'LLAMA_PREFILL_BATCH': '7'})
+                self.assertEqual(result.returncode, 1, (case, result.stderr))
+                self.assertIn('[ERROR]', result.stderr)
+                self.assertNotIn('AddressSanitizer', result.stderr)
+                self.assertNotIn('runtime error:', result.stderr)
+
+    def test_prefill_cli_equivalence(self):
+        cases = [
+            (self.shared, ('-i', '', '--generation-length', '1')),
+            (self.shared, ('-i', 'ABCDEFGHI', '--generation-length', '4')),
+            (self.shared, ('-i', 'ABCDEFGHI', '--generation-length', '0')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '5')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '7')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '10')),
+            (self.shared, ('-i', 'A'*31, '-n', '32')),
+            (self.shared, ('-i', 'A'*32, '-n', '32')),
+            (self.unshared, ('-i', 'ABC', '--generation-length', '4', '-t', '.8')),
+            (self.first_stop, ('--generation-length', '5')),
+            (self.later_stop, ('--generation-length', '5')),
+        ]
+        for engine in ('run', 'runq'):
+            for fixture, args in cases:
+                baseline, reference = self.execute(engine, *args, fixture=fixture,
+                                                    env={'LLAMA_PREFILL_BATCH': '1', 'LLAMA_PREFILL_LOGITS': 'all'})
+                for policy in ('last', 'all'):
+                    actual, data = self.execute(engine, *args, fixture=fixture,
+                                                env={'LLAMA_PREFILL_BATCH': '7', 'LLAMA_PREFILL_LOGITS': policy})
+                    self.assertEqual(actual.stdout, baseline.stdout)
+                    self.assertEqual(data['tokens'], reference['tokens'])
+                    self.assertEqual(data['stop_reason'], reference['stop_reason'])
+                    self.assertEqual(data['prefill']['microbatches'],
+                                     (data['tokens']['processed_prompt'] + 6)//7)
+                    self.assertEqual(data['parameters']['prefill_batch'], 7)
+                    self.assertEqual(data['parameters']['prefill_logits'], policy)
+                    self.assertEqual(data['timing_seconds']['time_to_first_token'] is None,
+                                     reference['timing_seconds']['time_to_first_token'] is None)
+
+    def test_prefill_chat_multiple_turns(self):
+        # Turn the deterministic first-stop classifier into an EOT classifier.
+        fixture = create(self.root/'chat-eot', shared=False, stop='first', seq_len=64)
+        d, _, _, _, _, vocab, _ = CONFIG
+        for filename, width in (('fp32.bin', d*4), ('int8.bin', d)):
+            data = bytearray((fixture/filename).read_bytes())
+            scales = vocab*(d//2)*4 if filename == 'int8.bin' else 0
+            base = len(data) - vocab*width - scales
+            for start, size in [(base, width)] + ([(len(data)-scales, (d//2)*4)] if scales else []):
+                data[start+128009*size:start+128010*size] = data[start+128001*size:start+128002*size]
+                data[start+128001*size:start+128002*size] = bytes(size)
+            (fixture/filename).write_bytes(data)
+        for engine in ('run', 'runq'):
+            baseline, reference = self.execute(engine, '-m', 'chat', '-y', '', '-i', 'A',
+                                                fixture=fixture, stdin='B\nexit\n',
+                                                env={'LLAMA_PREFILL_BATCH': '1', 'LLAMA_PROFILE': '1'})
+            actual, data = self.execute(engine, '-m', 'chat', '-y', '', '-i', 'A',
+                                        fixture=fixture, stdin='B\nexit\n',
+                                        env={'LLAMA_PREFILL_BATCH': '7', 'LLAMA_PROFILE': '1'})
+            self.assertEqual(actual.stdout, baseline.stdout)
+            self.assertEqual(data['tokens'], reference['tokens'])
+            self.assertEqual(data['tokens']['sampled_stop'], 2)
+            self.assertEqual(data['tokens']['decode_steps'], 2)  # EOT caching
+            self.assertEqual(data['stop_reason'], 'user_exit')
+            self.assertEqual(data['prefill']['microbatches'], 8)  # 24-token first turn, 23-token next turn
+
     @unittest.skipUnless('-DLLAMA_PCRE2' in (BUILD/'config').read_text(), 'new tokenizer requires PCRE2')
     def test_manifest_matches_layouts(self):
         """Manifest offsets equal the old pointer-bumping layout (oracle in tests/manifest.c)."""

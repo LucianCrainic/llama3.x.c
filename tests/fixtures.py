@@ -11,10 +11,12 @@ def floats(n, phase):
     return array.array('f', (0.12 * math.sin(i * 0.71 + phase) for i in range(n)))
 
 
-def create(root, shared=True, zero=False, stop=None):
+def create(root, shared=True, zero=False, stop=None, seq_len=None):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     d, h, layers, heads, kvheads, v, seq = CONFIG
+    if seq_len is not None:
+        seq = seq_len
     kv = d // heads * kvheads
     emb = floats(v * d, 0.2)
     norms = array.array('f', [1] * (layers * d))
@@ -51,7 +53,7 @@ def create(root, shared=True, zero=False, stop=None):
             f.write(weights[-1].tobytes())
     gs = 2
     with (root/'int8.bin').open('wb') as f:
-        header = struct.pack('<Ii7iBi', 0x616b3432, 2, *CONFIG, int(shared), gs)
+        header = struct.pack('<Ii7iBi', 0x616b3432, 2, d, h, layers, heads, kvheads, v, seq, int(shared), gs)
         f.write(header + bytes(256-len(header)))
         f.write(norms.tobytes()*2 + array.array('f', [1]*d).tobytes())
         for w in weights:

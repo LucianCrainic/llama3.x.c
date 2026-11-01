@@ -22,6 +22,29 @@ int main(int argc, char **argv) {
       printf("%d\n", tokens[i]);
     memory_free(tokens);
     free_tokenizer(&t);
+  } else if (!strcmp(argv[1], "batch")) {
+    if (argc < 4)
+      return 2;
+    Model model = {0};
+    engine_load(&model, argv[2]);
+    int n = argc - 3;
+    int *tokens = memory_alloc(n, sizeof(int), MEM_PROMPT);
+    for (int i = 0; i < n; i++)
+      tokens[i] = atoi(argv[i + 3]);
+    for (int i = 0; i < n;) {
+      int count = n - i;
+      if (count > engine_max_batch(&model))
+        count = engine_max_batch(&model);
+      LogitsWanted want =
+          model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
+      float *logits = engine_forward_batch(&model, tokens + i, count, i, want);
+      size_t values = (want == LOGITS_ALL ? (size_t)count : want == LOGITS_LAST ? 1u : 0u) * model.config.vocab_size;
+      if (values && fwrite(logits, sizeof(float), values, stdout) != values)
+        return 1;
+      i += count;
+    }
+    memory_free(tokens);
+    engine_free(&model);
   } else if (!strcmp(argv[1], "generate")) {
     if (argc < 5)
       return 2;

@@ -249,6 +249,13 @@ void write_report(void) {
   string(f, options.prompt_file);
   fputs(",\n    \"system_prompt\": ", f);
   string(f, options.system_prompt);
+  fputs(",\n    \"prefill_batch\": ", f);
+  if (metrics.runtime_ready)
+    fprintf(f, "%d", engine_max_batch(&model));
+  else
+    fputs("null", f);
+  fputs(",\n    \"prefill_logits\": ", f);
+  string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "
           "\"generated_output\": %zu,\n    \"forward_passes\": %zu,\n    \"decode_steps\": %zu,\n    \"sampled\": "
@@ -276,7 +283,8 @@ void write_report(void) {
   rate(f, metrics.forward_passes, metrics.inference_s);
   fputs(",\n    \"output\": ", f);
   rate(f, metrics.output_tokens, metrics.inference_s);
-  fputs("\n  },\n  \"profile_seconds\": ", f);
+  fprintf(f, "\n  },\n  \"prefill\": {\n    \"microbatches\": %zu\n  },\n  \"profile_seconds\": ",
+          metrics.prefill_microbatches);
   profile_report(f);
   fputs(",\n  \"memory_bytes\": {\n    \"model_file\": ", f);
   if (metrics.checkpoint_ready)

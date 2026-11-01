@@ -1,7 +1,10 @@
 """Converter smoke checks without installing large ML dependencies."""
 import ast
+import importlib.util
+import io
 from pathlib import Path
 from types import SimpleNamespace
+import struct
 from typing import List
 import unittest
 
@@ -9,6 +12,24 @@ TOOLS = Path(__file__).resolve().parents[1]/'tools'
 
 
 class ToolSmokeTests(unittest.TestCase):
+    def test_engine_comparison_gate(self):
+        spec = importlib.util.spec_from_file_location('compare_engines', TOOLS/'compare_engines.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        def compare(left, right):
+            return module.compare(io.BytesIO(struct.pack('4f', *left)),
+                                  io.BytesIO(struct.pack('4f', *right)), 2)
+        values = [1, 2, 4, 3]
+        self.assertTrue(compare(values, values)['passed'])
+        different = compare(values, [1, 2, 4, 5])
+        self.assertFalse(different['passed'])
+        self.assertEqual(different['max_abs'], 2)
+        self.assertEqual(different['argmax_agreement'], .5)
+        self.assertFalse(compare([0, 2, 4, 3], [-0., 2, 4, 3])['bitwise'])
+        self.assertFalse(compare([float('nan')]*4, [float('nan')]*4)['passed'])
+        with self.assertRaises(ValueError):
+            module.compare(io.BytesIO(b''), io.BytesIO(b''), 2)
+
     def test_all_sources_compile(self):
         for path in TOOLS.glob('*.py'):
             compile(path.read_text(), str(path), 'exec')

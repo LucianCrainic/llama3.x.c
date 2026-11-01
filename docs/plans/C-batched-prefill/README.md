@@ -1,5 +1,11 @@
 # Track C: batched prefill, and with it AMX (one socket)
 
+Status, 1 November 2026: **C1 implemented; local gates pass; cluster gate pending**.
+Development branch: `codex/prefill-c1-batch-api`, based on `develop` at `446b680`
+with the shared F1 implementation reused. See [usage](../../prefill.md) and
+[validation](../../prefill-c1-validation.md). C2–C7 remain planned; AMX is not yet
+implemented. C2 next needs the shared F2 worker-team interface.
+
 ## Goal
 
 Replace per-token prompt processing with microbatched prefill. Each weight byte read
