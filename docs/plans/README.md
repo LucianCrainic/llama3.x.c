@@ -134,7 +134,7 @@ Milestone status:
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M1 | **partial** (2026-11-01) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. Open: the Hugging Face gate under `teams` (no torch environment on the cluster) |
-| M2 | planned | — |
+| M2 | **implemented locally; cluster checks pending** (2026-11-01) | A4, A5, C1, C2, C3 code and tests are in; A6 is a dry-run-verified matrix. Open: the cluster `check` of A4, A5, C1, C2, C3 and the A6 campaign |
 | M3 | planned | — |
 | M4 | planned | — |
 | M5 | planned | — |

@@ -8,7 +8,32 @@ microbatch. The GEMM feeds every projection of the batched forward. The epilogue
 match the GEMV kinds (STORE, ADD, SWIGLU, PARTIAL), so the same kernel later serves the
 two-socket shards (D1).
 
-Status: **planned**. Branch: `feature/prefill-c2-avx512-gemm`.
+Status: **implemented locally; cluster check pending**. Branch: `feature/prefill-c2-avx512-gemm` (stacked on C1).
+
+Implementation notes:
+
+- `src/gemm.c`, `include/gemm.h`: `k_gemm_f32(A, lda, m, k, segments, count)` with up to three segments sharing A
+  (QKV) in one parallel region, each with its own ldc, weight pointer, leading dimension and epilogue
+  (`GEMM_STORE`, `ADD`, `SWIGLU`, `PARTIAL`). Segments are split into chunks of 16 weight rows distributed over the team
+  or OpenMP threads (`kernels_parallel_segments`, so a worker's share never straddles two segments).
+- **Microkernel: the plan's second alternative.** A 4×4 tile of dot products (4 A rows × 4 W rows, 16 independent zmm
+  accumulators, 8 loads per 16 FMAs, horizontal reduce at the end of a K block) reads A as it is, with no transposed
+  packing. K is blocked by 1024 (`LLAMA_GEMM_KC` tunes it), M by 256, and a chunk's tile sums go through a small scratch
+  so SWIGLU sees the complete K sum of both W1 and W3 before the nonlinearity. The broadcast form with packed A remains
+  an option if the sweep shows the horizontal reductions cost too much.
+- **Scalar instruction set** uses one K block and ascending k: it is bitwise equal to the per-row GEMV, which the tests
+  assert for STORE/ADD/SWIGLU.
+- `forward_layer_batch` (FP32 engine) runs a whole layer for `count` rows through the GEMM and writes K/V straight into
+  the cache. `LLAMA_PREFILL_GEMM=auto|on|off` (auto: AVX-512 kernels active and batch above one) selects it; the Q8
+  engine still runs the per-row reference (its AVX-512/AMX GEMM is C6). `runtime.kernels_prefill` reports the choice.
+- **Local evidence.** 12.9 M checks against the double reference over shapes with padded leading dimensions, all four
+  epilogues, M above one block, several chunks and K blocks, team sizes 1/3/7; the same driver with a portable
+  microkernel at K blocks 7/16/100/1024; and the AVX-512 microkernel's own code (macros, masks, tails) executed on a
+  scalar emulation (`tests/avx512_emul.h`, 21.6 M checks). Mutation checks (dropped masked tail, swapped tile index,
+  wrong edge index, lost K-block accumulation) are all caught. The microkernel also cross-compiles for x86-64.
+  **Not yet run:** the real AVX-512 instructions and any timing; both are the cluster `check`.
+- `build/release/gemm-bench` (`tests/gemm_bench.c`) prints GFLOP/s and weight GB/s per shape and M, GEMM and per-row GEMV,
+  with the weights bound to a node; `tools/summarize_gemm.py` turns it into the table.
 
 ## 2. Depends on / unblocks
 

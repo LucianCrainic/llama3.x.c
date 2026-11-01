@@ -7,7 +7,25 @@ owning socket's bound regions, first touched by the owner team. KV capacity is
 reported as reserved, resident and active bytes. Inference math is unchanged, and
 logits must be bitwise equal to A4.
 
-Status: **planned**. Branch: `feature/numa-a5-kv-placement`.
+Status: **implemented locally; cluster check pending**. Branch: `feature/numa-a5-kv-placement` (stacked on A4).
+
+Implementation notes:
+
+- `RunMemory` (`src/loader.c`): under `file` every buffer is the same `memory_alloc` as before. Under `ddr`/`hbm` the K and
+  V caches are two regions (`kv.k`, `kv.v`) whose pages the first write at each position creates, and every other
+  run-state buffer (activations, scores, logits, RoPE tables, the split-K attention workspace, the Q8 scratch) is carved
+  from one `work` region by a sizing pass followed by the real pass. The owning team writes the work region once.
+  Accounting follows the extent: `kv_cache_allocated_peak` is the reservation, residency comes from the query.
+- **Reporting.** `kv = {reserved_bytes, resident_bytes, active_bytes, node, verified, full, pages_queried,
+  pages_wrong_node, pages_missing, after_prompt: {...}}`. `resident_bytes` is `null` unless a `move_pages` query ran
+  (`LLAMA_KV_VERIFY=0` skips it). The snapshot after the prompt and the final one run between timed regions: their
+  duration is removed from TTFT and `total_inference` (`verify_excluded_s`) and added to `placement_verify`.
+- A KV page on the wrong node is fatal under strict placement, like a weights page.
+- `tools/check_placement.py` judges one report (nodes, full verification, nothing elsewhere or missing, and
+  active ≤ resident ≤ reserved plus a page per layer) and is what the cluster phase uses.
+- **Local evidence.** Accounting formulas hold for `file` and owned placements on both engines, a run to the exact
+  context limit, bitwise logits (A4 tests cover the new regions too), sanitizers. **Not yet run:** residency
+  verification of real KV regions, which needs Linux.
 
 ## 2. Depends on / unblocks
 

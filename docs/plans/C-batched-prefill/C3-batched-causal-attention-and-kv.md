@@ -11,7 +11,26 @@ Process M query rows of a microbatch together:
 
 The result must match per-row attention within the existing budget.
 
-Status: **planned**. Branch: `feature/prefill-c3-causal-attention`.
+Status: **implemented locally; cluster check pending**. Branch: `feature/prefill-c3-causal-attention` (stacked on C2).
+
+Implementation notes:
+
+- `k_attention_batch(out, q, kc, vc, att, work, heads, kv_heads, head_dim, seq_len, pos0, m)`. Row *i* uses exactly the
+  chunk plan `k_attention` uses at position `pos0 + i`, and the same chunk kernel and merge, so the result is **bitwise
+  equal to the per-row calls** (asserted by the test on whatever instruction set runs it) and positions after a row
+  never enter its chunks, which makes causality exact by construction (asserted by perturbing K/V).
+- Tasks are `(kv group, chunk, block of 4 rows)`; a block's rows read the same K/V chunk back to back. The merge runs
+  per `(row, head)` after a team barrier. The chunk kernel now takes a score buffer base and stride, so scores live in a
+  per-task stack buffer instead of `att[h * seq_len + t]` (`M × heads × seq_len` floats would not scale).
+- **Workspace.** `partial` holds as many rows as `LLAMA_ATTN_WORKSPACE_MIB` (default 32) allows, never less than one;
+  longer batches run in waves of that many rows, and the slots per head follow the last row of the wave. The FP32 engine
+  sizes it for `LLAMA_PREFILL_BATCH` rows (`k_attention_bytes_rows`).
+- The scalar instruction set loops the per-row call (no sharing to exploit). A portable chunk kernel exposes the same
+  driver on any host (`k_attention_batch_portable`).
+- **Local evidence.** Four head configurations (GQA 1, 2, 3, 4; head_dim 40/64/128), M ∈ {1, 2, 7, 32}, `pos0` ∈ {0, 31,
+  250, 4000} with the last row exactly on the context limit (crossing the 32- and 256-position chunk boundaries), whole
+  batch and two-row waves, poisoned outputs; mutation checks (a future position visible, a skipped wave row, a wrong
+  chunk count in the merge) are caught. **Not yet run:** the AVX-512 chunk kernel in the batch path and any timing.
 
 ## 2. Depends on / unblocks
 

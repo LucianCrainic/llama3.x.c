@@ -378,7 +378,7 @@ phase_A6() {
           a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" w8a32 hbm 56 LLAMA_BACKEND=teams \
             LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32
         fi
-        if [[ $precision == fp32 && $name == 8B ]]; then # the long-context point
+        if [[ $precision == fp32 && $name == 8[bB] ]]; then # the long-context point
           CONTEXT=8448 PROMPT="$OUT/prompt-8192.txt" a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" \
             long hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
         fi

@@ -13,7 +13,20 @@ staged-file baseline. Placement is separated into four effects:
 The result establishes the engine's local-HBM kernel rate, which is the baseline every
 later two-socket claim is judged against (study §10.3).
 
-Status: **planned**. Branch: `feature/numa-a6-campaign` (scripts and results doc only).
+Status: **matrix implemented and dry-run; not run**. Branch: `feature/numa-a6-campaign` (scripts and results doc only).
+
+Implementation notes:
+
+- `phase_A6` in `scripts/cresco8-placement.sbatch`, with `DRY_RUN=1` printing every launch (121 for 1B and 8B with three
+  repeats). Source checkpoints are staged in tmpfs on DDR node 0; the `file` baselines read a copy staged on HBM node 2
+  that exists only for the two runs that need it (the owned HBM copy needs the room), so each repeat re-stages it.
+- Configurations are interleaved across repeats (`REP=n` runs one repetition of a label). The run labels carry an `x`
+  tag (`xthp`, `xremote`) so the summarizer keeps THP and remote-control runs apart; `remote` points socket 0 at HBM
+  node 3 through `LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1`.
+- A failed bitwise gate (`anon-hbm` against the staged baseline) stops the benchmark and records why.
+- The default `--time` of 04:00:00 may be tight for three repeats; extend it at submission.
+- THP was `[always]` on hbm14 (A3), so "THP off" runs may already be huge-page backed; `thp_bytes` in `regions[]` is the
+  evidence, not the knob.
 
 ## 2. Depends on / unblocks
 

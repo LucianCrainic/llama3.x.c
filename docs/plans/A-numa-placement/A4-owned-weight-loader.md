@@ -7,7 +7,36 @@ running from the read-only file mapping. On one socket, every frequently read we
 goes to the selected node. The untied input embedding goes to DDR. Inference math is
 identical, and logits must be **bitwise** equal to `LLAMA_PLACEMENT=file`.
 
-Status: **planned**. Branch: `feature/numa-a4-owned-loader`.
+Status: **implemented locally; cluster check pending**. Branch: `feature/numa-a4-owned-loader`.
+
+Implementation notes:
+
+- New module `src/loader.c` / `include/loader.h`. A `WeightStore` answers "where does the byte at this file offset
+  live now": the file mapping (`file`, unchanged), or one of two engine-owned regions. Every weight view in `run.c` and
+  `runq.c` is now `weights_at(store, offset)`, so owned and mapped weights are described by the same manifest offsets.
+- **Segments.** `weights_plan` groups the manifest's tensors into at most four maximal file ranges of one class (weights
+  or untied embedding). Q8 files put the norms before the embedding, so an untied Q8 embedding splits the weights in
+  three ranges; FP32 untied is two, tied is one. Each range keeps its file offset modulo 64 inside its region, so kernels
+  see the alignment the mapping gave them. Unit-tested in `tests/manifest.c` for FP32 and Q8, tied and untied.
+- **Copy.** The socket-0 team (the coordinator when the backend is `omp`) `pread`s each worker's contiguous byte slice
+  straight into the region in chunks of at most 64 MiB (`LLAMA_LOADER_CHUNK` shrinks it for tests,
+  `LLAMA_LOADER_MAX_READ` forces short reads). Short reads and `EINTR` are retried; EOF and errors become a clean
+  failure with the regions released. The source is `pread`, never the mapping, so no page of the mapping is touched and
+  the mapping is unmapped afterwards: `memory_bytes.mapped_checkpoint` is 0 and `model_file` keeps the file size.
+- **Placement.** `LLAMA_PLACEMENT=ddr` binds both regions to socket 0's DDR node, `hbm` binds the weights to its HBM
+  node and the untied embedding to DDR. Binding or verification failure is fatal by default
+  (`LLAMA_PLACEMENT_STRICT=1` for `ddr`/`hbm`); `LLAMA_PLACEMENT_STRICT=0` falls back to unbound portable regions with a
+  warning, which is what the macOS tests use. `LLAMA_HBM_BUDGET_GIB` (default 56) is checked against everything this
+  process claims on HBM.
+- **Verification.** After the copy each region becomes read-only and `region_verify` queries every page
+  (`LLAMA_VERIFY_SAMPLES` samples instead); the evidence lands in `regions[]`. `timing_seconds.placement_populate` and
+  `placement_verify` are reported apart from `checkpoint_load`.
+- **Q8 embedding.** `runq` no longer builds the FP32 table: `forward_embedding` dequantizes the token's row with the
+  same product as before, so logits are bitwise equal and `dequantized_embedding_allocated_peak` is 0.
+- **Local evidence (macOS, portable regions).** Bitwise-equal logits against the mapping for FP32 and INT8, shared and
+  unshared classifier, per token and batched, default and short-read chunking, `omp` and `teams` backends; accounting of
+  `regions[]` against the manifest; sanitizer and ThreadSanitizer clean. **Not yet run:** the bound Linux path
+  (`mbind`, `move_pages`) with a real model; that is the cluster `check` below.
 
 ## 2. Depends on / unblocks
 
