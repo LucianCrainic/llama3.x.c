@@ -53,17 +53,31 @@ class RuntimeTests(unittest.TestCase):
         return result, data
 
     def test_baseline_numerical_regression(self):
-        for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
-            result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True)
-            self.assertEqual(result.returncode,0,result.stderr)
-            values = list(map(float,result.stdout.splitlines()))
-            self.assertEqual(len(values),48)
-            for actual, expected in zip(values,self.reference[engine]):
-                self.assertTrue(math.isclose(actual,expected,rel_tol=2e-5,abs_tol=2e-6),(engine,actual,expected))
-            for flag in ('--overflow','--add-overflow'):
-                result = subprocess.run([str(BUILD/unit),flag],capture_output=True,text=True)
-                self.assertEqual(result.returncode,1)
-                self.assertIn('overflow',result.stderr)
+        # The OpenMP/serial path, then worker teams with odd counts that stress range splitting.
+        backends = [{}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
+        for env in backends:
+            for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
+                result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True,
+                                        env={**os.environ, **env}, timeout=60)
+                self.assertEqual(result.returncode,0,(env,result.stderr))
+                values = list(map(float,result.stdout.splitlines()))
+                self.assertEqual(len(values),48)
+                for actual, expected in zip(values,self.reference[engine]):
+                    self.assertTrue(math.isclose(actual,expected,rel_tol=2e-5,abs_tol=2e-6),(env,engine,actual,expected))
+        for flag in ('--overflow','--add-overflow'):
+            result = subprocess.run([str(BUILD/'test-fp32'),flag],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertIn('overflow',result.stderr)
+
+    def test_backend_environment_is_validated(self):
+        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),
+                          ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '0'}, 'LLAMA_THREADS must be'),
+                          ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': 'x'}, 'LLAMA_THREADS must be')]:
+            with self.subTest(env=env):
+                self.execute('run', success=False, env=env)
+                result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                         '-i', 'A', '-t', '0'], capture_output=True, text=True, env={**os.environ, **env})
+                self.assertIn(text, result.stderr)
 
     @unittest.skipUnless('-DLLAMA_PCRE2' in (BUILD/'config').read_text(), 'new tokenizer requires PCRE2')
     def test_manifest_matches_layouts(self):

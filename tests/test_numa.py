@@ -208,6 +208,38 @@ class RegionTests(unittest.TestCase):
         self.assertEqual((v['on_node'], v['wrong_node']), (0, v['queried']))
 
 
+class WorkerTests(unittest.TestCase):
+    def run_workers(self, *args, timeout=120):
+        return subprocess.run([str(BUILD/'test-workers'), *map(str, args)], capture_output=True, text=True,
+                              timeout=timeout)
+
+    def test_unit_tests(self):
+        result = self.run_workers()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_barrier_stress_with_random_delays(self):
+        for threads in (2, 5, 8):
+            with self.subTest(threads=threads):
+                result = self.run_workers('barrier', 100000, threads)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fail_in_a_worker_ends_the_process(self):
+        for mode, text in [('fail-worker', 'injected failure in worker 1'), ('fail-leader', 'in the leader')]:
+            with self.subTest(mode=mode):
+                result = self.run_workers(mode, timeout=30)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(text, result.stderr)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'pinning is Linux-only')
+    def test_pinned_workers_read_back_their_cpu(self):
+        result = self.run_workers('affinity', 4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        if data['supported']:
+            self.assertEqual(data['verified'], 1)
+            self.assertTrue(all(w['assigned'] == w['observed'] for w in data['workers']))
+
+
 class RealMachineTests(unittest.TestCase):
     def run_probe(self, *args):
         return subprocess.run([str(BUILD/'numa_probe'), *args], capture_output=True, text=True, timeout=30)

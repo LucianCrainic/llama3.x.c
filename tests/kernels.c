@@ -1,6 +1,7 @@
 /* Kernel regression: every available instruction set against double-precision
  * references, and bitwise agreement for RoPE and activation quantization. */
 #include "kernels.h"
+#include "workers.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -230,9 +231,21 @@ static size_t test_rope(float *result) {
 }
 
 static void test_attention(void) {
-  const int shapes[][4] = {{2, 1, 2, 0},       {2, 1, 2, 3},      {4, 2, 64, 0},   {4, 2, 64, 70},
-                           {32, 8, 64, 300},   {32, 8, 128, 1000}, {24, 8, 128, 257}, {8, 8, 16, 40},
-                           {32, 8, 128, 4095}, {6, 2, 40, 33}};
+  const int shapes[][4] = {{2, 1, 2, 0},
+                           {2, 1, 2, 3},
+                           {4, 2, 64, 0},
+                           {4, 2, 64, 70},
+                           {32, 8, 64, 300},
+                           {32, 8, 128, 1000},
+                           {24, 8, 128, 257},
+                           {8, 8, 16, 40},
+                           {32, 8, 128, 4095},
+                           {6, 2, 40, 33},
+                           /* chunk boundaries of attention_chunks: 32 and 256 positions */
+                           {8, 2, 64, 31},
+                           {8, 2, 64, 32},
+                           {8, 2, 64, 255},
+                           {8, 2, 64, 256}};
   for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
     int heads = shapes[s][0], kv_heads = shapes[s][1], hd = shapes[s][2], pos = shapes[s][3];
     int seq = pos + 4, kv_dim = kv_heads * hd, kv_mul = heads / kv_heads;
@@ -306,6 +319,33 @@ int main(void) {
     if (memcmp(scales[0], scales[1], Q8_VALUES * sizeof(float)) && failures++ < 20)
       fprintf(stderr, "quantize [%s]: scales differ bitwise\n", current);
   }
+  /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
+   * against the same double-precision references as the OpenMP path. */
+  const int team_sizes[] = {1, 2, 3, 5, 7};
+  int8_t *scratch_q = zeroed(Q8_VALUES, 1);
+  float *scratch_s = zeroed(Q8_VALUES, sizeof(float));
+  static char label[64];
+  for (int i = 0; i < 2; i++) {
+    if (!ran[i])
+      continue;
+    kernels_select(isas[i]);
+    for (size_t t = 0; t < sizeof(team_sizes) / sizeof(*team_sizes); t++) {
+      PoolConfig config = {.teams = 1, .threads = {team_sizes[t], 0}, .cpus = {NULL, NULL}};
+      pool_start(&config);
+      kernels_set_team(pool_team(0));
+      snprintf(label, sizeof(label), "%s teams:%d", kernels_name(), team_sizes[t]);
+      current = label;
+      int before = failures;
+      test_f32();
+      test_q8(scratch_q, scratch_s);
+      test_norm();
+      test_attention();
+      printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
+      kernels_set_team(NULL);
+      pool_stop();
+    }
+  }
+  free(scratch_q), free(scratch_s);
   for (int i = 0; i < MEM_COUNT; i++)
     assert(memory_current[i] == 0);
   free(rope[0]), free(rope[1]), free(quantized[0]), free(quantized[1]), free(scales[0]), free(scales[1]);

@@ -13,7 +13,43 @@ OpenMP path numerically and in speed. The same interface later carries:
 The user decision requires that no separate scheduler be introduced for prefill, so
 this is the only scheduler the plans use.
 
-Status: **planned**. Branch: `feature/found-f2-worker-teams`.
+Status: **implemented, local tests pass; AVX-512 team paths, pinning and the cluster `check`
+not yet run**. Branch: `feature/found-f2-worker-teams` (stacked on A3).
+
+Implementation notes:
+
+- **`include/workers.h`, `src/workers.c`.** One pool, one or two teams, the caller is worker
+  0. Counters (`generation`, `done`, `ready`, `stop`, barrier count and generation) are
+  64 bytes apart; waiters spin 2048 times with `pause`/`yield`, then `sched_yield`.
+  `team_affinity_verified` and `team_worker_cpu` carry the read-back for F3.
+- **`fail()` in a worker** exits the process from that thread; the leader (spinning on
+  the job counter) cannot hang it, and `pool_stop` returns immediately when called from a
+  pool thread. Both are tested with subprocess timeouts.
+- **Kernels.** `kernels_set_team` routes `parallel_rows`, the F32/Q8 drivers and
+  attention to the team. `f32_team` / `q8_team` split every segment (Q, K, V) on its own
+  inside **one** `team_run`, so no extra barrier is added; the OpenMP path keeps its
+  concatenated split unchanged (it is not moved to per-segment splitting here, so its
+  results are bit-for-bit what they were). Attention uses a team-local atomic task queue,
+  `team_barrier`, then the head merge; the OpenMP path shares the same
+  `attention_task`/`attention_merge` helpers. `AttentionWork.workers` is set at init, so
+  the team must be set before `k_attention_init`.
+- **Backend.** `kernels_backend_init`/`kernels_backend_free` (called from
+  `engine_load_context`/`engine_free`) read `LLAMA_BACKEND=omp|teams`, `LLAMA_THREADS`
+  and `LLAMA_TOPOLOGY`. Without a topology the team pins its workers to the allowed
+  CPUs in order (Linux) or runs unpinned; with one, team 0 uses socket 0's CPUs
+  (virtual: unpinned). A team of two sockets is B's.
+- **Build.** `-pthread`, `MODE=tsan`, `workers.c` in `COMMON`; `OPENMP=0` is the default
+  and is what the teams tests run under.
+- **Tests (macOS, scalar).** `tests/kernels.c` runs every kernel on teams of 1, 2, 3, 5 and
+  7 against the double references, plus attention at 31/32/255/256/4095 positions;
+  `tests/workers.c` covers lifecycle, row coverage and a randomly delayed barrier stress;
+  `test_runtime.py` runs the fixture logits under teams of 1, 2, 3 and 7 within the
+  baseline tolerance. TSAN reports nothing on `test-workers`, `test-kernels` and the
+  engine fixtures under teams.
+- **Not run.** This Mac has no AVX-512, so the AVX-512 team paths are only type-checked
+  (`-arch x86_64 -fsyntax-only`, also with a stub `omp.h` for the `-fopenmp` build). Pinning
+  and read-back are Linux-only. `test-workers bench-barrier` measures the per-barrier cost
+  for the cluster `check`.
 
 ## 2. Depends on / unblocks
 

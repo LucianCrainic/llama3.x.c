@@ -14,6 +14,15 @@ void kernels_init(void);
 int kernels_select(KernelIsa isa); /* 0 when unsupported; used by tests */
 const char *kernels_name(void);    /* NULL before kernels_init() */
 
+/* Execution backend. With LLAMA_BACKEND=teams (default omp) the engine starts one persistent worker team
+ * (LLAMA_THREADS threads, else the allowed CPUs; LLAMA_TOPOLOGY selects its CPUs) and every kernel runs on it
+ * instead of opening OpenMP regions. kernels_set_team routes kernels to a team (NULL = OpenMP); set it before
+ * k_attention_init, which sizes the split-K workspace from the worker count. */
+struct Team;
+void kernels_set_team(struct Team *team);
+void kernels_backend_init(void);
+void kernels_backend_free(void);
+
 void k_rmsnorm(float *out, const float *x, const float *weight, int size, float epsilon);
 
 /* One position's RoPE table: 2 * head_dim floats (cosines duplicated per pair,
@@ -55,7 +64,7 @@ void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, 
  * chunks merged with a numerically stable softmax (split-K decoding). */
 typedef struct {
   float *partial;
-  int max_chunks, n_heads, head_dim;
+  int max_chunks, n_heads, head_dim, workers;
 } AttentionWork;
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 void k_attention_free(AttentionWork *work);

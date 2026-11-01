@@ -297,6 +297,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   t->fd = -1;
   model->implementation = t;
   kernels_init();
+  kernels_backend_init();
   const char *activations = getenv("LLAMA_Q8_ACTIVATIONS");
   if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
     fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
@@ -323,6 +324,7 @@ void engine_free(Model *model) {
     free_transformer(model->implementation);
     memory_free(model->implementation);
     model->implementation = NULL;
+    kernels_backend_free();
   }
 }
 const char *engine_precision(void) {
