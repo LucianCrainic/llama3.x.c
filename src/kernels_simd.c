@@ -64,6 +64,8 @@ const char *kernels_name(void) {
   return isa == KERNELS_AVX512 ? "avx512" : "scalar";
 }
 
+enum { BLOCK = 4 }; // rows per GEMV kernel call
+
 /* Each thread receives one contiguous, balanced row range, so weight rows are
  * streamed sequentially per thread and hardware prefetch stays effective. */
 typedef void (*RowFn)(const void *job, int r0, int r1);
@@ -157,16 +159,26 @@ AVX512 static void dots_f32_avx512(const float *w, size_t stride, int rows, cons
   }
 }
 
+/* The Q8 bodies take a compile-time row count and are force-inlined into one
+ * wrapper per count. Fixed-size accumulator arrays then live in registers;
+ * with a runtime count they were kept on the stack, and every VNNI and FMA step
+ * went through a store and a reload. */
+#define Q8_INLINE AVX512 static inline __attribute__((always_inline))
+
 /* W8A8 with VNNI. vpdpbusd multiplies unsigned by signed bytes, so |x| is the
  * unsigned operand and w takes x's sign; exact because no value is -128. Each
  * group's int32 lanes are scaled once into FP32 accumulators. gs % 64 == 0. */
-AVX512 static void dots_q8_avx512(const int8_t *wq, const float *ws, size_t n, int rows, const int8_t *xq,
-                                  const float *xs, int gs, float *out) {
+Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const int rows, const int8_t *xq,
+                            const float *xs, int gs, float *out) {
   const __m512i zero = _mm512_setzero_si512();
-  __m512 acc[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+  __m512 acc[BLOCK];
+  for (int r = 0; r < rows; r++)
+    acc[r] = _mm512_setzero_ps();
   size_t groups = n / gs;
   for (size_t g = 0; g < groups; g++) {
-    __m512i iacc[4] = {zero, zero, zero, zero};
+    __m512i iacc[BLOCK];
+    for (int r = 0; r < rows; r++)
+      iacc[r] = zero;
     for (int c = 0; c < gs; c += 64) {
       size_t off = g * gs + c;
       __m512i xv = _mm512_loadu_si512((const void *)(xq + off));
@@ -174,39 +186,79 @@ AVX512 static void dots_q8_avx512(const int8_t *wq, const float *ws, size_t n, i
       __mmask64 negative = _mm512_movepi8_mask(xv);
       for (int r = 0; r < rows; r++) {
         __m512i wv = _mm512_loadu_si512((const void *)(wq + r * n + off));
-        wv = _mm512_mask_sub_epi8(wv, negative, zero, wv);
-        iacc[r] = _mm512_dpbusd_epi32(iacc[r], ax, wv);
+        iacc[r] = _mm512_dpbusd_epi32(iacc[r], ax, _mm512_mask_sub_epi8(wv, negative, zero, wv));
       }
     }
+    __m512 xscale = _mm512_set1_ps(xs[g]);
     for (int r = 0; r < rows; r++)
-      acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc[r]), _mm512_set1_ps(ws[r * groups + g] * xs[g]), acc[r]);
+      acc[r] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(iacc[r]), xscale), _mm512_set1_ps(ws[r * groups + g]),
+                               acc[r]);
   }
   for (int r = 0; r < rows; r++)
     out[r] = _mm512_reduce_add_ps(acc[r]);
 }
 
 /* W8A32: weights are widened in registers and multiplied by FP32 activations;
- * each group's partial sum is scaled once. gs % 16 == 0. */
-AVX512 static void dots_q8f_avx512(const int8_t *wq, const float *ws, size_t n, int rows, const float *x, int gs,
-                                   float *out) {
-  __m512 acc[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
+ * each group's partial sum is scaled once. Two partial sums per row hide FMA
+ * latency. gs % 16 == 0. */
+Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const int rows, const float *x, int gs,
+                             float *out) {
+  __m512 acc[BLOCK];
+  for (int r = 0; r < rows; r++)
+    acc[r] = _mm512_setzero_ps();
   size_t groups = n / gs;
   for (size_t g = 0; g < groups; g++) {
-    __m512 gacc[4] = {_mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps()};
-    for (int c = 0; c < gs; c += 16) {
+    __m512 ga[BLOCK], gb[BLOCK];
+    for (int r = 0; r < rows; r++)
+      ga[r] = gb[r] = _mm512_setzero_ps();
+    int c = 0;
+    for (; c + 32 <= gs; c += 32) {
       size_t off = g * gs + c;
-      __m512 xv = _mm512_loadu_ps(x + off);
+      __m512 x0 = _mm512_loadu_ps(x + off), x1 = _mm512_loadu_ps(x + off + 16);
+      for (int r = 0; r < rows; r++) {
+        __m256i bytes = _mm256_loadu_si256((const __m256i *)(wq + r * n + off));
+        __m512 w0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(bytes)));
+        __m512 w1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(bytes, 1)));
+        ga[r] = _mm512_fmadd_ps(w0, x0, ga[r]);
+        gb[r] = _mm512_fmadd_ps(w1, x1, gb[r]);
+      }
+    }
+    for (; c < gs; c += 16) {
+      size_t off = g * gs + c;
+      __m512 x0 = _mm512_loadu_ps(x + off);
       for (int r = 0; r < rows; r++) {
         __m128i bytes = _mm_loadu_si128((const __m128i *)(wq + r * n + off));
-        gacc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes)), xv, gacc[r]);
+        ga[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes)), x0, ga[r]);
       }
     }
     for (int r = 0; r < rows; r++)
-      acc[r] = _mm512_fmadd_ps(gacc[r], _mm512_set1_ps(ws[r * groups + g]), acc[r]);
+      acc[r] = _mm512_fmadd_ps(_mm512_add_ps(ga[r], gb[r]), _mm512_set1_ps(ws[r * groups + g]), acc[r]);
   }
   for (int r = 0; r < rows; r++)
     out[r] = _mm512_reduce_add_ps(acc[r]);
 }
+
+#define Q8_WRAPPERS(rows)                                                                                            \
+  AVX512 static void dots_q8_avx512_##rows(const int8_t *wq, const float *ws, size_t n, const int8_t *xq,           \
+                                           const float *xs, int gs, float *out) {                                  \
+    dots_q8_body(wq, ws, n, rows, xq, xs, gs, out);                                                                 \
+  }                                                                                                                 \
+  AVX512 static void dots_q8f_avx512_##rows(const int8_t *wq, const float *ws, size_t n, const float *x, int gs,    \
+                                            float *out) {                                                           \
+    dots_q8f_body(wq, ws, n, rows, x, gs, out);                                                                     \
+  }
+Q8_WRAPPERS(1)
+Q8_WRAPPERS(2)
+Q8_WRAPPERS(3)
+Q8_WRAPPERS(4)
+#undef Q8_WRAPPERS
+
+typedef void (*DotsQ8Fn)(const int8_t *, const float *, size_t, const int8_t *, const float *, int, float *);
+typedef void (*DotsQ8fFn)(const int8_t *, const float *, size_t, const float *, int, float *);
+static const DotsQ8Fn dots_q8_avx512[BLOCK + 1] = {NULL, dots_q8_avx512_1, dots_q8_avx512_2, dots_q8_avx512_3,
+                                                   dots_q8_avx512_4};
+static const DotsQ8fFn dots_q8f_avx512[BLOCK + 1] = {NULL, dots_q8f_avx512_1, dots_q8f_avx512_2, dots_q8f_avx512_3,
+                                                     dots_q8f_avx512_4};
 
 /* Bitwise-equal to the scalar quantizer: same max, division and clamp, with
  * roundf's half-away-from-zero rule rebuilt from truncation. gs % 16 == 0. */
@@ -407,7 +459,6 @@ void k_rope_apply(float *q, float *k, const float *table, int n_heads, int n_kv_
 // GEMV drivers
 
 enum { STORE, ADD, SWIGLU };
-enum { BLOCK = 4 };
 
 static float silu_gate(float value, float gate) {
   // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid; elementwise multiply with w3(x)
@@ -509,11 +560,11 @@ static void q8_dots(K8Weight w, int row, int rows, const K8Input *x, int n, int 
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512) {
     if (x->q && gs % 64 == 0) {
-      dots_q8_avx512(wq, ws, (size_t)n, rows, x->q, x->s, gs, out);
+      dots_q8_avx512[rows](wq, ws, (size_t)n, x->q, x->s, gs, out);
       return;
     }
     if (!x->q && gs % 16 == 0) {
-      dots_q8f_avx512(wq, ws, (size_t)n, rows, x->f, gs, out);
+      dots_q8f_avx512[rows](wq, ws, (size_t)n, x->f, gs, out);
       return;
     }
   }
