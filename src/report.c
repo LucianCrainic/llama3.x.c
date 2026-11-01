@@ -118,7 +118,14 @@ static void write_v2_sections(FILE *f) {
   string(f, thp);
   fputs(",\n    \"precision_mode\": ", f);
   string(f, engine_precision());
-  fputs(",\n    \"prefill_batch\": null,\n    \"prefill_logits\": null,\n    \"kernels_prefill\": null\n  }", f);
+  fputs(",\n    \"prefill_batch\": ", f);
+  if (metrics.runtime_ready)
+    fprintf(f, "%d", engine_max_batch(&model));
+  else
+    fputs("null", f);
+  fputs(",\n    \"prefill_logits\": ", f);
+  string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
+  fputs(",\n    \"kernels_prefill\": null\n  }", f);
 
   const Topology *topology;
   char error[512];
@@ -197,7 +204,8 @@ static void write_v2_sections(FILE *f) {
             f);
   }
   fputs(region_history_count() ? "\n  ]" : "]", f);
-  fputs(",\n  \"kv\": null,\n  \"phase_seconds\": null,\n  \"prefill\": null", f);
+  fprintf(f, ",\n  \"kv\": null,\n  \"phase_seconds\": null,\n  \"prefill\": {\"microbatches\": %zu, \"tokens\": %zu, \"seconds\": %.9f, \"logits_rows\": %zu}",
+          metrics.prefill_microbatches, metrics.processed_tokens, metrics.prefill_s, metrics.prefill_logits_rows);
 }
 
 void write_report(void) {
@@ -330,6 +338,13 @@ void write_report(void) {
   string(f, options.prompt_file);
   fputs(",\n    \"system_prompt\": ", f);
   string(f, options.system_prompt);
+  fputs(",\n    \"prefill_batch\": ", f);
+  if (metrics.runtime_ready)
+    fprintf(f, "%d", engine_max_batch(&model));
+  else
+    fputs("null", f);
+  fputs(",\n    \"prefill_logits\": ", f);
+  string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "
           "\"generated_output\": %zu,\n    \"forward_passes\": %zu,\n    \"decode_steps\": %zu,\n    \"sampled\": "

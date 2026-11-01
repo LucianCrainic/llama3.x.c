@@ -33,9 +33,12 @@ def parse_env(items):
     return env
 
 
-def run_probe(probe, checkpoint, tokens, env):
-    result = subprocess.run([str(probe), str(checkpoint), *map(str, tokens)], capture_output=True,
-                            env={**os.environ, **env})
+def run_probe(probe, checkpoint, tokens, env, batch=None):
+    """Raw logits at every position. batch=M runs the batched prefill path (C1) with LLAMA_PREFILL_BATCH=M."""
+    command = [str(probe)] + (['batch'] if batch else []) + [str(checkpoint), *map(str, tokens)]
+    if batch:
+        env = {**env, 'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'}
+    result = subprocess.run(command, capture_output=True, env={**os.environ, **env})
     if result.returncode != 0:
         raise SystemExit(f'probe failed (exit {result.returncode}) under {env}: {result.stderr.decode(errors="replace")}')
     size = len(tokens) * 4
@@ -51,7 +54,8 @@ def positions(blob_a, blob_b, count):
         b = np.frombuffer(blob_b, dtype='<f4').reshape(count, vocab).astype(np.float64)
         for i in range(count):
             delta = np.abs(b[i] - a[i])
-            yield dict(max_abs=float(delta.max()), rms=float(np.sqrt(np.mean(delta ** 2))),
+            yield dict(bitwise=bool(blob_a[i * vocab * 4:(i + 1) * vocab * 4] == blob_b[i * vocab * 4:(i + 1) * vocab * 4]),
+                       max_abs=float(delta.max()), rms=float(np.sqrt(np.mean(delta ** 2))),
                        max_rel=float((delta / np.maximum(np.abs(a[i]), 1.0)).max()),
                        argmax_match=bool(a[i].argmax() == b[i].argmax()), finite=bool(np.isfinite(b[i]).all()))
         return
@@ -71,7 +75,8 @@ def positions(blob_a, blob_b, count):
             worst = max(worst, d)
             rel = max(rel, d / max(abs(x), 1.0))
             squares += d * d
-        yield dict(max_abs=worst, rms=math.sqrt(squares / vocab), max_rel=rel,
+        yield dict(bitwise=blob_a[i * vocab * 4:(i + 1) * vocab * 4] == blob_b[i * vocab * 4:(i + 1) * vocab * 4],
+                   max_abs=worst, rms=math.sqrt(squares / vocab), max_rel=rel,
                    argmax_match=max(range(vocab), key=row_a.__getitem__) == max(range(vocab), key=row_b.__getitem__),
                    finite=finite)
 
@@ -85,7 +90,10 @@ def main(argv=None):
     group.add_argument('--tokens-file', help='whitespace-separated token ids')
     parser.add_argument('--env-a', action='append', default=[], metavar='KEY=VALUE')
     parser.add_argument('--env-b', action='append', default=[], metavar='KEY=VALUE')
+    parser.add_argument('--batch-a', type=int, metavar='M', help='run config A through the batched prefill path, microbatch M')
+    parser.add_argument('--batch-b', type=int, metavar='M', help='run config B through the batched prefill path, microbatch M')
     parser.add_argument('--max-abs', type=float, default=1e-3, help='budget for max |delta logit| (default 1e-3)')
+    parser.add_argument('--bitwise', action='store_true', help='require bit-identical logits instead of the --max-abs budget')
     parser.add_argument('--output', help='write the JSON result here as well as to stdout')
     args = parser.parse_args(argv)
     text = args.tokens.replace(',', ' ') if args.tokens else Path(args.tokens_file).read_text()
@@ -93,20 +101,23 @@ def main(argv=None):
     if not tokens:
         raise SystemExit('no tokens given')
     env_a, env_b = parse_env(args.env_a), parse_env(args.env_b)
-    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a)
-    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b)
+    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a)
+    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b)
     if len(blob_a) != len(blob_b):
         raise SystemExit('the two configurations produced logits of different sizes')
     rows = []
     for index, row in enumerate(positions(blob_a, blob_b, len(tokens))):
         row.update(position=index, token=tokens[index])
-        row['passed'] = row['finite'] and row['argmax_match'] and row['max_abs'] <= args.max_abs
+        row['passed'] = row['finite'] and row['argmax_match'] and (
+            row['bitwise'] if args.bitwise else row['max_abs'] <= args.max_abs)
         rows.append(row)
     summary = dict(max_abs=max(r['max_abs'] for r in rows), rms=math.sqrt(sum(r['rms'] ** 2 for r in rows) / len(rows)),
                    max_rel=max(r['max_rel'] for r in rows),
-                   argmax_agreement=sum(r['argmax_match'] for r in rows) / len(rows))
+                   argmax_agreement=sum(r['argmax_match'] for r in rows) / len(rows),
+                   bitwise=all(r['bitwise'] for r in rows))
     result = dict(passed=all(r['passed'] for r in rows), probe=str(args.probe), checkpoint=str(args.checkpoint),
-                  env_a=env_a, env_b=env_b, tokens=len(tokens), budget=dict(max_abs=args.max_abs, argmax_agreement=1.0),
+                  env_a=env_a, env_b=env_b, batch_a=args.batch_a, batch_b=args.batch_b, tokens=len(tokens),
+                  budget=dict(max_abs=0.0 if args.bitwise else args.max_abs, argmax_agreement=1.0, bitwise=args.bitwise),
                   summary=summary, comparisons=rows)
     out = json.dumps(result, indent=2) + '\n'
     if args.output:

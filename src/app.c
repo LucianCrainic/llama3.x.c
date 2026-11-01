@@ -194,8 +194,8 @@ static int *tokenize(Tokenizer *t, const char *text, int bos, int *n) {
   return tokens;
 }
 
-/* Sequential prefill: every supplied token, including the last prompt token,
- * executes one forward pass. Only its final logits are sampled. A decode step
+/* Microbatched prefill: every supplied token, including the last prompt token,
+ * is forwarded. Only the final prompt logits are sampled. A decode step
  * forwards the previously generated token. EOS/EOT are sampled but not emitted. */
 static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n, int *position, int generation_limit,
                         int echo_prompt, double turn_start) {
@@ -207,18 +207,31 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   }
   float *logits = NULL;
   metrics.inference_started = 1;
-  for (int i = 0; i < n && *position < options.steps; i++) {
+  for (int i = 0; i < n && *position < options.steps;) {
+    int count = n - i;
+    if (count > engine_max_batch(&model))
+      count = engine_max_batch(&model);
+    if (count > options.steps - *position)
+      count = options.steps - *position;
+    LogitsWanted want = model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
     profile_stage = STAGE_PREFILL;
     double start = monotonic_seconds();
-    logits = engine_forward(&model, tokens[i], (*position)++);
+    logits = engine_forward_batch(&model, tokens + i, count, *position, want);
     metrics.prefill_s += monotonic_seconds() - start;
-    metrics.processed_tokens++;
-    metrics.forward_passes++;
-    if (echo_prompt && i + 1 < n && !options.no_text) {
-      print_token(t, tokens[i + 1]);
+    if (want == LOGITS_ALL)
+      logits += (size_t)(count - 1) * model.config.vocab_size;
+    *position += count;
+    metrics.processed_tokens += (size_t)count;
+    metrics.forward_passes += (size_t)count;
+    metrics.prefill_microbatches++;
+    metrics.prefill_logits_rows += want == LOGITS_ALL ? (size_t)count : want == LOGITS_LAST ? 1u : 0u;
+    if (echo_prompt && !options.no_text) {
+      for (int j = i; j < i + count && j + 1 < n; j++)
+        print_token(t, tokens[j + 1]);
       fflush(stdout);
     }
-    if (i + 1 < n && *position == options.steps) {
+    i += count;
+    if (i < n && *position == options.steps) {
       metrics.stop_reason = "step_limit";
       return -1;
     }
@@ -317,6 +330,7 @@ static void chat(Tokenizer *t, Sampler *s) {
     metrics.inference_s += monotonic_seconds() - start;
     /* Cache the end-of-turn marker before consuming the next user template. */
     if (stop == t->eot_id && pos < options.steps) {
+      profile_stage = STAGE_DECODE;
       double tick = monotonic_seconds();
       engine_forward(&model, stop, pos++);
       double elapsed = monotonic_seconds() - tick;

@@ -10,7 +10,23 @@ The first implementation is a **reference** that calls today's single-token kern
 once per row. Its logits at the final position must be **bitwise** equal to the
 per-token path, so all later kernel phases have an exact oracle.
 
-Status: **planned**. Branch: `feature/prefill-c1-batch-api`.
+Status: **implemented; cluster check pending**. Branch: `feature/prefill-c1-batch-api`.
+
+Implementation notes:
+
+- The reference path is layer-major (all rows of a microbatch through one layer before the
+  next) and calls the existing GEMV/attention kernels row by row. It lives in `run.c` and
+  `runq.c` behind `engine_forward_batch`; `src/prefill.c` holds `LLAMA_PREFILL_BATCH` /
+  `LLAMA_PREFILL_LOGITS` parsing and input validation. User documentation is
+  [`docs/prefill.md`](../../prefill.md) and local evidence
+  [`docs/prefill-c1-validation.md`](../../prefill-c1-validation.md) (developed on
+  `codex/prefill-c1-batch-api`, merged here).
+- Report schema v2: `prefill = {microbatches, tokens, seconds, logits_rows}` and
+  `runtime.prefill_batch` / `runtime.prefill_logits` are now filled.
+- `tools/compare_engines.py` gained `--batch-a/--batch-b M` (runs the probe's `batch` mode with
+  `LLAMA_PREFILL_LOGITS=all`) and `--bitwise` (the C1 gate).
+- Even at M = 1 the unused prompt classifiers are skipped, so `LLAMA_PREFILL_LOGITS=all`
+  is the per-token timing baseline.
 
 ## 2. Depends on / unblocks
 

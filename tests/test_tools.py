@@ -143,6 +143,14 @@ class CompareEnginesTests(unittest.TestCase):
         result, _ = self.compare('int8', '--env-b', 'LLAMA_Q8_ACTIVATIONS=fp32', '--output', str(output))
         self.assertEqual(json.loads(output.read_text())['tokens'], 4)
 
+    def test_batched_prefill_is_bitwise_equal_to_per_token(self):
+        for engine in ('fp32', 'int8'):
+            for batch in ('3', '32'):
+                result, data = self.compare(engine, '--batch-b', batch, '--bitwise')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(data['summary']['bitwise'])
+                self.assertEqual(data['batch_b'], int(batch))
+
     def test_bad_arguments(self):
         result, _ = self.compare('fp32', '--env-b', 'NOT_AN_ASSIGNMENT')
         self.assertNotEqual(result.returncode, 0)
