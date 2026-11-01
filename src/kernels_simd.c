@@ -165,12 +165,29 @@ AVX512 static void dots_f32_avx512(const float *w, size_t stride, int rows, cons
  * went through a store and a reload. */
 #define Q8_INLINE AVX512 static inline __attribute__((always_inline))
 
+/* Q8 work per weight byte is several times FP32's, so demand loads alone keep
+ * too few cache misses in flight to saturate HBM; weight lines are prefetched
+ * `ahead` bytes early. Short rows (a block of at most 8 KiB) prefetch the next
+ * block at the same offset. That adds streams, which pays off while a core has
+ * bandwidth to spare but costs HBM efficiency at a saturated socket, so longer
+ * rows prefetch 1 KiB ahead within the row (W8A8) or not at all (W8A32, which
+ * is compute-bound there). Measured on Xeon Max 9480 HBM, 1B and 8B Q8_0.
+ * Prefetching past the end of an array never faults. */
+enum { Q8_NEXT_BLOCK_MAX = 8192, Q8_IN_ROW = 1024 };
+static inline size_t q8_ahead(int rows, size_t n, int fp32_activations) {
+  size_t block = (size_t)rows * n;
+  if (block <= Q8_NEXT_BLOCK_MAX)
+    return block;
+  return fp32_activations ? 0 : Q8_IN_ROW;
+}
+
 /* W8A8 with VNNI. vpdpbusd multiplies unsigned by signed bytes, so |x| is the
  * unsigned operand and w takes x's sign; exact because no value is -128. Each
  * group's int32 lanes are scaled once into FP32 accumulators. gs % 64 == 0. */
 Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const int rows, const int8_t *xq,
                             const float *xs, int gs, float *out) {
   const __m512i zero = _mm512_setzero_si512();
+  const size_t ahead = q8_ahead(rows, n, 0);
   __m512 acc[BLOCK];
   for (int r = 0; r < rows; r++)
     acc[r] = _mm512_setzero_ps();
@@ -185,6 +202,7 @@ Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const i
       __m512i ax = _mm512_abs_epi8(xv);
       __mmask64 negative = _mm512_movepi8_mask(xv);
       for (int r = 0; r < rows; r++) {
+        _mm_prefetch((const char *)(wq + r * n + off + ahead), _MM_HINT_T0);
         __m512i wv = _mm512_loadu_si512((const void *)(wq + r * n + off));
         iacc[r] = _mm512_dpbusd_epi32(iacc[r], ax, _mm512_mask_sub_epi8(wv, negative, zero, wv));
       }
@@ -203,6 +221,7 @@ Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const i
  * latency. gs % 16 == 0. */
 Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const int rows, const float *x, int gs,
                              float *out) {
+  const size_t ahead = q8_ahead(rows, n, 1);
   __m512 acc[BLOCK];
   for (int r = 0; r < rows; r++)
     acc[r] = _mm512_setzero_ps();
@@ -216,6 +235,8 @@ Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const 
       size_t off = g * gs + c;
       __m512 x0 = _mm512_loadu_ps(x + off), x1 = _mm512_loadu_ps(x + off + 16);
       for (int r = 0; r < rows; r++) {
+        if (ahead && !(off & 63))
+          _mm_prefetch((const char *)(wq + r * n + off + ahead), _MM_HINT_T0);
         __m256i bytes = _mm256_loadu_si256((const __m256i *)(wq + r * n + off));
         __m512 w0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(bytes)));
         __m512 w1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(bytes, 1)));
