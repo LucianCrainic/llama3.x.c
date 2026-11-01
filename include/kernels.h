@@ -24,6 +24,13 @@ void kernels_backend_init(void);
 void kernels_backend_free(void);
 const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after the pool stops */
 
+/* Internal to gemm.c: the active instruction set, and the team-or-OpenMP choice. fn(job, segment, first, last) runs
+ * for each segment's balanced share [first, last) of its chunks[segment] chunks; a worker's share never straddles
+ * two segments. Returns after every share has run. */
+int kernels_avx512_active(void);
+typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
+void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
+
 void k_rmsnorm(float *out, const float *x, const float *weight, int size, float epsilon);
 
 /* One position's RoPE table: 2 * head_dim floats (cosines duplicated per pair,

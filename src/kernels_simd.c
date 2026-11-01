@@ -76,6 +76,44 @@ const char *kernels_name(void) {
 
 enum { BLOCK = 4 }; // rows per GEMV kernel call
 
+int kernels_avx512_active(void) {
+  return isa == KERNELS_AVX512;
+}
+
+typedef struct {
+  SegmentFn fn;
+  const void *job;
+  int count;
+  const int *chunks;
+} SegmentRun;
+
+static void run_segments(const SegmentRun *run, int worker, int workers) {
+  for (int s = 0; s < run->count; s++) {
+    int first = (int)((long long)run->chunks[s] * worker / workers);
+    int last = (int)((long long)run->chunks[s] * (worker + 1) / workers);
+    if (last > first)
+      run->fn(run->job, s, first, last);
+  }
+}
+
+static void segments_team(const void *p, int worker, int workers) {
+  run_segments(p, worker, workers);
+}
+
+void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job) {
+  SegmentRun run = {fn, job, count, chunks};
+  if (current_team) {
+    team_run(current_team, segments_team, &run);
+    return;
+  }
+#ifdef _OPENMP
+#pragma omp parallel
+  run_segments(&run, omp_get_thread_num(), omp_get_num_threads());
+#else
+  run_segments(&run, 0, 1);
+#endif
+}
+
 /* Each thread receives one contiguous, balanced row range, so weight rows are
  * streamed sequentially per thread and hardware prefetch stays effective. */
 static void parallel_rows(int rows, RowFn fn, const void *job) {

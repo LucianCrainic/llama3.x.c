@@ -151,6 +151,16 @@ class CompareEnginesTests(unittest.TestCase):
                 self.assertTrue(data['summary']['bitwise'])
                 self.assertEqual(data['batch_b'], int(batch))
 
+    def test_scalar_gemm_prefill_is_bitwise_equal_to_per_token(self):
+        # The scalar GEMM sums each output like the GEMV (one K block, ascending k); the Q8 engine has no GEMM yet.
+        for engine in ('fp32', 'int8'):
+            for batch in ('2', '7', '32'):
+                result, data = self.compare(engine, '--env-b', 'LLAMA_PREFILL_GEMM=on', '--batch-b', batch, '--bitwise')
+                self.assertEqual(result.returncode, 0, (engine, batch, result.stderr))
+                self.assertTrue(data['summary']['bitwise'])
+        result, _ = self.compare('fp32', '--env-b', 'LLAMA_PREFILL_GEMM=sometimes', '--batch-b', '2')
+        self.assertNotEqual(result.returncode, 0)
+
     def test_bad_arguments(self):
         result, _ = self.compare('fp32', '--env-b', 'NOT_AN_ASSIGNMENT')
         self.assertNotEqual(result.returncode, 0)

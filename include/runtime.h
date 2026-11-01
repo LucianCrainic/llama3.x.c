@@ -85,6 +85,7 @@ typedef struct {
   size_t mapped_bytes; /* still mapped from the file: 0 once the owned loader has unmapped it */
   int max_batch; /* LLAMA_PREFILL_BATCH, capped at the allocated context. */
   LogitsWanted prefill_logits;
+  int prefill_gemm; /* batched prefill runs the FP32 GEMM (C2) instead of one GEMV per row */
 } Model;
 void engine_load(Model *model, const char *path);
 void engine_load_context(Model *model, const char *path, int context);

@@ -163,7 +163,9 @@ static void write_v2_sections(FILE *f) {
     fputs("null", f);
   fputs(",\n    \"prefill_logits\": ", f);
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
-  fputs(",\n    \"kernels_prefill\": null\n  }", f);
+  fputs(",\n    \"kernels_prefill\": ", f);
+  string(f, metrics.runtime_ready && model.prefill_gemm ? kernels_name() : NULL);
+  fputs("\n  }", f);
 
   const Topology *topology;
   char error[512];

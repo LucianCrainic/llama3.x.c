@@ -338,6 +338,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(data['timing_seconds']['placement_populate'])
         self.assertEqual(data['memory_bytes']['owned_weights_peak'], 0)
 
+    def test_prefill_gemm_is_reported_and_selectable(self):
+        for setting, batch, expected in (('on', '4', 'scalar'), ('off', '4', None), ('on', '1', None)):
+            _, data = self.execute('run', '--benchmark', '--no-text', '-i', 'A long enough prompt',
+                                   env={'LLAMA_PREFILL_GEMM': setting, 'LLAMA_PREFILL_BATCH': batch,
+                                        'LLAMA_KERNELS': 'scalar'})
+            self.assertEqual(data['runtime']['kernels_prefill'], expected, (setting, batch))
+        _, data = self.execute('run', env={'LLAMA_PREFILL_GEMM': 'maybe'}, success=False)
+        self.assertIn('LLAMA_PREFILL_GEMM', data['error'])
+
     # ---- A5: KV cache and workspace placement ------------------------------------------------------------------
     def test_kv_accounting_matches_the_formula(self):
         layers, kv_dim, seq = CONFIG[2], CONFIG[0] // CONFIG[3] * CONFIG[4], CONFIG[-1]

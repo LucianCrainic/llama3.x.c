@@ -1,3 +1,4 @@
+#include "kernels.h"
 #include "prefill.h"
 
 #include <errno.h>
@@ -21,10 +22,17 @@ void prefill_configure(Model *model) {
   const char *logits = getenv("LLAMA_PREFILL_LOGITS");
   if (logits && *logits && strcmp(logits, "last") && strcmp(logits, "all"))
     fail("LLAMA_PREFILL_LOGITS must be last or all");
+  /* LLAMA_PREFILL_GEMM: auto = the GEMM where the AVX-512 kernels run, on = always (the scalar GEMM sums like the
+   * GEMV), off = the per-row reference. Only the FP32 engine has a GEMM so far; the Q8 engine ignores it. */
+  const char *gemm = getenv("LLAMA_PREFILL_GEMM");
+  if (gemm && *gemm && strcmp(gemm, "auto") && strcmp(gemm, "on") && strcmp(gemm, "off"))
+    fail("LLAMA_PREFILL_GEMM must be auto, on or off");
   model->max_batch = count < model->config.seq_len ? (int)count : model->config.seq_len;
+  model->prefill_gemm = (gemm && !strcmp(gemm, "on") ? 1 : gemm && !strcmp(gemm, "off") ? 0 : kernels_avx512_active()) &&
+                        model->max_batch > 1;
   model->prefill_logits = logits && !strcmp(logits, "all") ? LOGITS_ALL : LOGITS_LAST;
-  LOG(LOG_DEBUG, "prefill: maximum batch=%d, logits=%s", model->max_batch,
-      model->prefill_logits == LOGITS_ALL ? "all" : "last");
+  LOG(LOG_DEBUG, "prefill: maximum batch=%d, logits=%s, gemm=%s", model->max_batch,
+      model->prefill_logits == LOGITS_ALL ? "all" : "last", model->prefill_gemm ? "on" : "off");
 }
 
 int engine_max_batch(const Model *model) {

@@ -1,5 +1,6 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
+#include "gemm.h"
 #include "kernels.h"
 #include "loader.h"
 #include "prefill.h"
@@ -218,6 +219,46 @@ static void forward_layer(Transformer *t, RunState *s, size_t l, int pos) {
   PROFILE(PHASE_W2, k_matmul_add(x, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim));
 }
 
+/* One layer for `count` consecutive positions starting at pos0 through the GEMM: each weight matrix is streamed once for
+ * all rows. K and V rows are written straight into the cache, so every row sees its own and all earlier positions
+ * (later rows are ignored by the position bound of k_attention). */
+static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0, int count) {
+  Config *p = &t->config;
+  TransformerWeights *w = &t->weights;
+  int dim = p->dim, kv_dim = p->head_dim * p->n_kv_heads, hidden_dim = p->hidden_dim, head_size = p->head_dim;
+  size_t loff = l * p->seq_len * kv_dim;
+  float *kc = s->key_cache + loff, *vc = s->value_cache + loff;
+
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_att_weight + l * dim, dim,
+                                     p->norm_eps));
+  GemmSegment qkv[3] = {
+      {.c = s->q, .ldc = dim, .w = w->wq + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_STORE},
+      {.c = kc + (size_t)pos0 * kv_dim, .ldc = kv_dim, .w = w->wk + l * dim * kv_dim, .ldw = (size_t)dim, .n = kv_dim,
+       .kind = GEMM_STORE},
+      {.c = vc + (size_t)pos0 * kv_dim, .ldc = kv_dim, .w = w->wv + l * dim * kv_dim, .ldw = (size_t)dim, .n = kv_dim,
+       .kind = GEMM_STORE}};
+  PROFILE(PHASE_QKV, k_gemm_f32(s->xb, dim, count, dim, qkv, 3));
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
+                                     s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_ATTENTION, k_attention(s->xb + (size_t)i * dim, s->q + (size_t)i * dim, kc, vc, s->att, &s->attention,
+                                         p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos0 + i));
+  GemmSegment wo = {.c = s->x, .ldc = dim, .w = w->wo + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_ADD};
+  PROFILE(PHASE_WO, k_gemm_f32(s->xb, dim, count, dim, &wo, 1));
+
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_ffn_weight + l * dim, dim,
+                                     p->norm_eps));
+  GemmSegment up = {.c = s->hb, .ldc = hidden_dim, .w = w->w1 + l * dim * hidden_dim, .w3 = w->w3 + l * dim * hidden_dim,
+                    .ldw = (size_t)dim, .n = hidden_dim, .kind = GEMM_SWIGLU};
+  PROFILE(PHASE_W1_W3, k_gemm_f32(s->xb, dim, count, dim, &up, 1));
+  GemmSegment down = {.c = s->x, .ldc = dim, .w = w->w2 + l * dim * hidden_dim, .ldw = (size_t)hidden_dim, .n = dim,
+                      .kind = GEMM_ADD};
+  PROFILE(PHASE_W2, k_gemm_f32(s->hb, hidden_dim, count, hidden_dim, &down, 1));
+}
+
 static float *forward_logits(Transformer *t, RunState *s) {
   Config *p = &t->config;
   TransformerWeights *w = &t->weights;
@@ -252,11 +293,17 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   }
   /* A row reads only its own activations and this layer's preceding KV rows.
    * Layer-major execution is therefore bitwise equivalent to token-major. */
-  for (size_t l = 0; l < (size_t)p->n_layers; l++)
+  int gemm = model->prefill_gemm && count > 1;
+  for (size_t l = 0; l < (size_t)p->n_layers; l++) {
+    if (gemm) {
+      forward_layer_batch(t, s, l, pos0, count);
+      continue;
+    }
     for (int i = 0; i < count; i++) {
       RunState row = row_state(s, p, i);
       forward_layer(t, &row, l, pos0 + i);
     }
+  }
   if (want == LOGITS_NONE)
     return NULL;
   for (int i = want == LOGITS_ALL ? 0 : count - 1; i < count; i++) {
