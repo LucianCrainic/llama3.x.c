@@ -32,8 +32,8 @@ and activation quantization, which are bitwise identical by construction.
 | --- | --- | --- |
 | FP32 GEMV `k_matmul*` | original row loop | 4 rows per pass sharing each `x` load, 8 independent zmm FMA chains, masked tails |
 | Fused GEMV variants | – | `_qkv` (Wq/Wk/Wv in one region), `_swiglu` (W1 and W3 with the SiLU gate as epilogue), `_add` (Wo/W2 accumulate into the residual) |
-| Q8_0 W8A8 `k_matmul_q8*` | original grouped int32 loop | VNNI `vpdpbusd` on \|x\| and sign-adjusted w; per-group FP32 scaling in vector accumulators (group size multiple of 64) |
-| Q8_0 W8A32 | grouped FP32 loop | int8 widened in registers, FMA against FP32 activations (group size multiple of 16) |
+| Q8_0 W8A8 `k_matmul_q8*` | original grouped int32 loop | VNNI `vpdpbusd` on \|x\| and sign-adjusted w; per-group FP32 scaling in register accumulators (group size multiple of 64); software prefetch of weights |
+| Q8_0 W8A32 | grouped FP32 loop | int8 widened in registers, two FMA chains per row against FP32 activations (group size multiple of 16); prefetch for short rows only |
 | Quantization `k_quantize` | original | vector max/divide/clamp; `roundf` reproduced exactly (bitwise equal) |
 | RMSNorm `k_rmsnorm` | `rmsnorm_eps` | 4 accumulators, masked tail |
 | RoPE `k_rope_table` + `k_rope_apply` | table, original arithmetic | pair swap with `vpermilps`, no FMA (bitwise equal) |
@@ -124,13 +124,12 @@ Decode tok/s, mean ± sd of 3 runs:
 | 28 | 333 | 387 | 86% | 246 | 64% |
 | 56 | 447 | 552 | 81% | 355 | 64% |
 
-FP32 stays close to the ceiling at every thread count. Q8_0 holds a constant
-64%, so its limit is per-core instruction throughput, not memory. The
-per-token work is activation quantization, VNNI dots and one scale FMA per
-64-weight group. The Q8_0 kernel is therefore the next kernel target. 1B
-reaches lower shares (53% for Q8_0) because its matrices are small: 16 layers
-of 2,048-wide GEMVs at more than 200 tok/s, where per-region OpenMP
-synchronization is a visible part of the 4.5 ms per token.
+FP32 stays close to the ceiling at every thread count. In this campaign,
+Q8_0 held a constant 64% share. [Q8_0 tuning](#q8_0-tuning) below traces that
+to how many cache misses the kernel keeps in flight, and raises it to 69–75%.
+1B reaches lower shares because its matrices are small: 16 layers of
+2,048-wide GEMVs at more than 200 tok/s, where per-region OpenMP
+synchronization is a visible part of each token's time.
 
 ### Other configurations
 
@@ -149,6 +148,72 @@ synchronization is a visible part of the 4.5 ms per token.
 - **W8A32 costs 9% on 8B for the same HBM bytes.** Widening int8 to FP32
   gives 16 lanes per FMA, against 64 per VNNI instruction. On 1B it costs about
   20%, with high run-to-run variance (179 ± 13 tok/s).
+
+### Q8_0 tuning
+
+Two changes followed the campaign above, each measured on hbm14.
+
+**Accumulators in registers (`c494203`).** The VNNI and W8A32 kernels indexed
+fixed-size accumulator arrays with a runtime row count. Both GCC and Clang kept
+those arrays on the stack, so every `vpdpbusd` and FMA went through a store and
+a reload. One force-inlined body per row count (1–4) now keeps them in
+registers, and the weight scale moves into an embedded-broadcast FMA. The
+end-to-end effect was small: 8B on HBM went from 45.3 to 46.1 tok/s, W8A32
+gained 7% and 1B about 8% (job 5621207). The share of the HBM ceiling stayed at
+about 66% at every thread count.
+
+**Weight prefetch (`339f170`).** A constant share across thread counts points
+to the memory side. A GEMV microbenchmark on 4 GiB HBM matrices, using 14
+threads and best of 10 passes (job 5621219), separates the effects:
+
+| Kernel | n = 4,096 | n = 14,336 |
+| --- | ---: | ---: |
+| raw streaming read | 198 GB/s | 198 GB/s |
+| FP32 GEMV | 197 | 191 |
+| Q8_0, 4 rows per pass | 133 | 147 |
+| Q8_0, 1 row per pass | 100 | 100 |
+| Q8_0 + prefetch of the next 4-row block | 176 | 166 |
+| Q8_0 + prefetch 1 KiB ahead in the row | 161 | 169 |
+
+- **Q8_0 is limited by misses in flight, not arithmetic.** It executes several
+  times more instructions per weight byte than FP32, so the out-of-order window
+  holds fewer outstanding cache misses. A single row stream is slowest, and
+  software prefetch recovers most of the gap.
+- **The best distance depends on load.** An end-to-end A/B of five variants in
+  three interleaved rounds (job 5621230) showed that prefetching the next block
+  adds memory streams. That pays off while a core has bandwidth to spare (1B at
+  14 threads: +38%), but not on a saturated socket (8B at 56 threads: ±0%).
+- **The kernel therefore uses a rule.** Blocks of at most 8 KiB prefetch the
+  next block. Longer rows prefetch 1 KiB ahead within the row (W8A8) or not at
+  all (W8A32), because W8A32 is compute-bound at 8B and every prefetch variant
+  slowed it there.
+
+Result, against the original AVX-512 kernels in the same job (job 5621232),
+decode tok/s:
+
+| Model | Tier | Threads | Before | After | Gain | GB/s | Share of tier ceiling |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8B | HBM | 56 | 44.98 ± 0.16 | 47.85 ± 0.15 | +6.4% | 382 | 69% of 552 |
+| 8B | HBM | 28 | 30.83 | 33.90 | +10% | 270 | 70% of 387 |
+| 8B | HBM | 14 | 17.98 | 20.96 | +17% | 167 | 75% of 223 |
+| 8B | DDR | 56 | 28.20 ± 0.11 | 28.56 ± 0.09 | +1.3% | 228 | 86% |
+| 1B | HBM | 56 | 217.99 ± 4.15 | 258.00 ± 1.23 | +18% | 339 | 61% |
+| 1B | HBM | 14 | 92.55 | 135.10 | +46% | 177 | 80% |
+| 1B | DDR | 56 | 159.45 ± 0.53 | 161.33 ± 0.49 | +1.2% | 212 | 80% |
+| 8B | W8A32, HBM | 56 | 40.40 ± 0.08 | 42.16 ± 0.03 | +4.4% | 336 | 61% |
+| 1B | W8A32, HBM | 56 | 179.31 ± 13.13 | 218.29 ± 1.72 | +22% | 287 | 52% |
+
+The 14- and 28-thread "Before" values are single runs from job 5621182, and
+the W8A32 "Before" values are also from that job. HBM read traffic is the same
+before and after (3,390 GB for 8B), so the gain is from overlap, not from fewer
+bytes. Accuracy is unchanged in kind: W8A32 passes, W8A8 fails as described
+below, and `test-kernels` passes at 1, 56 and 112 threads.
+
+The remaining gap at a full socket (31% for 8B Q8_0, 19% for 8B FP32) is not
+yet attributed between the GEMVs and the rest of each token. That rest
+includes attention, RMSNorm, single-threaded activation quantization and six
+OpenMP regions per layer (about 190 per 8B token). A per-phase timing breakdown would be the next
+measurement.
 
 ### Accuracy against Hugging Face FP32
 

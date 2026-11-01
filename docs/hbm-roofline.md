@@ -277,7 +277,7 @@ Measured outcome of E1, step 1's kernel and parts of steps 3, 4 and 7: see
 [kernels.md](kernels.md#results-on-cresco8-flat-mode). At 56 threads the
 scalar engine runs at the same speed on DDR and HBM (8B FP32: 6.9 / 7.5
 tok/s). The AVX-512 kernels reach 14.9 tok/s (447 GB/s) on HBM and 8.3 on DDR.
-8B Q8_0 reaches 44.5 tok/s (355 GB/s).
+8B Q8_0 reaches 47.9 tok/s (382 GB/s) after prefetch tuning.
 
 For each step, report achieved GB/s, computed as bytes per token × tokens/s,
 next to the §3 roofline. Also record uncore `hbm_cas_rd`/`ddr_cas_rd`/UPI counters
