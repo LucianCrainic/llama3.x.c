@@ -13,7 +13,40 @@ This phase delivers the evidence plumbing that every later campaign needs:
 
 Each phase then adds only the run matrix for its own experiments.
 
-Status: **planned**. Branch: `feature/found-f3-reporting-campaigns`.
+Status: **implemented, local tests pass; cluster `check` not yet run**. Branch:
+`feature/found-f3-reporting-campaigns` (stacked on F2).
+
+Implementation notes:
+
+- **Schema v2** (`src/report.c`): `schema_version` is 2 and the report carries `runtime`,
+  `topology` (+ `topology_error`), `teams`, `regions`, `kv`, `phase_seconds`, `prefill`, and
+  `timing_seconds.{weight_pack,placement_populate,placement_verify}`. Producers that exist
+  fill them (backend, THP, precision mode, A1 topology, F2 teams with pinning read-back,
+  A2 regions and, once a verification is recorded, A3 evidence); the rest are `null`.
+  `placement` is always `file` until A4 adds `LLAMA_PLACEMENT`. `teams` is `null` for the
+  `omp` backend, `regions` is `[]` when nothing was reserved, and a topology that cannot be
+  discovered is `null` with the message in `topology_error` (never fatal).
+- **Discovery before pinning.** `kernels_backend_init` runs `numa_topology_try` first, so the
+  cached topology reflects the job's full allowed sets even though the pool pins the leader;
+  `TeamSummary` and the region history survive `pool_stop` / `engine_free` for the report,
+  which is written from an `atexit` handler.
+- **Tools.** `tools/compare_engines.py` (raw probe under env A and B, every position, JSON
+  like `validate.py`'s `comparisons[]`, non-zero exit over budget; numpy optional),
+  `tools/summarize_campaign.py` (v2 labels and fields, median and full range, tolerant of
+  v1 reports) and `tools/make_prompts.py` (fixed-length prompts from the Dickens opening
+  paragraph, counts and SHA-256 in `prompts.json`). `tests/probe.c` accepts `@file` text
+  because 32768 tokens do not fit one argv string on Linux.
+- **Scripts.** `scripts/lib/cresco8-common.sh` provides the functions listed above, and
+  `cresco8-{placement,tp,prefill}.sbatch` source it through `$ROOT` (Slurm runs a copy of
+  the script, so its own path is useless). `scripts/cresco8-kernels.sbatch` is left
+  untouched for old campaigns, so the library is a copy of its steps, not a refactor of it;
+  the cluster `check` is what shows the outputs are identical. Run labels come from
+  `run_label` and are parsed by `summarize_campaign.py`. Memory policy is only imposed when
+  `MEM_BIND` is set, so engine-owned placement runs can leave it unset.
+- **Local tests.** v2 keys and `null`s, the error-path JSON, `compare_engines` with identical
+  and perturbed environments, the summarizer on a synthetic directory, prompt lengths and
+  reproducibility, `bash -n`, and the library's environment checks. `shellcheck` was not
+  installed locally, so that test is skipped.
 
 ## 2. Depends on / unblocks
 

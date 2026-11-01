@@ -975,9 +975,18 @@ void k_attention(float *out, const float *q, const float *key_cache, const float
 // ----------------------------------------------------------------------------
 // Execution backend
 
-static int backend_started;
+static int backend_started, backend_used;
+
+const char *kernels_backend_name(void) {
+  return backend_used ? "teams" : "omp";
+}
 
 void kernels_backend_init(void) {
+  /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
+   * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
+  const Topology *topology_result;
+  char topology_error[512];
+  numa_topology_try(&topology_result, topology_error, sizeof(topology_error));
   const char *backend = getenv("LLAMA_BACKEND");
   if (!backend || !*backend || !strcmp(backend, "omp"))
     return;
@@ -993,8 +1002,8 @@ void kernels_backend_init(void) {
   if (requested && *requested) {
     char *end;
     long value = strtol(requested, &end, 10);
-    if (*end || value < 1 || value > 4096)
-      fail("LLAMA_THREADS must be an integer in 1..4096");
+    if (*end || value < 1 || value > TEAM_SUMMARY_THREADS)
+      fail("LLAMA_THREADS must be an integer in 1..%d", TEAM_SUMMARY_THREADS);
     threads = (int)value;
   }
   static int affinity[1024];
@@ -1020,7 +1029,7 @@ void kernels_backend_init(void) {
   PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {cpus, NULL}};
   pool_start(&config);
   kernels_set_team(pool_team(0));
-  backend_started = 1;
+  backend_started = backend_used = 1;
   LOG(LOG_DEBUG, "worker team: %d threads, %s", threads, cpus ? "pinned" : "unpinned");
 }
 

@@ -22,6 +22,7 @@ struct Team;
 void kernels_set_team(struct Team *team);
 void kernels_backend_init(void);
 void kernels_backend_free(void);
+const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after the pool stops */
 
 void k_rmsnorm(float *out, const float *x, const float *weight, int size, float epsilon);
 

@@ -38,6 +38,8 @@ struct Team {
 
 static Team *teams[2];
 static int team_count;
+static TeamSummary summaries[2];
+static int summary_count;
 static _Thread_local int in_pool_thread;
 
 static inline void relax(void) {
@@ -145,11 +147,20 @@ void pool_start(const PoolConfig *config) {
   if (config->teams < 1 || config->teams > 2)
     fail("invalid team count %d: expected 1 or 2", config->teams);
   for (int t = 0; t < config->teams; t++)
-    if (config->threads[t] < 1 || config->threads[t] > 4096)
+    if (config->threads[t] < 1 || config->threads[t] > TEAM_SUMMARY_THREADS)
       fail("invalid thread count %d for team %d", config->threads[t], t);
   for (int t = 0; t < config->teams; t++)
     teams[t] = team_create(t, config->threads[t], config->cpus[t]);
-  team_count = config->teams;
+  team_count = summary_count = config->teams;
+  for (int t = 0; t < team_count; t++) {
+    TeamSummary *summary = &summaries[t];
+    *summary = (TeamSummary){.index = t,
+                             .threads = teams[t]->size,
+                             .pinned = config->cpus[t] != NULL,
+                             .verified = team_affinity_verified(teams[t])};
+    memcpy(summary->assigned, teams[t]->assigned, (size_t)teams[t]->size * sizeof(int));
+    memcpy(summary->observed, teams[t]->observed, (size_t)teams[t]->size * sizeof(int));
+  }
 }
 
 void pool_stop(void) {
@@ -235,4 +246,11 @@ int team_affinity_verified(const Team *team) {
     if (team->observed[w] != team->assigned[w])
       return 0;
   return 1;
+}
+
+int pool_summary_count(void) {
+  return summary_count;
+}
+const TeamSummary *pool_summary(int index) {
+  return index >= 0 && index < summary_count ? &summaries[index] : NULL;
 }

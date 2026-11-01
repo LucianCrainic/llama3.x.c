@@ -49,7 +49,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn('runtime error:', result.stderr)
         data = json.loads(report.read_text())
         self.assertEqual(data['status'], 'completed' if success else 'error')
-        self.assertEqual(data['schema_version'], 1)
+        self.assertEqual(data['schema_version'], 2)
         return result, data
 
     def test_baseline_numerical_regression(self):
@@ -68,6 +68,36 @@ class RuntimeTests(unittest.TestCase):
             result = subprocess.run([str(BUILD/'test-fp32'),flag],capture_output=True,text=True)
             self.assertEqual(result.returncode,1)
             self.assertIn('overflow',result.stderr)
+
+    def test_report_schema_v2(self):
+        v2 = ('runtime', 'topology', 'topology_error', 'teams', 'regions', 'kv', 'phase_seconds', 'prefill')
+        _, data = self.execute('run')
+        for key in v2:
+            self.assertIn(key, data)
+        self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
+            'precision_mode': 'fp32', 'prefill_batch': None, 'prefill_logits': None, 'kernels_prefill': None})
+        self.assertIsNone(data['teams'])
+        self.assertEqual(data['regions'], [])
+        for key in ('kv', 'phase_seconds', 'prefill'):
+            self.assertIsNone(data[key])
+        for key in ('weight_pack', 'placement_populate', 'placement_verify'):
+            self.assertIsNone(data['timing_seconds'][key])
+        self.assertIn('owned_weights_peak', data['memory_bytes'])
+        self.assertIn('packed_weights_peak', data['memory_bytes'])
+        _, data = self.execute('runq', env={'LLAMA_Q8_ACTIVATIONS': 'fp32'})
+        self.assertEqual(data['runtime']['precision_mode'], 'int8_q8_0_w8a32')
+        _, data = self.execute('run', env={'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3',
+                                           'LLAMA_TOPOLOGY': 'virtual:1x3', 'LLAMA_THP': 'on'})
+        self.assertEqual((data['runtime']['backend'], data['runtime']['thp']), ('teams', 'on'))
+        self.assertEqual(data['teams'], [{'index': 0, 'threads': 3, 'cpus': None, 'affinity_verified': False}])
+        topology = data['topology']
+        self.assertIsNone(data['topology_error'])
+        self.assertEqual(topology['sockets'], [{'package': -1, 'cpus': None, 'threads': 3, 'ddr_node': -1,
+            'hbm_node': -1, 'ddr_allowed': True, 'hbm_allowed': True, 'classification': 'virtual'}])
+        # A topology that cannot be discovered is reported, not fatal, and failures still write valid JSON.
+        _, data = self.execute('run', env={'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1', 'LLAMA_SYSFS_ROOT': '/nonexistent'})
+        self.assertIsNone(data['topology'])
+        self.assertIn('cannot read', data['topology_error'])
 
     def test_backend_environment_is_validated(self):
         for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),

@@ -589,36 +589,51 @@ static void proc_mems_allowed(char *out, size_t size) {
 }
 #endif
 
-const Topology *numa_topology(void) {
-  static Topology topology;
-  static int ready;
-  if (ready)
-    return &topology;
-  NumaInputs in = {.sysfs_root = getenv("LLAMA_SYSFS_ROOT"), .spec = getenv("LLAMA_TOPOLOGY")};
+static Topology topology_cache;
+static int topology_state; /* 0 untried, 1 discovered, -1 failed */
+static char topology_error[512];
+
+int numa_topology_try(const Topology **topology, char *err, size_t err_size) {
+  if (topology_state == 0) {
+    NumaInputs in = {.sysfs_root = getenv("LLAMA_SYSFS_ROOT"), .spec = getenv("LLAMA_TOPOLOGY")};
 #ifdef __linux__
-  /* Capture the full allowed sets before anything is pinned. A fixture root replaces them (tests only). */
-  static char cpus[8192], mems[512];
-  if (!in.sysfs_root) {
-    cpu_set_t set;
-    unsigned char bits[MAX_CPUS] = {0};
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-      for (int i = 0; i < CPU_SETSIZE && i < MAX_CPUS; i++)
-        bits[i] = CPU_ISSET(i, &set) != 0;
-      format_list(bits, MAX_CPUS, cpus, sizeof(cpus));
-      in.allowed_cpus = cpus;
+    /* Capture the full allowed sets before anything is pinned. A fixture root replaces them (tests only). */
+    static char cpus[8192], mems[512];
+    if (!in.sysfs_root) {
+      cpu_set_t set;
+      unsigned char bits[MAX_CPUS] = {0};
+      if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        for (int i = 0; i < CPU_SETSIZE && i < MAX_CPUS; i++)
+          bits[i] = CPU_ISSET(i, &set) != 0;
+        format_list(bits, MAX_CPUS, cpus, sizeof(cpus));
+        in.allowed_cpus = cpus;
+      }
+      if (allowed_mems_list(mems, sizeof(mems)) == 0)
+        in.allowed_mems = mems;
     }
-    if (allowed_mems_list(mems, sizeof(mems)) == 0)
-      in.allowed_mems = mems;
-  }
 #endif
-  char err[512];
-  if (numa_discover(&topology, &in, err, sizeof(err)))
-    fail("topology discovery failed: %s", err);
+    if (numa_discover(&topology_cache, &in, topology_error, sizeof(topology_error)) == 0) {
 #ifdef __linux__
-  proc_mems_allowed(topology.proc_mems_allowed_list, sizeof(topology.proc_mems_allowed_list));
+      proc_mems_allowed(topology_cache.proc_mems_allowed_list, sizeof(topology_cache.proc_mems_allowed_list));
 #endif
-  ready = 1;
-  return &topology;
+      topology_state = 1;
+    } else
+      topology_state = -1;
+  }
+  if (topology_state < 0) {
+    snprintf(err, err_size, "%s", topology_error);
+    return -1;
+  }
+  *topology = &topology_cache;
+  return 0;
+}
+
+const Topology *numa_topology(void) {
+  const Topology *topology;
+  char err[512];
+  if (numa_topology_try(&topology, err, sizeof(err)))
+    fail("topology discovery failed: %s", err);
+  return topology;
 }
 
 /* ---- bound regions (A2) ---------------------------------------------------------------------------------------- */
@@ -626,6 +641,27 @@ const Topology *numa_topology(void) {
 enum { REGION_LIMIT = 1024, THP_BYTES = 2 << 20 };
 static NumaRegion live[REGION_LIMIT];
 static int live_count, exit_hook;
+static RegionRecord history[REGION_LIMIT];
+static int history_count;
+
+int region_history_count(void) {
+  return history_count;
+}
+const RegionRecord *region_history_at(int index) {
+  return index >= 0 && index < history_count ? &history[index] : NULL;
+}
+void region_record_verification(const NumaRegion *r, const PageCheck *check, size_t thp_bytes) {
+  for (int i = history_count - 1; i >= 0; i--) /* the newest reservation at this address */
+    if (history[i].id == r->mapping_base) {
+      history[i].checked = 1;
+      history[i].full = check->full;
+      history[i].thp_bytes = thp_bytes;
+      history[i].pages_queried = check->queried;
+      history[i].pages_mismatched = check->wrong_node + check->errors;
+      history[i].pages_missing = check->missing;
+      return;
+    }
+}
 
 const char *region_role_name(RegionRole role) {
   static const char *const names[] = {"weights", "packed", "embedding", "kv.k", "kv.v", "work", "scratch"};
@@ -820,6 +856,9 @@ int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, Region
                     .backend = bound ? BACKEND_LINUX_BOUND : BACKEND_PORTABLE,
                     .thp_requested = r->thp_requested};
   live[live_count++] = *r;
+  if (history_count < REGION_LIMIT)
+    history[history_count++] = (RegionRecord){
+        .id = base, .role = role, .socket = socket, .node = node, .thp_requested = r->thp_requested, .bytes = bytes};
   if (!exit_hook) {
     exit_hook = 1;
     atexit(region_release_all);

@@ -31,6 +31,15 @@ void team_barrier(Team *team);
 /* Pinning evidence. team_worker_cpu is the CPU the worker's affinity mask was read back as (-1 when it is not a
  * single CPU, or unpinned); team_affinity_verified is 1 when every worker was pinned and read back as assigned. */
 int team_worker_cpu(const Team *team, int worker);
+
+/* What the report records about each team. It is filled at pool_start and survives pool_stop. */
+enum { TEAM_SUMMARY_THREADS = 1024 };
+typedef struct {
+  int index, threads, pinned, verified;
+  int assigned[TEAM_SUMMARY_THREADS], observed[TEAM_SUMMARY_THREADS]; /* CPU ids; -1 unpinned or unknown */
+} TeamSummary;
+int pool_summary_count(void);
+const TeamSummary *pool_summary(int index);
 int team_affinity_verified(const Team *team);
 
 #endif

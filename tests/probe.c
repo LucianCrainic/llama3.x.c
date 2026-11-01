@@ -3,6 +3,27 @@
 #include "runtime.h"
 #include <stdlib.h>
 #include <string.h>
+/* A text argument starting with '@' names a file to read: long prompts do not fit in one argv string. */
+static char *text_argument(const char *arg) {
+  if (arg[0] != '@')
+    return strdup(arg);
+  FILE *file = fopen(arg + 1, "rb");
+  if (!file)
+    exit(2);
+  size_t size = 0, capacity = 1 << 16;
+  char *text = malloc(capacity);
+  for (size_t got; text && (got = fread(text + size, 1, capacity - size - 1, file)) > 0;) {
+    size += got;
+    if (size + 1 >= capacity)
+      text = realloc(text, capacity *= 2);
+  }
+  fclose(file);
+  if (!text)
+    exit(2);
+  text[size] = 0;
+  return text;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3)
     return 2;
@@ -12,12 +33,14 @@ int main(int argc, char **argv) {
     Tokenizer t = {0};
     build_tokenizer(&t, argv[2], atoi(argv[3]));
     int n, *tokens;
+    char *text = text_argument(argv[4]);
     if (!strcmp(argv[1], "chat"))
-      tokens = chat_prompt(&t, argc > 5 ? argv[5] : "", argv[4], 1, &n);
+      tokens = chat_prompt(&t, argc > 5 ? argv[5] : "", text, 1, &n);
     else {
-      tokens = memory_alloc(strlen(argv[4]) + 2, sizeof(int), MEM_PROMPT);
-      encode(&t, argv[4], 1, 0, tokens, &n);
+      tokens = memory_alloc(strlen(text) + 2, sizeof(int), MEM_PROMPT);
+      encode(&t, text, 1, 0, tokens, &n);
     }
+    free(text);
     for (int i = 0; i < n; i++)
       printf("%d\n", tokens[i]);
     memory_free(tokens);

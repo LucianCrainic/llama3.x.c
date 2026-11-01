@@ -53,6 +53,9 @@ const char *numa_class_name(TopologyClass c);
 /* Discovered once, before any pinning, from LLAMA_TOPOLOGY and the job's real affinity
  * and allowed memory nodes; fails the process on error. Call before threads are created. */
 const Topology *numa_topology(void);
+/* Same discovery and cache without failing the process: 0 and the topology, or -1 and the message. The result,
+ * including a failure, is cached by the first call. */
+int numa_topology_try(const Topology **topology, char *err, size_t err_size);
 
 /* Linux affinity and NUMA online read shared with the report; -1 when unavailable. */
 int numa_affinity_cpus(int *cpus, int capacity);
@@ -112,6 +115,19 @@ void page_check_classify(const int *status, size_t n, int node, PageCheck *out);
 size_t page_sample_plan(size_t pages, size_t extent_pages, size_t max_samples, size_t *out);
 size_t smaps_thp_bytes(const char *text, uintptr_t lo, uintptr_t hi);
 int numa_maps_lookup(const char *text, uintptr_t addr, char *policy, size_t policy_size, size_t *node_pages, int nodes);
+
+/* Every region the run reserved, released or not, for the report; verification fills in the evidence. */
+typedef struct {
+  const void *id; /* mapping base of the reservation */
+  RegionRole role;
+  int socket, node, thp_requested;
+  size_t bytes;
+  int checked, full; /* a verification was recorded; it was full rather than sampled */
+  size_t thp_bytes, pages_queried, pages_mismatched, pages_missing;
+} RegionRecord;
+int region_history_count(void);
+const RegionRecord *region_history_at(int index);
+void region_record_verification(const NumaRegion *r, const PageCheck *check, size_t thp_bytes);
 
 int region_round(size_t bytes, size_t align, size_t *rounded); /* -1 on zero or overflow */
 int region_thp_default(void);                                  /* LLAMA_THP=on */
