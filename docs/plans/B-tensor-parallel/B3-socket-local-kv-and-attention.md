@@ -7,7 +7,28 @@ grouped attention for its own query heads on its own team, with local head index
 and per-team task queues. The KV history, the attention scores and the per-head outputs
 never cross sockets (study §7).
 
-Status: **planned**. Branch: `feature/tp-b3-local-kv`.
+Status: **kernel side implemented and tested locally (macOS, scalar); engine-side KV regions and state land with B5;
+cluster `check` pending**. Branch: `feature/tp-local-b` (commit `test: check socket-local attention against the full
+attention`).
+
+Implementation notes:
+
+- **No attention signature change was needed.** `k_attention` already derives everything from the counts it is given
+  (`kv_dim = n_kv_heads · head_dim`, `kv_mul = n_heads / n_kv_heads`), so a socket calls it with `n_heads/S`,
+  `n_kv_heads/S` and a cache laid out `[position][kv_dim/S]`; every index is local. B2's `kernels_set_thread_team`
+  makes `k_attention_init` size the split-K work from the calling thread's team and makes `k_attention` run the
+  team-local task queue. The doc's "explicit local counts and strides" are the existing arguments.
+- **Added:** `k_attention_chunk_count(work, n_kv_heads, position)` so the report can give per-team chunk counts.
+- **Test** (`tests/kernels.c`, `test_attention_split`). Two coordinator threads, each bound to its own team (sizes 1, 3,
+  7), each with a socket-local cache for its KV heads and its own `AttentionWork`, attend concurrently at positions 0,
+  31, 32, 255, 256, 1000 and 4095. The concatenated outputs equal the full `k_attention` within `2e-5`. A NaN guard of
+  64 floats before and after each local K and V cache is unchanged afterwards (no out-of-range local indexing), and the
+  work is sized from each team (`workers`) with equal chunk counts on both sockets.
+- **Not done here (B5).** The engine's per-socket KV regions (`ROLE_KV_K`/`ROLE_KV_V` on the socket's HBM node, an A5
+  `RunMemory` per socket), per-team `att` buffers in the socket's `ROLE_WORK` region, the coordinator's position and
+  RoPE-table broadcast, and the lifecycle tests (cache reset, context limit, multi-turn) all need the two-socket forward.
+- **Open (cluster).** The attention kernel tests with 2 × 56 pinned workers and the AVX-512 half of the test;
+  attention task time per socket at contexts 512, 8192 and 32768 (`cresco8-tp.sbatch PHASE=B3`).
 
 ## 2. Depends on / unblocks
 

@@ -580,6 +580,104 @@ static void test_two_teams(void) {
   pool_stop();
 }
 
+/* ---- Socket-local attention (B3) ----------------------------------------------------------------------------------
+ * Each socket holds K/V for its own KV heads only, in a [position][kv_dim / S] cache, and attends for its own query
+ * heads with local counts on its own team. The concatenation of the sockets' outputs must equal the full attention. */
+enum { GUARD = 64 };
+
+typedef struct {
+  int socket, sockets, heads, kv_heads, hd, pos, seq;
+  const float *q, *kc, *vc;
+  float *out;    /* the full output; this socket writes its own heads */
+  int bad_guard; /* a guard float next to the local cache changed */
+  int chunks;    /* chunk count the local work reported */
+  int workers;
+} SplitJob;
+
+static void *split_main(void *p) {
+  SplitJob *job = p;
+  kernels_set_thread_team(job->sockets > 1 ? pool_team(job->socket) : NULL);
+  int hl = job->heads / job->sockets, kl = job->kv_heads / job->sockets, hd = job->hd, kv_local = kl * hd,
+      kv_full = job->kv_heads * hd;
+  size_t cells = (size_t)job->seq * kv_local;
+  float *k_all = zeroed(cells + 2 * GUARD, sizeof(float)), *v_all = zeroed(cells + 2 * GUARD, sizeof(float));
+  for (int i = 0; i < GUARD; i++)
+    k_all[i] = v_all[i] = k_all[GUARD + cells + i] = v_all[GUARD + cells + i] = NAN;
+  float *kl_cache = k_all + GUARD, *vl_cache = v_all + GUARD;
+  for (int t = 0; t < job->seq; t++) {
+    memcpy(kl_cache + (size_t)t * kv_local, job->kc + (size_t)t * kv_full + (size_t)job->socket * kv_local,
+           kv_local * sizeof(float));
+    memcpy(vl_cache + (size_t)t * kv_local, job->vc + (size_t)t * kv_full + (size_t)job->socket * kv_local,
+           kv_local * sizeof(float));
+  }
+  float *att = zeroed((size_t)hl * job->seq, sizeof(float));
+  AttentionWork work;
+  k_attention_init(&work, hl, kl, hd, job->seq); /* sized from this thread's team */
+  k_attention(job->out + (size_t)job->socket * hl * hd, job->q + (size_t)job->socket * hl * hd, kl_cache, vl_cache, att,
+              &work, hl, kl, hd, job->seq, job->pos);
+  job->chunks = k_attention_chunk_count(&work, kl, job->pos);
+  job->workers = work.workers;
+  for (int i = 0; i < GUARD; i++)
+    if (!isnan(k_all[i]) || !isnan(k_all[GUARD + cells + i]) || !isnan(v_all[i]) || !isnan(v_all[GUARD + cells + i]))
+      job->bad_guard++;
+  k_attention_free(&work);
+  kernels_set_thread_team(NULL);
+  free(k_all), free(v_all), free(att);
+  return NULL;
+}
+
+static void test_attention_split(void) {
+  const int positions[] = {0, 31, 32, 255, 256, 1000, 4095};
+  const int heads = 8, kv_heads = 4, hd = 16, kv_full = kv_heads * hd;
+  const int team_sizes[] = {1, 3, 7};
+  for (size_t ti = 0; ti < sizeof(team_sizes) / sizeof(*team_sizes); ti++) {
+    PoolConfig config = {.teams = 2, .threads = {team_sizes[ti], team_sizes[ti]}, .cpus = {NULL, NULL}};
+    pool_start(&config);
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
+      int pos = positions[pi], seq = pos + 4;
+      float *q = zeroed((size_t)heads * hd, sizeof(float)), *full = zeroed((size_t)heads * hd, sizeof(float));
+      float *split = zeroed((size_t)heads * hd, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+      float *kc = zeroed((size_t)seq * kv_full, sizeof(float)), *vc = zeroed((size_t)seq * kv_full, sizeof(float));
+      fill(q, (size_t)heads * hd, 2);
+      fill(kc, (size_t)seq * kv_full, 2);
+      fill(vc, (size_t)seq * kv_full, 1);
+      AttentionWork work;
+      k_attention_init(&work, heads, kv_heads, hd, seq); /* main thread: no team bound, default backend */
+      k_attention(full, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos);
+      k_attention_free(&work);
+      SplitJob job[2];
+      for (int s = 0; s < 2; s++)
+        job[s] = (SplitJob){.socket = s,
+                            .sockets = 2,
+                            .heads = heads,
+                            .kv_heads = kv_heads,
+                            .hd = hd,
+                            .pos = pos,
+                            .seq = seq,
+                            .q = q,
+                            .kc = kc,
+                            .vc = vc,
+                            .out = split};
+      pthread_t thread;
+      assert(!pthread_create(&thread, NULL, split_main, &job[1]));
+      split_main(&job[0]);
+      pthread_join(thread, NULL);
+      for (int i = 0; i < heads * hd; i++)
+        check("attention.split", split[i], full[i], 2e-5);
+      checks += 2;
+      if ((job[0].bad_guard || job[1].bad_guard) && failures++ < 20)
+        fprintf(stderr, "attention split [%s]: local cache guard overwritten (position %d)\n", current, pos);
+      if ((job[0].workers != team_sizes[ti] || job[1].workers != team_sizes[ti] || job[0].chunks < 1 ||
+           job[0].chunks != job[1].chunks) &&
+          failures++ < 20)
+        fprintf(stderr, "attention split [%s]: per-team work sized %d/%d for teams of %d\n", current, job[0].workers,
+                job[1].workers, team_sizes[ti]);
+      free(q), free(full), free(split), free(att), free(kc), free(vc);
+    }
+    pool_stop();
+  }
+}
+
 int main(void) {
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
   float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
@@ -604,6 +702,7 @@ int main(void) {
     test_attention_batch();
     test_partial();
     test_two_teams();
+    test_attention_split();
     rng = seed; /* identical inputs for every instruction set */
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");

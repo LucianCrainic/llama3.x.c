@@ -927,6 +927,10 @@ void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head
   k_attention_init_in(work, n_heads, n_kv_heads, head_dim, seq_len, NULL);
 }
 
+int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int position) {
+  return attention_chunks(position + 1, n_kv_heads, work->max_chunks, work->workers);
+}
+
 void k_attention_free(AttentionWork *work) {
   if (!work->external)
     memory_free(work->partial);

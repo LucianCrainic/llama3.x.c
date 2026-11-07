@@ -112,6 +112,9 @@ void k_attention_batch(float *out, const float *q, const float *key_cache, const
 void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
                                 AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
                                 int m);
+/* Position chunks the split-K attention uses for `position` with this work's team size and the given (local) KV head
+ * count, for the report and for choosing contexts where a team has too little work. */
+int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int position);
 void k_attention_free(AttentionWork *work);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);
