@@ -1,5 +1,7 @@
 #include "runtime.h"
 
+#include "shards.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -64,6 +66,18 @@ size_t checked_add(size_t a, size_t b) {
     fail("size addition overflow: %zu + %zu", a, b);
   return a + b;
 }
+void memory_track(MemoryKind kind, size_t bytes) {
+  memory_current[kind] = checked_add(memory_current[kind], bytes);
+  if (memory_current[kind] > memory_peak[kind])
+    memory_peak[kind] = memory_current[kind];
+  total_current = checked_add(total_current, bytes);
+  if (total_current > memory_total_peak)
+    memory_total_peak = total_current;
+}
+void memory_untrack(MemoryKind kind, size_t bytes) {
+  memory_current[kind] -= bytes;
+  total_current -= bytes;
+}
 void *memory_alloc(size_t count, size_t size, MemoryKind kind) {
   size_t bytes = checked_mul(count, size);
   if (bytes > PTRDIFF_MAX)
@@ -73,20 +87,14 @@ void *memory_alloc(size_t count, size_t size, MemoryKind kind) {
     fail("allocation failed for category %d: %zu bytes (%s)", kind, bytes, strerror(errno));
   block->allocation.bytes = bytes;
   block->allocation.kind = kind;
-  memory_current[kind] = checked_add(memory_current[kind], bytes);
-  if (memory_current[kind] > memory_peak[kind])
-    memory_peak[kind] = memory_current[kind];
-  total_current = checked_add(total_current, bytes);
-  if (total_current > memory_total_peak)
-    memory_total_peak = total_current;
+  memory_track(kind, bytes);
   return block + 1;
 }
 void memory_free(void *pointer) {
   if (!pointer)
     return;
   Allocation *block = (Allocation *)pointer - 1;
-  memory_current[block->allocation.kind] -= block->allocation.bytes;
-  total_current -= block->allocation.bytes;
+  memory_untrack(block->allocation.kind, block->allocation.bytes);
   free(block);
 }
 
@@ -119,7 +127,7 @@ static void validate_config(Config *p, int quantized, int gs) {
     fail("unsupported INT8 group size %d: must divide dim and hidden_dim and fit int32 accumulation", gs);
 }
 
-static size_t tensor_bytes(size_t count, int quantized, int gs) {
+size_t tensor_bytes(size_t count, int quantized, int gs) {
   if (!quantized)
     return checked_mul(count, sizeof(float));
   /* Scales follow raw bytes with no padding in v2. Reject unaligned files. */
@@ -129,7 +137,7 @@ static size_t tensor_bytes(size_t count, int quantized, int gs) {
 }
 
 void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int *gs, int *fd, float **data,
-                    size_t *bytes) {
+                    size_t *bytes, TensorManifest *manifest) {
   _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(int32_t) == 4 && offsetof(Config, format) == 28,
                  "checkpoint ABI requires 32-bit int/float and seven packed ints");
   const uint32_t endian = 1;
@@ -247,6 +255,11 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
     fail("version 3 checkpoint has unexpected trailing bytes");
   if (needed != *bytes)
     LOG(LOG_WARN, "checkpoint '%s' has %zu trailing bytes", path, *bytes - needed);
+  /* The manifest is an independent description of the same layout; any
+   * disagreement with the arithmetic above is a bug, never a warning. */
+  manifest_build(manifest, p, quantized, *gs, header_size);
+  if (manifest->file_bytes != needed)
+    fail("tensor manifest covers %zu bytes but the checkpoint layout needs %zu", manifest->file_bytes, needed);
   /* Validate allocation extents too, before making the read-only mapping. */
   checked_mul(checked_mul(checked_mul(l, (size_t)p->seq_len), kv), sizeof(float));
   checked_mul(checked_mul((size_t)p->n_heads, (size_t)p->seq_len), sizeof(float));

@@ -6,6 +6,7 @@ are not substitutes for validation with licensed production model weights.
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -83,12 +84,18 @@ class ReferenceTests(unittest.TestCase):
                     model = export.load_hf_model(root/'hf')
                     export.model_export(model, root/'fp32.bin', 3)
                     export.version2_export(model, root/'int8.bin', version=3)
-                for length in (1, 4, 17):
+                for length in (1, 4, 17, 33):
                     tokens = [65 + i % 20 for i in range(length)]
                     for precision in ('fp32', 'int8'):
                         record, actual, expected = compare(hf, root/f'{precision}.bin', tokens, precision)
                         record.update(factor=factor, tied=tied, precision=precision, length=length)
                         records.append(record)
+                        for batch in (1, 3, 7, 32):
+                            raw = subprocess.check_output(
+                                [str(BUILD/f'probe-{precision}'), 'batch', str(root/f'{precision}.bin'),
+                                 *map(str, tokens)],
+                                env={**os.environ, 'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'})
+                            self.assertEqual(raw, actual.tobytes())
                         if precision == 'fp32':
                             np.testing.assert_allclose(actual, expected, rtol=3e-4, atol=4e-6)
                             self.assertEqual(record['argmax_agreement'], 1.)

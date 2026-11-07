@@ -3,6 +3,27 @@
 #include "runtime.h"
 #include <stdlib.h>
 #include <string.h>
+/* A text argument starting with '@' names a file to read: long prompts do not fit in one argv string. */
+static char *text_argument(const char *arg) {
+  if (arg[0] != '@')
+    return strdup(arg);
+  FILE *file = fopen(arg + 1, "rb");
+  if (!file)
+    exit(2);
+  size_t size = 0, capacity = 1 << 16;
+  char *text = malloc(capacity);
+  for (size_t got; text && (got = fread(text + size, 1, capacity - size - 1, file)) > 0;) {
+    size += got;
+    if (size + 1 >= capacity)
+      text = realloc(text, capacity *= 2);
+  }
+  fclose(file);
+  if (!text)
+    exit(2);
+  text[size] = 0;
+  return text;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3)
     return 2;
@@ -12,16 +33,41 @@ int main(int argc, char **argv) {
     Tokenizer t = {0};
     build_tokenizer(&t, argv[2], atoi(argv[3]));
     int n, *tokens;
+    char *text = text_argument(argv[4]);
     if (!strcmp(argv[1], "chat"))
-      tokens = chat_prompt(&t, argc > 5 ? argv[5] : "", argv[4], 1, &n);
+      tokens = chat_prompt(&t, argc > 5 ? argv[5] : "", text, 1, &n);
     else {
-      tokens = memory_alloc(strlen(argv[4]) + 2, sizeof(int), MEM_PROMPT);
-      encode(&t, argv[4], 1, 0, tokens, &n);
+      tokens = memory_alloc(strlen(text) + 2, sizeof(int), MEM_PROMPT);
+      encode(&t, text, 1, 0, tokens, &n);
     }
+    free(text);
     for (int i = 0; i < n; i++)
       printf("%d\n", tokens[i]);
     memory_free(tokens);
     free_tokenizer(&t);
+  } else if (!strcmp(argv[1], "batch")) {
+    if (argc < 4)
+      return 2;
+    Model model = {0};
+    engine_load(&model, argv[2]);
+    int n = argc - 3;
+    int *tokens = memory_alloc(n, sizeof(int), MEM_PROMPT);
+    for (int i = 0; i < n; i++)
+      tokens[i] = atoi(argv[i + 3]);
+    for (int i = 0; i < n;) {
+      int count = n - i;
+      if (count > engine_max_batch(&model))
+        count = engine_max_batch(&model);
+      LogitsWanted want =
+          model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
+      float *logits = engine_forward_batch(&model, tokens + i, count, i, want);
+      size_t values = (want == LOGITS_ALL ? (size_t)count : want == LOGITS_LAST ? 1u : 0u) * model.config.vocab_size;
+      if (values && fwrite(logits, sizeof(float), values, stdout) != values)
+        return 1;
+      i += count;
+    }
+    memory_free(tokens);
+    engine_free(&model);
   } else if (!strcmp(argv[1], "generate")) {
     if (argc < 5)
       return 2;

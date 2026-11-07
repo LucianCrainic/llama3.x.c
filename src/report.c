@@ -1,6 +1,9 @@
 #include "app.h"
 #include "kernels.h"
+#include "loader.h"
+#include "numa.h"
 #include "profile.h"
+#include "workers.h"
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,9 +15,8 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#ifdef __linux__
-#include <sched.h>
-#endif
+/* Matches CPU_SETSIZE, the most CPUs an affinity mask can name. */
+#define CPU_LIMIT 1024
 #ifndef BUILD_MODE
 #define BUILD_MODE "custom"
 #endif
@@ -101,6 +103,153 @@ static void profile_report(FILE *f) {
   fputs("\n  }", f);
 }
 
+static void int_list(FILE *f, const int *values, int n) {
+  fputc('[', f);
+  for (int i = 0; i < n; i++)
+    fprintf(f, "%s%d", i ? ", " : "", values[i]);
+  fputc(']', f);
+}
+
+static void kv_fields(FILE *f, const KvStats *k) {
+  fprintf(f, "\"reserved_bytes\": %zu, \"resident_bytes\": ", k->reserved_bytes);
+  if (k->verified)
+    fprintf(f, "%zu", k->resident_bytes);
+  else
+    fputs("null", f);
+  fprintf(f, ", \"active_bytes\": %zu, \"node\": ", k->active_bytes);
+  if (k->node >= 0)
+    fprintf(f, "%d", k->node);
+  else
+    fputs("null", f);
+  fprintf(f, ", \"verified\": %s, \"full\": %s, \"pages_queried\": %zu, \"pages_wrong_node\": %zu, "
+             "\"pages_missing\": %zu",
+          k->verified ? "true" : "false", k->full ? "true" : "false", k->pages_queried, k->pages_wrong_node,
+          k->pages_missing);
+}
+
+/* The final state, with the snapshot taken when the prompt had been processed nested as after_prompt. */
+static void kv_object(FILE *f) {
+  if (!metrics.kv_final_ready) {
+    fputs("null", f);
+    return;
+  }
+  fputc('{', f);
+  kv_fields(f, &metrics.kv_final);
+  fputs(", \"after_prompt\": ", f);
+  if (metrics.kv_prompt_ready) {
+    fputc('{', f);
+    kv_fields(f, &metrics.kv_prompt);
+    fputc('}', f);
+  } else
+    fputs("null", f);
+  fputc('}', f);
+}
+
+/* Schema v2: runtime, topology, teams, regions and placeholders for producers that do not exist yet (null). */
+static void write_v2_sections(FILE *f) {
+  const char *thp = region_thp_default() ? "on" : "off";
+  fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
+  string(f, kernels_backend_name());
+  fputs(",\n    \"sockets\": 1,\n    \"placement\": ", f);
+  string(f, placement_active());
+  fputs(",\n    \"thp\": ", f);
+  string(f, thp);
+  fputs(",\n    \"precision_mode\": ", f);
+  string(f, engine_precision());
+  fputs(",\n    \"prefill_batch\": ", f);
+  if (metrics.runtime_ready)
+    fprintf(f, "%d", engine_max_batch(&model));
+  else
+    fputs("null", f);
+  fputs(",\n    \"prefill_logits\": ", f);
+  string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
+  fputs(",\n    \"kernels_prefill\": ", f);
+  string(f, metrics.runtime_ready && model.prefill_gemm ? kernels_name() : NULL);
+  fputs("\n  }", f);
+
+  const Topology *topology;
+  char error[512];
+  fputs(",\n  \"topology\": ", f);
+  if (numa_topology_try(&topology, error, sizeof(error)) == 0) {
+    fputs("{\n    \"sockets\": [", f);
+    for (int s = 0; s < topology->nsockets; s++) {
+      const SocketTopo *k = &topology->socket[s];
+      fprintf(f, "%s\n      {\"package\": %d, \"cpus\": ", s ? "," : "", k->package);
+      if (k->cpus)
+        int_list(f, k->cpus, k->ncpus);
+      else
+        fprintf(f, "null, \"threads\": %d", k->ncpus);
+      fprintf(f, ", \"ddr_node\": %d, \"hbm_node\": %d, \"ddr_allowed\": %s, \"hbm_allowed\": %s, \"classification\": ",
+              k->ddr_node, k->hbm_node, k->ddr_allowed ? "true" : "false", k->hbm_allowed ? "true" : "false");
+      string(f, numa_class_name(topology->classification));
+      fputc('}', f);
+    }
+    fputs("\n    ],\n    \"mems_allowed\": [", f);
+    int first = 1;
+    for (int n = 0; n <= topology->max_node; n++)
+      if (topology->mems_allowed[n / (8 * sizeof(unsigned long))] >> (n % (8 * sizeof(unsigned long))) & 1) {
+        fprintf(f, "%s%d", first ? "" : ", ", n);
+        first = 0;
+      }
+    fputs("],\n    \"mems_allowed_list\": ", f);
+    string(f, topology->classification == CLASS_VIRTUAL ? NULL : topology->mems_allowed_list);
+    fputs(",\n    \"cpus_allowed\": ", f);
+    int affinity[CPU_LIMIT];
+    int count = numa_affinity_cpus(affinity, CPU_LIMIT);
+    if (count >= 0)
+      int_list(f, affinity, count);
+    else
+      fputs("null", f);
+    fputs("\n  },\n  \"topology_error\": null", f);
+  } else {
+    fputs("null,\n  \"topology_error\": ", f);
+    string(f, error);
+  }
+
+  fputs(",\n  \"teams\": ", f);
+  if (pool_summary_count() == 0)
+    fputs("null", f);
+  else {
+    fputc('[', f);
+    for (int t = 0; t < pool_summary_count(); t++) {
+      const TeamSummary *team = pool_summary(t);
+      fprintf(f, "%s\n    {\"index\": %d, \"threads\": %d, \"cpus\": ", t ? "," : "", team->index, team->threads);
+      if (team->pinned)
+        int_list(f, team->assigned, team->threads);
+      else
+        fputs("null", f);
+      fprintf(f, ", \"affinity_verified\": %s}", team->verified ? "true" : "false");
+    }
+    fputs("\n  ]", f);
+  }
+
+  fputs(",\n  \"regions\": [", f);
+  for (int i = 0; i < region_history_count(); i++) {
+    const RegionRecord *r = region_history_at(i);
+    fprintf(f, "%s\n    {\"role\": \"%s\", \"socket\": %d, \"node\": ", i ? "," : "", region_role_name(r->role),
+            r->socket);
+    if (r->node >= 0)
+      fprintf(f, "%d", r->node);
+    else
+      fputs("null", f);
+    fprintf(f, ", \"bytes\": %zu, \"thp_requested\": %s, ", r->bytes, r->thp_requested ? "true" : "false");
+    if (r->checked)
+      fprintf(f,
+              "\"thp_bytes\": %zu, \"verified\": \"%s\", \"pages_queried\": %zu, \"pages_mismatched\": %zu, "
+              "\"pages_missing\": %zu}",
+              r->thp_bytes, r->full ? "full" : "sampled", r->pages_queried, r->pages_mismatched, r->pages_missing);
+    else
+      fputs("\"thp_bytes\": null, \"verified\": \"unverified\", \"pages_queried\": null, \"pages_mismatched\": "
+            "null, \"pages_missing\": null}",
+            f);
+  }
+  fputs(region_history_count() ? "\n  ]" : "]", f);
+  fputs(",\n  \"kv\": ", f);
+  kv_object(f);
+  fprintf(f, ",\n  \"phase_seconds\": null,\n  \"prefill\": {\"microbatches\": %zu, \"tokens\": %zu, \"seconds\": %.9f, \"logits_rows\": %zu}",
+          metrics.prefill_microbatches, metrics.processed_tokens, metrics.prefill_s, metrics.prefill_logits_rows);
+}
+
 void write_report(void) {
   if (!options.json)
     return;
@@ -122,7 +271,7 @@ void write_report(void) {
   char timestamp[32] = "";
   if (gmtime_r(&now, &utc))
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
-  fputs("{\n  \"schema_version\": 1,\n  \"timestamp_utc\": ", f);
+  fputs("{\n  \"schema_version\": 2,\n  \"timestamp_utc\": ", f);
   string(f, timestamp);
   fputs(",\n  \"status\": ", f);
   string(f, metrics.completed ? "completed" : "error");
@@ -178,36 +327,18 @@ void write_report(void) {
   else
     fputs("null", f);
   fputs(",\n    \"affinity_cpus\": ", f);
-#ifdef __linux__
-  cpu_set_t affinity;
-  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+  int affinity[CPU_LIMIT];
+  int affinity_count = numa_affinity_cpus(affinity, CPU_LIMIT);
+  if (affinity_count >= 0) {
     fputc('[', f);
-    int comma = 0;
-    for (int i = 0; i < CPU_SETSIZE; i++)
-      if (CPU_ISSET(i, &affinity)) {
-        fprintf(f, "%s%d", comma ? ", " : "", i);
-        comma = 1;
-      }
+    for (int i = 0; i < affinity_count; i++)
+      fprintf(f, "%s%d", i ? ", " : "", affinity[i]);
     fputc(']', f);
   } else
     fputs("null", f);
-#else
-  fputs("null", f);
-#endif
   fputs(",\n    \"numa_online_nodes\": ", f);
-#ifdef __linux__
-  FILE *nodes = fopen("/sys/devices/system/node/online", "r");
   char topology[256];
-  if (nodes && fgets(topology, sizeof(topology), nodes)) {
-    topology[strcspn(topology, "\r\n")] = 0;
-    string(f, topology);
-  } else
-    fputs("null", f);
-  if (nodes)
-    fclose(nodes);
-#else
-  fputs("null", f);
-#endif
+  string(f, numa_online_nodes(topology, sizeof(topology)) == 0 ? topology : NULL);
   fputs("\n  },\n  \"build\": {\n    \"compiler\": ", f);
   string(f, __VERSION__);
   fputs(",\n    \"mode\": ", f);
@@ -249,6 +380,13 @@ void write_report(void) {
   string(f, options.prompt_file);
   fputs(",\n    \"system_prompt\": ", f);
   string(f, options.system_prompt);
+  fputs(",\n    \"prefill_batch\": ", f);
+  if (metrics.runtime_ready)
+    fprintf(f, "%d", engine_max_batch(&model));
+  else
+    fputs("null", f);
+  fputs(",\n    \"prefill_logits\": ", f);
+  string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "
           "\"generated_output\": %zu,\n    \"forward_passes\": %zu,\n    \"decode_steps\": %zu,\n    \"sampled\": "
@@ -267,7 +405,11 @@ void write_report(void) {
   timing(f, "average_time_per_generated_token", metrics.output_tokens ? metrics.inference_s / metrics.output_tokens : 0,
          metrics.output_tokens > 0, 1);
   timing(f, "average_decode_step", metrics.decode_steps ? metrics.decode_s / metrics.decode_steps : 0,
-         metrics.decode_steps > 0, 0);
+         metrics.decode_steps > 0, 1);
+  /* weight_pack arrives with weight packing (C5); the placement timings come from the owned loader (A4). */
+  timing(f, "weight_pack", 0, 0, 1);
+  timing(f, "placement_populate", metrics.placement_populate_s, metrics.placement_owned, 1);
+  timing(f, "placement_verify", metrics.placement_verify_s, metrics.placement_owned, 0);
   fputs("  },\n  \"throughput_tokens_per_second\": {\n    \"prefill\": ", f);
   rate(f, metrics.processed_tokens, metrics.prefill_s);
   fputs(",\n    \"decode\": ", f);
@@ -278,9 +420,10 @@ void write_report(void) {
   rate(f, metrics.output_tokens, metrics.inference_s);
   fputs("\n  },\n  \"profile_seconds\": ", f);
   profile_report(f);
+  write_v2_sections(f);
   fputs(",\n  \"memory_bytes\": {\n    \"model_file\": ", f);
   if (metrics.checkpoint_ready)
-    fprintf(f, "%zu", model.mapped_bytes);
+    fprintf(f, "%zu", model.file_bytes);
   else
     fputs("null", f);
   fputs(",\n    \"mapped_checkpoint\": ", f);
@@ -291,7 +434,7 @@ void write_report(void) {
   const char *names[] = {
       "kv_cache_allocated_peak",       "activations_allocated_peak", "dequantized_embedding_allocated_peak",
       "model_metadata_allocated_peak", "tokenizer_allocated_peak",   "sampler_allocated_peak",
-      "prompt_buffers_allocated_peak"};
+      "prompt_buffers_allocated_peak", "owned_weights_peak",         "packed_weights_peak"};
   for (int i = 0; i < MEM_COUNT; i++)
     fprintf(f, ",\n    \"%s\": %zu", names[i], memory_peak[i]);
   fprintf(f, ",\n    \"explicit_allocations_peak\": %zu,\n    \"peak_resident\": ", memory_total_peak);

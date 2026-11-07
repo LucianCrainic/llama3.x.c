@@ -1,4 +1,5 @@
 #include "app.h"
+#include "loader.h"
 #include "profile.h"
 #include <errno.h>
 #include <limits.h>
@@ -194,9 +195,23 @@ static int *tokenize(Tokenizer *t, const char *text, int bos, int *n) {
   return tokens;
 }
 
-/* Sequential prefill: every supplied token, including the last prompt token,
- * executes one forward pass. Only its final logits are sampled. A decode step
+/* Microbatched prefill: every supplied token, including the last prompt token,
+ * is forwarded. Only the final prompt logits are sampled. A decode step
  * forwards the previously generated token. EOS/EOT are sampled but not emitted. */
+/* KV accounting and, in an owned placement, a page-placement query of the caches. It runs between timed regions: its
+ * duration is added to verify_excluded_s, which the callers take out of TTFT and inference time. */
+static int kv_position;
+static void kv_snapshot(KvStats *out, int *ready, int position) {
+  const char *verify = getenv("LLAMA_KV_VERIFY");
+  double start = monotonic_seconds();
+  engine_kv_stats(&model, position, !(verify && !strcmp(verify, "0")), out);
+  double spent = monotonic_seconds() - start;
+  metrics.verify_excluded_s += spent;
+  if (metrics.placement_owned)
+    metrics.placement_verify_s += spent;
+  *ready = 1;
+}
+
 static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n, int *position, int generation_limit,
                         int echo_prompt, double turn_start) {
   metrics.input_tokens += (size_t)n;
@@ -207,18 +222,31 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   }
   float *logits = NULL;
   metrics.inference_started = 1;
-  for (int i = 0; i < n && *position < options.steps; i++) {
+  for (int i = 0; i < n && *position < options.steps;) {
+    int count = n - i;
+    if (count > engine_max_batch(&model))
+      count = engine_max_batch(&model);
+    if (count > options.steps - *position)
+      count = options.steps - *position;
+    LogitsWanted want = model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
     profile_stage = STAGE_PREFILL;
     double start = monotonic_seconds();
-    logits = engine_forward(&model, tokens[i], (*position)++);
+    logits = engine_forward_batch(&model, tokens + i, count, *position, want);
     metrics.prefill_s += monotonic_seconds() - start;
-    metrics.processed_tokens++;
-    metrics.forward_passes++;
-    if (echo_prompt && i + 1 < n && !options.no_text) {
-      print_token(t, tokens[i + 1]);
+    if (want == LOGITS_ALL)
+      logits += (size_t)(count - 1) * model.config.vocab_size;
+    *position += count;
+    metrics.processed_tokens += (size_t)count;
+    metrics.forward_passes += (size_t)count;
+    metrics.prefill_microbatches++;
+    metrics.prefill_logits_rows += want == LOGITS_ALL ? (size_t)count : want == LOGITS_LAST ? 1u : 0u;
+    if (echo_prompt && !options.no_text) {
+      for (int j = i; j < i + count && j + 1 < n; j++)
+        print_token(t, tokens[j + 1]);
       fflush(stdout);
     }
-    if (i + 1 < n && *position == options.steps) {
+    i += count;
+    if (i < n && *position == options.steps) {
       metrics.stop_reason = "step_limit";
       return -1;
     }
@@ -226,6 +254,11 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   if (!logits) {
     metrics.stop_reason = "step_limit";
     return -1;
+  }
+  if (!metrics.kv_prompt_ready) {
+    double before = metrics.verify_excluded_s;
+    kv_snapshot(&metrics.kv_prompt, &metrics.kv_prompt_ready, *position);
+    turn_start += metrics.verify_excluded_s - before;
   }
   int output_count = 0;
   for (;;) {
@@ -273,10 +306,12 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
                     : tokenize(t, prompt ? prompt : "", 1, &n);
   metrics.tokenization_s += monotonic_seconds() - start;
   int pos = 0;
+  double excluded = metrics.verify_excluded_s;
   run_sequence(t, s, tokens, n, &pos, options.generation_length, !options.chat_template, start);
+  kv_position = pos;
   if (!options.no_text)
     putchar('\n');
-  metrics.inference_s += monotonic_seconds() - start;
+  metrics.inference_s += monotonic_seconds() - start - (metrics.verify_excluded_s - excluded);
   memory_free(tokens);
 }
 
@@ -311,12 +346,14 @@ static void chat(Tokenizer *t, Sampler *s) {
     int *tokens = chat_prompt(t, system, user, pos == 0, &n);
     metrics.tokenization_s += monotonic_seconds() - start;
     fputs("Assistant: ", stderr);
+    double excluded = metrics.verify_excluded_s;
     int stop = run_sequence(t, s, tokens, n, &pos, -1, 0, start);
     if (!options.no_text)
       putchar('\n');
-    metrics.inference_s += monotonic_seconds() - start;
+    metrics.inference_s += monotonic_seconds() - start - (metrics.verify_excluded_s - excluded);
     /* Cache the end-of-turn marker before consuming the next user template. */
     if (stop == t->eot_id && pos < options.steps) {
+      profile_stage = STAGE_DECODE;
       double tick = monotonic_seconds();
       engine_forward(&model, stop, pos++);
       double elapsed = monotonic_seconds() - tick;
@@ -330,6 +367,7 @@ static void chat(Tokenizer *t, Sampler *s) {
     if (stop != t->eot_id)
       break;
   }
+  kv_position = pos;
   memory_free(owned_system);
 }
 
@@ -365,12 +403,13 @@ int main(int argc, char **argv) {
   start = monotonic_seconds();
   build_sampler(&s, model.config.vocab_size, options.temperature, options.topp, options.seed);
   metrics.runtime_s += monotonic_seconds() - start;
-  LOG(LOG_INFO, "%s: dim=%d layers=%d context=%d; mapped=%zu bytes; seed=%llu", engine_precision(), model.config.dim,
-      model.config.n_layers, model.config.seq_len, model.mapped_bytes, options.seed);
+  LOG(LOG_INFO, "%s: dim=%d layers=%d context=%d; mapped=%zu of %zu bytes; placement=%s; seed=%llu", engine_precision(), model.config.dim,
+      model.config.n_layers, model.config.seq_len, model.mapped_bytes, model.file_bytes, placement_active(), options.seed);
   if (!strcmp(options.mode, "chat"))
     chat(&t, &s);
   else
     generate(&t, &s, options.prompt);
+  kv_snapshot(&metrics.kv_final, &metrics.kv_final_ready, kv_position);
   if (!options.no_text && fflush(stdout))
     fail("cannot flush generated text: %s", strerror(errno));
   if (ferror(stdout))

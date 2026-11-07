@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=llama-tp
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=112
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --time=04:00:00
+# Flat Mode campaign skeleton for tensor parallelism (track B) on a dual Xeon Max 9480 node.
+# Submit with a verified --partition/--nodelist and separate -o/-e paths; every submission needs the
+# owner's go-ahead for that job. Required: ROOT (tree under test), OUT (new directory), PYTHON. Optional: MODELS
+# ("NAME:ARTIFACT_DIR:HF_SNAPSHOT ..."; the artifact directory holds fp32-v3.bin, int8-v3.bin, tokenizer-v2.bin);
+# without it the model gates are skipped and recorded.
+# PHASE is a space-separated list of phase ids ("A1 A2"); phase_<ID> functions below (or in the library) hold each
+# phase's matrix. PHASE=none runs only the common check. The exit status is non-zero if any expectation failed.
+set -euo pipefail
+# Slurm runs a copy of this script, so the library is found through ROOT, not through the script's own path.
+: "${ROOT:?tree under test required}"
+# shellcheck source=lib/cresco8-common.sh
+source "$ROOT/scripts/lib/cresco8-common.sh"
+require_env
+job_begin
+if ! dry_run; then
+  check_stage
+  validate_models
+fi
+run_phases
+exit "$OVERALL"

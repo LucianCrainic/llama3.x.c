@@ -49,23 +49,174 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn('runtime error:', result.stderr)
         data = json.loads(report.read_text())
         self.assertEqual(data['status'], 'completed' if success else 'error')
-        self.assertEqual(data['schema_version'], 1)
+        self.assertEqual(data['schema_version'], 2)
         return result, data
 
     def test_baseline_numerical_regression(self):
-        for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
-            result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True)
-            self.assertEqual(result.returncode,0,result.stderr)
-            values = list(map(float,result.stdout.splitlines()))
-            self.assertEqual(len(values),48)
-            for actual, expected in zip(values,self.reference[engine]):
-                self.assertTrue(math.isclose(actual,expected,rel_tol=2e-5,abs_tol=2e-6),(engine,actual,expected))
-            for flag in ('--overflow','--add-overflow'):
-                result = subprocess.run([str(BUILD/unit),flag],capture_output=True,text=True)
-                self.assertEqual(result.returncode,1)
-                self.assertIn('overflow',result.stderr)
+        # The OpenMP/serial path, then worker teams with odd counts that stress range splitting.
+        backends = [{}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
+        for env in backends:
+            for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
+                result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True,
+                                        env={**os.environ, **env}, timeout=60)
+                self.assertEqual(result.returncode,0,(env,result.stderr))
+                values = list(map(float,result.stdout.splitlines()))
+                self.assertEqual(len(values),48)
+                for actual, expected in zip(values,self.reference[engine]):
+                    self.assertTrue(math.isclose(actual,expected,rel_tol=2e-5,abs_tol=2e-6),(env,engine,actual,expected))
+        for flag in ('--overflow','--add-overflow'):
+            result = subprocess.run([str(BUILD/'test-fp32'),flag],capture_output=True,text=True)
+            self.assertEqual(result.returncode,1)
+            self.assertIn('overflow',result.stderr)
+
+    def test_report_schema_v2(self):
+        v2 = ('runtime', 'topology', 'topology_error', 'teams', 'regions', 'kv', 'phase_seconds', 'prefill')
+        _, data = self.execute('run')
+        for key in v2:
+            self.assertIn(key, data)
+        self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
+            'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None})
+        self.assertIsNone(data['teams'])
+        self.assertEqual(data['regions'], [])
+        self.assertIsNone(data['phase_seconds'])
+        self.assertEqual(set(data['kv']), {'reserved_bytes', 'resident_bytes', 'active_bytes', 'node', 'verified', 'full',
+                                           'pages_queried', 'pages_wrong_node', 'pages_missing', 'after_prompt'})
+        self.assertEqual(set(data['prefill']), {'microbatches', 'tokens', 'seconds', 'logits_rows'})
+        for key in ('weight_pack', 'placement_populate', 'placement_verify'):
+            self.assertIsNone(data['timing_seconds'][key])
+        self.assertIn('owned_weights_peak', data['memory_bytes'])
+        self.assertIn('packed_weights_peak', data['memory_bytes'])
+        _, data = self.execute('runq', env={'LLAMA_Q8_ACTIVATIONS': 'fp32'})
+        self.assertEqual(data['runtime']['precision_mode'], 'int8_q8_0_w8a32')
+        _, data = self.execute('run', env={'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3',
+                                           'LLAMA_TOPOLOGY': 'virtual:1x3', 'LLAMA_THP': 'on'})
+        self.assertEqual((data['runtime']['backend'], data['runtime']['thp']), ('teams', 'on'))
+        self.assertEqual(data['teams'], [{'index': 0, 'threads': 3, 'cpus': None, 'affinity_verified': False}])
+        topology = data['topology']
+        self.assertIsNone(data['topology_error'])
+        self.assertEqual(topology['sockets'], [{'package': -1, 'cpus': None, 'threads': 3, 'ddr_node': -1,
+            'hbm_node': -1, 'ddr_allowed': True, 'hbm_allowed': True, 'classification': 'virtual'}])
+        # A topology that cannot be discovered is reported, not fatal, and failures still write valid JSON.
+        _, data = self.execute('run', env={'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1', 'LLAMA_SYSFS_ROOT': '/nonexistent'})
+        self.assertIsNone(data['topology'])
+        self.assertIn('cannot read', data['topology_error'])
+
+    def test_backend_environment_is_validated(self):
+        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),
+                          ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '0'}, 'LLAMA_THREADS must be'),
+                          ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': 'x'}, 'LLAMA_THREADS must be')]:
+            with self.subTest(env=env):
+                self.execute('run', success=False, env=env)
+                result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                         '-i', 'A', '-t', '0'], capture_output=True, text=True, env={**os.environ, **env})
+                self.assertIn(text, result.stderr)
+
+    def test_prefill_bitwise_and_classifier_calls(self):
+        for shared in (True, False):
+            fixture = create(self.root/f'prefill-{shared}', shared=shared, seq_len=64)
+            for binary, filename, activations in (
+                ('test-prefill-fp32', 'fp32.bin', 'int8'),
+                ('test-prefill-int8', 'int8.bin', 'int8'),
+                ('test-prefill-int8', 'int8.bin', 'fp32'),
+            ):
+                for batch in (1, 2, 3, 7, 32):
+                    with self.subTest(shared=shared, binary=binary, activations=activations, batch=batch):
+                        result = subprocess.run([str(BUILD/binary), str(fixture/filename)],
+                                                capture_output=True, text=True, timeout=120,
+                                                env={**os.environ, 'LLAMA_PREFILL_BATCH': str(batch),
+                                                     'LLAMA_Q8_ACTIVATIONS': activations})
+                        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prefill_invalid_inputs_and_configuration(self):
+        for engine, binary, filename in (('run', 'test-prefill-fp32', 'fp32.bin'),
+                                          ('runq', 'test-prefill-int8', 'int8.bin')):
+            for value in ('0', '-1', '+1', ' 2', '2 ', '2x', '1.5', '2147483648', '9'*40):
+                _, data = self.execute(engine, success=False, env={'LLAMA_PREFILL_BATCH': value})
+                self.assertIn('LLAMA_PREFILL_BATCH', data['error'])
+            self.execute(engine, success=False, env={'LLAMA_PREFILL_LOGITS': 'none'})
+            _, data = self.execute(engine, '--context-length', '8', '--generation-length', '1',
+                                   env={'LLAMA_PREFILL_BATCH': '2147483647'})
+            self.assertEqual(data['parameters']['prefill_batch'], 8)
+            for case in ('null', 'zero', 'negative-count', 'large-count', 'negative-pos',
+                         'large-pos', 'context', 'token', 'negative-token', 'policy'):
+                result = subprocess.run([str(BUILD/binary), str(self.shared/filename), case],
+                                        capture_output=True, text=True,
+                                        env={**os.environ, 'LLAMA_PREFILL_BATCH': '7'})
+                self.assertEqual(result.returncode, 1, (case, result.stderr))
+                self.assertIn('[ERROR]', result.stderr)
+                self.assertNotIn('AddressSanitizer', result.stderr)
+                self.assertNotIn('runtime error:', result.stderr)
+
+    def test_prefill_cli_equivalence(self):
+        cases = [
+            (self.shared, ('-i', '', '--generation-length', '1')),
+            (self.shared, ('-i', 'ABCDEFGHI', '--generation-length', '4')),
+            (self.shared, ('-i', 'ABCDEFGHI', '--generation-length', '0')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '5')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '7')),
+            (self.shared, ('-i', 'ABCDEFGHI', '-n', '10')),
+            (self.shared, ('-i', 'A'*31, '-n', '32')),
+            (self.shared, ('-i', 'A'*32, '-n', '32')),
+            (self.unshared, ('-i', 'ABC', '--generation-length', '4', '-t', '.8')),
+            (self.first_stop, ('--generation-length', '5')),
+            (self.later_stop, ('--generation-length', '5')),
+        ]
+        for engine in ('run', 'runq'):
+            for fixture, args in cases:
+                baseline, reference = self.execute(engine, *args, fixture=fixture,
+                                                    env={'LLAMA_PREFILL_BATCH': '1', 'LLAMA_PREFILL_LOGITS': 'all'})
+                for policy in ('last', 'all'):
+                    actual, data = self.execute(engine, *args, fixture=fixture,
+                                                env={'LLAMA_PREFILL_BATCH': '7', 'LLAMA_PREFILL_LOGITS': policy})
+                    self.assertEqual(actual.stdout, baseline.stdout)
+                    self.assertEqual(data['tokens'], reference['tokens'])
+                    self.assertEqual(data['stop_reason'], reference['stop_reason'])
+                    self.assertEqual(data['prefill']['microbatches'],
+                                     (data['tokens']['processed_prompt'] + 6)//7)
+                    self.assertEqual(data['parameters']['prefill_batch'], 7)
+                    self.assertEqual(data['parameters']['prefill_logits'], policy)
+                    self.assertEqual(data['timing_seconds']['time_to_first_token'] is None,
+                                     reference['timing_seconds']['time_to_first_token'] is None)
+
+    def test_prefill_chat_multiple_turns(self):
+        # Turn the deterministic first-stop classifier into an EOT classifier.
+        fixture = create(self.root/'chat-eot', shared=False, stop='first', seq_len=64)
+        d, _, _, _, _, vocab, _ = CONFIG
+        for filename, width in (('fp32.bin', d*4), ('int8.bin', d)):
+            data = bytearray((fixture/filename).read_bytes())
+            scales = vocab*(d//2)*4 if filename == 'int8.bin' else 0
+            base = len(data) - vocab*width - scales
+            for start, size in [(base, width)] + ([(len(data)-scales, (d//2)*4)] if scales else []):
+                data[start+128009*size:start+128010*size] = data[start+128001*size:start+128002*size]
+                data[start+128001*size:start+128002*size] = bytes(size)
+            (fixture/filename).write_bytes(data)
+        for engine in ('run', 'runq'):
+            baseline, reference = self.execute(engine, '-m', 'chat', '-y', '', '-i', 'A',
+                                                fixture=fixture, stdin='B\nexit\n',
+                                                env={'LLAMA_PREFILL_BATCH': '1', 'LLAMA_PROFILE': '1'})
+            actual, data = self.execute(engine, '-m', 'chat', '-y', '', '-i', 'A',
+                                        fixture=fixture, stdin='B\nexit\n',
+                                        env={'LLAMA_PREFILL_BATCH': '7', 'LLAMA_PROFILE': '1'})
+            self.assertEqual(actual.stdout, baseline.stdout)
+            self.assertEqual(data['tokens'], reference['tokens'])
+            self.assertEqual(data['tokens']['sampled_stop'], 2)
+            self.assertEqual(data['tokens']['decode_steps'], 2)  # EOT caching
+            self.assertEqual(data['stop_reason'], 'user_exit')
+            self.assertEqual(data['prefill']['microbatches'], 8)  # 24-token first turn, 23-token next turn
 
     @unittest.skipUnless('-DLLAMA_PCRE2' in (BUILD/'config').read_text(), 'new tokenizer requires PCRE2')
+    def test_manifest_matches_layouts(self):
+        """Manifest offsets equal the old pointer-bumping layout (oracle in tests/manifest.c)."""
+        def check(*args):
+            result = subprocess.run([str(BUILD/'test-manifest'), *map(str, args)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        check()
+        v3 = upgrade_v3(create(self.root/'v3-manifest', shared=False))
+        v3_shared = upgrade_v3(create(self.root/'v3-manifest-shared'))
+        for fixture in (self.shared, self.unshared, v3, v3_shared):
+            check('fp32', fixture/'fp32.bin')
+            check('int8', fixture/'int8.bin')
+
     def test_v3_metadata_context_and_stopping(self):
         fixture = upgrade_v3(create(self.root/'v3'))
         for engine in ('run', 'runq'):
@@ -124,8 +275,126 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(mem['kv_cache_allocated_peak'],2*CONFIG[2]*CONFIG[-1]*2*4)
             self.assertEqual(mem['mapped_checkpoint'],mem['model_file'])
             self.assertEqual(mem['model_file'],(self.shared/('fp32.bin' if engine=='run' else 'int8.bin')).stat().st_size)
-            if engine=='runq':
-                self.assertEqual(mem['dequantized_embedding_allocated_peak'],CONFIG[5]*CONFIG[0]*4)
+            if engine=='runq':  # embedding rows are dequantized on demand since A4: no FP32 table exists
+                self.assertEqual(mem['dequantized_embedding_allocated_peak'],0)
+
+    # ---- A4: owned weight placement ----------------------------------------------------------------------------
+    OWNED = {'LLAMA_PLACEMENT': 'ddr', 'LLAMA_PLACEMENT_STRICT': '0'}  # portable regions: no NUMA needed
+
+    def logits(self, engine, fixture, tokens, env, batch=None):
+        probe = BUILD/('probe-fp32' if engine == 'run' else 'probe-int8')
+        model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
+        command = [str(probe)] + (['batch'] if batch else []) + [str(model), *map(str, tokens)]
+        extra = {'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'} if batch else {}
+        result = subprocess.run(command, capture_output=True, timeout=60, env={**os.environ, **extra, **env})
+        self.assertEqual(result.returncode, 0, result.stderr.decode())  # exit 3 would mean a leak
+        return result.stdout
+
+    def test_owned_placement_is_bitwise_equal_to_the_file_mapping(self):
+        tokens = [65, 66, 67, 68, 69, 70, 71]
+        variants = [{}, {'LLAMA_LOADER_CHUNK': '7', 'LLAMA_LOADER_MAX_READ': '5'},
+                    {'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3', 'LLAMA_LOADER_CHUNK': '4096'}]
+        for fixture in (self.shared, self.unshared):
+            for engine in ('run', 'runq'):
+                for batch in (None, 3):
+                    expected = self.logits(engine, fixture, tokens, {}, batch)
+                    self.assertEqual(len(expected), len(tokens) * 128010 * 4)
+                    for extra in variants:
+                        actual = self.logits(engine, fixture, tokens, {**self.OWNED, **extra}, batch)
+                        self.assertEqual(actual, expected, (fixture.name, engine, batch, extra))
+
+    def test_owned_placement_report_and_accounting(self):
+        for engine, name in (('run', 'fp32.bin'), ('runq', 'int8.bin')):
+            for fixture in (self.shared, self.unshared):
+                _, data = self.execute(engine, '--benchmark', '--generation-length', '2', '--no-text', fixture=fixture,
+                                       env=self.OWNED)
+                self.assertEqual(data['runtime']['placement'], 'ddr')
+                mem, file_size = data['memory_bytes'], (fixture/name).stat().st_size
+                self.assertEqual((mem['model_file'], mem['mapped_checkpoint']), (file_size, 0))
+                everything = data['regions']
+                self.assertEqual(sorted(r['role'] for r in everything if r['role'].startswith('kv') or r['role'] == 'work'),
+                                 ['kv.k', 'kv.v', 'work'])
+                regions = [r for r in everything if r['role'] in ('weights', 'embedding')]
+                roles = sorted(r['role'] for r in regions)
+                self.assertEqual(roles, ['weights'] if fixture is self.shared else ['embedding', 'weights'])
+                # Portable regions (no NUMA nodes here) carry no evidence; bound ones on Linux must be fully verified.
+                for r in everything:
+                    if r['node'] is None:
+                        self.assertEqual(r['verified'], 'unverified')
+                    elif r['role'] in ('weights', 'embedding'):
+                        self.assertEqual((r['verified'], r['pages_mismatched'], r['pages_missing']), ('full', 0, 0))
+                total = sum(r['bytes'] for r in regions)
+                header = 28 if engine == 'run' else 256
+                # Everything after the header is copied; padding keeps each range's alignment modulo 64.
+                self.assertGreaterEqual(total, file_size - header)
+                self.assertLess(total, file_size - header + 3 * 64)
+                self.assertEqual(mem['owned_weights_peak'] + mem['dequantized_embedding_allocated_peak'], total)
+                self.assertEqual(data['kv']['reserved_bytes'], mem['kv_cache_allocated_peak'])
+                for key in ('placement_populate', 'placement_verify'):
+                    self.assertGreaterEqual(data['timing_seconds'][key], 0)
+                self.assertLess(data['timing_seconds']['checkpoint_load'], 5)
+        _, data = self.execute('run', '--benchmark', '--no-text')
+        self.assertEqual((data['runtime']['placement'], data['regions']), ('file', []))
+        self.assertIsNone(data['timing_seconds']['placement_populate'])
+        self.assertEqual(data['memory_bytes']['owned_weights_peak'], 0)
+
+    def test_prefill_gemm_is_reported_and_selectable(self):
+        for setting, batch, expected in (('on', '4', 'scalar'), ('off', '4', None), ('on', '1', None)):
+            _, data = self.execute('run', '--benchmark', '--no-text', '-i', 'A long enough prompt',
+                                   env={'LLAMA_PREFILL_GEMM': setting, 'LLAMA_PREFILL_BATCH': batch,
+                                        'LLAMA_KERNELS': 'scalar'})
+            self.assertEqual(data['runtime']['kernels_prefill'], expected, (setting, batch))
+        _, data = self.execute('run', env={'LLAMA_PREFILL_GEMM': 'maybe'}, success=False)
+        self.assertIn('LLAMA_PREFILL_GEMM', data['error'])
+
+    # ---- A5: KV cache and workspace placement ------------------------------------------------------------------
+    def test_kv_accounting_matches_the_formula(self):
+        layers, kv_dim, seq = CONFIG[2], CONFIG[0] // CONFIG[3] * CONFIG[4], CONFIG[-1]
+        for env in ({}, self.OWNED):
+            for engine in ('run', 'runq'):
+                _, data = self.execute(engine, '--benchmark', '--generation-length', '5', '--no-text', env=env)
+                kv, tokens = data['kv'], data['tokens']
+                self.assertEqual(kv['reserved_bytes'], 2 * layers * seq * kv_dim * 4)
+                position = tokens['processed_prompt'] + tokens['decode_steps']
+                self.assertEqual(kv['active_bytes'], 2 * layers * position * kv_dim * 4)
+                self.assertEqual(kv['after_prompt']['active_bytes'], 2 * layers * tokens['processed_prompt'] * kv_dim * 4)
+                self.assertLessEqual(kv['active_bytes'], kv['reserved_bytes'])
+                if env and kv['node'] is not None:  # bound KV on Linux: every queried page on the requested node
+                    self.assertTrue(kv['verified'] and kv['pages_wrong_node'] == 0)
+                    # Residency is counted in whole pages: a page per cache beyond the logical extent is legitimate.
+                    self.assertGreaterEqual(kv['resident_bytes'], kv['active_bytes'])
+                    self.assertLessEqual(kv['resident_bytes'], kv['reserved_bytes'] + 2 * os.sysconf('SC_PAGE_SIZE'))
+                else:  # residency is never invented
+                    self.assertFalse(kv['verified'])
+                    self.assertIsNone(kv['resident_bytes'])
+                self.assertEqual(data['memory_bytes']['kv_cache_allocated_peak'], kv['reserved_bytes'])
+
+    def test_kv_verification_is_untimed_and_can_be_disabled(self):
+        _, data = self.execute('run', '--benchmark', '--no-text', env={**self.OWNED, 'LLAMA_KV_VERIFY': '0'})
+        self.assertFalse(data['kv']['verified'])
+        self.assertIsNone(data['kv']['resident_bytes'])
+
+    def test_owned_placement_runs_to_the_context_limit(self):
+        for engine in ('run', 'runq'):
+            for env in ({}, self.OWNED):
+                _, data = self.execute(engine, '--benchmark', '--no-text', '--context-length', '16', env=env)
+                self.assertEqual(data['tokens']['processed_prompt'] + data['tokens']['decode_steps'], 16)
+                self.assertEqual(data['kv']['active_bytes'], data['kv']['reserved_bytes'])
+
+    def test_placement_configuration_errors(self):
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'bogus'}, success=False)
+        self.assertIn('LLAMA_PLACEMENT must be file, ddr or hbm', data['error'])
+        _, data = self.execute('run', env={**self.OWNED, 'LLAMA_LOADER_CHUNK': '0'}, success=False)
+        self.assertIn('LLAMA_LOADER_CHUNK', data['error'])
+        # hbm needs a real HBM node; without one it must fail rather than silently use DDR (strict is the default).
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2'}, success=False)
+        self.assertIn('LLAMA_PLACEMENT=hbm cannot be honoured', data['error'])
+        _, data = self.execute('run', '--benchmark', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2',
+                                                          'LLAMA_PLACEMENT_STRICT': '0'})
+        self.assertEqual(data['runtime']['placement'], 'hbm')  # explicit opt-out: unbound memory, still correct
+        _, data = self.execute('run', env={'LLAMA_PLACEMENT': 'hbm', 'LLAMA_TOPOLOGY': 'virtual:1x2',
+                                           'LLAMA_PLACEMENT_STRICT': '0', 'LLAMA_HBM_BUDGET_GIB': '-1'}, success=False)
+        self.assertIn('LLAMA_HBM_BUDGET_GIB', data['error'])
 
     def test_phase_profile(self):
         phases = {'embedding','rope_table','rmsnorm','quantize','qkv','rope','kv_store','attention','wo',

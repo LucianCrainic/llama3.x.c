@@ -3,10 +3,14 @@
  * live only in plain functions; ISA-specific work runs in target-attributed
  * helpers called once per row block, so no outlined region needs AVX-512. */
 #include "kernels.h"
+#include "numa.h"
+#include "workers.h"
 #include <float.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -21,6 +25,12 @@
 
 static KernelIsa isa = KERNELS_SCALAR;
 static int initialized;
+/* With a team set, kernels run on it instead of opening OpenMP regions. */
+static Team *current_team;
+
+void kernels_set_team(Team *team) {
+  current_team = team;
+}
 
 static int supported(KernelIsa which) {
   if (which == KERNELS_SCALAR)
@@ -66,10 +76,51 @@ const char *kernels_name(void) {
 
 enum { BLOCK = 4 }; // rows per GEMV kernel call
 
+int kernels_avx512_active(void) {
+  return isa == KERNELS_AVX512;
+}
+
+typedef struct {
+  SegmentFn fn;
+  const void *job;
+  int count;
+  const int *chunks;
+} SegmentRun;
+
+static void run_segments(const SegmentRun *run, int worker, int workers) {
+  for (int s = 0; s < run->count; s++) {
+    int first = (int)((long long)run->chunks[s] * worker / workers);
+    int last = (int)((long long)run->chunks[s] * (worker + 1) / workers);
+    if (last > first)
+      run->fn(run->job, s, first, last);
+  }
+}
+
+static void segments_team(const void *p, int worker, int workers) {
+  run_segments(p, worker, workers);
+}
+
+void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job) {
+  SegmentRun run = {fn, job, count, chunks};
+  if (current_team) {
+    team_run(current_team, segments_team, &run);
+    return;
+  }
+#ifdef _OPENMP
+#pragma omp parallel
+  run_segments(&run, omp_get_thread_num(), omp_get_num_threads());
+#else
+  run_segments(&run, 0, 1);
+#endif
+}
+
 /* Each thread receives one contiguous, balanced row range, so weight rows are
  * streamed sequentially per thread and hardware prefetch stays effective. */
-typedef void (*RowFn)(const void *job, int r0, int r1);
 static void parallel_rows(int rows, RowFn fn, const void *job) {
+  if (current_team) {
+    team_parallel_rows(current_team, rows, fn, job);
+    return;
+  }
 #ifdef _OPENMP
 #pragma omp parallel
   {
@@ -359,8 +410,8 @@ AVX512 static void rope_avx512(float *v, const float *table, int heads, int head
  * unnormalized value sum for each query head. K/V chunks are at most 256
  * positions, so heads after the first re-read them from L2, not memory. */
 AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const float *vc, int kv_dim, int head_dim,
-                                          int heads, int t0, int t1, float *att, int seq_len, float *partial,
-                                          size_t head_stride) {
+                                          int heads, int t0, int t1, float *scores, size_t score_stride,
+                                          float *partial, size_t head_stride) {
   enum { MAX_VECTORS = 16 };
   int vectors = (head_dim + 15) / 16;
   __mmask16 last = tail_mask(head_dim - (vectors - 1) * 16);
@@ -370,7 +421,7 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
     __m512 qv[MAX_VECTORS];
     for (int v = 0; v < vectors; v++)
       qv[v] = _mm512_maskz_loadu_ps(v + 1 == vectors ? last : 0xFFFF, q + (size_t)h * head_dim + v * 16);
-    float *a = att + (size_t)h * seq_len;
+    float *a = scores + (size_t)h * score_stride; /* a[t - t0] is the score of position t */
     int t = t0;
     for (; t + 4 <= t1; t += 4) {
       const float *k0 = kc + (size_t)t * kv_dim, *k1 = k0 + kv_dim, *k2 = k1 + kv_dim, *k3 = k2 + kv_dim;
@@ -382,22 +433,22 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
         s2 = _mm512_fmadd_ps(qv[v], _mm512_maskz_loadu_ps(m, k2 + v * 16), s2);
         s3 = _mm512_fmadd_ps(qv[v], _mm512_maskz_loadu_ps(m, k3 + v * 16), s3);
       }
-      a[t] = _mm512_reduce_add_ps(s0) / divisor;
-      a[t + 1] = _mm512_reduce_add_ps(s1) / divisor;
-      a[t + 2] = _mm512_reduce_add_ps(s2) / divisor;
-      a[t + 3] = _mm512_reduce_add_ps(s3) / divisor;
+      a[t - t0] = _mm512_reduce_add_ps(s0) / divisor;
+      a[t - t0 + 1] = _mm512_reduce_add_ps(s1) / divisor;
+      a[t - t0 + 2] = _mm512_reduce_add_ps(s2) / divisor;
+      a[t - t0 + 3] = _mm512_reduce_add_ps(s3) / divisor;
     }
     for (; t < t1; t++) {
       const float *k0 = kc + (size_t)t * kv_dim;
       __m512 s0 = _mm512_setzero_ps();
       for (int v = 0; v < vectors; v++)
         s0 = _mm512_fmadd_ps(qv[v], _mm512_maskz_loadu_ps(v + 1 == vectors ? last : 0xFFFF, k0 + v * 16), s0);
-      a[t] = _mm512_reduce_add_ps(s0) / divisor;
+      a[t - t0] = _mm512_reduce_add_ps(s0) / divisor;
     }
     __m512 vmax = _mm512_set1_ps(-FLT_MAX);
     for (t = t0; t < t1; t += 16) {
       __mmask16 m = tail_mask(t1 - t);
-      __m512 s = _mm512_maskz_loadu_ps(m, a + t);
+      __m512 s = _mm512_maskz_loadu_ps(m, a + (t - t0));
       if (_mm512_mask_cmp_ps_mask(m, _mm512_and_ps(s, abs_mask), finite, _CMP_LE_OQ) != m)
         fail("nonfinite value in softmax");
       vmax = _mm512_mask_max_ps(vmax, m, vmax, s);
@@ -406,8 +457,8 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
     __m512 vsum = _mm512_setzero_ps(), shift = _mm512_set1_ps(max_val);
     for (t = t0; t < t1; t += 16) {
       __mmask16 m = tail_mask(t1 - t);
-      __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(m, a + t), shift));
-      _mm512_mask_storeu_ps(a + t, m, e);
+      __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(m, a + (t - t0)), shift));
+      _mm512_mask_storeu_ps(a + (t - t0), m, e);
       vsum = _mm512_mask_add_ps(vsum, m, vsum, e);
     }
     __m512 ov[MAX_VECTORS];
@@ -415,7 +466,7 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
       ov[v] = _mm512_setzero_ps();
     for (t = t0; t < t1; t++) {
       const float *vr = vc + (size_t)t * kv_dim;
-      __m512 p = _mm512_set1_ps(a[t]);
+      __m512 p = _mm512_set1_ps(a[t - t0]);
       for (int v = 0; v < vectors; v++)
         ov[v] = _mm512_fmadd_ps(p, _mm512_maskz_loadu_ps(v + 1 == vectors ? last : 0xFFFF, vr + v * 16), ov[v]);
     }
@@ -545,7 +596,22 @@ static void f32_rows(const void *p, int r0, int r1) {
   }
 }
 
+/* Teams split every segment on its own, so one member's range never straddles Q, K and V. */
+static void f32_team(const void *p, int worker, int workers) {
+  const F32Job *job = p;
+  for (int s = 0; s < job->count; s++) {
+    const F32Segment *seg = &job->segment[s];
+    int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
+    if (r1 > r0)
+      f32_range(job, seg, r0, r1);
+  }
+}
+
 static void f32_run(F32Job *job) {
+  if (current_team) {
+    team_run(current_team, f32_team, job);
+    return;
+  }
   int rows = 0;
   for (int s = 0; s < job->count; s++)
     rows += job->segment[s].d;
@@ -655,7 +721,21 @@ static void q8_rows(const void *p, int r0, int r1) {
   }
 }
 
+static void q8_team(const void *p, int worker, int workers) {
+  const Q8Job *job = p;
+  for (int s = 0; s < job->count; s++) {
+    const Q8Segment *seg = &job->segment[s];
+    int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
+    if (r1 > r0)
+      q8_range(job, seg, r0, r1);
+  }
+}
+
 static void q8_run(Q8Job *job) {
+  if (current_team) {
+    team_run(current_team, q8_team, job);
+    return;
+  }
   int rows = 0;
   for (int s = 0; s < job->count; s++)
     rows += job->segment[s].d;
@@ -721,6 +801,8 @@ void k_quantize(int8_t *q, float *s, const float *x, int n, int gs) {
 // Attention
 
 static int max_threads(void) {
+  if (current_team)
+    return team_size(current_team);
 #ifdef _OPENMP
   return omp_get_max_threads();
 #else
@@ -728,11 +810,10 @@ static int max_threads(void) {
 #endif
 }
 
-#if HAVE_AVX512
 /* Enough chunks to occupy every thread, each of 32..256 positions where the
  * prefix allows, bounded by the workspace. */
-static int attention_chunks(int positions, int n_kv_heads, int limit) {
-  int chunks = (max_threads() + n_kv_heads - 1) / n_kv_heads;
+static int attention_chunks(int positions, int n_kv_heads, int limit, int workers) {
+  int chunks = (workers + n_kv_heads - 1) / n_kv_heads;
   int longest = (positions + 31) / 32, shortest = (positions + 255) / 256;
   if (chunks > longest)
     chunks = longest;
@@ -742,76 +823,213 @@ static int attention_chunks(int positions, int n_kv_heads, int limit) {
     chunks = limit;
   return chunks < 1 ? 1 : chunks;
 }
-#endif
+static int attention_max_chunks(int n_kv_heads, int seq_len, int workers) {
+  int by_threads = (workers + n_kv_heads - 1) / n_kv_heads, by_length = (seq_len + 255) / 256;
+  return by_threads > by_length ? by_threads : by_length;
+}
 
-void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
-  int by_threads = (max_threads() + n_kv_heads - 1) / n_kv_heads, by_length = (seq_len + 255) / 256;
-  work->max_chunks = by_threads > by_length ? by_threads : by_length;
+static size_t attention_row_floats(int n_heads, int head_dim, int max_chunks) {
+  return checked_mul(checked_mul((size_t)n_heads, (size_t)max_chunks), (size_t)head_dim + 2);
+}
+
+static size_t attention_budget_floats(void) {
+  const char *value = getenv("LLAMA_ATTN_WORKSPACE_MIB");
+  long mib = value && *value ? atol(value) : 32;
+  return mib > 0 ? (size_t)mib * (1u << 20) / sizeof(float) : 1;
+}
+
+/* Rows of partials that fit: at least one, at most `rows`, otherwise as many as the budget holds. */
+static size_t attention_rows_capacity(int n_heads, int head_dim, int max_chunks, int rows) {
+  size_t per_row = attention_row_floats(n_heads, head_dim, max_chunks), fit = attention_budget_floats() / per_row;
+  size_t want = rows > 1 ? (size_t)rows : 1;
+  return fit < 1 ? 1 : fit < want ? fit : want;
+}
+
+size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
+  int chunks = attention_max_chunks(n_kv_heads, seq_len, max_threads());
+  return checked_mul(checked_mul(attention_rows_capacity(n_heads, head_dim, chunks, rows),
+                                 attention_row_floats(n_heads, head_dim, chunks)),
+                     sizeof(float));
+}
+
+size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+  return k_attention_bytes_rows(n_heads, n_kv_heads, head_dim, seq_len, 1);
+}
+
+void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
+                           float *memory) {
+  /* The team (or OpenMP thread count) must be set before this: it sizes the split-K workspace. */
+  work->workers = max_threads();
+  work->max_chunks = attention_max_chunks(n_kv_heads, seq_len, work->workers);
   work->n_heads = n_heads;
   work->head_dim = head_dim;
-  work->partial = memory_alloc(checked_mul(checked_mul((size_t)n_heads, (size_t)work->max_chunks), (size_t)head_dim + 2),
-                               sizeof(float), MEM_ACTIVATION);
+  work->external = memory != NULL;
+  work->capacity = checked_mul(attention_rows_capacity(n_heads, head_dim, work->max_chunks, rows),
+                               attention_row_floats(n_heads, head_dim, work->max_chunks));
+  work->partial = memory ? memory : memory_alloc(work->capacity, sizeof(float), MEM_ACTIVATION);
+}
+
+void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory) {
+  k_attention_init_rows(work, n_heads, n_kv_heads, head_dim, seq_len, 1, memory);
+}
+
+void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len) {
+  k_attention_init_in(work, n_heads, n_kv_heads, head_dim, seq_len, NULL);
 }
 
 void k_attention_free(AttentionWork *work) {
-  memory_free(work->partial);
+  if (!work->external)
+    memory_free(work->partial);
   work->partial = NULL;
+}
+
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  float *att;
+  int n_heads, n_kv_heads, head_size, seq_len, pos;
+} ScalarAttention;
+
+static void attention_scalar_head(const ScalarAttention *j, int h) {
+  int head_size = j->head_size, pos = j->pos, kv_dim = j->n_kv_heads * head_size, kv_mul = j->n_heads / j->n_kv_heads;
+  // get the query vector for this head
+  const float *qh = j->q + h * head_size;
+  // attention scores for this head
+  float *a = j->att + (size_t)h * j->seq_len;
+  // iterate over all timesteps, including the current one
+  for (int t = 0; t <= pos; t++) {
+    // get the key vector for this head and at this timestep
+    const float *k = j->key_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+    // calculate the attention score as the dot product of q and k
+    float score = 0.0f;
+    for (int i = 0; i < head_size; i++) {
+      score += qh[i] * k[i];
+    }
+    score /= sqrtf(head_size);
+    // save the score to the attention buffer
+    a[t] = score;
+  }
+
+  // softmax the scores to get attention weights, from 0..pos inclusively
+  softmax(a, pos + 1);
+
+  // weighted sum of the values, store back into xb
+  float *xb = j->out + h * head_size;
+  memset(xb, 0, head_size * sizeof(float));
+  for (int t = 0; t <= pos; t++) {
+    // get the value vector for this head and at this timestep
+    const float *v = j->value_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+    // get the attention weight for this timestep
+    float w = a[t];
+    // accumulate the weighted value into xb
+    for (int i = 0; i < head_size; i++) {
+      xb[i] += w * v[i];
+    }
+  }
+}
+
+static void attention_scalar_rows(const void *p, int h0, int h1) {
+  for (int h = h0; h < h1; h++)
+    attention_scalar_head(p, h);
 }
 
 static void attention_scalar(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                              int n_heads, int n_kv_heads, int head_size, int seq_len, int pos) {
-  int kv_dim = n_kv_heads * head_size, kv_mul = n_heads / n_kv_heads;
+  ScalarAttention job = {out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_size, seq_len, pos};
+  if (current_team) {
+    team_parallel_rows(current_team, n_heads, attention_scalar_rows, &job);
+    return;
+  }
   // multihead attention. iterate over all heads
   int h;
 #ifdef _OPENMP
 #pragma omp parallel for private(h)
 #endif
-  for (h = 0; h < n_heads; h++) {
-    // get the query vector for this head
-    const float *qh = q + h * head_size;
-    // attention scores for this head
-    float *a = att + (size_t)h * seq_len;
-    // iterate over all timesteps, including the current one
-    for (int t = 0; t <= pos; t++) {
-      // get the key vector for this head and at this timestep
-      const float *k = key_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-      // calculate the attention score as the dot product of q and k
-      float score = 0.0f;
-      for (int i = 0; i < head_size; i++) {
-        score += qh[i] * k[i];
-      }
-      score /= sqrtf(head_size);
-      // save the score to the attention buffer
-      a[t] = score;
-    }
-
-    // softmax the scores to get attention weights, from 0..pos inclusively
-    softmax(a, pos + 1);
-
-    // weighted sum of the values, store back into xb
-    float *xb = out + h * head_size;
-    memset(xb, 0, head_size * sizeof(float));
-    for (int t = 0; t <= pos; t++) {
-      // get the value vector for this head and at this timestep
-      const float *v = value_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
-      // get the attention weight for this timestep
-      float w = a[t];
-      // accumulate the weighted value into xb
-      for (int i = 0; i < head_size; i++) {
-        xb[i] += w * v[i];
-      }
-    }
-  }
+  for (h = 0; h < n_heads; h++)
+    attention_scalar_head(&job, h);
 }
+
+/* Merge chunk results: rescale each by exp(m_c - M) and normalize. `base` holds `chunks` slots of `slot` floats. */
+static void merge_chunks(const float *base, size_t slot, int chunks, int head_dim, float *o) {
+  float max_val = base[head_dim];
+  for (int c = 1; c < chunks; c++)
+    if (base[c * slot + head_dim] > max_val)
+      max_val = base[c * slot + head_dim];
+  float sum = 0.0f;
+  memset(o, 0, head_dim * sizeof(float));
+  for (int c = 0; c < chunks; c++) {
+    const float *chunk = base + c * slot;
+    float weight = expf(chunk[head_dim] - max_val);
+    sum += weight * chunk[head_dim + 1];
+    for (int i = 0; i < head_dim; i++)
+      o[i] += weight * chunk[i];
+  }
+  for (int i = 0; i < head_dim; i++)
+    o[i] /= sum;
+}
+
+#if HAVE_AVX512
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  float *att, *partial;
+  int n_heads, head_dim, seq_len, positions, kv_mul, kv_dim, chunks, tasks;
+  size_t slot, head_stride;
+  atomic_int next_task; /* team-local queue over (kv group, chunk) tasks */
+} SplitKJob;
+
+static void attention_task(const SplitKJob *j, int task) {
+  int g = task / j->chunks, c = task % j->chunks;
+  int t0 = (int)((long long)j->positions * c / j->chunks), t1 = (int)((long long)j->positions * (c + 1) / j->chunks);
+  int h0 = g * j->kv_mul;
+  attention_chunk_avx512(j->q + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_dim,
+                         j->value_cache + (size_t)g * j->head_dim, j->kv_dim, j->head_dim, j->kv_mul, t0, t1,
+                         j->att + (size_t)h0 * j->seq_len + t0, j->seq_len,
+                         j->partial + h0 * j->head_stride + c * j->slot, j->head_stride);
+}
+
+static void attention_merge(const SplitKJob *j, int h) {
+  merge_chunks(j->partial + h * j->head_stride, j->slot, j->chunks, j->head_dim, j->out + (size_t)h * j->head_dim);
+}
+
+static void attention_team(const void *p, int worker, int workers) {
+  SplitKJob *j = (SplitKJob *)p;
+  for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
+    attention_task(j, task);
+  team_barrier(current_team); /* every chunk of every head is in `partial` before any head is merged */
+  for (int h = (int)((long long)j->n_heads * worker / workers);
+       h < (int)((long long)j->n_heads * (worker + 1) / workers); h++)
+    attention_merge(j, h);
+}
+#endif
 
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && head_dim <= 256) {
     int positions = position + 1, kv_mul = n_heads / n_kv_heads, kv_dim = n_kv_heads * head_dim;
-    int chunks = attention_chunks(positions, n_kv_heads, work->max_chunks), tasks = n_kv_heads * chunks;
-    size_t slot = (size_t)head_dim + 2, head_stride = (size_t)work->max_chunks * slot;
-    float *partial = work->partial;
+    int chunks = attention_chunks(positions, n_kv_heads, work->max_chunks, work->workers);
+    SplitKJob job = {.out = out,
+                     .q = q,
+                     .key_cache = key_cache,
+                     .value_cache = value_cache,
+                     .att = att,
+                     .partial = work->partial,
+                     .n_heads = n_heads,
+                     .head_dim = head_dim,
+                     .seq_len = seq_len,
+                     .positions = positions,
+                     .kv_mul = kv_mul,
+                     .kv_dim = kv_dim,
+                     .chunks = chunks,
+                     .tasks = n_kv_heads * chunks,
+                     .slot = (size_t)head_dim + 2,
+                     .head_stride = (size_t)work->max_chunks * ((size_t)head_dim + 2)};
+    atomic_init(&job.next_task, 0);
+    if (current_team) {
+      team_run(current_team, attention_team, &job);
+      return;
+    }
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -819,41 +1037,263 @@ void k_attention(float *out, const float *q, const float *key_cache, const float
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic, 1)
 #endif
-      for (int task = 0; task < tasks; task++) {
-        int g = task / chunks, c = task % chunks;
-        int t0 = (int)((long long)positions * c / chunks), t1 = (int)((long long)positions * (c + 1) / chunks);
-        int h0 = g * kv_mul;
-        attention_chunk_avx512(q + (size_t)h0 * head_dim, key_cache + (size_t)g * head_dim,
-                               value_cache + (size_t)g * head_dim, kv_dim, head_dim, kv_mul, t0, t1,
-                               att + (size_t)h0 * seq_len, seq_len, partial + h0 * head_stride + c * slot,
-                               head_stride);
-      }
-      /* Merge chunk results: rescale each by exp(m_c - M) and normalize. */
+      for (int task = 0; task < job.tasks; task++)
+        attention_task(&job, task);
 #ifdef _OPENMP
 #pragma omp for
 #endif
-      for (int h = 0; h < n_heads; h++) {
-        const float *base = partial + h * head_stride;
-        float max_val = base[head_dim];
-        for (int c = 1; c < chunks; c++)
-          if (base[c * slot + head_dim] > max_val)
-            max_val = base[c * slot + head_dim];
-        float *o = out + (size_t)h * head_dim, sum = 0.0f;
-        memset(o, 0, head_dim * sizeof(float));
-        for (int c = 0; c < chunks; c++) {
-          const float *chunk = base + c * slot;
-          float weight = expf(chunk[head_dim] - max_val);
-          sum += weight * chunk[head_dim + 1];
-          for (int i = 0; i < head_dim; i++)
-            o[i] += weight * chunk[i];
-        }
-        for (int i = 0; i < head_dim; i++)
-          o[i] /= sum;
-      }
+      for (int h = 0; h < n_heads; h++)
+        attention_merge(&job, h);
     }
     return;
   }
 #endif
   (void)work;
   attention_scalar(out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_dim, seq_len, position);
+}
+
+// ----------------------------------------------------------------------------
+// Batched causal attention (C3)
+
+typedef void (*ChunkFn)(const float *q, const float *kc, const float *vc, int kv_dim, int head_dim, int heads, int t0,
+                        int t1, float *scores, size_t score_stride, float *partial, size_t head_stride);
+
+/* Scalar reference of the chunk kernel: one GQA group over positions [t0, t1), writing per query head the
+ * unnormalized value sum, the local maximum and the local sum of exponentials, like attention_chunk_avx512. */
+static void attention_chunk_portable(const float *q, const float *kc, const float *vc, int kv_dim, int head_dim,
+                                     int heads, int t0, int t1, float *scores, size_t score_stride, float *partial,
+                                     size_t head_stride) {
+  float divisor = sqrtf((float)head_dim);
+  for (int h = 0; h < heads; h++) {
+    const float *qh = q + (size_t)h * head_dim;
+    float *a = scores + (size_t)h * score_stride, max_val = -FLT_MAX;
+    for (int t = t0; t < t1; t++) {
+      const float *k = kc + (size_t)t * kv_dim;
+      float score = 0.0f;
+      for (int i = 0; i < head_dim; i++)
+        score += qh[i] * k[i];
+      a[t - t0] = score / divisor;
+      if (a[t - t0] > max_val)
+        max_val = a[t - t0];
+    }
+    float *o = partial + (size_t)h * head_stride, sum = 0.0f;
+    memset(o, 0, head_dim * sizeof(float));
+    for (int t = t0; t < t1; t++) {
+      float e = expf(a[t - t0] - max_val);
+      sum += e;
+      const float *v = vc + (size_t)t * kv_dim;
+      for (int i = 0; i < head_dim; i++)
+        o[i] += e * v[i];
+    }
+    o[head_dim] = max_val;
+    o[head_dim + 1] = sum;
+  }
+}
+
+enum { BATCH_ROW_BLOCK = 4, BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
+
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  float *partial;
+  ChunkFn chunk;
+  int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
+  int pos0, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch */
+  int chunks_wave, blocks, tasks;
+  size_t slot, head_stride, row_stride;
+  atomic_int next_task; /* team-local queue over (kv group, chunk, row block) tasks */
+} BatchJob;
+
+static int batch_row_chunks(const BatchJob *j, int row) {
+  return attention_chunks(j->pos0 + row + 1, j->n_kv_heads, j->limit, j->workers);
+}
+
+/* One (kv group, chunk, block of rows) task. Rows of a block read the same K/V chunk back to back, so it stays in L2;
+ * each row uses exactly the chunk plan k_attention would use at its position, and positions past the row are masked
+ * simply by never being part of its chunks. */
+static void batch_task(const BatchJob *j, int task) {
+  int block = task % j->blocks, rest = task / j->blocks, c = rest % j->chunks_wave, g = rest / j->chunks_wave;
+  float scores[BATCH_MAX_GROUP * BATCH_MAX_CHUNK];
+  int first = block * BATCH_ROW_BLOCK, last = first + BATCH_ROW_BLOCK < j->rows ? first + BATCH_ROW_BLOCK : j->rows;
+  for (int rr = first; rr < last; rr++) {
+    int row = j->row0 + rr, positions = j->pos0 + row + 1, chunks = batch_row_chunks(j, row);
+    if (c >= chunks)
+      continue;
+    int t0 = (int)((long long)positions * c / chunks), t1 = (int)((long long)positions * (c + 1) / chunks);
+    int h0 = g * j->kv_mul;
+    j->chunk(j->q + (size_t)row * j->dim + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_dim,
+             j->value_cache + (size_t)g * j->head_dim, j->kv_dim, j->head_dim, j->kv_mul, t0, t1, scores,
+             (size_t)(t1 - t0), j->partial + (size_t)rr * j->row_stride + (size_t)h0 * j->head_stride + c * j->slot,
+             j->head_stride);
+  }
+}
+
+static void batch_merge(const BatchJob *j, int item) {
+  int rr = item / j->n_heads, h = item % j->n_heads, row = j->row0 + rr;
+  merge_chunks(j->partial + (size_t)rr * j->row_stride + (size_t)h * j->head_stride, j->slot, batch_row_chunks(j, row),
+               j->head_dim, j->out + (size_t)row * j->dim + (size_t)h * j->head_dim);
+}
+
+static void batch_team(const void *p, int worker, int workers) {
+  BatchJob *j = (BatchJob *)p;
+  for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
+    batch_task(j, task);
+  team_barrier(current_team); /* every chunk of every row and head is in `partial` before any is merged */
+  int items = j->rows * j->n_heads;
+  for (int item = (int)((long long)items * worker / workers); item < (int)((long long)items * (worker + 1) / workers);
+       item++)
+    batch_merge(j, item);
+}
+
+static void attention_batch_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
+                                   ChunkFn chunk) {
+  BatchJob job = {.out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
+                  .chunk = chunk, .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim,
+                  .kv_mul = n_heads / n_kv_heads, .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim,
+                  .limit = work->max_chunks, .workers = work->workers, .pos0 = pos0,
+                  .slot = (size_t)head_dim + 2};
+  for (int row0 = 0; row0 < m;) {
+    /* A wave holds as many rows of partials as the workspace allows; chunk counts only grow with the position, so the
+     * last row of the wave sets the slots per head. */
+    int rows = m - row0;
+    for (;;) {
+      job.row0 = row0, job.rows = rows;
+      job.chunks_wave = batch_row_chunks(&job, row0 + rows - 1);
+      if (rows == 1 || (size_t)rows * n_heads * job.chunks_wave * job.slot <= work->capacity)
+        break;
+      rows = (int)(work->capacity / ((size_t)n_heads * job.chunks_wave * job.slot));
+      rows = rows < 1 ? 1 : rows;
+    }
+    job.head_stride = (size_t)job.chunks_wave * job.slot;
+    job.row_stride = (size_t)n_heads * job.head_stride;
+    job.blocks = (rows + BATCH_ROW_BLOCK - 1) / BATCH_ROW_BLOCK;
+    job.tasks = n_kv_heads * job.chunks_wave * job.blocks;
+    atomic_init(&job.next_task, 0);
+    if (current_team) {
+      team_run(current_team, batch_team, &job);
+    } else {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+      {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (int task = 0; task < job.tasks; task++)
+          batch_task(&job, task);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (int item = 0; item < job.rows * n_heads; item++)
+          batch_merge(&job, item);
+      }
+    }
+    row0 += rows;
+  }
+}
+
+static int batch_supported(int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m) {
+  (void)seq_len;
+  return head_dim <= 256 && n_heads / n_kv_heads <= BATCH_MAX_GROUP && m > 1 && pos0 >= 0;
+}
+
+void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m) {
+#if HAVE_AVX512
+  if (isa == KERNELS_AVX512 && batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
+    attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
+                           attention_chunk_avx512);
+    return;
+  }
+#endif
+  /* The scalar kernels have no cross-row sharing to exploit: one row at a time, exactly the per-row call. */
+  size_t dim = (size_t)n_heads * head_dim;
+  for (int i = 0; i < m; i++)
+    k_attention(out + i * dim, q + i * dim, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len,
+                pos0 + i);
+}
+
+void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
+                                int m) {
+  if (!batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m))
+    fail("portable batched attention needs head_dim <= 256, at most %d heads per KV head and m > 1", BATCH_MAX_GROUP);
+  attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
+                         attention_chunk_portable);
+}
+
+// ----------------------------------------------------------------------------
+// Execution backend
+
+static int backend_started, backend_used;
+
+const char *kernels_backend_name(void) {
+  return backend_used ? "teams" : "omp";
+}
+
+void kernels_backend_init(void) {
+  /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
+   * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
+  const Topology *topology_result;
+  char topology_error[512];
+  numa_topology_try(&topology_result, topology_error, sizeof(topology_error));
+  const char *backend = getenv("LLAMA_BACKEND");
+  if (!backend || !*backend || !strcmp(backend, "omp"))
+    return;
+  if (strcmp(backend, "teams"))
+    fail("LLAMA_BACKEND must be omp or teams");
+  if (backend_started)
+    return;
+#ifdef _OPENMP
+  LOG(LOG_INFO, "LLAMA_BACKEND=teams: OpenMP regions are unused");
+#endif
+  int threads = 0, available;
+  const char *requested = getenv("LLAMA_THREADS");
+  if (requested && *requested) {
+    char *end;
+    long value = strtol(requested, &end, 10);
+    if (*end || value < 1 || value > TEAM_SUMMARY_THREADS)
+      fail("LLAMA_THREADS must be an integer in 1..%d", TEAM_SUMMARY_THREADS);
+    threads = (int)value;
+  }
+  static int affinity[1024];
+  const int *cpus;
+  const char *topology = getenv("LLAMA_TOPOLOGY");
+  if (topology && *topology) {
+    const SocketTopo *socket = &numa_topology()->socket[0]; /* one team on the first socket until B adds two */
+    available = socket->ncpus;
+    cpus = socket->cpus;
+  } else {
+    int allowed = numa_affinity_cpus(affinity, 1024);
+    available = allowed > 0 ? allowed : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    cpus = allowed > 0 ? affinity : NULL;
+  }
+  if (available < 1)
+    available = 1;
+  const char *bind = getenv("OMP_PROC_BIND");
+  if (!(topology && *topology) && available == 1 && bind && *bind && strcmp(bind, "false") && strcmp(bind, "FALSE"))
+    LOG(LOG_WARN,
+        "only one CPU is allowed and OMP_PROC_BIND=%s is set: the OpenMP runtime pins the launching thread to one "
+        "core at load. Unset it (or set OMP_PROC_BIND=false) for LLAMA_BACKEND=teams",
+        bind);
+  if (!threads)
+    threads = available;
+  if (cpus && threads > available) {
+    LOG(LOG_WARN, "LLAMA_THREADS=%d exceeds the %d allowed CPUs: workers are not pinned", threads, available);
+    cpus = NULL;
+  }
+  PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {cpus, NULL}};
+  pool_start(&config);
+  kernels_set_team(pool_team(0));
+  backend_started = backend_used = 1;
+  LOG(LOG_DEBUG, "worker team: %d threads, %s", threads, cpus ? "pinned" : "unpinned");
+}
+
+void kernels_backend_free(void) {
+  if (!backend_started)
+    return;
+  kernels_set_team(NULL);
+  pool_stop();
+  backend_started = 0;
 }
