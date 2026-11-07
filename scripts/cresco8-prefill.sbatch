@@ -52,7 +52,7 @@ c_run() {
 # The reference batched path must equal the per-token path bit for bit at every position, and skipping the prompt
 # classifiers is the only speed difference expected.
 phase_C1() {
-  local dir="$OUT/C1" entry name artifacts hf precision staged tokenizer backend m rep benv
+  local dir="$OUT/C1" entry name artifacts hf precision staged tokenizer backend m rep benv gemm_env
   if [[ -z $MODELS ]]; then
     echo 'MODELS is empty: no C1 model run was made' | tee "$dir/no-models.txt"
     return 0
@@ -64,11 +64,16 @@ phase_C1() {
     tokenizer="$artifacts/tokenizer-v2.bin"
     for precision in $PRECISIONS; do
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      # The bitwise criterion is about the reference batched path. On AVX-512 hosts the default FP32 batched path is the
+      # C2 GEMM, which sums in another order than the GEMV (its agreement is C2's budget gate), so FP32 pins it off here.
+      gemm_env=()
+      [[ $precision != fp32 ]] || gemm_env=(LLAMA_PREFILL_GEMM=off)
       for backend in omp teams; do
         read -r -a benv <<< "$(backend_env "$backend" 56 | tr '\n' ' ')"
         for m in 7 32; do
           CMP_FLAGS=(--bitwise --batch-b "$m")
-          a_bitwise "$dir" "$name" "$precision" "$staged" "$backend-m1-vs-m$m" "${benv[@]}" -- "${benv[@]}"
+          a_bitwise "$dir" "$name" "$precision" "$staged" "$backend-m1-vs-m$m" "${benv[@]}" -- "${benv[@]}" \
+            ${gemm_env[@]+"${gemm_env[@]}"}
         done
       done
       if [[ $precision == int8 ]]; then
@@ -81,6 +86,8 @@ phase_C1() {
       unstage_model_on 0 "$name" "$precision"
     done
     # Speed: only the classifier skipped, 8B FP32 (HBM-staged), 86- and 2048-token prompts, interleaved repeats.
+    # C1_SPEED=0 re-runs only the comparisons above.
+    [[ ${C1_SPEED:-1} != 0 ]] || continue
     staged=$(stage_model_on 2 "$name" fp32 "$artifacts")
     for ((rep = 1; rep <= REPEATS; rep++)); do
       for logits in all last; do
