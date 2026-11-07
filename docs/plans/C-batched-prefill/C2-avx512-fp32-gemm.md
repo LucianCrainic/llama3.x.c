@@ -8,7 +8,7 @@ microbatch. The GEMM feeds every projection of the batched forward. The epilogue
 match the GEMV kinds (STORE, ADD, SWIGLU, PARTIAL), so the same kernel later serves the
 two-socket shards (D1).
 
-Status: **implemented locally; cluster check pending**. Branch: `feature/prefill-c2-avx512-gemm` (stacked on C1).
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -120,6 +120,40 @@ the user's go-ahead to submit.
 | `compare_engines.py` 8B FP32: M = 64 GEMM vs per-token, `all` logits, 4 prompts | max\|Δlogit\| ≤ 1e-3, argmax 100% |
 | GEMM microbenchmark: 8B layer shapes (4096×4096, 1024×4096, 14336×4096, 4096×14336) at M ∈ {1, 8, 16, 32, 64, 128, 256}, 56 workers, HBM | **Measured** GFLOP/s and GB/s, compared with the **modeled** ridge (B≈32) and the **measured** FP32 FMA peak of 8.8 TF (`docs/hbm-roofline.md:25-31`) |
 | Short prefill sweep: 8B FP32, 2048-token prompt, M ∈ {16, 32, 64, 128} | Prefill tok/s recorded (C7 is the full campaign) |
+
+### Cluster results (2026-11-07)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, commit `fec5f44`, `STAGE=check`, `HF_GATE=0`. Job 5693938 (38 min), results `m2-prefill-20261107-1` under `~/PFS/lpor`; the AVX-512 GEMM ran on hardware for
+the first time here.
+
+- **Kernel parity on hardware.** `test-kernels` and the GEMM tests pass on teams of 1, 28 and 56 (`avx512 ok`).
+- **Agreement** (`compare_engines.py`, GEMM at M = 64 against the per-token path, budget max |Δlogit| ≤ 1e-3, argmax
+  100%): 1B 1.1e-5 to 3.1e-5 over prompts of 53, 128, 256 and 512 tokens; 8B 1.4e-4, 4.7e-5, 2.0e-4 and 4.8e-4. Argmax
+  agreement 100% in all eight. The 8B error grows with prompt length and is within a factor of two of the budget at 512
+  tokens; watch it at longer prompts.
+- **GEMM microbenchmark** (56 workers, weights on HBM, best of the runs, 8B layer shapes; FMA peak 8.8 TFLOP/s):
+
+  | Shape | M = 1 | M = 8 | M = 16 | M = 64 | M = 128 | GEMM / GEMV rows at M = 64 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1024 × 4096 | 780 | 2374 | 2474 | 2494 | 2330 | 2.4× |
+  | 4096 × 4096 | 498 | 2720 | 2391 | 3489 | 3584 | 2.7× |
+  | 4096 × 14336 | 226 | 1727 | 2623 | 3063 | 2948 | 13.9× |
+  | 14336 × 4096 | 267 | 1854 | 2829 | 3538 | 3593 | 15.7× |
+
+  (GFLOP/s.) The GEMM reaches 40-41% of the FMA peak on the large shapes, and wins from M = 8 upward; at M = 1 it is
+  slower than the GEMV, so the engine keeps the GEMV for decode.
+- **End to end** (8B FP32, 2048-token prompt, 56 threads, weights HBM-staged, median of 3, last-position logits):
+
+  | M | Prefill tok/s | TTFT s | Decode tok/s |
+  | ---: | ---: | ---: | ---: |
+  | 1 (per-token) | 16.5 | 126.5 | 14.9 |
+  | 16 | 127.9 | 16.4 | 15.2 |
+  | 32 | 156.6 | 13.4 | 15.2 |
+  | 64 | 173.5 | 12.1 | 15.0 |
+  | 128 | 174.7 | 12.0 | 15.2 |
+
+  Prefill is 10.5× faster at M = 64 and flattens beyond it; decode is unchanged. On 1B: 111.8 tok/s per-token, 915 at
+  M = 64 (8.2×), 970 at M = 128.
 
 ## 7. Exit criteria
 

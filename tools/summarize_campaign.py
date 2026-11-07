@@ -14,6 +14,7 @@ LABEL = re.compile(r'^(?P<model>.+?)-(?P<precision>fp32|bf16|int8|w8a32)-(?P<bac
                    r'(?P<placement>file|ddr|hbm)-s(?P<sockets>[12])-t(?P<threads>\d+)(?:-m(?P<m>\d+))?'
                    r'(?:-p(?P<prompt>\d+))?(?:-c(?P<ctx>\d+))?(?:-k(?P<kernel>[a-z0-9_]+))?(?:-x(?P<tag>[a-z0-9_]+))?-(?P<rep>\d+)$')
 CAS_LINE = 64  # bytes per uncore CAS
+SMALL_REGION = 16 << 20  # regions below this are not placement-verified
 
 
 def parse_label(stem):
@@ -64,7 +65,9 @@ def placement_status(report):
         return f'{placement} (unverified)'
     if any((r.get('pages_mismatched') or 0) > 0 for r in regions):
         return f'{placement} (MISMATCH)'
-    if all(r.get('verified') == 'full' for r in regions):
+    # Small scratch regions (the work area) are reserved but deliberately not verified: they do not make a run unverified.
+    regions = [r for r in regions if r.get('verified') != 'unverified' or (r.get('bytes') or 0) >= SMALL_REGION]
+    if regions and all(r.get('verified') == 'full' for r in regions):
         return f'{placement} (verified)'
     if any(r.get('verified') == 'sampled' for r in regions):
         return f'{placement} (sampled)'

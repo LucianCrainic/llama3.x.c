@@ -7,7 +7,7 @@ running from the read-only file mapping. On one socket, every frequently read we
 goes to the selected node. The untied input embedding goes to DDR. Inference math is
 identical, and logits must be **bitwise** equal to `LLAMA_PLACEMENT=file`.
 
-Status: **implemented locally; cluster check pending**. Branch: `feature/numa-a4-owned-loader`.
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -127,6 +127,25 @@ the user's go-ahead to submit.
 | `validate.py` with `LLAMA_PLACEMENT=hbm` | Same results as today. FP32 gated; INT8 recorded. |
 | Startup breakdown for 8B FP32/INT8 | **Measured** load, populate, verify; peak RSS; page-cache footprint |
 | Full verification with the 8B weights on HBM | 100% on node 2 |
+
+### Cluster results (2026-11-07)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, commit `fec5f44`, `STAGE=check`, `HF_GATE=0`. Job 5693937 (14.5 min, 49 of 49 expectations passed), results `m2-place-20261107-1` under `~/PFS/lpor`.
+The Hugging Face gate was not repeated: with bitwise-identical logits its result cannot differ from the gate the staged
+baseline already passed (M1).
+
+- **Bitwise logits.** `file` (checkpoint staged on HBM node 2) against `hbm` and `ddr` (engine-owned regions) are
+  bitwise identical at all 53 prompt positions on 1B and 8B, FP32 and Q8_0 (W8A8, plus W8A32 on the Q8 `teams` run),
+  under both `omp` and `teams`: 18 comparisons, 0 non-bitwise (26 with A5's, all bitwise).
+- **Placement.** 8B FP32 (30.0 GB) is fully verified on the requested node (2 for `hbm`, 0 for `ddr`): 7,329,028 pages
+  queried, 0 mismatched, 0 missing, 30.0 GB on transparent huge pages. The embedding sits on node 0 (DDR) by design
+  (2.1 GB FP32, 0.56 GB Q8). `mapped_checkpoint` is 0: the engine no longer maps the file.
+- **Startup cost** (one launch each, 8B): FP32 populate 0.29 s + verify 0.46 s for 30.0 GB; Q8 0.08 s + 0.14 s for 8.0 GB.
+- **Speed sanity** (single launches, not a benchmark): 8B FP32 decode 14.6 tok/s on `hbm` against 14.9 for the staged
+  baseline.
+- **Tooling note.** `summarize_campaign.py` prints `(unverified)` for these runs because the 1 MB work region is
+  deliberately not verified; the placement checker (`placement-*.txt`) is the evidence and reports every large region
+  `verified=full`.
 
 ## 7. Exit criteria
 

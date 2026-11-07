@@ -62,6 +62,16 @@ class CampaignSummaryTests(unittest.TestCase):
         for bad in ('correctness-1b-fp32', '1b-fp32-omp-file-s1-t56', 'x-fp16-omp-file-s1-t1-1'):
             self.assertIsNone(sc.parse_label(bad))
 
+    def test_small_unverified_work_region_does_not_hide_a_verified_placement(self):
+        import summarize_campaign as sc
+        large = {'verified': 'full', 'pages_mismatched': 0, 'bytes': 2**30}
+        work = {'verified': 'unverified', 'bytes': 2**20}
+        status = lambda *regions: sc.placement_status({'runtime': {'placement': 'hbm'}, 'regions': list(regions)})
+        self.assertEqual(status(large, work), 'hbm (verified)')
+        self.assertEqual(status(large, dict(work, bytes=2**30)), 'hbm (unverified)')  # a big unchecked region still counts
+        self.assertEqual(status(work), 'hbm (unverified)')                             # nothing was verified at all
+        self.assertEqual(status(large, dict(large, pages_mismatched=3)), 'hbm (MISMATCH)')
+
     def test_summary_of_repeats_failures_and_old_reports(self):
         import summarize_campaign as sc
         with tempfile.TemporaryDirectory() as temp:

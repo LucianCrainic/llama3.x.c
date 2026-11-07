@@ -11,7 +11,7 @@ Process M query rows of a microbatch together:
 
 The result must match per-row attention within the existing budget.
 
-Status: **implemented locally; cluster check pending**. Branch: `feature/prefill-c3-causal-attention` (stacked on C2).
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -115,6 +115,25 @@ the user's go-ahead to submit.
 | `test-kernels` attention cases, 56 workers | Pass |
 | `compare_engines.py` 8B FP32: M = 64 (GEMM + batched attention) vs per-token, prompt lengths 86 and 2048 | max\|Δlogit\| ≤ 1e-3, argmax 100% |
 | Attention share of prefill time at prompts 2048 and 8192, M = 64 | **Measured**. Long prompts make attention quadratic; record when it overtakes GEMM. |
+
+### Cluster results (2026-11-07)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, commit `fec5f44`, `STAGE=check`, `HF_GATE=0`. Job 5693938, same run as C2.
+
+- **Kernel parity on hardware.** The attention tests pass on teams of 1, 28 and 56.
+- **Agreement** (batched attention at M = 64 against the per-token path): max |Δlogit| 1.1e-5 (1B, 86 tokens), 3.1e-5
+  (1B, 512), 6.0e-6 (1B, 2048, last row only); 8B 1.4e-4, 4.8e-4 and 9.8e-6. Argmax agreement 100%. The 8B 512-token
+  case equals the C2 GEMM comparison, so the attention kernel adds no visible error of its own.
+- **Where the time goes** (`LLAMA_PROFILE=1`, M = 64, share of prefill forward time):
+
+  | Model, prompt | W1/W3 | W2 | QKV | Attention | Wo | RMSNorm |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 8B, 2048 | 37% | 25% | 13% | 12% | 7% | 5% |
+  | 8B, 8192 | 33% | 23% | 11% | 21% | 6% | 5% |
+  | 1B, 2048 | 34% | 23% | 11% | 18% | 6% | 6% |
+  | 1B, 8192 | 31% | 19% | 10% | 28% | 5% | 5% |
+
+  Attention grows with the prompt but has not overtaken the GEMMs by 8192 tokens; on 1B it is already 28%.
 
 ## 7. Exit criteria
 

@@ -7,7 +7,7 @@ owning socket's bound regions, first touched by the owner team. KV capacity is
 reported as reserved, resident and active bytes. Inference math is unchanged, and
 logits must be bitwise equal to A4.
 
-Status: **implemented locally; cluster check pending**. Branch: `feature/numa-a5-kv-placement` (stacked on A4).
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -98,6 +98,18 @@ the user's go-ahead to submit.
 | 8B FP32/INT8, `--context-length 32768`, a 2048-token prompt, 128 generated tokens, HBM | KV pages 100% on node 2 after the prompt and at the end; `active` ≤ `resident` ≤ `reserved` |
 | `compare_engines.py` against A4 | Bitwise identical logits |
 | Same with `LLAMA_THP=on` | THP backing reported for weights and KV |
+
+### Cluster results (2026-11-07)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, commit `fec5f44`, `STAGE=check`, `HF_GATE=0`. Job 5693937, same run as A4.
+
+- **Residency.** For 1B and 8B, FP32 and Q8, with THP off and on: the K, V and work regions are reserved on the requested
+  node, and the KV pages that exist are verified on it with none elsewhere (`elsewhere=0`). `active <= resident <=
+  reserved` holds after the prompt and at the end (8B FP32, 2048-token prompt, 32768 context: active 579 MB, resident
+  671 MB, reserved 8.59 GB; the unwritten remainder shows as missing pages, as designed).
+- **Logits.** `hbm` against `file` stays bitwise identical with microbatched prefill (M = 32) on all four model and
+  precision combinations.
+- **Not measured.** The decode effect of socket-local KV at long context belongs to A6.
 
 ## 7. Exit criteria
 
