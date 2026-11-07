@@ -613,8 +613,9 @@ static void *split_main(void *p) {
            kv_local * sizeof(float));
   }
   float *att = zeroed((size_t)hl * job->seq, sizeof(float));
-  AttentionWork work;
-  k_attention_init(&work, hl, kl, hd, job->seq); /* sized from this thread's team */
+  AttentionWork work; /* caller memory: memory_alloc's accounting belongs to one thread */
+  float *work_memory = zeroed(k_attention_bytes(hl, kl, hd, job->seq) / sizeof(float) + 1, sizeof(float));
+  k_attention_init_in(&work, hl, kl, hd, job->seq, work_memory); /* sized from this thread's team */
   k_attention(job->out + (size_t)job->socket * hl * hd, job->q + (size_t)job->socket * hl * hd, kl_cache, vl_cache, att,
               &work, hl, kl, hd, job->seq, job->pos);
   job->chunks = k_attention_chunk_count(&work, kl, job->pos);
@@ -624,7 +625,7 @@ static void *split_main(void *p) {
       job->bad_guard++;
   k_attention_free(&work);
   kernels_set_thread_team(NULL);
-  free(k_all), free(v_all), free(att);
+  free(k_all), free(v_all), free(att), free(work_memory);
   return NULL;
 }
 
@@ -714,7 +715,8 @@ static void *bench_attention_main(void *p) {
   fill(kc, (size_t)seq * kv_local, 2);
   fill(vc, (size_t)seq * kv_local, 1);
   AttentionWork work;
-  k_attention_init(&work, hl, kl, hd, seq);
+  float *work_memory = zeroed(k_attention_bytes(hl, kl, hd, seq) / sizeof(float) + 1, sizeof(float));
+  k_attention_init_in(&work, hl, kl, hd, seq, work_memory);
   atomic_fetch_add(job->go, 1);
   while (atomic_load(job->go) < 2)
     ;
@@ -729,7 +731,7 @@ static void *bench_attention_main(void *p) {
   job->workers = work.workers;
   k_attention_free(&work);
   kernels_set_thread_team(NULL);
-  free(q), free(out), free(kc), free(vc), free(att), free(samples);
+  free(q), free(out), free(kc), free(vc), free(att), free(samples), free(work_memory);
   return NULL;
 }
 
