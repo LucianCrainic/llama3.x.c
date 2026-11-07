@@ -1,11 +1,16 @@
 /* Shard planning and packing (B1): every original tensor must be rebuilt bit for bit from its shards.
- * Random checkpoint bytes stand in for weights, since shards only move bytes. */
+ * Random checkpoint bytes stand in for weights, since shards only move bytes.
+ *   test-shards                                          synthetic reconstruction and rejection cases
+ *   test-shards verify FILE fp32|int8 [ddr|hbm|file] [THREADS]
+ *       shards a real checkpoint over two sockets (the machine's topology, or LLAMA_TOPOLOGY=virtual:2xT), compares
+ *       every shard with the file bitwise, verifies the pages of each region, and prints one JSON object */
 #include "shards.h"
 #include "loader.h"
 #include "numa.h"
 #include "runtime.h"
 #include "workers.h"
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -188,7 +193,116 @@ static void expect_rejected(const Config *p, int quantized, int gs, int sockets,
     assert(memory_current[i] == 0);
 }
 
-int main(void) {
+/* ---- verify: a real checkpoint, two sockets -------------------------------------------------------------------------
+ */
+
+typedef struct {
+  ShardSet *set;
+  int fd, socket;
+  Team *team;
+} LoadArg;
+
+static void *load_main(void *p) {
+  LoadArg *arg = p;
+  shards_load(arg->set, arg->fd, arg->socket, arg->team);
+  return NULL;
+}
+
+static int shard_matches(const Shard *sh, const unsigned char *file) {
+  const TensorDesc *t = sh->src;
+  size_t elem = t->dtype == DT_Q8 ? 1 : sizeof(float), row_values = (size_t)t->cols * elem;
+  size_t groups = t->dtype == DT_Q8 ? (size_t)(t->cols / t->group_size) : 0, row_scales = groups * sizeof(float);
+  for (int r = 0; r < sh->rows; r++) {
+    size_t src_row = (size_t)(sh->row0 + r);
+    if (memcmp((const char *)sh->q + (size_t)r * sh->ld * elem,
+               file + t->offset + src_row * row_values + (size_t)sh->col0 * elem, (size_t)sh->cols * elem))
+      return 0;
+    if (t->dtype == DT_Q8 &&
+        memcmp(sh->s + (size_t)r * (sh->cols / t->group_size),
+               file + t->scale_offset + src_row * row_scales + (size_t)(sh->col0 / t->group_size) * sizeof(float),
+               (size_t)(sh->cols / t->group_size) * sizeof(float)))
+      return 0;
+  }
+  return 1;
+}
+
+static int verify_mode(int argc, char **argv) {
+  if (argc < 4)
+    return 2;
+  int quantized = !strcmp(argv[3], "int8");
+  const char *placement = argc > 4 ? argv[4] : "file";
+  Config config;
+  TensorManifest m;
+  int shared, gs, fd;
+  float *data;
+  size_t bytes;
+  checkpoint_map(argv[2], quantized, &config, &shared, &gs, &fd, &data, &bytes, &m);
+  ShardSet set;
+  shards_plan(&set, &m, &config, 2, gs);
+  const Topology *topology = numa_topology();
+  char err[256];
+  if (numa_check_placement(topology, 2, placement, err, sizeof(err)))
+    fail("%s", err);
+  PoolConfig pool = {.teams = 2};
+  for (int s = 0; s < 2; s++) {
+    pool.threads[s] = argc > 5 ? atoi(argv[5]) : topology->socket[s].ncpus;
+    pool.cpus[s] = pool.threads[s] <= topology->socket[s].ncpus ? topology->socket[s].cpus : NULL;
+  }
+  pool_start(&pool);
+  NumaRegion region[2] = {{0}, {0}}, global = {0};
+  void *base[2];
+  for (int s = 0; s < 2; s++) {
+    int node = !strcmp(placement, "hbm")   ? topology->socket[s].hbm_node
+               : !strcmp(placement, "ddr") ? topology->socket[s].ddr_node
+                                           : -1;
+    region_reserve(&region[s], set.region_bytes[s], s, node, ROLE_WEIGHTS, region_thp_default());
+    base[s] = region[s].data;
+  }
+  if (set.global_bytes)
+    region_reserve(&global, set.global_bytes, 0, strcmp(placement, "file") ? topology->socket[0].ddr_node : -1,
+                   ROLE_EMBEDDING, region_thp_default());
+  shards_bind(&set, base, global.data);
+  LoadArg arg[2] = {{&set, fd, 0, pool_team(0)}, {&set, fd, 1, pool_team(1)}};
+  double start = monotonic_seconds();
+  pthread_t thread;
+  assert(!pthread_create(&thread, NULL, load_main, &arg[1]));
+  load_main(&arg[0]);
+  pthread_join(thread, NULL);
+  double load_seconds = monotonic_seconds() - start;
+
+  int match = 1;
+  for (int i = 0; i < set.count; i++)
+    match &= shard_matches(&set.t[i], (const unsigned char *)data);
+  int placed = 1;
+  printf("{\"sockets\": 2, \"precision\": \"%s\", \"gs\": %d, \"shared\": %d, \"shards\": %d, \"match\": %d, "
+         "\"load_seconds\": %.4f, \"rows_seconds\": [%.4f, %.4f], \"cols_seconds\": [%.4f, %.4f], "
+         "\"scratch_peak\": [%zu, %zu], \"region_bytes\": [%zu, %zu], \"global_bytes\": %zu, \"regions\": [",
+         quantized ? "int8" : "fp32", gs, shared, set.count, match, load_seconds, set.rows_seconds[0],
+         set.rows_seconds[1], set.cols_seconds[0], set.cols_seconds[1], set.scratch_peak[0], set.scratch_peak[1],
+         set.region_bytes[0], set.region_bytes[1], set.global_bytes);
+  NumaRegion *all[3] = {&region[0], &region[1], &global};
+  for (int i = 0; i < 3; i++) {
+    PageCheck check = {0};
+    int status = all[i]->node >= 0 ? region_verify(all[i], 0, &check) : -1;
+    if (status == 0 && (check.wrong_node || check.missing || check.errors))
+      placed = 0;
+    printf("%s{\"socket\": %d, \"node\": %d, \"verified\": %d, \"queried\": %zu, \"on_node\": %zu, "
+           "\"wrong_node\": %zu, \"missing\": %zu}",
+           i ? ", " : "", all[i]->socket, all[i]->node, status == 0, check.queried, check.on_node, check.wrong_node,
+           check.missing);
+  }
+  printf("], \"placement_ok\": %d}\n", placed);
+  for (int i = 0; i < 3; i++)
+    region_release(all[i]);
+  pool_stop();
+  shards_free(&set);
+  manifest_free(&m);
+  return match && placed ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  if (argc >= 2 && !strcmp(argv[1], "verify"))
+    return verify_mode(argc, argv);
   int count = 0;
   for (int quantized = 0; quantized < 2; quantized++)
     for (int gs = 2; gs <= 8; gs *= 2) {

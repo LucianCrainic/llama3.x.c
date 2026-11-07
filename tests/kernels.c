@@ -1,10 +1,12 @@
 /* Kernel regression: every available instruction set against double-precision
  * references, and bitwise agreement for RoPE and activation quantization. */
 #include "kernels.h"
+#include "numa.h"
 #include "workers.h"
 #include <assert.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -629,8 +631,16 @@ static void *split_main(void *p) {
 static void test_attention_split(void) {
   const int positions[] = {0, 31, 32, 255, 256, 1000, 4095};
   const int heads = 8, kv_heads = 4, hd = 16, kv_full = kv_heads * hd;
-  const int team_sizes[] = {1, 3, 7};
-  for (size_t ti = 0; ti < sizeof(team_sizes) / sizeof(*team_sizes); ti++) {
+  int team_sizes[8] = {1, 3, 7};
+  size_t team_size_count = 3;
+  const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "1,56": two teams of that size each */
+  if (override && *override) {
+    team_size_count = 0;
+    for (char *copy = strdup(override), *token = strtok(copy, ","); token && team_size_count < 8;
+         token = strtok(NULL, ","))
+      team_sizes[team_size_count++] = atoi(token);
+  }
+  for (size_t ti = 0; ti < team_size_count; ti++) {
     PoolConfig config = {.teams = 2, .threads = {team_sizes[ti], team_sizes[ti]}, .cpus = {NULL, NULL}};
     pool_start(&config);
     for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
@@ -678,7 +688,85 @@ static void test_attention_split(void) {
   }
 }
 
-int main(void) {
+/* Attention time per socket on socket-local caches at the 8B shape (16 query heads and 4 KV heads per socket), for the
+ * B3 cluster check: both sockets attend at the same time on their own teams, at several contexts. */
+typedef struct {
+  int socket, context, reps;
+  atomic_int *go;
+  double median;
+  int chunks, workers;
+} BenchJob;
+
+static int compare_seconds(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x > y) - (x < y);
+}
+
+static void *bench_attention_main(void *p) {
+  BenchJob *job = p;
+  kernels_set_thread_team(pool_team(job->socket));
+  const int hl = 16, kl = 4, hd = 128, kv_local = kl * hd, seq = job->context + 1;
+  float *q = zeroed((size_t)hl * hd, sizeof(float)), *out = zeroed((size_t)hl * hd, sizeof(float));
+  float *kc = zeroed((size_t)seq * kv_local, sizeof(float)), *vc = zeroed((size_t)seq * kv_local, sizeof(float));
+  float *att = zeroed((size_t)hl * seq, sizeof(float));
+  double *samples = zeroed(job->reps, sizeof(double));
+  fill(q, (size_t)hl * hd, 2);
+  fill(kc, (size_t)seq * kv_local, 2);
+  fill(vc, (size_t)seq * kv_local, 1);
+  AttentionWork work;
+  k_attention_init(&work, hl, kl, hd, seq);
+  atomic_fetch_add(job->go, 1);
+  while (atomic_load(job->go) < 2)
+    ;
+  for (int r = 0; r < job->reps; r++) {
+    double start = monotonic_seconds();
+    k_attention(out, q, kc, vc, att, &work, hl, kl, hd, seq, job->context);
+    samples[r] = monotonic_seconds() - start;
+  }
+  qsort(samples, (size_t)job->reps, sizeof(double), compare_seconds);
+  job->median = samples[job->reps / 2];
+  job->chunks = k_attention_chunk_count(&work, kl, job->context);
+  job->workers = work.workers;
+  k_attention_free(&work);
+  kernels_set_thread_team(NULL);
+  free(q), free(out), free(kc), free(vc), free(att), free(samples);
+  return NULL;
+}
+
+static void bench_attention(int threads) {
+  const Topology *topology = numa_topology();
+  const int *cpus[2] = {NULL, NULL};
+  if (topology->nsockets == 2 && topology->socket[0].cpus && topology->socket[0].ncpus >= threads &&
+      topology->socket[1].ncpus >= threads) {
+    cpus[0] = topology->socket[0].cpus;
+    cpus[1] = topology->socket[1].cpus;
+  }
+  PoolConfig config = {.teams = 2, .threads = {threads, threads}, .cpus = {cpus[0], cpus[1]}};
+  pool_start(&config);
+  const int contexts[] = {512, 8192, 32768};
+  for (size_t c = 0; c < sizeof(contexts) / sizeof(*contexts); c++) {
+    atomic_int go = 0;
+    BenchJob job[2];
+    for (int s = 0; s < 2; s++)
+      job[s] = (BenchJob){.socket = s, .context = contexts[c], .reps = 200, .go = &go};
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, bench_attention_main, &job[1]));
+    bench_attention_main(&job[0]);
+    pthread_join(thread, NULL);
+    printf("{\"kernel\": \"%s\", \"threads\": %d, \"pinned\": %d, \"context\": %d, \"chunks\": %d, "
+           "\"median_us\": [%.1f, %.1f]}\n",
+           kernels_name(), threads, cpus[0] != NULL, contexts[c], job[0].chunks, job[0].median * 1e6,
+           job[1].median * 1e6);
+  }
+  pool_stop();
+}
+
+int main(int argc, char **argv) {
+  if (argc >= 2 && !strcmp(argv[1], "bench-attention")) {
+    kernels_init();
+    bench_attention(argc > 2 ? atoi(argv[2]) : 4);
+    return 0;
+  }
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
   float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
   int8_t *quantized[2] = {zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1)};
