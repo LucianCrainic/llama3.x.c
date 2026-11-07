@@ -4,6 +4,7 @@
  * helpers called once per row block, so no outlined region needs AVX-512. */
 #include "kernels.h"
 #include "numa.h"
+#include "tp.h"
 #include "workers.h"
 #include <float.h>
 #include <math.h>
@@ -1287,6 +1288,7 @@ const char *kernels_backend_name(void) {
 }
 
 void kernels_backend_init(void) {
+  int sockets = tp_sockets_requested(); /* LLAMA_SOCKETS=2 without LLAMA_BACKEND=teams fails here */
   /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
    * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
   const Topology *topology_result;
@@ -1310,6 +1312,26 @@ void kernels_backend_init(void) {
     if (*end || value < 1 || value > TEAM_SUMMARY_THREADS)
       fail("LLAMA_THREADS must be an integer in 1..%d", TEAM_SUMMARY_THREADS);
     threads = (int)value;
+  }
+  if (sockets == 2) { /* B5: one team per socket, on that socket's CPUs (virtual: unpinned) */
+    tp_check_topology("file");
+    const Topology *two = numa_topology();
+    PoolConfig config = {.teams = 2};
+    for (int s = 0; s < 2; s++) {
+      const SocketTopo *socket = &two->socket[s];
+      config.threads[s] = threads ? threads : socket->ncpus;
+      config.cpus[s] = socket->cpus;
+      if (socket->cpus && config.threads[s] > socket->ncpus) {
+        LOG(LOG_WARN, "LLAMA_THREADS=%d exceeds the %d CPUs of socket %d: its workers are not pinned", threads,
+            socket->ncpus, s);
+        config.cpus[s] = NULL;
+      }
+    }
+    pool_start(&config);
+    kernels_set_team(pool_team(0));
+    backend_started = backend_used = 1;
+    LOG(LOG_DEBUG, "worker teams: %d + %d threads", config.threads[0], config.threads[1]);
+    return;
   }
   static int affinity[1024];
   const int *cpus;

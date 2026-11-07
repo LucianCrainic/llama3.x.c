@@ -158,6 +158,7 @@ typedef struct {
   KvStats kv_prompt, kv_final;
   int kv_prompt_ready, kv_final_ready;
   int placement_owned; /* the checkpoint was copied into engine-owned regions */
+  int sockets;         /* 2 when the model is split over both sockets (LLAMA_SOCKETS=2); 0 until then */
   int checkpoint_ready, tokenizer_ready, runtime_ready, inference_started;
   int has_first_token, completed;
   const char *stop_reason;

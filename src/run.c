@@ -7,6 +7,7 @@
 #include "profile.h"
 #include "runtime.h"
 #include "shards.h"
+#include "tp.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,7 @@ typedef struct {
   WeightStore store;          // where those bytes live now: the mapping, or owned regions (A4)
   RunMemory mem;              // where the run state and KV caches live (A5)
   RunState state;             // buffers for the "wave" of activations in the forward pass
+  Tp *tp;                     // LLAMA_SOCKETS=2: the two-socket engine, which owns weights, KV and activations (B5)
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
   float *data;      // memory mapped data pointer
@@ -135,12 +137,17 @@ static void read_checkpoint(const char *path, Config *config, TransformerWeights
   checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size, manifest);
   metrics.checkpoint_s = monotonic_seconds() - start;
   /* Placement time is reported on its own, not as checkpoint_load. */
+  if (tp_sockets_requested() == 2) { /* the shards are loaded by tp_create, straight from the file */
+    metrics.checkpoint_ready = 1;
+    return;
+  }
   weights_open(store, *fd, data, *file_size, manifest);
   memory_map_weights(weights, manifest, store);
   metrics.checkpoint_ready = 1;
 }
 
 static void free_transformer(Transformer *t) {
+  tp_free(t->tp);
   // close the memory mapping
   if (t->data != MAP_FAILED) {
     munmap(t->data, t->file_size);
@@ -284,6 +291,17 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   Transformer *t = model->implementation;
   Config *p = &t->config;
   RunState *s = &t->state;
+  if (t->tp) { /* per-token on two sockets; D1 adds the batched path */
+    float *logits = NULL;
+    if (want == LOGITS_ALL && !s->batch_logits)
+      s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
+    for (int i = 0; i < count; i++) {
+      logits = tp_forward(t->tp, tokens[i], pos0 + i);
+      if (want == LOGITS_ALL)
+        memcpy(s->batch_logits + (size_t)i * p->vocab_size, logits, (size_t)p->vocab_size * sizeof(float));
+    }
+    return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? s->batch_logits : logits;
+  }
   if (want == LOGITS_ALL && !s->batch_logits)
     s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
   for (int i = 0; i < count; i++) {
@@ -334,12 +352,24 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->config = t->config;
   double start = monotonic_seconds();
   prefill_configure(model);
-  malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
+  if (tp_sockets_requested() == 2) {
+    model->prefill_gemm = 0;
+    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0);
+    munmap(t->data, t->file_size); /* the shards were read with pread */
+    t->data = MAP_FAILED;
+    model->mapped_bytes = 0;
+  } else {
+    malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
+  }
   metrics.runtime_s = monotonic_seconds() - start;
   metrics.runtime_ready = 1;
 }
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;
+  if (t->tp) {
+    tp_kv_stats(t->tp, position, out);
+    return;
+  }
   size_t kv_dim = (size_t)t->config.head_dim * t->config.n_kv_heads;
   size_t active = checked_mul(checked_mul(checked_mul(2, (size_t)t->config.n_layers), (size_t)position), kv_dim * sizeof(float));
   runmem_kv_stats(&t->mem, active, verify, out);
@@ -347,7 +377,8 @@ void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
 float *engine_forward(Model *model, int token, int position) {
   if (token < 0 || token >= model->config.vocab_size || position < 0 || position >= model->config.seq_len)
     fail("forward input out of range: token=%d position=%d", token, position);
-  return forward(model->implementation, token, position);
+  Transformer *t = model->implementation;
+  return t->tp ? tp_forward(t->tp, token, position) : forward(t, token, position);
 }
 void engine_free(Model *model) {
   if (model->implementation) {

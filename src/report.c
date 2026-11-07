@@ -150,7 +150,7 @@ static void write_v2_sections(FILE *f) {
   const char *thp = region_thp_default() ? "on" : "off";
   fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
   string(f, kernels_backend_name());
-  fputs(",\n    \"sockets\": 1,\n    \"placement\": ", f);
+  fprintf(f, ",\n    \"sockets\": %d,\n    \"placement\": ", metrics.sockets ? metrics.sockets : 1);
   string(f, placement_active());
   fputs(",\n    \"thp\": ", f);
   string(f, thp);
