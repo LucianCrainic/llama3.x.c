@@ -205,7 +205,7 @@ static void gemm_run(const float *a, int lda, int m, int k, const GemmSegment *s
 #define AMX_STORED(t, p, stride) emul_tile_stored(t, p, (long)(stride))
 #define AMX_DPBF16PS(c, a, b) emul_tile_dpbf16ps(c, a, b)
 #define AMX_DPBSSD(c, a, b) emul_tile_dpbssd(c, a, b)
-#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) &&                                              \
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(GEMM_EMULATE_AVX512) &&              \
     (__has_include(<amxtileintrin.h>) || __has_include(<amxintrin.h>))
 #include <cpuid.h>
 #include <immintrin.h>
