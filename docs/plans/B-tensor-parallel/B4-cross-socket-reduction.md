@@ -11,7 +11,46 @@ residual **once**. Use the release/acquire protocol of study §9. It must be:
 - sized for a vector of `M × dim` FP32 values, so D1's batched prefill can reuse it
   unchanged.
 
-Status: **planned**. Branch: `feature/tp-b4-reduction`.
+Status: **implemented and tested locally (macOS, scalar, TSAN); cluster `check` pending**. Branch:
+`feature/tp-local-b` (commit `feat: add the cross-socket Exchange`).
+
+Implementation notes:
+
+- **API** (`include/workers.h`, `src/workers.c`). `exchange_create`, `exchange_destroy`, `exchange_partial`,
+  `exchange_reduce_add`, `exchange_abort`, `exchange_region_bytes`, `exchange_set_timing`/`exchange_timing`.
+  The proposed signatures changed in two places:
+  - `exchange_partial(e, socket)` is called **once per reduction by the socket's coordinator, before the projection
+    job**, not by every worker. It numbers the generation and performs step 5 (waits for `consumed_peer ≥ g - 2`),
+    so no worker races on a generation counter. It returns `NULL` after an abort.
+  - The team of each socket comes from the pool (`pool_team(s)`), so `exchange_reduce_add` takes no `Team *`.
+- **Protocol.** Exactly §4.2: local barrier, `ready_s` (release), wait on `ready_peer` (acquire), each worker adds its
+  range `residual[i] += p0[i] + p1[i]`, local barrier, `consumed_s` (release). `ready` and `consumed` are on separate
+  64-byte lines; the partial buffers are cache-line aligned, in a caller-owned `ROLE_WORK` region or on the heap.
+- **Reuse rule is a safety net here.** With a strictly alternating `exchange_partial`/`exchange_reduce_add` per
+  socket, `ready_peer ≥ g + 1` already implies that the peer finished reading generation g, so removing the
+  `consumed` wait does not change any test result (mutation-checked). It is kept because the protocol states it and
+  because it is the guard once B5 decouples the add from the next projection. The abort test covers it directly.
+- **Abort.** `workers_abort()` sets a process-wide flag. `fail()` sets it before exit handlers run; `exchange_abort`
+  is the same flag. Every exchange wait loop and `team_barrier` return on it. Workers that are still computing when
+  `fail()` unmaps regions in its exit handlers can fault; that is not specific to the exchange and not addressed.
+- **Two coordinators.** Team 0's `team_run` is called by the engine's main thread, which is worker 0 of team 0. Team 1
+  therefore needs a coordinator thread of its own to call `team_run`, concurrently. The test harness uses a pthread;
+  B5 must provide the engine's equivalent (see B5, open item).
+- **Timing.** With `exchange_set_timing`, the leader of each socket accumulates `reduce` (step 3 add) and
+  `barrier_wait` (steps 1, 3 wait, 4, and the reuse wait). Wiring them into the report's `phase_seconds` is B5.
+- **Tests** (`tests/workers.c`, run by `make test` through `test-workers` and `tests/test_numa.py`). 2 × T workers
+  for T = 1, 3, 7 and E = 1, 7, 4096, 4096·64 (1000 generations; 200 for the largest), team sizes (3, 1) and (2, 5),
+  a slow producer or a slow consumer on either socket (random sleeps at three protocol steps), regions and heap
+  buffers; the residuals are compared **bitwise** with a serial reference after the last generation. Abort: an
+  in-process abort releases workers waiting for `ready` and a coordinator waiting on the reuse rule
+  (`exchange_partial` returns `NULL`); `fail()` in a socket-1 worker and in the socket-0 coordinator end the process
+  with exit 1 (subprocess, 30 s guard). `test-workers bench-exchange` is the cluster microbenchmark (§6); it lives in
+  `tests/workers.c` instead of a separate `exchange_bench.c`.
+- **Verified locally.** `make test`, `make MODE=sanitize` and `make MODE=tsan OPENMP=0` on `test-workers`: no reports.
+  Mutations (ready published before the local barrier, swapped operand order) are caught by the exactness check.
+- **Open (cluster).** Pinned latency for E = 4096 and 4096 × {16, 64, 256} on 2 × {14, 28, 56} workers with the
+  buffers on HBM 2 and 3, against the per-token budget of §7; remote-push alternative of §8; `cresco8-tp.sbatch
+  PHASE=B4`. This Mac's median of 4 µs for E = 4096 (4+4 unpinned workers) is not evidence for CRESCO8.
 
 ## 2. Depends on / unblocks
 
