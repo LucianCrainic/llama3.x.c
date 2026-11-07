@@ -5,8 +5,9 @@ cluster, apart from the A6 campaign. In Wave 3, B1-B6 (two-socket tensor paralle
 precision mode, batched Q8 with AMX-INT8, the campaign scripts) are implemented and tested locally, B on the virtual
 topology and C on macOS against instruction models, with none of that code yet run on the cluster; B7 and Waves 4-5 (D)
 have not started. See the milestone table in §4 and each phase document's status line.
-Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
-`feature/numa-tp-prefill`.
+Baseline tree: `feature/simd-kernels` at `5bc2b8c`. The plan was executed on the integration branch
+`feature/numa-tp-prefill`, which was closed on 7 November 2026 when everything was merged into `develop`; work now
+continues from `develop`.
 
 This folder turns three features into phases that can each be implemented and reviewed
 on their own:
@@ -262,13 +263,13 @@ Each phase records the error it observes, next to the gate.
 
 ### 6.6 Branches, commits and records
 
-- The plan lives on the integration branch `feature/numa-tp-prefill`, cut from
+- The plan lived on the integration branch `feature/numa-tp-prefill` (closed 2026-11-07, merged into `develop`), cut from
   `feature/simd-kernels` at `5bc2b8c` so that the AVX-512 kernels the plans cite are
   present. Kernel work continues separately on `feature/simd-kernels`, and is merged
   into the integration branch when a phase needs it.
-- One branch per phase off `feature/numa-tp-prefill`, named
+- One branch per phase off `develop` (earlier phases: off `feature/numa-tp-prefill`), named
   `feature/<track>-<id>-<slug>` (for example `feature/numa-a2-bound-regions`). Each
-  phase merges back into `feature/numa-tp-prefill`.
+  phase merges back into `develop`.
 - Conventional commits (`feat:`, `test:`, `docs:`, `fix:`, `chore:`).
 - Each campaign phase produces a results document with a `-validation` companion,
   following `docs/phase2.md` and `docs/phase2-validation.md`. Each result cites date,
