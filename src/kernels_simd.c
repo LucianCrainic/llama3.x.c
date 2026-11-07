@@ -1043,6 +1043,7 @@ typedef struct {
   int n_heads, head_dim, seq_len, positions, kv_mul, kv_dim, chunks, tasks;
   size_t slot, head_stride;
   atomic_int next_task; /* team-local queue over (kv group, chunk) tasks */
+  Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
 } SplitKJob;
 
 static void attention_task(const SplitKJob *j, int task) {
@@ -1063,7 +1064,7 @@ static void attention_team(const void *p, int worker, int workers) {
   SplitKJob *j = (SplitKJob *)p;
   for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
     attention_task(j, task);
-  team_barrier(current_team); /* every chunk of every head is in `partial` before any head is merged */
+  team_barrier(j->team); /* every chunk of every head is in `partial` before any head is merged */
   for (int h = (int)((long long)j->n_heads * worker / workers);
        h < (int)((long long)j->n_heads * (worker + 1) / workers); h++)
     attention_merge(j, h);
@@ -1093,6 +1094,7 @@ void k_attention(float *out, const float *q, const float *key_cache, const float
                      .slot = (size_t)head_dim + 2,
                      .head_stride = (size_t)work->max_chunks * ((size_t)head_dim + 2)};
     atomic_init(&job.next_task, 0);
+    job.team = current_team;
     if (current_team) {
       team_run(current_team, attention_team, &job);
       return;
@@ -1169,6 +1171,7 @@ typedef struct {
   int chunks_wave, blocks, tasks;
   size_t slot, head_stride, row_stride;
   atomic_int next_task; /* team-local queue over (kv group, chunk, row block) tasks */
+  Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
 } BatchJob;
 
 static int batch_row_chunks(const BatchJob *j, int row) {
@@ -1205,7 +1208,7 @@ static void batch_team(const void *p, int worker, int workers) {
   BatchJob *j = (BatchJob *)p;
   for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
     batch_task(j, task);
-  team_barrier(current_team); /* every chunk of every row and head is in `partial` before any is merged */
+  team_barrier(j->team); /* every chunk of every row and head is in `partial` before any is merged */
   int items = j->rows * j->n_heads;
   for (int item = (int)((long long)items * worker / workers); item < (int)((long long)items * (worker + 1) / workers);
        item++)
@@ -1237,6 +1240,7 @@ static void attention_batch_driver(float *out, const float *q, const float *key_
     job.blocks = (rows + BATCH_ROW_BLOCK - 1) / BATCH_ROW_BLOCK;
     job.tasks = n_kv_heads * job.chunks_wave * job.blocks;
     atomic_init(&job.next_task, 0);
+    job.team = current_team;
     if (current_team) {
       team_run(current_team, batch_team, &job);
     } else {
