@@ -115,7 +115,7 @@ agreement is BF16 too). The packing-time run uses `LLAMA_PLACEMENT=hbm` and so d
 | `test-bf16-emul`: the AMX path on the software tile model vs the portable reference | **bit for bit** equal on all of the above (the model adds every K pair in ascending order, and a BF16 product is exact in FP32) |
 | `test-bf16-engine[-emul]`, synthetic fixture, 24 positions, all-position logits | per-token (decode) logits in BF16 mode equal the FP32 model **bitwise**; BF16 logits are bitwise independent of the microbatch split (M = 2, 7, whole); emulated AMX equals the scalar BF16 reference forward (max\|Δ\| = 0). BF16 vs FP32 on this fixture: max_abs 1.5e-3, rms 3.7e-4, argmax agreement 1/24 (the fixture's logits are near-flat noise; recorded, not gated) |
 | `tests/test_runtime.py` | mode validation, guards, report fields, packed-region accounting (`packed_weights_peak` equals the padded size formula under `LLAMA_PLACEMENT=ddr`), FP32 default unchanged |
-| `make test`, `make MODE=sanitize test` | green on macOS (see the final run in the README) |
+| `make test`, `make MODE=sanitize test` | green on macOS arm64, release and sanitize builds (2026-11-07, after C7) |
 
 Not exercised locally: the real `tdpbf16ps` instruction (its in-pair summation order may differ from the model's in the
 last bit, which is the reason for the 2e-6 budget on hardware), the 1B and 8B models, the Hugging Face comparison, and
