@@ -1,6 +1,7 @@
 """Two-socket tensor parallelism (B5, B6) on the virtual topology: LLAMA_SOCKETS=2 against the one-socket teams
 backend, on fixtures that can be split (two KV heads)."""
 import array
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -101,6 +102,25 @@ class TensorParallelTests(unittest.TestCase):
         self.assertEqual(len(all_rows), len(TOKENS) * TP_ODD_CONFIG[5])
         self.assert_agree(self.logits('fp32', 'odd', None, 1), all_rows, TP_ODD_CONFIG[5])
 
+    def test_batched_gemm_knobs_do_not_reach_the_two_socket_path(self):
+        """C6's batched Q8 GEMM and C2's FP32 GEMM are one-socket paths: on two sockets the knob changes nothing (the
+        forward stays per token, bitwise) and the report names no batched prefill kernel."""
+        for precision, name in (('int8', 'int8.bin'), ('fp32', 'fp32.bin')):
+            with self.subTest(precision=precision):
+                base = self.probe(precision, 'shared', 'batch', 2, LLAMA_PREFILL_BATCH='4')
+                forced = self.probe(precision, 'shared', 'batch', 2, LLAMA_PREFILL_BATCH='4', LLAMA_PREFILL_GEMM='on')
+                self.assertEqual(base, forced)
+                fixture = self.fixtures['shared']
+                report = Path(self.temp.name)/f'gemm-{precision}.json'
+                engine = 'runq' if precision == 'int8' else 'run'
+                result = subprocess.run([str(BUILD/engine), str(fixture/name), '-z', str(fixture/'tokenizer.bin'), '-i', 'ABCDE',
+                                         '-t', '0', '--json', str(report)], capture_output=True, text=True, timeout=60,
+                                        env=environment(2, LLAMA_PREFILL_BATCH='4', LLAMA_PREFILL_GEMM='on'))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                runtime = json.loads(report.read_text())['runtime']
+                self.assertEqual(runtime['sockets'], 2)
+                self.assertIsNone(runtime['kernels_prefill'])
+
     def test_greedy_generation_is_identical(self):
         one = self.probe('fp32', 'unshared', 'generate', 1)
         self.assertGreaterEqual(len(one.split()), 8)
@@ -131,6 +151,9 @@ class TensorParallelTests(unittest.TestCase):
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_PLACEMENT': 'hbm'}, 'virtual'),
         ]
         cases.append((self.fixtures['gs16']/'int8.bin', environment(2), 'group size 16 does not divide'))
+        # C5 and B5 meet here: BF16 prefill packs the whole matrices, which the two-socket forward does not hold.
+        cases.append((self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4'},
+                      'LLAMA_PRECISION=bf16 is not supported with LLAMA_SOCKETS=2'))
         for model, env, text in cases:
             with self.subTest(text=text):
                 probe = 'probe-int8' if str(model).endswith('int8.bin') else 'probe-fp32'
