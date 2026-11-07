@@ -3,6 +3,7 @@
 
 #include "kernels.h"
 #include "runtime.h"
+#include "shards.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -63,7 +64,7 @@ float f32_from_bf16(uint16_t v);
 
 /* Packing for the tile microkernels. W is rows x cols row-major (W[out][in]) with leading dimension ld (elements).
  * Rows are grouped in tiles of 16 and zero-padded, as is K (to 32 for BF16 pairs, 64 for int8 quads). The helpers take
- * plain (rows, cols, ld) pointers; adapt them to a Shard once B1 lands. The _tiles forms pack tiles [first, last) so a
+ * plain (rows, cols, ld) pointers; pack_*_job_from_shard (below) builds the job of a loaded B1 Shard. The _tiles forms pack tiles [first, last) so a
  * worker team can split the work. */
 size_t bf16_vnni_elements(int rows, int cols);
 size_t s8_vnni_bytes(int rows, int cols);
@@ -153,5 +154,14 @@ typedef struct {
   size_t ld;
 } PackS8;
 void pack_s8_vnni_many(const PackS8 *jobs, int count);
+
+/* Packing jobs for a loaded B1 Shard (shards.h), so one socket's slice is packed where it lives: the job packs the
+ * shard's rows x cols block at its own stride (`ld`) into `dst`, which must hold bf16_vnni_elements / s8_vnni_bytes
+ * of (shard->rows, shard->cols). The shard must be a ROWS or COLS shard of the right dtype (F32 for BF16, Q8 for
+ * int8) and bound (and loaded before the job runs); anything else is an error. A Q8 shard's group scales stay in
+ * shard->s, rows x (cols / gs), exactly as a K8Weight reads them; they are not packed. Pack as many shards as you
+ * like with one pack_*_many call, then use the result with GemmBf16Segment.w / GemmQ8Segment.pw. */
+PackBf16 pack_bf16_job_from_shard(uint16_t *dst, const Shard *shard);
+PackS8 pack_s8_job_from_shard(int8_t *dst, const Shard *shard);
 
 #endif

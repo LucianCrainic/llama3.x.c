@@ -146,8 +146,15 @@ FP32 rounding per addition; the hardware's order inside a pair is not specified,
 - **Packing layout.** A tile of 16 output channels is stored K-pair-major (BF16) or K-quad-major (int8), so one tile
   load is a contiguous 1 KiB: BF16 element `nt * kp * 16 + (k / 32) * 512`, int8 byte `nt * kp * 16 + (k / 64) * 1024`,
   with K and the channels zero-padded (`kp` = K rounded up to 32 or 64). The helpers take plain `(rows, cols, ld)`
-  pointers. **Adapt them to the B1 `Shard` descriptor when it lands**: a shard is a (row range, column range) view of
-  the same `W[out][in]` matrix, so the call becomes `pack_*(dst, shard_base, shard_rows, shard_cols, shard_ld)`.
+  pointers. A B1 `Shard` is a (row range, column range) copy of the same `W[out][in]` matrix with its own stride
+  (`ld` = `cols`), so the call is `pack_*(dst, shard->q, shard->rows, shard->cols, shard->ld)`;
+  `pack_bf16_job_from_shard` and `pack_s8_job_from_shard` build that job (with a check that the shard is a bound ROWS or
+  COLS shard of the right dtype), and `pack_*_vnni_many` takes one job per shard. Added on the integration branch
+  `feature/tp-merge-b-c`; `tests/shards.c` checks, for every ROWS and COLS shard of 96 plans (FP32 and Q8, one and two
+  sockets), that the job's bytes equal packing the matching slice of the source tensor in place. Not done: the engines
+  still pack whole matrices (`run.c`, `runq.c`), and the two-socket path (`src/tp.c`) does not pack at all, so
+  `LLAMA_SOCKETS=2` with `LLAMA_PRECISION=bf16` is rejected until D1 wires a packed forward per socket. A Q8 shard's
+  group scales stay in `shard->s` and are read in place, as `K8Weight` does.
 - **Microkernel contract.** `A` must be zero-padded and readable up to whole tiles, `C` has room for whole 16 x 16
   tiles. The C5 and C6 drivers own that padding in their aligned A panels.
 - **Workspace.** `aligned_buffer_alloc()` carves a 64-byte-aligned range out of an accounted `memory_alloc`; the C5

@@ -135,8 +135,9 @@ everything about speed.
 - **Packing.** At load, on the worker team, into one `ROLE_PACKED` region (`packed_open/take/seal` in `src/loader.c`):
   bound to the placement mode's weights node, claimed against `LLAMA_HBM_BUDGET_GIB` before any byte is packed,
   read-only afterwards and page-verified like the other regions. `packed_weights_peak` is the region size,
-  `timing_seconds.weight_pack` the time. The B1 `Shard` descriptor is not used yet: the loop packs the whole matrices;
-  with shards, the same `pack_bf16_vnni_many` job list takes one entry per shard (see the C4 note).
+  `timing_seconds.weight_pack` the time. The B1 `Shard` descriptor is not used by the engine yet: the loop packs the whole matrices;
+  with shards, the same `pack_bf16_vnni_many` job list takes one entry per shard, built by `pack_bf16_job_from_shard`
+  (see the C4 note).
 - **Report.** `runtime.precision_mode` is `bf16` (the engine's `engine_precision()` returns `bf16_from_fp32`),
   `runtime.kernels_prefill` is `amx-bf16` or `bf16-reference`, `build.amx_permission`, `memory_bytes.packed_weights_peak`,
   `timing_seconds.weight_pack`.

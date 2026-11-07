@@ -1101,3 +1101,19 @@ void pack_s8_vnni_many(const PackS8 *jobs, int count) {
   int chunks = (int)tiles;
   kernels_parallel_segments(1, &chunks, pack_s8_chunks, &all);
 }
+
+static void check_packable(const Shard *shard, TensorDtype dtype, const char *what) {
+  if (!shard || !shard->q || !shard->src || (shard->kind != SHARD_ROWS && shard->kind != SHARD_COLS) ||
+      shard->src->dtype != dtype || shard->rows <= 0 || shard->cols <= 0 || shard->ld < (size_t)shard->cols)
+    fail("%s needs a bound ROWS or COLS %s shard", what, dtype == DT_F32 ? "FP32" : "Q8_0");
+}
+
+PackBf16 pack_bf16_job_from_shard(uint16_t *dst, const Shard *shard) {
+  check_packable(shard, DT_F32, "pack_bf16_job_from_shard");
+  return (PackBf16){dst, shard->q, shard->rows, shard->cols, shard->ld};
+}
+
+PackS8 pack_s8_job_from_shard(int8_t *dst, const Shard *shard) {
+  check_packable(shard, DT_Q8, "pack_s8_job_from_shard");
+  return (PackS8){dst, shard->q, shard->rows, shard->cols, shard->ld};
+}

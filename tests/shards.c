@@ -5,6 +5,7 @@
  *       shards a real checkpoint over two sockets (the machine's topology, or LLAMA_TOPOLOGY=virtual:2xT), compares
  *       every shard with the file bitwise, verifies the pages of each region, and prints one JSON object */
 #include "shards.h"
+#include "gemm.h"
 #include "loader.h"
 #include "numa.h"
 #include "runtime.h"
@@ -112,6 +113,44 @@ static void reconstruct(const ShardSet *set, const TensorDesc *t, int fd) {
   free(value), free(scale), free(file_v), free(file_s), free(vcover), free(scover);
 }
 
+/* C4 packing on a B1 shard: the adapter's job packs the shard's own copy (stride = cols) to the same bytes as packing the
+ * matching slice of the source tensor in place (stride = the tensor's cols). BF16 for FP32 tensors, int8 for Q8_0. */
+static void check_packing(const ShardSet *set, int fd) {
+  for (int i = 0; i < set->count; i++) {
+    const Shard *sh = &set->t[i];
+    if (sh->kind != SHARD_ROWS && sh->kind != SHARD_COLS)
+      continue;
+    const TensorDesc *t = sh->src;
+    int q8 = t->dtype == DT_Q8;
+    size_t elem = q8 ? 1 : sizeof(float), vbytes = (size_t)t->rows * t->cols * elem;
+    unsigned char *file_v = malloc(vbytes);
+    assert(pread(fd, file_v, vbytes, (off_t)t->offset) == (ssize_t)vbytes);
+    const unsigned char *slice = file_v + ((size_t)sh->row0 * t->cols + sh->col0) * elem;
+    if (q8) {
+      size_t bytes = s8_vnni_bytes(sh->rows, sh->cols);
+      int8_t *via_shard = calloc(bytes, 1), *via_slice = calloc(bytes, 1);
+      PackS8 job = pack_s8_job_from_shard(via_shard, sh);
+      assert(job.rows == sh->rows && job.cols == sh->cols && job.ld == sh->ld);
+      pack_s8_vnni_many(&job, 1);
+      pack_s8_vnni(via_slice, (const int8_t *)slice, sh->rows, sh->cols, (size_t)t->cols);
+      assert(!memcmp(via_shard, via_slice, bytes));
+      free(via_shard), free(via_slice);
+    } else {
+      size_t elements = bf16_vnni_elements(sh->rows, sh->cols);
+      uint16_t *via_shard = calloc(elements, sizeof(uint16_t)), *via_slice = calloc(elements, sizeof(uint16_t));
+      float *aligned = malloc(vbytes); /* the file bytes are not float-aligned in general */
+      memcpy(aligned, file_v, vbytes);
+      PackBf16 job = pack_bf16_job_from_shard(via_shard, sh);
+      assert(job.rows == sh->rows && job.cols == sh->cols && job.ld == sh->ld);
+      pack_bf16_vnni_many(&job, 1);
+      pack_bf16_vnni(via_slice, aligned + (size_t)sh->row0 * t->cols + sh->col0, sh->rows, sh->cols, (size_t)t->cols);
+      assert(!memcmp(via_shard, via_slice, elements * sizeof(uint16_t)));
+      free(via_shard), free(via_slice), free(aligned);
+    }
+    free(file_v);
+  }
+}
+
 static void run_case(const Case *c) {
   TensorManifest m;
   manifest_build(&m, &c->config, c->quantized, c->gs, HEADER);
@@ -156,6 +195,7 @@ static void run_case(const Case *c) {
       continue; /* the tied embedding is rebuilt through the classifier alias */
     reconstruct(&set, t, fd);
   }
+  check_packing(&set, fd);
   /* COPY shards agree on both sockets; the vocabulary split gives the remainder to the last socket. */
   const Shard *cls0 = shards_find(&set, T_WCLS, -1, 0),
               *cls1 = c->sockets == 2 ? shards_find(&set, T_WCLS, -1, 1) : NULL;
