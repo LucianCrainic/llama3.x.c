@@ -86,6 +86,7 @@ typedef struct {
   int max_batch; /* LLAMA_PREFILL_BATCH, capped at the allocated context. */
   LogitsWanted prefill_logits;
   int prefill_gemm; /* batched prefill runs the FP32 GEMM (C2) instead of one GEMV per row */
+  const char *prefill_kernel; /* the batched prefill kernel in use, for the report (NULL when prefill_gemm is off) */
   int prefill_bf16; /* LLAMA_PRECISION=bf16 (C5): the batched GEMM runs on BF16-packed weights; decode is unchanged */
 } Model;
 void engine_load(Model *model, const char *path);

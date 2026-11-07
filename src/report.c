@@ -165,9 +165,7 @@ static void write_v2_sections(FILE *f) {
   fputs(",\n    \"prefill_logits\": ", f);
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fputs(",\n    \"kernels_prefill\": ", f);
-  string(f, !metrics.runtime_ready || !model.prefill_gemm ? NULL
-            : model.prefill_bf16                          ? (kernels_amx_active() ? "amx-bf16" : "bf16-reference")
-                                                          : kernels_name());
+  string(f, metrics.runtime_ready && model.prefill_gemm ? model.prefill_kernel : NULL);
   fputs("\n  }", f);
 
   const Topology *topology;

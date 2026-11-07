@@ -443,6 +443,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   prefill_configure(model);
   malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
   bf16_mode = t->bf16 = model->prefill_bf16;
+  model->prefill_kernel = t->bf16 ? (kernels_amx_active() ? "amx-bf16" : "bf16-reference") : kernels_name();
   if (t->bf16) {
     t->state_batch = model->max_batch;
     pack_weights(t);

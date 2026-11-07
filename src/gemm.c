@@ -197,6 +197,7 @@ static void gemm_run(const float *a, int lda, int m, int k, const GemmSegment *s
 #define GEMM_AMX 1
 #define GEMM_AMX_EMULATED 1
 #define AMX_TARGET
+#define AMX_AVX_TARGET
 #define AMX_LOADCFG(p) emul_tile_loadconfig(p)
 #define AMX_RELEASE() emul_tile_release()
 #define AMX_ZERO(t) emul_tile_zero(t)
@@ -211,6 +212,10 @@ static void gemm_run(const float *a, int lda, int m, int k, const GemmSegment *s
 #define GEMM_AMX 1
 #define GEMM_AMX_EMULATED 0
 #define AMX_TARGET __attribute__((target("amx-tile,amx-bf16,amx-int8")))
+/* The Q8 chunk kernel also rescales in FP32 between tile operations; with AVX-512 in its target the compiler vectorizes
+ * those plain C loops. */
+#define AMX_AVX_TARGET                                                                                                 \
+  __attribute__((target("amx-tile,amx-bf16,amx-int8,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,fma")))
 #define AMX_LOADCFG(p) _tile_loadconfig(p)
 #define AMX_RELEASE() _tile_release()
 #define AMX_ZERO(t) _tile_zero(t)
@@ -539,6 +544,72 @@ AMX_TARGET void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t
       AMX_STORED(3, c + 16 * ldc + 16, ldc * sizeof(int32_t));
   }
 }
+/* One chunk of the batched Q8_0 GEMM on AMX-INT8 (C6): out[m][n] = sum over groups g of
+ * fma((float)dot_g[m][n] * xs[m][g], ws[n][g], previous), for m, n <= 32. dot_g is the exact int32 dot of one K group,
+ * computed with signed x signed `tdpbssd` (gs / 64 tile steps accumulate into the same tiles before the rescale). The
+ * rescale operand order is that of the AVX-512 GEMV (`fmadd(mul(cvt(i32), xs), ws, acc)`); results are not bitwise
+ * equal to it because the GEMV keeps 16 lane accumulators and reduces at the end. a   int8 activations, row stride lda
+ * bytes, readable up to 32 rows (rows >= m are never used), k % gs == 0, gs % 64 == 0 xs  activation scales, row stride
+ * xs_ld floats bp  weights packed by pack_s8_vnni, the (at most two) 16-row tiles of this chunk ws  weight scales of
+ * the chunk's rows, row stride ws_ld floats (the checkpoint's [row][group] layout) probe  when non-NULL, receives the
+ * int32 dots, probe[(g * 32 + r) * 32 + c] (tests) */
+AMX_AVX_TARGET void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const float *xs, size_t xs_ld,
+                                 const int8_t *bp, const float *ws, size_t ws_ld, int m, int n, int k, int gs,
+                                 int32_t *probe) {
+  amx_thread_configure();
+  const size_t tile = (size_t)k * 16;
+  const int wide = n > 16, tall = m > 16, groups = k / gs, steps = gs / 64;
+  _Alignas(64) int32_t dots[32 * 32];
+  float scale[32];
+  for (int r = 0; r < m; r++)
+    memset(out + (size_t)r * ldo, 0, (size_t)n * sizeof(float));
+  for (int g = 0; g < groups; g++) {
+    AMX_ZERO(0);
+    if (wide)
+      AMX_ZERO(1);
+    if (tall) {
+      AMX_ZERO(2);
+      if (wide)
+        AMX_ZERO(3);
+    }
+    for (int t = 0; t < steps; t++) {
+      const size_t k0 = (size_t)g * (size_t)gs + (size_t)t * 64;
+      AMX_LOADD(4, a + k0, lda);
+      if (tall)
+        AMX_LOADD(5, a + 16 * lda + k0, lda);
+      AMX_LOADD(6, bp + (k0 / 64) * 1024, 64);
+      if (wide)
+        AMX_LOADD(7, bp + tile + (k0 / 64) * 1024, 64);
+      AMX_DPBSSD(0, 4, 6);
+      if (wide)
+        AMX_DPBSSD(1, 4, 7);
+      if (tall) {
+        AMX_DPBSSD(2, 5, 6);
+        if (wide)
+          AMX_DPBSSD(3, 5, 7);
+      }
+    }
+    AMX_STORED(0, dots, 32 * sizeof(int32_t));
+    if (wide)
+      AMX_STORED(1, dots + 16, 32 * sizeof(int32_t));
+    if (tall) {
+      AMX_STORED(2, dots + 16 * 32, 32 * sizeof(int32_t));
+      if (wide)
+        AMX_STORED(3, dots + 16 * 32 + 16, 32 * sizeof(int32_t));
+    }
+    if (probe)
+      memcpy(probe + (size_t)g * 32 * 32, dots, sizeof(dots));
+    for (int c = 0; c < n; c++)
+      scale[c] = ws[(size_t)c * ws_ld + (size_t)g];
+    for (int r = 0; r < m; r++) {
+      const float x = xs[(size_t)r * xs_ld + (size_t)g];
+      float *row = out + (size_t)r * ldo;
+      const int32_t *d = dots + r * 32;
+      for (int c = 0; c < n; c++)
+        row[c] = fmaf((float)d[c] * x, scale[c], row[c]);
+    }
+  }
+}
 #else
 void gemm_amx_thread_release(void) {}
 void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k) {
@@ -547,6 +618,12 @@ void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, con
 }
 void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n, int k) {
   (void)c, (void)ldc, (void)a, (void)lda, (void)bp, (void)m, (void)n, (void)k;
+  fail("AMX tile kernels are not compiled into this build");
+}
+void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const float *xs, size_t xs_ld, const int8_t *bp,
+                  const float *ws, size_t ws_ld, int m, int n, int k, int gs, int32_t *probe) {
+  (void)out, (void)ldo, (void)a, (void)lda, (void)xs, (void)xs_ld, (void)bp, (void)ws, (void)ws_ld, (void)m, (void)n,
+      (void)k, (void)gs, (void)probe;
   fail("AMX tile kernels are not compiled into this build");
 }
 #endif
@@ -729,4 +806,298 @@ void pack_bf16_vnni_many(const PackBf16 *jobs, int count) {
     fail("too many weight tiles to pack: %lld", tiles);
   int chunks = (int)tiles;
   kernels_parallel_segments(1, &chunks, pack_bf16_chunks, &all);
+}
+
+/* ---- Q8_0 batched GEMM (C6) ---------------------------------------------------------------------------------------
+ */
+
+typedef struct {
+  const float *x;
+  int8_t *q;
+  float *s;
+  size_t ldx;
+  int n, gs;
+} QuantizeJob;
+
+/* One chunk is one row: the per-row `k_quantize`, so the int8 values and scales are those of the per-token path. */
+static void quantize_chunks(const void *p, int segment, int first, int last) {
+  const QuantizeJob *job = p;
+  (void)segment;
+  for (int row = first; row < last; row++)
+    k_quantize(job->q + (size_t)row * (size_t)job->n, job->s + (size_t)row * (size_t)(job->n / job->gs),
+               job->x + (size_t)row * job->ldx, job->n, job->gs);
+}
+
+void k_quantize_rows(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs) {
+  QuantizeJob job = {x, q, s, ldx, n, gs};
+  kernels_parallel_segments(1, &m, quantize_chunks, &job);
+}
+
+typedef void (*Q8Micro)(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld, const int8_t *w,
+                        size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile);
+
+enum { Q8_MR = 2, Q8_NR = 4, Q8_MB = 32 };
+
+/* tile[r * 4 + c] = sum over groups of (float)(int32 dot of x row r and w row c in the group) * ws * xs, the scalar
+ * GEMV's expression, so with the scalar instruction set the GEMM equals the per-row GEMV bitwise. */
+static void q8_micro_portable(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,
+                              const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile) {
+  for (int r = 0; r < mr; r++)
+    for (int c = 0; c < nr; c++) {
+      const int8_t *xr = x + (size_t)r * ldx, *wr = w + (size_t)c * ldw;
+      const float *sr = ws + (size_t)c * ws_ld, *xsr = xs + (size_t)r * xs_ld;
+      float val = 0.0f;
+      for (int j = 0; j <= k - gs; j += gs) {
+        int32_t ival = 0;
+        for (int l = 0; l < gs; l++)
+          ival += ((int32_t)xr[j + l]) * ((int32_t)wr[j + l]);
+        val += ((float)ival) * sr[j / gs] * xsr[j / gs];
+      }
+      tile[r * Q8_NR + c] = val;
+    }
+}
+
+#if GEMM_AVX512
+/* The VNNI tile of the AVX-512 Q8 rung: MR activation rows by NR weight rows share every load. Per 64-byte step the
+ * activation's |x| is the unsigned operand and the weight takes x's sign (`vpdpbusd`, exact because no value is -128),
+ * each group's int32 lanes are scaled once into FP32 lane accumulators exactly as dots_q8_body does for one row, and
+ * the lanes are reduced at the end. gs % 64 == 0. */
+#define Q8_INLINE AVX512 static inline __attribute__((always_inline))
+Q8_INLINE void q8_micro_body(const int MR, const int NR, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,
+                             const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile) {
+  const __m512i zero = _mm512_setzero_si512();
+  __m512 acc[Q8_MR][Q8_NR];
+  for (int r = 0; r < MR; r++)
+    for (int c = 0; c < NR; c++)
+      acc[r][c] = _mm512_setzero_ps();
+  const int groups = k / gs;
+  for (int g = 0; g < groups; g++) {
+    __m512i iacc[Q8_MR][Q8_NR];
+    for (int r = 0; r < MR; r++)
+      for (int c = 0; c < NR; c++)
+        iacc[r][c] = zero;
+    for (int off = g * gs; off < (g + 1) * gs; off += 64) {
+      __m512i ax[Q8_MR];
+      __mmask64 negative[Q8_MR];
+      for (int r = 0; r < MR; r++) {
+        __m512i xv = _mm512_loadu_si512((const void *)(x + (size_t)r * ldx + off));
+        ax[r] = _mm512_abs_epi8(xv);
+        negative[r] = _mm512_movepi8_mask(xv);
+      }
+      for (int c = 0; c < NR; c++) {
+        __m512i wv = _mm512_loadu_si512((const void *)(w + (size_t)c * ldw + off));
+        for (int r = 0; r < MR; r++)
+          iacc[r][c] = _mm512_dpbusd_epi32(iacc[r][c], ax[r], _mm512_mask_sub_epi8(wv, negative[r], zero, wv));
+      }
+    }
+    for (int r = 0; r < MR; r++) {
+      __m512 xscale = _mm512_set1_ps(xs[(size_t)r * xs_ld + g]);
+      for (int c = 0; c < NR; c++)
+        acc[r][c] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(iacc[r][c]), xscale),
+                                    _mm512_set1_ps(ws[(size_t)c * ws_ld + g]), acc[r][c]);
+    }
+  }
+  for (int r = 0; r < MR; r++)
+    for (int c = 0; c < NR; c++)
+      tile[r * Q8_NR + c] = _mm512_reduce_add_ps(acc[r][c]);
+}
+
+#define Q8_MICRO(MR, NR)                                                                                               \
+  AVX512 static void q8_micro_##MR##x##NR(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,  \
+                                          const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs,   \
+                                          float *tile) {                                                               \
+    (void)mr, (void)nr;                                                                                                \
+    q8_micro_body(MR, NR, x, ldx, xs, xs_ld, w, ldw, ws, ws_ld, k, gs, tile);                                          \
+  }
+Q8_MICRO(1, 1)
+Q8_MICRO(1, 2)
+Q8_MICRO(1, 3)
+Q8_MICRO(1, 4)
+Q8_MICRO(2, 1)
+Q8_MICRO(2, 2)
+Q8_MICRO(2, 3)
+Q8_MICRO(2, 4)
+#undef Q8_MICRO
+static const Q8Micro q8_micro_table[Q8_MR + 1][Q8_NR + 1] = {
+    {NULL, NULL, NULL, NULL, NULL},
+    {NULL, q8_micro_1x1, q8_micro_1x2, q8_micro_1x3, q8_micro_1x4},
+    {NULL, q8_micro_2x1, q8_micro_2x2, q8_micro_2x3, q8_micro_2x4}};
+#endif
+
+typedef struct {
+  const int8_t *xq;
+  const float *xs;
+  int m, k, gs, groups, count;
+  Q8GemmBackend backend;
+  GemmQ8Segment segment[GEMM_MAX_SEGMENTS];
+} Q8GemmJob;
+
+/* acc[mb][32] = the Q8 sums of activation rows [m0, m0 + mb) against weight rows [n0, n0 + nc). */
+static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, int n0, int nc, int m0, int mb,
+                    float *acc) {
+  const int groups = job->groups;
+  const int8_t *x = job->xq + (size_t)m0 * (size_t)job->k;
+  const float *xs = job->xs + (size_t)m0 * (size_t)groups;
+  if (job->backend == Q8_GEMM_AMX) {
+    amx_q8_chunk(acc, 32, x, (size_t)job->k, xs, (size_t)groups, packed + (size_t)(n0 / 16) * (size_t)job->k * 16,
+                 w.s + (size_t)n0 * groups, (size_t)groups, mb, nc, job->k, job->gs, NULL);
+    return;
+  }
+  float tile[Q8_MR * Q8_NR];
+  for (int mi = 0; mi < mb; mi += Q8_MR) {
+    int mr = mb - mi < Q8_MR ? mb - mi : Q8_MR;
+    for (int ni = 0; ni < nc; ni += Q8_NR) {
+      int nr = nc - ni < Q8_NR ? nc - ni : Q8_NR;
+      const int8_t *wq = w.q + (size_t)(n0 + ni) * (size_t)job->k;
+      const float *wsc = w.s + (size_t)(n0 + ni) * (size_t)groups;
+      Q8Micro micro = q8_micro_portable;
+#if GEMM_AVX512
+      if (job->backend == Q8_GEMM_AVX512)
+        micro = q8_micro_table[mr][nr];
+#endif
+      micro(mr, nr, x + (size_t)mi * (size_t)job->k, (size_t)job->k, xs + (size_t)mi * (size_t)groups, (size_t)groups,
+            wq, (size_t)job->k, wsc, (size_t)groups, job->k, job->gs, tile);
+      for (int r = 0; r < mr; r++)
+        for (int c = 0; c < nr; c++)
+          acc[(size_t)(mi + r) * 32 + ni + c] = tile[r * Q8_NR + c];
+    }
+  }
+}
+
+static void q8_gemm_chunks(const void *p, int s, int first, int last) {
+  const Q8GemmJob *job = p;
+  const GemmQ8Segment *seg = &job->segment[s];
+  const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
+  _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
+  for (int chunk = first; chunk < last; chunk++) {
+    int n0 = chunk * chunk_n, nc = seg->n - n0 < chunk_n ? seg->n - n0 : chunk_n;
+    for (int m0 = 0; m0 < job->m; m0 += Q8_MB) {
+      int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
+      q8_sums(job, seg->w, seg->pw, n0, nc, m0, mb, acc);
+      if (seg->kind == GEMM_SWIGLU)
+        q8_sums(job, seg->w3, seg->pw3, n0, nc, m0, mb, gate);
+      for (int r = 0; r < mb; r++) {
+        float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
+        const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
+        for (int c = 0; c < nc; c++) {
+          if (seg->kind == GEMM_ADD)
+            out[c] += sum[c];
+          else if (seg->kind == GEMM_SWIGLU)
+            out[c] = silu_gate(sum[c], g[c]);
+          else
+            out[c] = sum[c];
+        }
+      }
+    }
+  }
+}
+
+Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count) {
+  if (gs % 64 == 0) {
+    int packed = GEMM_AMX && gemm_amx_active();
+    for (int s = 0; s < count && packed; s++)
+      packed = segments[s].pw && (segments[s].kind != GEMM_SWIGLU || segments[s].pw3);
+    if (packed)
+      return Q8_GEMM_AMX;
+#if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
+    if (kernels_avx512_active())
+      return Q8_GEMM_AVX512;
+#endif
+  }
+  return Q8_GEMM_PORTABLE;
+}
+
+static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
+                        const GemmQ8Segment *segments, int count) {
+  if (count < 1 || count > GEMM_MAX_SEGMENTS)
+    fail("GEMM needs 1..%d segments, got %d", GEMM_MAX_SEGMENTS, count);
+  if (gs <= 0 || k % gs)
+    fail("Q8 GEMM: K=%d is not a multiple of the group size %d", k, gs);
+  for (int s = 0; s < count; s++)
+    if (segments[s].kind == GEMM_SWIGLU && !segments[s].w3.q)
+      fail("GEMM_SWIGLU needs a second weight matrix");
+  if (m <= 0 || k <= 0)
+    return;
+  Q8GemmJob job = {.xq = xq, .xs = xs, .m = m, .k = k, .gs = gs, .groups = k / gs, .count = count, .backend = backend};
+  int chunks[GEMM_MAX_SEGMENTS];
+  const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16;
+  for (int s = 0; s < count; s++) {
+    job.segment[s] = segments[s];
+    chunks[s] = (segments[s].n + chunk_n - 1) / chunk_n;
+  }
+  kernels_parallel_segments(count, chunks, q8_gemm_chunks, &job);
+}
+
+void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count) {
+  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count);
+}
+
+/* Test hook: one named backend. Returns 0 when it is not compiled in. The caller must know the CPU can run it. */
+int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
+                           const GemmQ8Segment *segments, int count) {
+  if ((backend == Q8_GEMM_AMX && !GEMM_AMX) || (backend == Q8_GEMM_AVX512 && !GEMM_AVX512))
+    return 0;
+  if (backend != Q8_GEMM_PORTABLE && gs % 64)
+    return 0;
+  q8_gemm_run(backend, xq, xs, m, k, gs, segments, count);
+  return 1;
+}
+
+/* Test hook: the exact int32 group dots the AMX chunk kernel produces, dots[(g * m + r) * n + c]. */
+int k_gemm_q8_amx_dots_test(int32_t *dots, const int8_t *xq, int m, int k, int gs, const int8_t *packed, int n) {
+#if GEMM_AMX
+  const int groups = k / gs;
+  const size_t zeros = (size_t)(m > n ? m : n) * (size_t)groups + 1;
+  float *scales = calloc(zeros * 2, sizeof(float)), *out = calloc((size_t)32 * 32, sizeof(float));
+  int32_t *probe = calloc((size_t)groups * 32 * 32, sizeof(int32_t));
+  if (!scales || !out || !probe)
+    fail("cannot allocate the probe buffers");
+  for (int m0 = 0; m0 < m; m0 += 32)
+    for (int n0 = 0; n0 < n; n0 += 32) {
+      int mb = m - m0 < 32 ? m - m0 : 32, nc = n - n0 < 32 ? n - n0 : 32;
+      amx_q8_chunk(out, 32, xq + (size_t)m0 * k, (size_t)k, scales, (size_t)groups,
+                   packed + (size_t)(n0 / 16) * (size_t)k * 16, scales + zeros, (size_t)groups, mb, nc, k, gs, probe);
+      for (int g = 0; g < groups; g++)
+        for (int r = 0; r < mb; r++)
+          for (int c = 0; c < nc; c++)
+            dots[((size_t)g * m + m0 + r) * n + n0 + c] = probe[((size_t)g * 32 + r) * 32 + c];
+    }
+  free(scales), free(out), free(probe);
+  return 1;
+#else
+  (void)dots, (void)xq, (void)m, (void)k, (void)gs, (void)packed, (void)n;
+  return 0;
+#endif
+}
+
+/* ---- packing int8 matrices on the worker team (C6) --------------------------------------------------------------- */
+
+typedef struct {
+  const PackS8 *jobs;
+  int count;
+} PackAllS8;
+
+static void pack_s8_chunks(const void *p, int s, int first, int last) {
+  const PackAllS8 *all = p;
+  (void)s;
+  int base = 0;
+  for (int i = 0; i < all->count && base < last; i++) {
+    const PackS8 *job = &all->jobs[i];
+    int tiles = (job->rows + 15) / 16;
+    if (base + tiles > first)
+      pack_s8_vnni_tiles(job->dst, job->w, job->rows, job->cols, job->ld, first > base ? first - base : 0,
+                         last < base + tiles ? last - base : tiles);
+    base += tiles;
+  }
+}
+
+void pack_s8_vnni_many(const PackS8 *jobs, int count) {
+  PackAllS8 all = {jobs, count};
+  long long tiles = 0;
+  for (int i = 0; i < count; i++)
+    tiles += (jobs[i].rows + 15) / 16;
+  if (tiles > INT32_MAX)
+    fail("too many weight tiles to pack: %lld", tiles);
+  int chunks = (int)tiles;
+  kernels_parallel_segments(1, &chunks, pack_s8_chunks, &all);
 }

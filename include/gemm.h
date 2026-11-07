@@ -1,6 +1,7 @@
 #ifndef LLAMA_GEMM_H
 #define LLAMA_GEMM_H
 
+#include "kernels.h"
 #include "runtime.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -112,5 +113,45 @@ typedef struct {
   size_t ld;
 } PackBf16;
 void pack_bf16_vnni_many(const PackBf16 *jobs, int count);
+
+/* ---- Q8_0 batched GEMM (C6) ----------------------------------------------------------------------------------------
+ * W8A8 with the repository's Q8_0 rule: int8 weights with one FP32 scale per group of gs inputs, activations quantized
+ * per token row and group by k_quantize, per group `(float)(int32 dot) * ws * xs` accumulated in FP32. Three backends
+ * with that semantic: the portable one (the scalar GEMV's arithmetic, so on the scalar instruction set it equals the
+ * per-row GEMV bitwise), a tiled AVX-512 VNNI kernel (the "avx512-q8" rung; agrees with the GEMV within the Q8 budget),
+ * and AMX-INT8 on weights packed by pack_s8_vnni (exact int32 group dots; same budget). gs % 64 != 0 uses the portable
+ * backend. W8A32 is not routed through any of them. */
+typedef struct {
+  float *c; /* m x n output, row-major, leading dimension ldc */
+  int ldc;
+  K8Weight w, w3;         /* n x k int8 values (row stride k) and n x (k / gs) scales; w3 for GEMM_SWIGLU */
+  const int8_t *pw, *pw3; /* the same values packed by pack_s8_vnni; NULL unless AMX may be used */
+  int n;
+  GemmKind kind;
+} GemmQ8Segment;
+typedef enum { Q8_GEMM_PORTABLE, Q8_GEMM_AVX512, Q8_GEMM_AMX } Q8GemmBackend;
+
+/* Quantizes m rows of n values (row stride ldx) with k_quantize per row, in parallel: row r of q (stride n) and of s
+ * (stride n / gs) is bitwise what the per-token path produces. */
+void k_quantize_rows(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs);
+/* C[m][n] (op)= Xq[m][k] . Wq[n][k]^T with activation scales xs[m][k / gs]; xq and xs are dense (row strides k and
+ * k / gs). For AMX, xq must be readable up to the next multiple of 32 rows. Segments share the activations. */
+void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count);
+/* The backend k_gemm_q8 would choose (for logging and reports). */
+Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
+/* Test hooks: one named backend (0 when not compiled in; the caller must know the CPU can run it), and the exact int32
+ * group dots of the AMX chunk kernel, dots[(g * m + r) * n + c]. */
+int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
+                           const GemmQ8Segment *segments, int count);
+int k_gemm_q8_amx_dots_test(int32_t *dots, const int8_t *xq, int m, int k, int gs, const int8_t *packed, int n);
+
+/* Packs many int8 matrices with the active worker team (or OpenMP, or serially). */
+typedef struct {
+  int8_t *dst;
+  const int8_t *w;
+  int rows, cols;
+  size_t ld;
+} PackS8;
+void pack_s8_vnni_many(const PackS8 *jobs, int count);
 
 #endif

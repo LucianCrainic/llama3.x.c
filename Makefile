@@ -77,6 +77,16 @@ $(BUILD_DIR)/test-bf16-engine-emul: tests/bf16_engine.c src/run.c tests/amx_emul
 # The CLI with the AMX tile instructions on the software model, for the report, mode-guard and fixture tests.
 $(BUILD_DIR)/run-amx-emul: src/run.c tests/amx_emul.h $(COMMON) $(APP) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX -DBUILD_MODE='"$(MODE)"' -DBUILD_FLAGS='"emulated AMX"' $(CFLAGS) src/run.c $(COMMON) $(APP) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-q8: tests/q8.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/q8.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-q8-emul: tests/q8.c tests/amx_emul.h tests/avx512_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX -DGEMM_EMULATE_AVX512 $(CFLAGS) tests/q8.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-q8-engine: tests/q8_engine.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/q8_engine.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-q8-engine-emul: tests/q8_engine.c src/runq.c tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/q8_engine.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/runq-amx-emul: src/runq.c tests/amx_emul.h $(COMMON) $(APP) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX -DBUILD_MODE='"$(MODE)"' -DBUILD_FLAGS='"emulated AMX"' $(CFLAGS) src/runq.c $(COMMON) $(APP) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/gemm-bench: tests/gemm_bench.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gemm_bench.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-manifest: tests/manifest.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
@@ -91,7 +101,7 @@ $(BUILD_DIR)/test-prefill-fp32: tests/prefill.c src/run.c $(COMMON) $(HEADERS) $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-prefill-int8: tests/prefill.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
+test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/test-q8 $(BUILD_DIR)/test-q8-emul $(BUILD_DIR)/test-q8-engine $(BUILD_DIR)/test-q8-engine-emul $(BUILD_DIR)/runq-amx-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
 	$(BUILD_DIR)/test-kernels
 	$(BUILD_DIR)/test-gemm
 	$(BUILD_DIR)/test-gemm-emul
@@ -99,6 +109,8 @@ test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernel
 	$(BUILD_DIR)/test-amx-emul
 	$(BUILD_DIR)/test-bf16
 	$(BUILD_DIR)/test-bf16-emul
+	$(BUILD_DIR)/test-q8
+	$(BUILD_DIR)/test-q8-emul
 	$(BUILD_DIR)/test-manifest
 	$(BUILD_DIR)/test-regions
 	$(BUILD_DIR)/test-workers
