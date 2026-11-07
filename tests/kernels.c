@@ -4,6 +4,7 @@
 #include "workers.h"
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -355,6 +356,230 @@ static void test_attention_batch(void) {
       }
 }
 
+/* ---- Shard kernels (B2): partial outputs, column slices, row slices and padded rows -------------------------------
+ */
+
+static int bitwise_expected(void) {
+  /* The AVX-512 GEMV reduces a block of four rows differently from one to three rows, so a row computed in another
+   * block position can differ in the last bits. Only the scalar kernels keep the exact per-row order. */
+  return !strcmp(kernels_name(), "scalar");
+}
+
+static void test_partial_f32(void) {
+  const int shapes[][2] = {{64, 5}, {96, 9}, {200, 4}, {1024, 7}};
+  for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+    int n = shapes[s][0], d = shapes[s][1], half = n / 2;
+    for (int pad = 0; pad < 2; pad++) {
+      size_t ld = (size_t)half + (pad ? 16 : 0);
+      float *x = zeroed(n, sizeof(float)), *w = zeroed((size_t)n * d, sizeof(float));
+      float *w0 = zeroed(ld * d, sizeof(float)), *w1 = zeroed(ld * d, sizeof(float));
+      float *p0 = zeroed(d, sizeof(float)), *p1 = zeroed(d, sizeof(float)), *full = zeroed(d, sizeof(float));
+      float *base = zeroed(d, sizeof(float));
+      double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double));
+      fill(x, n, 1);
+      fill(w, (size_t)n * d, 1);
+      fill(base, d, 4);
+      for (size_t i = 0; i < ld * d; i++)
+        w0[i] = w1[i] = NAN; /* padding must never be read */
+      for (int i = 0; i < d; i++) {
+        memcpy(w0 + i * ld, w + (size_t)i * n, half * sizeof(float));
+        memcpy(w1 + i * ld, w + (size_t)i * n + half, (n - half) * sizeof(float));
+        for (int j = 0; j < n; j++) {
+          ref[i] += (double)w[(size_t)i * n + j] * x[j];
+          mag[i] += fabs((double)w[(size_t)i * n + j] * x[j]);
+        }
+      }
+      for (int i = 0; i < d; i++)
+        p0[i] = p1[i] = 1e30f; /* PARTIAL overwrites, like STORE */
+      k_matmul_ld(p0, x, w0, ld, half, d, K_PARTIAL);
+      k_matmul_ld(p1, x + half, w1, ld, n - half, d, K_PARTIAL);
+      for (int i = 0; i < d; i++)
+        check("partial.sum", (double)p0[i] + (double)p1[i], ref[i], 2e-5 * mag[i] + 1e-6);
+      /* Row slices of the full tensor: the shard's rows are the full product's rows. */
+      k_matmul(full, x, w, n, d);
+      int split = d / 2;
+      memcpy(p0, base, d * sizeof(float));
+      k_matmul_ld(p0, x, w, (size_t)n, n, split, K_STORE);
+      k_matmul_ld(p0 + split, x, w + (size_t)split * n, (size_t)n, n, d - split, K_STORE);
+      for (int i = 0; i < d; i++) {
+        checks++;
+        if (bitwise_expected() ? memcmp(&p0[i], &full[i], sizeof(float)) != 0
+                               : fabs((double)p0[i] - full[i]) > 2e-5 * mag[i] + 1e-6) {
+          if (failures++ < 20)
+            fprintf(stderr, "row slice [%s]: row %d differs from the full product\n", current, i);
+        }
+      }
+      /* K_ADD with padded rows accumulates; SWIGLU on padded rows matches the unpadded pair form. */
+      memcpy(p1, base, d * sizeof(float));
+      k_matmul_ld(p1, x, w0, ld, half, d, K_ADD);
+      for (int i = 0; i < d; i++) {
+        double ref0 = 0, mag0 = 0;
+        for (int j = 0; j < half; j++) {
+          ref0 += (double)w[(size_t)i * n + j] * x[j];
+          mag0 += fabs((double)w[(size_t)i * n + j] * x[j]);
+        }
+        check("partial.add", p1[i], base[i] + ref0, 2e-5 * (mag0 + fabs(base[i])) + 1e-6);
+      }
+      float *gated = zeroed(d, sizeof(float)), *unpadded = zeroed(d, sizeof(float));
+      float *w3 = zeroed(ld * d, sizeof(float)), *w3_plain = zeroed((size_t)half * d, sizeof(float));
+      for (size_t i = 0; i < ld * d; i++)
+        w3[i] = NAN;
+      for (int i = 0; i < d; i++)
+        for (int j = 0; j < half; j++)
+          w3[i * ld + j] = w3_plain[(size_t)i * half + j] = uniform();
+      k_matmul_swiglu_ld(gated, x, w0, w3, ld, half, d);
+      float *w0_plain = zeroed((size_t)half * d, sizeof(float));
+      for (int i = 0; i < d; i++)
+        memcpy(w0_plain + (size_t)i * half, w0 + i * ld, half * sizeof(float));
+      k_matmul_swiglu(unpadded, x, w0_plain, w3_plain, half, d);
+      for (int i = 0; i < d; i++) {
+        checks++;
+        if (memcmp(&gated[i], &unpadded[i], sizeof(float)) && failures++ < 20)
+          fprintf(stderr, "swiglu_ld [%s]: padded and packed rows differ at %d\n", current, i);
+      }
+      free(gated), free(unpadded), free(w3), free(w3_plain), free(w0_plain);
+      free(x), free(w), free(w0), free(w1), free(p0), free(p1), free(full), free(base), free(ref), free(mag);
+    }
+  }
+}
+
+static void test_partial_q8(void) {
+  const int gss[] = {4, 16, 64, 128};
+  const int n = 512, d = 7, half = n / 2;
+  for (size_t g = 0; g < sizeof(gss) / sizeof(*gss); g++) {
+    int gs = gss[g], groups = n / gs, hg = half / gs;
+    for (int pad = 0; pad < 2; pad++) {
+      size_t ld = (size_t)half + (pad ? (size_t)gs : 0), sld = ld / gs;
+      float *x = zeroed(n, sizeof(float)), *ws = zeroed((size_t)d * groups, sizeof(float));
+      int8_t *wq = zeroed((size_t)n * d, 1);
+      int8_t *w0q = zeroed(ld * d, 1), *w1q = zeroed(ld * d, 1);
+      float *w0s = zeroed(sld * d, sizeof(float)), *w1s = zeroed(sld * d, sizeof(float));
+      fill(x, n, 3);
+      for (size_t i = 0; i < (size_t)n * d; i++)
+        wq[i] = (int8_t)(uniform() * 127.0f);
+      for (int i = 0; i < d * groups; i++)
+        ws[i] = 0.001f + 0.01f * fabsf(uniform());
+      memset(w0q, 127, ld * d), memset(w1q, 127, ld * d); /* padding */
+      for (size_t i = 0; i < sld * d; i++)
+        w0s[i] = w1s[i] = NAN;
+      for (int i = 0; i < d; i++) {
+        memcpy(w0q + i * ld, wq + (size_t)i * n, half);
+        memcpy(w1q + i * ld, wq + (size_t)i * n + half, half);
+        memcpy(w0s + i * sld, ws + (size_t)i * groups, hg * sizeof(float));
+        memcpy(w1s + i * sld, ws + (size_t)i * groups + hg, hg * sizeof(float));
+      }
+      int8_t *xq = zeroed(n, 1);
+      float *xs = zeroed(groups, sizeof(float));
+      k_quantize(xq, xs, x, n, gs);
+      /* Each half's activations are quantized from the owned slice alone, at the original group boundaries. */
+      int8_t *xq0 = zeroed(half, 1), *xq1 = zeroed(half, 1);
+      float *xs0 = zeroed(hg, sizeof(float)), *xs1 = zeroed(hg, sizeof(float));
+      k_quantize(xq0, xs0, x, half, gs);
+      k_quantize(xq1, xs1, x + half, half, gs);
+      checks += 2;
+      if ((memcmp(xq0, xq, half) || memcmp(xq1, xq + half, half) || memcmp(xs0, xs, hg * sizeof(float)) ||
+           memcmp(xs1, xs + hg, hg * sizeof(float))) &&
+          failures++ < 20)
+        fprintf(stderr, "quantize slices [%s]: differ from the full quantization (gs %d)\n", current, gs);
+      for (int mode = 0; mode < 2; mode++) {
+        double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double));
+        for (int i = 0; i < d; i++)
+          for (int gi = 0; gi < groups; gi++) {
+            double a = 0, am = 0;
+            for (int j = gi * gs; j < (gi + 1) * gs; j++) {
+              double xv = mode ? x[j] : xq[j];
+              a += wq[(size_t)i * n + j] * xv;
+              am += fabs(wq[(size_t)i * n + j] * xv);
+            }
+            double sx = mode ? 1.0 : xs[gi];
+            ref[i] += a * ws[i * groups + gi] * sx;
+            mag[i] += am * ws[i * groups + gi] * sx;
+          }
+        K8Input in0 = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq0, xs0, x};
+        K8Input in1 = mode ? (K8Input){NULL, NULL, x + half} : (K8Input){xq1, xs1, x + half};
+        K8Weight a = {w0q, w0s}, b = {w1q, w1s};
+        float *p0 = zeroed(d, sizeof(float)), *p1 = zeroed(d, sizeof(float)), *both = zeroed(d, sizeof(float));
+        for (int i = 0; i < d; i++)
+          p0[i] = p1[i] = 1e30f;
+        k_matmul_q8_ld(p0, &in0, &a, ld, half, d, gs, K_PARTIAL);
+        k_matmul_q8_ld(p1, &in1, &b, ld, half, d, gs, K_PARTIAL);
+        const char *name = mode ? "q8_partial_w8a32" : "q8_partial_w8a8";
+        for (int i = 0; i < d; i++)
+          check(name, (double)p0[i] + (double)p1[i], ref[i], 2e-5 * mag[i] + 1e-6);
+        /* Padded rows and packed rows give the same bits, and ADD accumulates. */
+        K8Input full_in = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq, xs, x};
+        K8Weight plain = {wq, ws};
+        k_matmul_q8(both, &full_in, plain, n, d, gs);
+        for (int i = 0; i < d; i++)
+          check(name, both[i], ref[i], 2e-5 * mag[i] + 1e-6);
+        float *add = zeroed(d, sizeof(float));
+        for (int i = 0; i < d; i++)
+          add[i] = 0.5f;
+        k_matmul_q8_ld(add, &in0, &a, ld, half, d, gs, K_ADD);
+        for (int i = 0; i < d; i++) {
+          checks++;
+          if (fabsf(add[i] - 0.5f - p0[i]) > 1e-4f * (fabsf(p0[i]) + 1) && failures++ < 20)
+            fprintf(stderr, "%s [%s]: ADD differs from PARTIAL plus the base at %d\n", name, current, i);
+        }
+        free(add), free(p0), free(p1), free(both), free(ref), free(mag);
+      }
+      free(x), free(ws), free(wq), free(w0q), free(w1q), free(w0s), free(w1s), free(xq), free(xs), free(xq0), free(xq1),
+          free(xs0), free(xs1);
+    }
+  }
+}
+
+static void test_partial(void) {
+  test_partial_f32();
+  test_partial_q8();
+}
+
+/* Two coordinator threads, each bound to its own team, run kernels at the same time. */
+typedef struct {
+  int socket, failed;
+} TwoTeams;
+
+static void *two_team_main(void *p) {
+  TwoTeams *job = p;
+  kernels_set_thread_team(pool_team(job->socket));
+  unsigned long long local = 0x9E3779B97F4A7C15ull * (unsigned)(job->socket + 1);
+  const int n = 200, d = 37;
+  float *x = zeroed(n, sizeof(float)), *w = zeroed((size_t)n * d, sizeof(float)), *out = zeroed(d, sizeof(float));
+  for (int i = 0; i < n; i++)
+    x[i] = (float)((local = local * 6364136223846793005ull + 1) >> 40) / (float)(1 << 24) - 0.5f;
+  for (int i = 0; i < n * d; i++)
+    w[i] = (float)((local = local * 6364136223846793005ull + 1) >> 40) / (float)(1 << 24) - 0.5f;
+  for (int rep = 0; rep < 300; rep++) {
+    k_matmul(out, x, w, n, d);
+    for (int i = 0; i < d; i++) {
+      double ref = 0, mag = 0;
+      for (int j = 0; j < n; j++) {
+        ref += (double)w[(size_t)i * n + j] * x[j];
+        mag += fabs((double)w[(size_t)i * n + j] * x[j]);
+      }
+      if (fabs(out[i] - ref) > 2e-5 * mag + 1e-6)
+        job->failed++;
+    }
+  }
+  kernels_set_thread_team(NULL);
+  free(x), free(w), free(out);
+  return NULL;
+}
+
+static void test_two_teams(void) {
+  PoolConfig config = {.teams = 2, .threads = {3, 2}, .cpus = {NULL, NULL}};
+  pool_start(&config);
+  TwoTeams job[2] = {{0, 0}, {1, 0}};
+  pthread_t thread;
+  assert(!pthread_create(&thread, NULL, two_team_main, &job[1]));
+  two_team_main(&job[0]);
+  pthread_join(thread, NULL);
+  checks += 2;
+  if ((job[0].failed || job[1].failed) && failures++ < 20)
+    fprintf(stderr, "two teams [%s]: %d + %d results out of budget\n", current, job[0].failed, job[1].failed);
+  pool_stop();
+}
+
 int main(void) {
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
   float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
@@ -377,6 +602,8 @@ int main(void) {
     rope_used = test_rope(rope[i]);
     test_attention();
     test_attention_batch();
+    test_partial();
+    test_two_teams();
     rng = seed; /* identical inputs for every instruction set */
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
@@ -421,6 +648,7 @@ int main(void) {
       test_norm();
       test_attention();
       test_attention_batch();
+      test_partial();
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();

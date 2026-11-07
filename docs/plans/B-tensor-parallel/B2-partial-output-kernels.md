@@ -12,7 +12,42 @@ Add the kernel variants that a shard needs:
 The residual is added exactly once, after the cross-socket sum (B4). Without this, a
 per-socket `ADD` epilogue would apply the residual twice (study §6.2).
 
-Status: **planned**. Branch: `feature/tp-b2-partial-kernels`.
+Status: **implemented and tested locally (macOS, scalar); AVX-512 type-checked only, cluster `check` pending**.
+Branch: `feature/tp-local-b` (commit `feat: add partial-output and strided shard kernels`).
+
+Implementation notes:
+
+- **Entry points** (`include/kernels.h`, `src/kernels_simd.c`): `k_matmul_ld`, `k_matmul_swiglu_ld`, `k_matmul_q8_ld`,
+  `k_matmul_q8_swiglu_ld`, the `KernelEpilogue` kinds `K_STORE`, `K_ADD`, `K_PARTIAL`, `K_SWIGLU`, and
+  `kernels_set_thread_team`. `K_PARTIAL` is the `PARTIAL` epilogue: it stores like `K_STORE`. The `_ld` forms
+  validate `ld >= n` (and `ld % gs == 0` for Q8) and reject `K_SWIGLU` outside the pair form.
+- **Existing entry points are untouched.** Their jobs carry `ld = 0` (meaning `n`), so the same row stride and the
+  same AVX-512 `dots_*` calls result. The AVX-512 Q8 bodies gained an `ld` parameter next to `n` (weight rows use
+  `ld`, scales use `ld / gs`, the input length stays `n`); the FP32 body already took a stride. With `ld == n` every
+  address expression equals the old one.
+- **Team-local.** `kernels_set_thread_team(team)` binds the calling thread's kernels to a team, overriding the
+  process-wide `kernels_set_team` for that thread, because two socket coordinators must run kernels on two teams at
+  the same time. The B3 attention entry points use the same selection. QKV on a shard needs nothing new: the three
+  segments already take their own row counts (`dim/S`, `kv_dim/S`, `kv_dim/S`) and split per segment.
+- **Tests** (`tests/kernels.c`, scalar, team sizes none/1/2/3/5/7; the AVX-512 half runs on the cluster).
+  - Column slices of random `W[d][n]` at `n/2` with `K_PARTIAL`, sum in double: within `2e-5·Σ|w·x| + 1e-6`, with
+    padded (`ld = n/2 + 16`) and packed rows; padding is NaN (FP32) or 127 and NaN scales (Q8), so a read of
+    padding fails.
+  - Q8 W8A8 and W8A32 for gs 4, 16, 64, 128: each half's activations are quantized from the owned slice and must equal
+    the corresponding slice of the full quantization **bitwise** (values and scales); the halves sum to the double
+    reference within the budget; `K_ADD` equals `K_PARTIAL` plus the base.
+  - Row slices: the shard's rows equal the full product's rows **bitwise for the scalar kernels**. Specification
+    said bitwise for every ISA; the AVX-512 GEMV reduces a 4-row block differently from a 1-3-row tail, so a row
+    computed in another block position can differ in the last bits (already true across team splits). The test asserts
+    bitwise on scalar and the budget otherwise.
+  - Two coordinator threads, each bound to its own team (3 and 2 workers), run 300 GEMVs each concurrently.
+  - ASAN/UBSAN and TSAN clean on `test-kernels`; a mutation of the scale stride is caught.
+- **Cross-compile.** `cc -arch x86_64 -fsyntax-only` compiles `kernels_simd.c`, `tests/kernels.c`, `loader.c` and
+  `shards.c` without warnings. There is no AVX-512 emulation of the Q8 `dots` bodies (the emulator in
+  `tests/avx512_emul.h` covers only the GEMM microkernel), so the changed AVX-512 Q8 code is reviewed, not executed.
+- **Open (cluster).** `test-kernels` on AVX-512 with team sizes 1, 28 and 56 (`LLAMA_TEST_TEAMS`), looking for
+  `avx512 ok` and 0 failures, which also covers the new Q8 `ld` argument; the existing Q8 results on AVX-512 (logits
+  of the 1B/8B Q8 gate) must be unchanged, since `ld == n` there; `cresco8-tp.sbatch PHASE=B2`.
 
 ## 2. Depends on / unblocks
 

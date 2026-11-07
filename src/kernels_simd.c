@@ -26,10 +26,18 @@
 static KernelIsa isa = KERNELS_SCALAR;
 static int initialized;
 /* With a team set, kernels run on it instead of opening OpenMP regions. */
-static Team *current_team;
+static Team *default_team;
+/* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
+ * process-wide default, so two coordinators can run kernels on two teams at the same time. */
+static _Thread_local Team *thread_team;
+#define current_team (thread_team ? thread_team : default_team)
 
 void kernels_set_team(Team *team) {
-  current_team = team;
+  default_team = team;
+}
+
+void kernels_set_thread_team(Team *team) {
+  thread_team = team;
 }
 
 static int supported(KernelIsa which) {
@@ -235,14 +243,14 @@ static inline size_t q8_ahead(int rows, size_t n, int fp32_activations) {
 /* W8A8 with VNNI. vpdpbusd multiplies unsigned by signed bytes, so |x| is the
  * unsigned operand and w takes x's sign; exact because no value is -128. Each
  * group's int32 lanes are scaled once into FP32 accumulators. gs % 64 == 0. */
-Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const int rows, const int8_t *xq,
+Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, size_t ld, const int rows, const int8_t *xq,
                             const float *xs, int gs, float *out) {
   const __m512i zero = _mm512_setzero_si512();
   const size_t ahead = q8_ahead(rows, n, 0);
   __m512 acc[BLOCK];
   for (int r = 0; r < rows; r++)
     acc[r] = _mm512_setzero_ps();
-  size_t groups = n / gs;
+  size_t groups = n / gs, scale_ld = ld / gs;
   for (size_t g = 0; g < groups; g++) {
     __m512i iacc[BLOCK];
     for (int r = 0; r < rows; r++)
@@ -253,14 +261,14 @@ Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const i
       __m512i ax = _mm512_abs_epi8(xv);
       __mmask64 negative = _mm512_movepi8_mask(xv);
       for (int r = 0; r < rows; r++) {
-        _mm_prefetch((const char *)(wq + r * n + off + ahead), _MM_HINT_T0);
-        __m512i wv = _mm512_loadu_si512((const void *)(wq + r * n + off));
+        _mm_prefetch((const char *)(wq + r * ld + off + ahead), _MM_HINT_T0);
+        __m512i wv = _mm512_loadu_si512((const void *)(wq + r * ld + off));
         iacc[r] = _mm512_dpbusd_epi32(iacc[r], ax, _mm512_mask_sub_epi8(wv, negative, zero, wv));
       }
     }
     __m512 xscale = _mm512_set1_ps(xs[g]);
     for (int r = 0; r < rows; r++)
-      acc[r] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(iacc[r]), xscale), _mm512_set1_ps(ws[r * groups + g]),
+      acc[r] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(iacc[r]), xscale), _mm512_set1_ps(ws[r * scale_ld + g]),
                                acc[r]);
   }
   for (int r = 0; r < rows; r++)
@@ -270,13 +278,13 @@ Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, const i
 /* W8A32: weights are widened in registers and multiplied by FP32 activations;
  * each group's partial sum is scaled once. Two partial sums per row hide FMA
  * latency. gs % 16 == 0. */
-Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const int rows, const float *x, int gs,
-                             float *out) {
+Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, size_t ld, const int rows, const float *x,
+                             int gs, float *out) {
   const size_t ahead = q8_ahead(rows, n, 1);
   __m512 acc[BLOCK];
   for (int r = 0; r < rows; r++)
     acc[r] = _mm512_setzero_ps();
-  size_t groups = n / gs;
+  size_t groups = n / gs, scale_ld = ld / gs;
   for (size_t g = 0; g < groups; g++) {
     __m512 ga[BLOCK], gb[BLOCK];
     for (int r = 0; r < rows; r++)
@@ -287,8 +295,8 @@ Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const 
       __m512 x0 = _mm512_loadu_ps(x + off), x1 = _mm512_loadu_ps(x + off + 16);
       for (int r = 0; r < rows; r++) {
         if (ahead && !(off & 63))
-          _mm_prefetch((const char *)(wq + r * n + off + ahead), _MM_HINT_T0);
-        __m256i bytes = _mm256_loadu_si256((const __m256i *)(wq + r * n + off));
+          _mm_prefetch((const char *)(wq + r * ld + off + ahead), _MM_HINT_T0);
+        __m256i bytes = _mm256_loadu_si256((const __m256i *)(wq + r * ld + off));
         __m512 w0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(bytes)));
         __m512 w1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(bytes, 1)));
         ga[r] = _mm512_fmadd_ps(w0, x0, ga[r]);
@@ -299,25 +307,25 @@ Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, const 
       size_t off = g * gs + c;
       __m512 x0 = _mm512_loadu_ps(x + off);
       for (int r = 0; r < rows; r++) {
-        __m128i bytes = _mm_loadu_si128((const __m128i *)(wq + r * n + off));
+        __m128i bytes = _mm_loadu_si128((const __m128i *)(wq + r * ld + off));
         ga[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes)), x0, ga[r]);
       }
     }
     for (int r = 0; r < rows; r++)
-      acc[r] = _mm512_fmadd_ps(_mm512_add_ps(ga[r], gb[r]), _mm512_set1_ps(ws[r * groups + g]), acc[r]);
+      acc[r] = _mm512_fmadd_ps(_mm512_add_ps(ga[r], gb[r]), _mm512_set1_ps(ws[r * scale_ld + g]), acc[r]);
   }
   for (int r = 0; r < rows; r++)
     out[r] = _mm512_reduce_add_ps(acc[r]);
 }
 
-#define Q8_WRAPPERS(rows)                                                                                            \
-  AVX512 static void dots_q8_avx512_##rows(const int8_t *wq, const float *ws, size_t n, const int8_t *xq,           \
-                                           const float *xs, int gs, float *out) {                                  \
-    dots_q8_body(wq, ws, n, rows, xq, xs, gs, out);                                                                 \
-  }                                                                                                                 \
-  AVX512 static void dots_q8f_avx512_##rows(const int8_t *wq, const float *ws, size_t n, const float *x, int gs,    \
-                                            float *out) {                                                           \
-    dots_q8f_body(wq, ws, n, rows, x, gs, out);                                                                     \
+#define Q8_WRAPPERS(rows)                                                                                              \
+  AVX512 static void dots_q8_avx512_##rows(const int8_t *wq, const float *ws, size_t n, size_t ld, const int8_t *xq,   \
+                                           const float *xs, int gs, float *out) {                                      \
+    dots_q8_body(wq, ws, n, ld, rows, xq, xs, gs, out);                                                                \
+  }                                                                                                                    \
+  AVX512 static void dots_q8f_avx512_##rows(const int8_t *wq, const float *ws, size_t n, size_t ld, const float *x,    \
+                                            int gs, float *out) {                                                      \
+    dots_q8f_body(wq, ws, n, ld, rows, x, gs, out);                                                                    \
   }
 Q8_WRAPPERS(1)
 Q8_WRAPPERS(2)
@@ -325,8 +333,8 @@ Q8_WRAPPERS(3)
 Q8_WRAPPERS(4)
 #undef Q8_WRAPPERS
 
-typedef void (*DotsQ8Fn)(const int8_t *, const float *, size_t, const int8_t *, const float *, int, float *);
-typedef void (*DotsQ8fFn)(const int8_t *, const float *, size_t, const float *, int, float *);
+typedef void (*DotsQ8Fn)(const int8_t *, const float *, size_t, size_t, const int8_t *, const float *, int, float *);
+typedef void (*DotsQ8fFn)(const int8_t *, const float *, size_t, size_t, const float *, int, float *);
 static const DotsQ8Fn dots_q8_avx512[BLOCK + 1] = {NULL, dots_q8_avx512_1, dots_q8_avx512_2, dots_q8_avx512_3,
                                                    dots_q8_avx512_4};
 static const DotsQ8fFn dots_q8f_avx512[BLOCK + 1] = {NULL, dots_q8f_avx512_1, dots_q8f_avx512_2, dots_q8f_avx512_3,
@@ -530,7 +538,9 @@ void k_rope_apply(float *q, float *k, const float *table, int n_heads, int n_kv_
 // ----------------------------------------------------------------------------
 // GEMV drivers
 
-enum { STORE, ADD, SWIGLU };
+/* PARTIAL stores like STORE, into a socket-local partial buffer that the cross-socket reduction adds to the residual
+ * exactly once; it stays a separate kind so call sites state their intent. */
+enum { STORE = K_STORE, ADD = K_ADD, PARTIAL = K_PARTIAL, SWIGLU = K_SWIGLU };
 
 static float silu_gate(float value, float gate) {
   // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid; elementwise multiply with w3(x)
@@ -538,15 +548,15 @@ static float silu_gate(float value, float gate) {
   return value * gate;
 }
 
-static void f32_dots(const float *w, int rows, const float *x, int n, float *out) {
+static void f32_dots(const float *w, size_t ld, int rows, const float *x, int n, float *out) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512) {
-    dots_f32_avx512(w, (size_t)n, rows, x, n, out);
+    dots_f32_avx512(w, ld, rows, x, n, out);
     return;
   }
 #endif
   for (int r = 0; r < rows; r++) {
-    const float *wr = w + (size_t)r * n;
+    const float *wr = w + (size_t)r * ld;
     float val = 0.0f;
     for (int j = 0; j < n; j++) {
       val += wr[j] * x[j];
@@ -564,15 +574,17 @@ typedef struct {
   const float *x;
   int n, kind, count;
   F32Segment segment[3];
+  size_t ld; /* weight row stride in floats; 0 = n */
 } F32Job;
 
 static void f32_range(const F32Job *job, const F32Segment *seg, int r0, int r1) {
   float dots[BLOCK], gates[BLOCK];
+  size_t ld = job->ld ? job->ld : (size_t)job->n;
   for (int i = r0; i < r1; i += BLOCK) {
     int rows = r1 - i < BLOCK ? r1 - i : BLOCK;
-    f32_dots(seg->w + (size_t)i * job->n, rows, job->x, job->n, dots);
+    f32_dots(seg->w + (size_t)i * ld, ld, rows, job->x, job->n, dots);
     if (job->kind == SWIGLU)
-      f32_dots(seg->w3 + (size_t)i * job->n, rows, job->x, job->n, gates);
+      f32_dots(seg->w3 + (size_t)i * ld, ld, rows, job->x, job->n, gates);
     for (int r = 0; r < rows; r++) {
       if (job->kind == ADD)
         seg->out[i + r] += dots[r];
@@ -620,45 +632,45 @@ static void f32_run(F32Job *job) {
 
 void k_matmul(float *out, const float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
-  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}};
+  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0};
   f32_run(&job);
 }
 void k_matmul_add(float *out, const float *x, const float *w, int n, int d) {
-  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}};
+  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0};
   f32_run(&job);
 }
 void k_matmul_qkv(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv, int n,
                   int dq, int dkv) {
-  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}};
+  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0};
   f32_run(&job);
 }
 void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w3, int n, int d) {
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0};
   f32_run(&job);
 }
 
 // ----------------------------------------------------------------------------
 // Q8_0 drivers
 
-static void q8_dots(K8Weight w, int row, int rows, const K8Input *x, int n, int gs, float *out) {
-  size_t groups = (size_t)n / gs;
-  const int8_t *wq = w.q + (size_t)row * n;
-  const float *ws = w.s + (size_t)row * groups;
+static void q8_dots(K8Weight w, size_t ld, int row, int rows, const K8Input *x, int n, int gs, float *out) {
+  size_t scale_ld = ld / gs;
+  const int8_t *wq = w.q + (size_t)row * ld;
+  const float *ws = w.s + (size_t)row * scale_ld;
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512) {
     if (x->q && gs % 64 == 0) {
-      dots_q8_avx512[rows](wq, ws, (size_t)n, x->q, x->s, gs, out);
+      dots_q8_avx512[rows](wq, ws, (size_t)n, ld, x->q, x->s, gs, out);
       return;
     }
     if (!x->q && gs % 16 == 0) {
-      dots_q8f_avx512[rows](wq, ws, (size_t)n, x->f, gs, out);
+      dots_q8f_avx512[rows](wq, ws, (size_t)n, ld, x->f, gs, out);
       return;
     }
   }
 #endif
   for (int r = 0; r < rows; r++) {
-    const int8_t *wr = wq + (size_t)r * n;
-    const float *sr = ws + (size_t)r * groups;
+    const int8_t *wr = wq + (size_t)r * ld;
+    const float *sr = ws + (size_t)r * scale_ld;
     float val = 0.0f;
     // do the matmul in groups of GS
     for (int j = 0; j <= n - gs; j += gs) {
@@ -689,15 +701,17 @@ typedef struct {
   const K8Input *x;
   int n, gs, kind, count;
   Q8Segment segment[3];
+  size_t ld; /* weight row stride in values (a multiple of gs); 0 = n */
 } Q8Job;
 
 static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
   float dots[BLOCK], gates[BLOCK];
+  size_t ld = job->ld ? job->ld : (size_t)job->n;
   for (int i = r0; i < r1; i += BLOCK) {
     int rows = r1 - i < BLOCK ? r1 - i : BLOCK;
-    q8_dots(seg->w, i, rows, job->x, job->n, job->gs, dots);
+    q8_dots(seg->w, ld, i, rows, job->x, job->n, job->gs, dots);
     if (job->kind == SWIGLU)
-      q8_dots(seg->w3, i, rows, job->x, job->n, job->gs, gates);
+      q8_dots(seg->w3, ld, i, rows, job->x, job->n, job->gs, gates);
     for (int r = 0; r < rows; r++) {
       if (job->kind == ADD)
         seg->out[i + r] += dots[r];
@@ -743,20 +757,56 @@ static void q8_run(Q8Job *job) {
 }
 
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}};
+  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0};
   q8_run(&job);
 }
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}};
+  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0};
   q8_run(&job);
 }
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs) {
-  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}};
+  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0};
   q8_run(&job);
 }
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0};
+  q8_run(&job);
+}
+
+/* ---- Shard entry points (B2) ----------------------------------------------------------------------------------
+ * Weight rows have stride ld (a shard packed by B1 has ld = its column count; ld may exceed n for padded rows).
+ * Row slices need nothing more: pass the shard's rows. A column slice passes its own n and the slice of the input. */
+static void check_epilogue(int kind, const char *name) {
+  if (kind != STORE && kind != ADD && kind != PARTIAL)
+    fail("%s: invalid epilogue kind %d", name, kind);
+}
+
+void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind) {
+  check_epilogue(kind, "k_matmul_ld");
+  if (ld < (size_t)n)
+    fail("k_matmul_ld: row stride %zu is shorter than the %d inputs", ld, n);
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld};
+  f32_run(&job);
+}
+void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d) {
+  if (ld < (size_t)n)
+    fail("k_matmul_swiglu_ld: row stride %zu is shorter than the %d inputs", ld, n);
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld};
+  f32_run(&job);
+}
+void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind) {
+  check_epilogue(kind, "k_matmul_q8_ld");
+  if (ld < (size_t)n || ld % (size_t)gs)
+    fail("k_matmul_q8_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld};
+  q8_run(&job);
+}
+void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
+                           int d, int gs) {
+  if (ld < (size_t)n || ld % (size_t)gs)
+    fail("k_matmul_q8_swiglu_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld};
   q8_run(&job);
 }
 

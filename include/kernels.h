@@ -20,6 +20,9 @@ const char *kernels_name(void);    /* NULL before kernels_init() */
  * k_attention_init, which sizes the split-K workspace from the worker count. */
 struct Team;
 void kernels_set_team(struct Team *team);
+/* Binds the calling thread's kernels to a team, overriding kernels_set_team for this thread only (NULL = back to the
+ * default). Each socket's coordinator thread does this once, so two sockets can run kernels concurrently (B2). */
+void kernels_set_thread_team(struct Team *team);
 void kernels_backend_init(void);
 void kernels_backend_free(void);
 const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after the pool stops */
@@ -47,6 +50,15 @@ void k_matmul_qkv(float *q, float *k, float *v, const float *x, const float *wq,
                   int dq, int dkv);
 void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w3, int n, int d);
 
+/* Shard entry points (B2). Weight rows have stride ld elements (ld >= n; a packed shard has ld = its columns). Row
+ * slices of a tensor use the ordinary entry points on the shard's rows; a column slice (Wo, W2) passes n = its column
+ * count and the matching slice of the input. `kind` is K_STORE, K_ADD or K_PARTIAL: PARTIAL writes W*x like STORE into
+ * a socket-local partial buffer, and the cross-socket reduction adds the residual once, so a two-socket Wo or W2 must
+ * not use K_ADD. SWIGLU keeps its pair form. For Q8, ld must be a multiple of gs. */
+typedef enum { K_STORE, K_ADD, K_PARTIAL, K_SWIGLU } KernelEpilogue;
+void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind);
+void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d);
+
 /* Q8_0: int8 rows with one FP32 scale per group of gs inputs. Values must lie in
  * [-127, 127] (the exporter and k_quantize guarantee it). An input with q == NULL
  * multiplies dequantized weights by the FP32 activations f (W8A32); otherwise
@@ -66,6 +78,11 @@ void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs);
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs);
+/* Shard variants of the above. A column slice's activations are quantized from the owned slice only, at the original
+ * group boundaries (col0 % gs == 0), so W8A8 and W8A32 both see whole groups. */
+void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind);
+void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
+                           int d, int gs);
 
 /* Causal single-token attention over a layer's cache rows [position][kv_dim].
  * The AVX-512 path processes each GQA group together and splits positions into
