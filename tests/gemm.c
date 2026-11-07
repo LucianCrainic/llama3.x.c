@@ -179,7 +179,8 @@ int main(void) {
 #else
   const int emulated = 0;
 #endif
-  const KernelIsa isas[2] = {KERNELS_SCALAR, KERNELS_AVX512};
+  const KernelIsa isas[3] = {KERNELS_SCALAR, KERNELS_AVX512, KERNELS_AMX};
+  const char *const isa_names[3] = {"scalar", "avx512", "amx"};
   int team_sizes[8] = {1, 3, 7};
   size_t team_size_count = 3;
   const char *override = getenv("LLAMA_TEST_TEAMS");
@@ -189,12 +190,12 @@ int main(void) {
          token = strtok(NULL, ","))
       team_sizes[team_size_count++] = atoi(token);
   }
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     if (!kernels_select(isas[i])) {
-      printf("gemm: %s unavailable on this CPU, skipped\n", i ? "avx512" : "scalar");
+      printf("gemm: %s unavailable on this CPU, skipped\n", isa_names[i]);
       continue;
     }
-    int simd_ok = emulated || i == 1;
+    int simd_ok = emulated || i >= 1; /* the amx level keeps the AVX-512 FP32 microkernel */
     int before = failures;
     test_variants(kernels_name(), simd_ok);
     if (i == 0) {

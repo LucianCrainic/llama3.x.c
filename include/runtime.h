@@ -86,6 +86,8 @@ typedef struct {
   int max_batch; /* LLAMA_PREFILL_BATCH, capped at the allocated context. */
   LogitsWanted prefill_logits;
   int prefill_gemm; /* batched prefill runs the FP32 GEMM (C2) instead of one GEMV per row */
+  const char *prefill_kernel; /* the batched prefill kernel in use, for the report (NULL when prefill_gemm is off) */
+  int prefill_bf16; /* LLAMA_PRECISION=bf16 (C5): the batched GEMM runs on BF16-packed weights; decode is unchanged */
 } Model;
 void engine_load(Model *model, const char *path);
 void engine_load_context(Model *model, const char *path, int context);
@@ -155,6 +157,8 @@ typedef struct {
   size_t sampled_tokens, stop_tokens, turns;
   size_t prefill_microbatches, prefill_logits_rows;
   double placement_populate_s, placement_verify_s, verify_excluded_s;
+  double weight_pack_s; /* BF16 packing at load (C5) */
+  int weight_packed;
   KvStats kv_prompt, kv_final;
   int kv_prompt_ready, kv_final_ready;
   int placement_owned; /* the checkpoint was copied into engine-owned regions */

@@ -6,10 +6,12 @@
 /* Compute kernels shared by both engines. kernels_init() selects one instruction
  * set per process: AVX-512 (F/BW/DQ/VL/VNNI + FMA) when the CPU and OS support it,
  * otherwise the scalar reference, which keeps the original operation order.
- * LLAMA_KERNELS=auto|scalar|avx512 overrides the automatic choice; an explicit
+ * LLAMA_KERNELS=auto|scalar|avx512|amx overrides the automatic choice; an explicit
  * unsupported request fails. SIMD reductions change FP32 summation order, so
- * results agree with the scalar reference within tolerance, not bitwise. */
-typedef enum { KERNELS_SCALAR, KERNELS_AVX512 } KernelIsa;
+ * results agree with the scalar reference within tolerance, not bitwise.
+ * KERNELS_AMX (C4) keeps every kernel on its AVX-512 path and additionally lets the batched GEMM use AMX tiles; it
+ * needs the CPU feature and the kernel's tile-data permission, and `auto` never selects it. */
+typedef enum { KERNELS_SCALAR, KERNELS_AVX512, KERNELS_AMX } KernelIsa;
 void kernels_init(void);
 int kernels_select(KernelIsa isa); /* 0 when unsupported; used by tests */
 const char *kernels_name(void);    /* NULL before kernels_init() */
@@ -31,6 +33,7 @@ const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after
  * for each segment's balanced share [first, last) of its chunks[segment] chunks; a worker's share never straddles
  * two segments. Returns after every share has run. */
 int kernels_avx512_active(void);
+int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
 typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
 void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
 

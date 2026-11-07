@@ -1,9 +1,10 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
 Plan date: 1 November 2026. Status as of 7 November 2026: Wave 1 (M1) is complete; Wave 2 (M2) is implemented
-and tested locally, with its cluster checks still to run; in Wave 3, B1-B6 are implemented and tested locally on
-the virtual topology (the cluster checks of B1-B6, and B7, are still to do) while C4-C7 and Waves 4-5 have not started.
-See the milestone table in §4 and each phase document's status line.
+and tested locally, with its cluster checks still to run; in Wave 3, B1-B6 (two-socket tensor parallelism) and C4-C7
+(AMX enablement, the BF16 precision mode, batched Q8 with AMX-INT8, the campaign scripts) are implemented and tested
+locally, B on the virtual topology and C on macOS against instruction models, with none of that code yet run on the
+cluster; B7 and Waves 4-5 (D) have not started. See the milestone table in §4 and each phase document's status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
 
@@ -138,7 +139,7 @@ Milestone status:
 | --- | --- | --- |
 | M1 | **complete** (2026-11-07) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%, Hugging Face gate under `teams` passes for 1B and 8B FP32). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. `make test` is green on Linux. Not part of M1 and still open: the F3 acceptance comparison with the kernels script |
 | M2 | **implemented locally; cluster checks pending** (2026-11-01) | A4, A5, C1, C2, C3 code and tests are in; A6 is a dry-run-verified matrix. Open: the cluster `check` of A4, A5, C1, C2, C3 and the A6 campaign |
-| M3 | **partly implemented locally; cluster checks pending** (2026-11-07) | B1-B6 are in (branch `feature/tp-local-b`): the cross-socket exchange, shard planning and packing, partial-output kernels, socket-local attention, and the FP32 and Q8 two-socket forward behind `LLAMA_SOCKETS=2`. Tested on macOS with `LLAMA_TOPOLOGY=virtual:2xT` (scalar kernels; ASAN/UBSAN and TSAN clean): bitwise exchange and shard reconstruction, logits within 4e-6 of the one-socket path for FP32 and within 1.1e-5 for Q8 (W8A8 and W8A32). Open: all cluster `check`s (`cresco8-tp.sbatch PHASE=B1..B6`, dry-run verified), the AVX-512 half of the new kernel tests, pinned reduction latency, per-socket page verification of KV, B7, and all of C4-C7. B1 builds on A4, whose cluster check is still pending |
+| M3 | **partly implemented locally; no cluster evidence** (2026-11-07) | B1-B6 and C4-C6 code and tests are in (branches `feature/tp-local-b` and `claude/tp-local-c-5140c7`, merged on `feature/tp-merge-b-c`); `phase_C4`-`phase_C7` and `phase_B1`-`phase_B6` are dry-run-verified. Track B: the cross-socket exchange, shard planning and packing, partial-output kernels, socket-local attention, and the FP32 and Q8 two-socket forward behind `LLAMA_SOCKETS=2`, tested on macOS with `LLAMA_TOPOLOGY=virtual:2xT` (scalar kernels; ASAN/UBSAN and TSAN clean): bitwise exchange and shard reconstruction, logits within 4e-6 of the one-socket path for FP32 and within 1.1e-5 for Q8 (W8A8 and W8A32). Track C: C4, C5, C6 pass on macOS against software models of the AMX tile instructions and of the AVX-512 integer subset. Never executed on real hardware: the AMX tile kernels, the AVX-512 FP32 GEMM of C2, the AVX-512 VNNI Q8 kernel of C6, and the AVX-512 half of the new B kernel tests. Open: all cluster `check`s (`cresco8-tp.sbatch PHASE=B1..B6`, then C4, C5, C6 after the M2 checks of C1-C3), the C7 campaign, pinned reduction latency, per-socket page verification of KV, and B7. B1 builds on A4, whose cluster check is still pending. `LLAMA_SOCKETS=2` does not combine with `LLAMA_PRECISION=bf16` or the batched Q8 GEMM (the two-socket forward runs per token until D1) |
 | M4 | planned | — |
 | M5 | planned | — |
 

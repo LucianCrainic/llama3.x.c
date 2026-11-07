@@ -1,5 +1,6 @@
 /* LLaMA 3 CPU inference, derived from Andrej Karpathy and James W. DeLancey.
  * See LICENSE. Numerical kernels intentionally remain independent per precision. */
+#include "gemm.h"
 #include "kernels.h"
 #include "loader.h"
 #include "prefill.h"
@@ -65,6 +66,12 @@ typedef struct {
   float *value_cache; // (layer, seq_len, kv_dim); cache persists for this sequence
 } RunState;
 
+/* The VNNI-quad copy of one layer's int8 values for AMX-INT8 (C6); the group scales stay where the checkpoint has them.
+ */
+typedef struct {
+  const int8_t *wq, *wk, *wv, *wo, *w1, *w2, *w3;
+} PackedLayer;
+
 typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
@@ -73,6 +80,8 @@ typedef struct {
   RunMemory mem;              // where the run state and KV caches live (A5)
   RunState state;             // buffers for the "wave" of activations in the forward pass
   Tp *tp;                     // LLAMA_SOCKETS=2: the two-socket engine, which owns weights, KV and activations (B6)
+  PackedLayer *packed;        // (layer) AMX-INT8 packed weights, NULL unless amx is selected for W8A8 (C6)
+  PackedStore packed_store;
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
   float *data;      // memory mapped data pointer
@@ -82,20 +91,22 @@ typedef struct {
 static void alloc_buffers(RunState *s, const Config *p, int max_batch, RunMemory *rm) {
   // Zeroed activations are owned for the lifetime of this model.
   int kv_dim = (p->dim / p->n_heads) * p->n_kv_heads;
+  /* The quantized activation rows are padded to whole 32-row blocks: the AMX kernel loads 16 rows at a time. */
+  int padded = (max_batch + 31) / 32 * 32;
   s->x = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
   s->xb = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
   s->hb = runmem_alloc(rm, checked_mul(max_batch, p->hidden_dim), sizeof(float));
-  s->xq = (QuantizedTensor){.q = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(int8_t)),
-                            .s = runmem_alloc(rm, checked_mul(max_batch, p->dim / GS), sizeof(float))};
-  s->hq = (QuantizedTensor){.q = runmem_alloc(rm, checked_mul(max_batch, p->hidden_dim), sizeof(int8_t)),
-                            .s = runmem_alloc(rm, checked_mul(max_batch, p->hidden_dim / GS), sizeof(float))};
+  s->xq = (QuantizedTensor){.q = runmem_alloc(rm, checked_mul(padded, p->dim), sizeof(int8_t)),
+                            .s = runmem_alloc(rm, checked_mul(padded, p->dim / GS), sizeof(float))};
+  s->hq = (QuantizedTensor){.q = runmem_alloc(rm, checked_mul(padded, p->hidden_dim), sizeof(int8_t)),
+                            .s = runmem_alloc(rm, checked_mul(padded, p->hidden_dim / GS), sizeof(float))};
   s->q = runmem_alloc(rm, checked_mul(max_batch, p->dim), sizeof(float));
   s->k = runmem_alloc(rm, checked_mul(max_batch, kv_dim), sizeof(float));
   s->v = runmem_alloc(rm, checked_mul(max_batch, kv_dim), sizeof(float));
   s->att = runmem_alloc(rm, checked_mul((size_t)p->n_heads, p->seq_len), sizeof(float));
   s->logits = runmem_alloc(rm, p->vocab_size, sizeof(float));
   s->rope = runmem_alloc(rm, checked_mul(max_batch, 2 * (size_t)p->head_dim), sizeof(float));
-  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len, 1);
+  runmem_attention(rm, &s->attention, p->n_heads, p->n_kv_heads, p->head_dim, p->seq_len, max_batch);
 }
 
 static void malloc_run_state(RunState *s, Config *p, int max_batch, RunMemory *rm) {
@@ -211,6 +222,8 @@ static void read_checkpoint(const char *path, Config *config, TransformerWeights
 
 static void free_transformer(Transformer *t) {
   tp_free(t->tp);
+  memory_free(t->packed);
+  packed_close(&t->packed_store);
   // free QuantizedTensors
   memory_free(t->weights.wq);
   memory_free(t->weights.wk);
@@ -256,6 +269,98 @@ static RunState row_state(RunState *s, const Config *p, int i) {
   row.hq.q += (size_t)i * p->hidden_dim;
   row.hq.s += (size_t)i * (p->hidden_dim / GS);
   return row;
+}
+
+/* ---- batched prefill (C6) ------------------------------------------------------------------------------------------
+ */
+
+/* Packs every layer's seven int8 matrices into VNNI quads for AMX-INT8, on the worker team, in one bound region that is
+ * claimed against the per-socket budget first. The checkpoint's group scales are read in place. */
+static void pack_weights(Transformer *t) {
+  const Config *p = &t->config;
+  const TransformerWeights *w = &t->weights;
+  double start = monotonic_seconds();
+  size_t dim = (size_t)p->dim, kv = (size_t)p->head_dim * p->n_kv_heads, hidden = (size_t)p->hidden_dim;
+  const size_t rows[7] = {dim, kv, kv, dim, hidden, dim, hidden}, cols[7] = {dim, dim, dim, dim, dim, hidden, dim};
+  size_t per_layer = 0;
+  for (int i = 0; i < 7; i++)
+    per_layer += s8_vnni_bytes((int)rows[i], (int)cols[i]);
+  packed_open(&t->packed_store, checked_mul(per_layer, (size_t)p->n_layers), "the packed int8 weights");
+  t->packed = memory_alloc((size_t)p->n_layers, sizeof(PackedLayer), MEM_METADATA);
+  PackS8 *jobs = memory_alloc(checked_mul((size_t)p->n_layers, 7), sizeof(PackS8), MEM_METADATA);
+  for (size_t l = 0; l < (size_t)p->n_layers; l++) {
+    const int8_t *src[7] = {w->wq[l].q, w->wk[l].q, w->wv[l].q, w->wo[l].q, w->w1[l].q, w->w2[l].q, w->w3[l].q};
+    int8_t *dst[7];
+    for (int i = 0; i < 7; i++) {
+      dst[i] = packed_take(&t->packed_store, s8_vnni_bytes((int)rows[i], (int)cols[i]));
+      jobs[l * 7 + i] = (PackS8){dst[i], src[i], (int)rows[i], (int)cols[i], cols[i]};
+    }
+    t->packed[l] = (PackedLayer){dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6]};
+  }
+  pack_s8_vnni_many(jobs, p->n_layers * 7);
+  memory_free(jobs);
+  packed_seal(&t->packed_store);
+  metrics.weight_pack_s += monotonic_seconds() - start;
+  metrics.weight_packed = 1;
+  LOG(LOG_INFO, "packed %zu bytes of int8 weights for AMX-INT8 in %.2f s", t->packed_store.region.logical_bytes,
+      monotonic_seconds() - start);
+}
+
+/* One layer for `count` consecutive positions through the batched Q8 GEMM (W8A8): each row is quantized exactly as the
+ * per-token path quantizes it (k_quantize per row and group), each weight matrix is streamed once for all rows, and K
+ * and V rows are written straight into the cache. */
+static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0, int count) {
+  Config *p = &t->config;
+  TransformerWeights *w = &t->weights;
+  int dim = p->dim, kv_dim = p->head_dim * p->n_kv_heads, hidden_dim = p->hidden_dim, head_size = p->head_dim;
+  size_t loff = l * p->seq_len * kv_dim;
+  float *kc = s->key_cache + loff, *vc = s->value_cache + loff;
+  static const PackedLayer none;
+  const PackedLayer *pl = t->packed ? &t->packed[l] : &none;
+
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_RMSNORM,
+            k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_att_weight + l * dim, dim, p->norm_eps));
+  PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
+  GemmQ8Segment qkv[3] = {{.c = s->q, .ldc = dim, .w = weight(w->wq + l), .pw = pl->wq, .n = dim, .kind = GEMM_STORE},
+                          {.c = kc + (size_t)pos0 * kv_dim,
+                           .ldc = kv_dim,
+                           .w = weight(w->wk + l),
+                           .pw = pl->wk,
+                           .n = kv_dim,
+                           .kind = GEMM_STORE},
+                          {.c = vc + (size_t)pos0 * kv_dim,
+                           .ldc = kv_dim,
+                           .w = weight(w->wv + l),
+                           .pw = pl->wv,
+                           .n = kv_dim,
+                           .kind = GEMM_STORE}};
+  PROFILE(PHASE_QKV, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, qkv, 3));
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
+                                     s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
+  PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
+                                             head_size, p->seq_len, pos0, count));
+  PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
+  GemmQ8Segment wo = {.c = s->x, .ldc = dim, .w = weight(w->wo + l), .pw = pl->wo, .n = dim, .kind = GEMM_ADD};
+  PROFILE(PHASE_WO, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, &wo, 1));
+
+  for (int i = 0; i < count; i++)
+    PROFILE(PHASE_RMSNORM,
+            k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_ffn_weight + l * dim, dim, p->norm_eps));
+  PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
+  GemmQ8Segment up = {.c = s->hb,
+                      .ldc = hidden_dim,
+                      .w = weight(w->w1 + l),
+                      .w3 = weight(w->w3 + l),
+                      .pw = pl->w1,
+                      .pw3 = pl->w3,
+                      .n = hidden_dim,
+                      .kind = GEMM_SWIGLU};
+  PROFILE(PHASE_W1_W3, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, &up, 1));
+  PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->hq.q, s->hq.s, s->hb, (size_t)hidden_dim, count, hidden_dim, GS));
+  GemmQ8Segment down = {.c = s->x, .ldc = dim, .w = weight(w->w2 + l), .pw = pl->w2, .n = dim, .kind = GEMM_ADD};
+  PROFILE(PHASE_W2, k_gemm_q8(s->hq.q, s->hq.s, count, hidden_dim, GS, &down, 1));
 }
 
 static void forward_embedding(Transformer *t, RunState *s, int token, int pos) {
@@ -361,12 +466,19 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
     forward_embedding(t, &row, tokens[i], pos0 + i);
   }
   /* A row reads only its own activations and this layer's preceding KV rows.
-   * Layer-major execution is therefore bitwise equivalent to token-major. */
-  for (size_t l = 0; l < (size_t)p->n_layers; l++)
+   * Layer-major execution is therefore bitwise equivalent to token-major. With the batched Q8 GEMM (W8A8 only) results
+   * agree within the Q8 budget, and bitwise on the scalar instruction set. */
+  int gemm = model->prefill_gemm && count > 1;
+  for (size_t l = 0; l < (size_t)p->n_layers; l++) {
+    if (gemm) {
+      forward_layer_batch(t, s, l, pos0, count);
+      continue;
+    }
     for (int i = 0; i < count; i++) {
       RunState row = row_state(s, p, i);
       forward_layer(t, &row, l, pos0 + i);
     }
+  }
   if (want == LOGITS_NONE)
     return NULL;
   for (int i = want == LOGITS_ALL ? 0 : count - 1; i < count; i++) {
@@ -388,6 +500,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->implementation = t;
   kernels_init();
   kernels_backend_init();
+  prefill_precision(1); /* LLAMA_PRECISION=bf16 is an error here */
   const char *activations = getenv("LLAMA_Q8_ACTIVATIONS");
   if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
     fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
@@ -403,12 +516,33 @@ void engine_load_context(Model *model, const char *path, int context) {
   double start = monotonic_seconds();
   prefill_configure(model);
   if (tp_sockets_requested() == 2) {
+    model->prefill_gemm = 0; /* the two-socket path runs per token; D1 adds the batched one */
     t->tp = tp_create(&t->config, &t->manifest, t->fd, 1, GS, fp32_activations);
     munmap(t->data, t->file_size); /* the shards were read with pread */
     t->data = MAP_FAILED;
     model->mapped_bytes = 0;
   } else {
+    /* C6: which batched Q8 kernel runs. W8A32 never uses the batched GEMM: it stays on the per-row AVX-512 kernel. */
+    if (fp32_activations) {
+      model->prefill_gemm = 0;
+      if (kernels_amx_active())
+        LOG(LOG_INFO, "W8A32 prefill uses avx512: the per-row kernel, never AMX-INT8");
+    } else if (model->prefill_gemm) {
+      if (kernels_amx_active() && GS % 64 == 0) {
+        model->prefill_kernel = "amx-int8";
+      } else if (kernels_avx512_active() && GS % 64 == 0) {
+        model->prefill_kernel = "avx512-q8";
+      } else {
+        model->prefill_kernel = "portable-q8";
+        if (kernels_avx512_active())
+          LOG(LOG_INFO, "W8A8 batched prefill: group size %d is not a multiple of 64, using the portable Q8 GEMM", GS);
+      }
+      if (kernels_amx_active() && GS % 64)
+        LOG(LOG_INFO, "AMX-INT8 needs a group size that is a multiple of 64 (this checkpoint has %d): falling back", GS);
+    }
     malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
+    if (model->prefill_kernel && !strcmp(model->prefill_kernel, "amx-int8"))
+      pack_weights(t);
   }
   metrics.runtime_s = monotonic_seconds() - start;
   metrics.runtime_ready = 1;

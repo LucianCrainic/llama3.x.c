@@ -1,10 +1,15 @@
 /* Batched FP32 GEMM (C2). One driver, two microkernels: a portable one (also the scalar instruction set) and an
  * AVX-512 4x4 dot-product tile. The driver splits every segment's N into chunks of NC weight rows that are
  * distributed over the workers; a chunk loops over blocks of M rows and blocks of K, collects each block's tile sums
- * in a small scratch and applies the epilogue once all of K has been summed. */
+ * in a small scratch and applies the epilogue once all of K has been summed.
+ *
+ * AMX (C4): ISA detection and the Linux tile-data permission, per-thread tile configuration, the BF16 and INT8 tile
+ * microkernels and the VNNI packing helpers. The `amx` target attribute is used only in this file. */
 #include "gemm.h"
 #include "kernels.h"
 #include <math.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -184,6 +189,445 @@ static void gemm_run(const float *a, int lda, int m, int k, const GemmSegment *s
   kernels_parallel_segments(count, chunks, gemm_chunks, &job);
 }
 
+/* ---- AMX (C4) ---------------------------------------------------------------------------------------------------
+ * GEMM_EMULATE_AMX swaps the tile instructions for the software model in tests/amx_emul.h, so the loops below run
+ * on any host. The macros take literal tile numbers, as the hardware intrinsics require. */
+#if defined(GEMM_EMULATE_AMX)
+#include "../tests/amx_emul.h"
+#define GEMM_AMX 1
+#define GEMM_AMX_EMULATED 1
+#define AMX_TARGET
+#define AMX_AVX_TARGET
+#define AMX_LOADCFG(p) emul_tile_loadconfig(p)
+#define AMX_RELEASE() emul_tile_release()
+#define AMX_ZERO(t) emul_tile_zero(t)
+#define AMX_LOADD(t, p, stride) emul_tile_loadd(t, p, (long)(stride))
+#define AMX_STORED(t, p, stride) emul_tile_stored(t, p, (long)(stride))
+#define AMX_DPBF16PS(c, a, b) emul_tile_dpbf16ps(c, a, b)
+#define AMX_DPBSSD(c, a, b) emul_tile_dpbssd(c, a, b)
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) &&                                              \
+    (__has_include(<amxtileintrin.h>) || __has_include(<amxintrin.h>))
+#include <cpuid.h>
+#include <immintrin.h>
+#define GEMM_AMX 1
+#define GEMM_AMX_EMULATED 0
+#define AMX_TARGET __attribute__((target("amx-tile,amx-bf16,amx-int8")))
+/* The Q8 chunk kernel also rescales in FP32 between tile operations; with AVX-512 in its target the compiler vectorizes
+ * those plain C loops. */
+#define AMX_AVX_TARGET                                                                                                 \
+  __attribute__((target("amx-tile,amx-bf16,amx-int8,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,fma")))
+#define AMX_LOADCFG(p) _tile_loadconfig(p)
+#define AMX_RELEASE() _tile_release()
+#define AMX_ZERO(t) _tile_zero(t)
+#define AMX_LOADD(t, p, stride) _tile_loadd(t, p, stride)
+#define AMX_STORED(t, p, stride) _tile_stored(t, p, stride)
+#define AMX_DPBF16PS(c, a, b) _tile_dpbf16ps(c, a, b)
+#define AMX_DPBSSD(c, a, b) _tile_dpbssd(c, a, b)
+#else
+#define GEMM_AMX 0
+#define GEMM_AMX_EMULATED 0
+#endif
+
+#if GEMM_AMX && !GEMM_AMX_EMULATED && defined(__linux__)
+#include <errno.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if __has_include(<asm/prctl.h>)
+#include <asm/prctl.h>
+#endif
+/* The documented values (Linux 5.16 and later), used when the installed headers predate them. */
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#define XFEATURE_XTILEDATA 18
+_Static_assert(ARCH_GET_XCOMP_PERM == 0x1022 && ARCH_REQ_XCOMP_PERM == 0x1023, "arch_prctl XCOMP_PERM request codes");
+#define AMX_PERMISSION_SYSCALL 1
+#endif
+
+static int amx_active;
+static const char *amx_permission_name = "not requested";
+#if GEMM_AMX && !GEMM_AMX_EMULATED
+static int amx_checked;
+static char amx_reason[256];
+#endif
+
+#if GEMM_AMX && !GEMM_AMX_EMULATED
+/* CPUID leaf 7, subleaf 0, EDX: bit 22 AMX-BF16, bit 24 AMX-TILE, bit 25 AMX-INT8. Read directly rather than through
+ * __builtin_cpu_supports, whose AMX names depend on the compiler version. */
+static int cpu_has_amx(void) {
+  unsigned a, b, c, d;
+  if (__get_cpuid_max(0, NULL) < 7)
+    return 0;
+  __cpuid_count(7, 0, a, b, c, d);
+  const unsigned need = (1u << 22) | (1u << 24) | (1u << 25);
+  return (d & need) == need;
+}
+#endif
+
+/* NULL when AMX can be used, else why not. Requests the kernel's tile-data permission on the first call; that must
+ * happen before any worker thread executes a tile instruction, and kernels_init() is that point. */
+const char *gemm_amx_unavailable(void) {
+#if !GEMM_AMX
+  return "this build has no AMX support (it needs x86-64 and a compiler with the AMX intrinsics, GCC 11 or later)";
+#elif GEMM_AMX_EMULATED
+  return NULL;
+#else
+  if (amx_checked)
+    return amx_reason[0] ? amx_reason : NULL;
+  amx_checked = 1;
+  __builtin_cpu_init();
+  if (!cpu_has_amx()) {
+    amx_permission_name = "unsupported";
+    snprintf(amx_reason, sizeof(amx_reason), "this CPU does not report AMX-TILE, AMX-BF16 and AMX-INT8");
+  } else if (!(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+               __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") &&
+               __builtin_cpu_supports("avx512vnni"))) {
+    snprintf(amx_reason, sizeof(amx_reason), "AVX-512 F/BW/DQ/VL/VNNI is unavailable");
+  } else {
+#ifdef AMX_PERMISSION_SYSCALL
+    unsigned long permitted = 0;
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
+      amx_permission_name = "denied";
+      snprintf(amx_reason, sizeof(amx_reason),
+               "the kernel refused permission for AMX tile data (arch_prctl ARCH_REQ_XCOMP_PERM: %s)", strerror(errno));
+    } else if (syscall(SYS_arch_prctl, ARCH_GET_XCOMP_PERM, &permitted) != 0 ||
+               !(permitted & (1ul << XFEATURE_XTILEDATA))) {
+      amx_permission_name = "denied";
+      snprintf(amx_reason, sizeof(amx_reason), "arch_prctl ARCH_GET_XCOMP_PERM does not show XTILEDATA as permitted");
+    } else {
+      amx_permission_name = "granted";
+    }
+#else
+    amx_permission_name = "unsupported";
+    snprintf(amx_reason, sizeof(amx_reason), "the tile-data permission request is implemented for Linux only");
+#endif
+  }
+  return amx_reason[0] ? amx_reason : NULL;
+#endif
+}
+
+const char *gemm_amx_permission(void) {
+  return amx_permission_name;
+}
+
+void gemm_amx_enable(int on) {
+  amx_active = on;
+}
+
+int gemm_amx_active(void) {
+  return amx_active;
+}
+
+int gemm_amx_compiled(void) {
+  return GEMM_AMX;
+}
+
+int gemm_amx_emulated(void) {
+  return GEMM_AMX_EMULATED;
+}
+
+/* ---- BF16 conversion and VNNI packing (portable) ---------------------------------------------------------------- */
+
+/* Round to nearest even on the 16 dropped bits; denormals convert like any other value (they are not flushed); a NaN
+ * stays a NaN (quieted, sign and top payload bits kept); infinities are exact; values at or above the midpoint to
+ * 2^128 round to infinity. */
+uint16_t bf16_from_f32(float x) {
+  uint32_t u;
+  memcpy(&u, &x, sizeof(u));
+  if ((u & 0x7fffffffu) > 0x7f800000u)
+    return (uint16_t)((u >> 16) | 0x0040u);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+
+float f32_from_bf16(uint16_t v) {
+  uint32_t u = (uint32_t)v << 16;
+  float x;
+  memcpy(&x, &u, sizeof(x));
+  return x;
+}
+
+static size_t round_up(size_t v, size_t to) {
+  return (v + to - 1) / to * to;
+}
+
+size_t bf16_vnni_elements(int rows, int cols) {
+  return round_up((size_t)rows, 16) * round_up((size_t)cols, 32);
+}
+
+size_t s8_vnni_bytes(int rows, int cols) {
+  return round_up((size_t)rows, 16) * round_up((size_t)cols, 64);
+}
+
+/* Tile `nt` holds weight rows [16 nt, 16 nt + 16). Inside it, K pair p (columns 2p, 2p+1) is a row of 16 channel
+ * pairs: dst[((nt * kp/2 + p) * 16 + c) * 2 + e] = bf16(w[16 nt + c][2p + e]), with kp = cols rounded up to 32. A
+ * tile load of 16 pair rows (32 values of K) then starts at element nt * kp * 16 + (k / 32) * 512 and is contiguous. */
+void pack_bf16_vnni_tiles(uint16_t *dst, const float *w, int rows, int cols, size_t ld, int first, int last) {
+  size_t kp = round_up((size_t)cols, 32);
+  for (int nt = first; nt < last; nt++)
+    for (size_t p = 0; p < kp / 2; p++)
+      for (int c = 0; c < 16; c++)
+        for (int e = 0; e < 2; e++) {
+          size_t row = (size_t)nt * 16 + (size_t)c, col = 2 * p + (size_t)e;
+          dst[((size_t)nt * (kp / 2) + p) * 32 + (size_t)c * 2 + (size_t)e] =
+              row < (size_t)rows && col < (size_t)cols ? bf16_from_f32(w[row * ld + col]) : 0;
+        }
+}
+
+void pack_bf16_vnni(uint16_t *dst, const float *w, int rows, int cols, size_t ld) {
+  pack_bf16_vnni_tiles(dst, w, rows, cols, ld, 0, (rows + 15) / 16);
+}
+
+/* The same for int8 with VNNI quads: dst[((nt * kp/4 + q) * 16 + c) * 4 + e] = w[16 nt + c][4q + e], kp = cols
+ * rounded up to 64, so a tile load starts at byte nt * kp * 16 + (k / 64) * 1024. */
+void pack_s8_vnni_tiles(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld, int first, int last) {
+  size_t kp = round_up((size_t)cols, 64);
+  for (int nt = first; nt < last; nt++)
+    for (size_t q = 0; q < kp / 4; q++)
+      for (int c = 0; c < 16; c++)
+        for (int e = 0; e < 4; e++) {
+          size_t row = (size_t)nt * 16 + (size_t)c, col = 4 * q + (size_t)e;
+          dst[((size_t)nt * (kp / 4) + q) * 64 + (size_t)c * 4 + (size_t)e] =
+              row < (size_t)rows && col < (size_t)cols ? w[row * ld + col] : 0;
+        }
+}
+
+void pack_s8_vnni(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld) {
+  pack_s8_vnni_tiles(dst, w, rows, cols, ld, 0, (rows + 15) / 16);
+}
+
+/* ---- aligned workspace ------------------------------------------------------------------------------------------ */
+
+void aligned_buffer_alloc(AlignedBuffer *buffer, size_t bytes, MemoryKind kind) {
+  buffer->base = memory_alloc(checked_add(bytes, 63), 1, kind);
+  buffer->data = (void *)(((uintptr_t)buffer->base + 63) & ~(uintptr_t)63);
+  buffer->bytes = bytes;
+}
+
+void aligned_buffer_free(AlignedBuffer *buffer) {
+  memory_free(buffer->base);
+  *buffer = (AlignedBuffer){0};
+}
+
+/* ---- tile configuration and microkernels ------------------------------------------------------------------------ */
+
+#if GEMM_AMX
+/* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
+ * and a 16 x 16 FP32 or int32 C block. Tiles 0-3 hold C (m block x n block), 4-5 the A blocks, 6-7 the B blocks. */
+typedef struct {
+  uint8_t palette_id, start_row, reserved[14];
+  uint16_t colsb[16];
+  uint8_t rows[16];
+} TileConfig;
+_Static_assert(sizeof(TileConfig) == 64, "the tile configuration is 64 bytes");
+
+static _Thread_local int amx_thread_ready;
+static pthread_key_t amx_key;
+static pthread_once_t amx_key_once = PTHREAD_ONCE_INIT;
+
+AMX_TARGET static void amx_thread_exit(void *unused) {
+  (void)unused;
+  AMX_RELEASE();
+}
+
+static void amx_key_create(void) {
+  pthread_key_create(&amx_key, amx_thread_exit);
+}
+
+/* Configures this thread's tiles at its first AMX job. A worker's tile state ends with the thread (the key's destructor
+ * releases it explicitly); the coordinator thread calls gemm_amx_thread_release() when the engine is torn down. */
+AMX_TARGET static void amx_thread_configure(void) {
+  if (amx_thread_ready)
+    return;
+  TileConfig config __attribute__((aligned(64))) = {.palette_id = 1};
+  for (int t = 0; t < 8; t++) {
+    config.rows[t] = 16;
+    config.colsb[t] = 64;
+  }
+  AMX_LOADCFG(&config);
+  amx_thread_ready = 1;
+  pthread_once(&amx_key_once, amx_key_create);
+  pthread_setspecific(amx_key, &amx_thread_ready);
+}
+
+AMX_TARGET void gemm_amx_thread_release(void) {
+  if (!amx_thread_ready)
+    return;
+  AMX_RELEASE();
+  amx_thread_ready = 0;
+  pthread_setspecific(amx_key, NULL);
+}
+
+/* C[m][n] = sum_k A[m][k] * B[n][k] for m, n <= 32, with 2 x 2 C tiles in flight. A is BF16 row-major with leading
+ * dimension lda (elements) and must be readable, zero-padded, up to ceil(m, 16) rows and ceil(k, 32) columns. B is
+ * packed by pack_bf16_vnni for the same k; bp points at the first of its (at most two) 16-column tiles. C needs room
+ * for whole 16 x 16 tiles (ceil(m, 16) rows by ceil(n, 16) columns); only the first m x n values are meaningful. */
+AMX_TARGET void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m,
+                                   int n, int k) {
+  amx_thread_configure();
+  const size_t kp = round_up((size_t)k, 32), tile = kp * 16;
+  const int wide = n > 16, tall = m > 16;
+  AMX_ZERO(0);
+  if (wide)
+    AMX_ZERO(1);
+  if (tall) {
+    AMX_ZERO(2);
+    if (wide)
+      AMX_ZERO(3);
+  }
+  for (size_t k0 = 0; k0 < kp; k0 += 32) {
+    AMX_LOADD(4, a + k0, lda * sizeof(uint16_t));
+    if (tall)
+      AMX_LOADD(5, a + 16 * lda + k0, lda * sizeof(uint16_t));
+    AMX_LOADD(6, bp + (k0 / 32) * 512, 64);
+    if (wide)
+      AMX_LOADD(7, bp + tile + (k0 / 32) * 512, 64);
+    AMX_DPBF16PS(0, 4, 6);
+    if (wide)
+      AMX_DPBF16PS(1, 4, 7);
+    if (tall) {
+      AMX_DPBF16PS(2, 5, 6);
+      if (wide)
+        AMX_DPBF16PS(3, 5, 7);
+    }
+  }
+  AMX_STORED(0, c, ldc * sizeof(float));
+  if (wide)
+    AMX_STORED(1, c + 16, ldc * sizeof(float));
+  if (tall) {
+    AMX_STORED(2, c + 16 * ldc, ldc * sizeof(float));
+    if (wide)
+      AMX_STORED(3, c + 16 * ldc + 16, ldc * sizeof(float));
+  }
+}
+
+/* The same for signed int8: C[m][n] = sum_k A[m][k] * B[n][k] as exact int32, K in blocks of 64. A is readable up to
+ * ceil(k, 64) columns, zero-padded; B is packed by pack_s8_vnni. */
+AMX_TARGET void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n,
+                                 int k) {
+  amx_thread_configure();
+  const size_t kp = round_up((size_t)k, 64), tile = kp * 16;
+  const int wide = n > 16, tall = m > 16;
+  AMX_ZERO(0);
+  if (wide)
+    AMX_ZERO(1);
+  if (tall) {
+    AMX_ZERO(2);
+    if (wide)
+      AMX_ZERO(3);
+  }
+  for (size_t k0 = 0; k0 < kp; k0 += 64) {
+    AMX_LOADD(4, a + k0, lda);
+    if (tall)
+      AMX_LOADD(5, a + 16 * lda + k0, lda);
+    AMX_LOADD(6, bp + (k0 / 64) * 1024, 64);
+    if (wide)
+      AMX_LOADD(7, bp + tile + (k0 / 64) * 1024, 64);
+    AMX_DPBSSD(0, 4, 6);
+    if (wide)
+      AMX_DPBSSD(1, 4, 7);
+    if (tall) {
+      AMX_DPBSSD(2, 5, 6);
+      if (wide)
+        AMX_DPBSSD(3, 5, 7);
+    }
+  }
+  AMX_STORED(0, c, ldc * sizeof(int32_t));
+  if (wide)
+    AMX_STORED(1, c + 16, ldc * sizeof(int32_t));
+  if (tall) {
+    AMX_STORED(2, c + 16 * ldc, ldc * sizeof(int32_t));
+    if (wide)
+      AMX_STORED(3, c + 16 * ldc + 16, ldc * sizeof(int32_t));
+  }
+}
+/* One chunk of the batched Q8_0 GEMM on AMX-INT8 (C6): out[m][n] = sum over groups g of
+ * fma((float)dot_g[m][n] * xs[m][g], ws[n][g], previous), for m, n <= 32. dot_g is the exact int32 dot of one K group,
+ * computed with signed x signed `tdpbssd` (gs / 64 tile steps accumulate into the same tiles before the rescale). The
+ * rescale operand order is that of the AVX-512 GEMV (`fmadd(mul(cvt(i32), xs), ws, acc)`); results are not bitwise
+ * equal to it because the GEMV keeps 16 lane accumulators and reduces at the end. a   int8 activations, row stride lda
+ * bytes, readable up to 32 rows (rows >= m are never used), k % gs == 0, gs % 64 == 0 xs  activation scales, row stride
+ * xs_ld floats bp  weights packed by pack_s8_vnni, the (at most two) 16-row tiles of this chunk ws  weight scales of
+ * the chunk's rows, row stride ws_ld floats (the checkpoint's [row][group] layout) probe  when non-NULL, receives the
+ * int32 dots, probe[(g * 32 + r) * 32 + c] (tests) */
+AMX_AVX_TARGET void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const float *xs, size_t xs_ld,
+                                 const int8_t *bp, const float *ws, size_t ws_ld, int m, int n, int k, int gs,
+                                 int32_t *probe) {
+  amx_thread_configure();
+  const size_t tile = (size_t)k * 16;
+  const int wide = n > 16, tall = m > 16, groups = k / gs, steps = gs / 64;
+  _Alignas(64) int32_t dots[32 * 32];
+  float scale[32];
+  for (int r = 0; r < m; r++)
+    memset(out + (size_t)r * ldo, 0, (size_t)n * sizeof(float));
+  for (int g = 0; g < groups; g++) {
+    AMX_ZERO(0);
+    if (wide)
+      AMX_ZERO(1);
+    if (tall) {
+      AMX_ZERO(2);
+      if (wide)
+        AMX_ZERO(3);
+    }
+    for (int t = 0; t < steps; t++) {
+      const size_t k0 = (size_t)g * (size_t)gs + (size_t)t * 64;
+      AMX_LOADD(4, a + k0, lda);
+      if (tall)
+        AMX_LOADD(5, a + 16 * lda + k0, lda);
+      AMX_LOADD(6, bp + (k0 / 64) * 1024, 64);
+      if (wide)
+        AMX_LOADD(7, bp + tile + (k0 / 64) * 1024, 64);
+      AMX_DPBSSD(0, 4, 6);
+      if (wide)
+        AMX_DPBSSD(1, 4, 7);
+      if (tall) {
+        AMX_DPBSSD(2, 5, 6);
+        if (wide)
+          AMX_DPBSSD(3, 5, 7);
+      }
+    }
+    AMX_STORED(0, dots, 32 * sizeof(int32_t));
+    if (wide)
+      AMX_STORED(1, dots + 16, 32 * sizeof(int32_t));
+    if (tall) {
+      AMX_STORED(2, dots + 16 * 32, 32 * sizeof(int32_t));
+      if (wide)
+        AMX_STORED(3, dots + 16 * 32 + 16, 32 * sizeof(int32_t));
+    }
+    if (probe)
+      memcpy(probe + (size_t)g * 32 * 32, dots, sizeof(dots));
+    for (int c = 0; c < n; c++)
+      scale[c] = ws[(size_t)c * ws_ld + (size_t)g];
+    for (int r = 0; r < m; r++) {
+      const float x = xs[(size_t)r * xs_ld + (size_t)g];
+      float *row = out + (size_t)r * ldo;
+      const int32_t *d = dots + r * 32;
+      for (int c = 0; c < n; c++)
+        row[c] = fmaf((float)d[c] * x, scale[c], row[c]);
+    }
+  }
+}
+#else
+void gemm_amx_thread_release(void) {}
+void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k) {
+  (void)c, (void)ldc, (void)a, (void)lda, (void)bp, (void)m, (void)n, (void)k;
+  fail("AMX tile kernels are not compiled into this build");
+}
+void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n, int k) {
+  (void)c, (void)ldc, (void)a, (void)lda, (void)bp, (void)m, (void)n, (void)k;
+  fail("AMX tile kernels are not compiled into this build");
+}
+void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const float *xs, size_t xs_ld, const int8_t *bp,
+                  const float *ws, size_t ws_ld, int m, int n, int k, int gs, int32_t *probe) {
+  (void)out, (void)ldo, (void)a, (void)lda, (void)xs, (void)xs_ld, (void)bp, (void)ws, (void)ws_ld, (void)m, (void)n,
+      (void)k, (void)gs, (void)probe;
+  fail("AMX tile kernels are not compiled into this build");
+}
+#endif
+
 int k_gemm_kc(void) {
 #if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
   if (kernels_avx512_active()) {
@@ -217,4 +661,443 @@ int k_gemm_f32_simd_test(const float *a, int lda, int m, int k, const GemmSegmen
 
 void k_gemm_f32_portable(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc) {
   gemm_run(a, lda, m, k, segments, count, kc, micro_portable);
+}
+
+/* ---- BF16 GEMM (C5) --------------------------------------------------------------------------------------------- */
+
+/* The reference tile kernel: the same contract and the same result as amx_bf16_tile_gemm, in plain C. Every product of
+ * two BF16 values is exact in FP32, and the sum runs in ascending K, so this is the scalar BF16 reference ("convert,
+ * then multiply in FP32") and it equals the software tile model bit for bit. */
+static void bf16_micro_portable(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n,
+                                int k) {
+  const size_t kp = round_up((size_t)k, 32);
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++) {
+      const uint16_t *b = bp + (size_t)(j / 16) * kp * 16 + (size_t)(j % 16) * 2;
+      float sum = 0.0f;
+      for (int l = 0; l < k; l++)
+        sum += f32_from_bf16(a[(size_t)i * lda + l]) * f32_from_bf16(b[(size_t)(l / 2) * 32 + (size_t)(l & 1)]);
+      c[(size_t)i * ldc + j] = sum;
+    }
+}
+
+typedef void (*Bf16Micro)(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k);
+
+typedef struct {
+  const float *src;
+  uint16_t *panel;
+  size_t src_ld, panel_ld;
+  int m, k, count;
+  GemmBf16Segment segment[GEMM_MAX_SEGMENTS];
+  Bf16Micro micro;
+} Bf16Job;
+
+/* One chunk is one panel row: the activations of one token converted to BF16 (round to nearest even), the K padding
+ * zeroed, and the padding rows below the last token zeroed too. */
+static void bf16_convert_rows(const void *p, int s, int first, int last) {
+  const Bf16Job *job = p;
+  (void)s;
+  for (int row = first; row < last; row++) {
+    uint16_t *dst = job->panel + (size_t)row * job->panel_ld;
+    int done = 0;
+    if (row < job->m) {
+      const float *src = job->src + (size_t)row * job->src_ld;
+      for (; done < job->k; done++)
+        dst[done] = bf16_from_f32(src[done]);
+    }
+    memset(dst + done, 0, ((size_t)job->panel_ld - (size_t)done) * sizeof(uint16_t));
+  }
+}
+
+enum { BF16_NC = 32, BF16_MB = 32 };
+
+static void bf16_chunks(const void *p, int s, int first, int last) {
+  const Bf16Job *job = p;
+  const GemmBf16Segment *seg = &job->segment[s];
+  const size_t tile = round_up((size_t)job->k, 32) * 16;
+  _Alignas(64) float acc[BF16_MB * 32], gate[BF16_MB * 32];
+  for (int chunk = first; chunk < last; chunk++) {
+    int n0 = chunk * BF16_NC, nc = seg->n - n0 < BF16_NC ? seg->n - n0 : BF16_NC;
+    const uint16_t *w = seg->w + (size_t)(n0 / 16) * tile;
+    for (int m0 = 0; m0 < job->m; m0 += BF16_MB) {
+      int mb = job->m - m0 < BF16_MB ? job->m - m0 : BF16_MB;
+      const uint16_t *a = job->panel + (size_t)m0 * job->panel_ld;
+      job->micro(acc, 32, a, job->panel_ld, w, mb, nc, job->k);
+      if (seg->kind == GEMM_SWIGLU)
+        job->micro(gate, 32, a, job->panel_ld, seg->w3 + (size_t)(n0 / 16) * tile, mb, nc, job->k);
+      for (int r = 0; r < mb; r++) {
+        float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
+        const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
+        for (int c = 0; c < nc; c++) {
+          if (seg->kind == GEMM_ADD)
+            out[c] += sum[c];
+          else if (seg->kind == GEMM_SWIGLU)
+            out[c] = silu_gate(sum[c], g[c]);
+          else
+            out[c] = sum[c];
+        }
+      }
+    }
+  }
+}
+
+size_t k_gemm_bf16_panel_bytes(int m, int k) {
+  return round_up((size_t)(m > 0 ? m : 1), 16) * (round_up((size_t)(k > 0 ? k : 1), 32) + 32) * sizeof(uint16_t);
+}
+
+void k_gemm_bf16(const float *a, int lda, int m, int k, const GemmBf16Segment *segments, int count,
+                 AlignedBuffer *panel) {
+  if (count < 1 || count > GEMM_MAX_SEGMENTS)
+    fail("GEMM needs 1..%d segments, got %d", GEMM_MAX_SEGMENTS, count);
+  for (int s = 0; s < count; s++)
+    if (!segments[s].w || (segments[s].kind == GEMM_SWIGLU && !segments[s].w3))
+      fail("BF16 GEMM segment %d has no packed weights", s);
+  if (m <= 0 || k <= 0)
+    return;
+  if (panel->bytes < k_gemm_bf16_panel_bytes(m, k))
+    fail("BF16 activation panel holds %zu bytes but %zu are needed", panel->bytes, k_gemm_bf16_panel_bytes(m, k));
+  Bf16Job job = {.src = a,
+                 .panel = panel->data,
+                 .src_ld = (size_t)lda,
+                 .panel_ld = round_up((size_t)k, 32) + 32,
+                 .m = m,
+                 .k = k,
+                 .count = count,
+                 .micro = gemm_amx_active() ? amx_bf16_tile_gemm : bf16_micro_portable};
+  int rows = (int)round_up((size_t)m, 16);
+  kernels_parallel_segments(1, &rows, bf16_convert_rows, &job);
+  int chunks[GEMM_MAX_SEGMENTS];
+  for (int s = 0; s < count; s++) {
+    job.segment[s] = segments[s];
+    chunks[s] = (segments[s].n + BF16_NC - 1) / BF16_NC;
+  }
+  kernels_parallel_segments(count, chunks, bf16_chunks, &job);
+}
+
+/* ---- packing many matrices on the worker team ----------------------------------------------------------------------
+ */
+
+typedef struct {
+  const PackBf16 *jobs;
+  int count;
+} PackAll;
+
+/* A chunk is one 16-row tile; chunk numbers run over the tiles of all matrices laid end to end. */
+static void pack_bf16_chunks(const void *p, int s, int first, int last) {
+  const PackAll *all = p;
+  (void)s;
+  int base = 0;
+  for (int i = 0; i < all->count && base < last; i++) {
+    const PackBf16 *job = &all->jobs[i];
+    int tiles = (job->rows + 15) / 16;
+    if (base + tiles > first)
+      pack_bf16_vnni_tiles(job->dst, job->w, job->rows, job->cols, job->ld, first > base ? first - base : 0,
+                           last < base + tiles ? last - base : tiles);
+    base += tiles;
+  }
+}
+
+void pack_bf16_vnni_many(const PackBf16 *jobs, int count) {
+  PackAll all = {jobs, count};
+  long long tiles = 0;
+  for (int i = 0; i < count; i++)
+    tiles += (jobs[i].rows + 15) / 16;
+  if (tiles > INT32_MAX)
+    fail("too many weight tiles to pack: %lld", tiles);
+  int chunks = (int)tiles;
+  kernels_parallel_segments(1, &chunks, pack_bf16_chunks, &all);
+}
+
+/* ---- Q8_0 batched GEMM (C6) ---------------------------------------------------------------------------------------
+ */
+
+typedef struct {
+  const float *x;
+  int8_t *q;
+  float *s;
+  size_t ldx;
+  int n, gs;
+} QuantizeJob;
+
+/* One chunk is one row: the per-row `k_quantize`, so the int8 values and scales are those of the per-token path. */
+static void quantize_chunks(const void *p, int segment, int first, int last) {
+  const QuantizeJob *job = p;
+  (void)segment;
+  for (int row = first; row < last; row++)
+    k_quantize(job->q + (size_t)row * (size_t)job->n, job->s + (size_t)row * (size_t)(job->n / job->gs),
+               job->x + (size_t)row * job->ldx, job->n, job->gs);
+}
+
+void k_quantize_rows(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs) {
+  QuantizeJob job = {x, q, s, ldx, n, gs};
+  kernels_parallel_segments(1, &m, quantize_chunks, &job);
+}
+
+typedef void (*Q8Micro)(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld, const int8_t *w,
+                        size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile);
+
+enum { Q8_MR = 2, Q8_NR = 4, Q8_MB = 32 };
+
+/* tile[r * 4 + c] = sum over groups of (float)(int32 dot of x row r and w row c in the group) * ws * xs, the scalar
+ * GEMV's expression, so with the scalar instruction set the GEMM equals the per-row GEMV bitwise. */
+static void q8_micro_portable(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,
+                              const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile) {
+  for (int r = 0; r < mr; r++)
+    for (int c = 0; c < nr; c++) {
+      const int8_t *xr = x + (size_t)r * ldx, *wr = w + (size_t)c * ldw;
+      const float *sr = ws + (size_t)c * ws_ld, *xsr = xs + (size_t)r * xs_ld;
+      float val = 0.0f;
+      for (int j = 0; j <= k - gs; j += gs) {
+        int32_t ival = 0;
+        for (int l = 0; l < gs; l++)
+          ival += ((int32_t)xr[j + l]) * ((int32_t)wr[j + l]);
+        val += ((float)ival) * sr[j / gs] * xsr[j / gs];
+      }
+      tile[r * Q8_NR + c] = val;
+    }
+}
+
+#if GEMM_AVX512
+/* The VNNI tile of the AVX-512 Q8 rung: MR activation rows by NR weight rows share every load. Per 64-byte step the
+ * activation's |x| is the unsigned operand and the weight takes x's sign (`vpdpbusd`, exact because no value is -128),
+ * each group's int32 lanes are scaled once into FP32 lane accumulators exactly as dots_q8_body does for one row, and
+ * the lanes are reduced at the end. gs % 64 == 0. */
+#define Q8_INLINE AVX512 static inline __attribute__((always_inline))
+Q8_INLINE void q8_micro_body(const int MR, const int NR, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,
+                             const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs, float *tile) {
+  const __m512i zero = _mm512_setzero_si512();
+  __m512 acc[Q8_MR][Q8_NR];
+  for (int r = 0; r < MR; r++)
+    for (int c = 0; c < NR; c++)
+      acc[r][c] = _mm512_setzero_ps();
+  const int groups = k / gs;
+  for (int g = 0; g < groups; g++) {
+    __m512i iacc[Q8_MR][Q8_NR];
+    for (int r = 0; r < MR; r++)
+      for (int c = 0; c < NR; c++)
+        iacc[r][c] = zero;
+    for (int off = g * gs; off < (g + 1) * gs; off += 64) {
+      __m512i ax[Q8_MR];
+      __mmask64 negative[Q8_MR];
+      for (int r = 0; r < MR; r++) {
+        __m512i xv = _mm512_loadu_si512((const void *)(x + (size_t)r * ldx + off));
+        ax[r] = _mm512_abs_epi8(xv);
+        negative[r] = _mm512_movepi8_mask(xv);
+      }
+      for (int c = 0; c < NR; c++) {
+        __m512i wv = _mm512_loadu_si512((const void *)(w + (size_t)c * ldw + off));
+        for (int r = 0; r < MR; r++)
+          iacc[r][c] = _mm512_dpbusd_epi32(iacc[r][c], ax[r], _mm512_mask_sub_epi8(wv, negative[r], zero, wv));
+      }
+    }
+    for (int r = 0; r < MR; r++) {
+      __m512 xscale = _mm512_set1_ps(xs[(size_t)r * xs_ld + g]);
+      for (int c = 0; c < NR; c++)
+        acc[r][c] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(iacc[r][c]), xscale),
+                                    _mm512_set1_ps(ws[(size_t)c * ws_ld + g]), acc[r][c]);
+    }
+  }
+  for (int r = 0; r < MR; r++)
+    for (int c = 0; c < NR; c++)
+      tile[r * Q8_NR + c] = _mm512_reduce_add_ps(acc[r][c]);
+}
+
+#define Q8_MICRO(MR, NR)                                                                                               \
+  AVX512 static void q8_micro_##MR##x##NR(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld,  \
+                                          const int8_t *w, size_t ldw, const float *ws, size_t ws_ld, int k, int gs,   \
+                                          float *tile) {                                                               \
+    (void)mr, (void)nr;                                                                                                \
+    q8_micro_body(MR, NR, x, ldx, xs, xs_ld, w, ldw, ws, ws_ld, k, gs, tile);                                          \
+  }
+Q8_MICRO(1, 1)
+Q8_MICRO(1, 2)
+Q8_MICRO(1, 3)
+Q8_MICRO(1, 4)
+Q8_MICRO(2, 1)
+Q8_MICRO(2, 2)
+Q8_MICRO(2, 3)
+Q8_MICRO(2, 4)
+#undef Q8_MICRO
+static const Q8Micro q8_micro_table[Q8_MR + 1][Q8_NR + 1] = {
+    {NULL, NULL, NULL, NULL, NULL},
+    {NULL, q8_micro_1x1, q8_micro_1x2, q8_micro_1x3, q8_micro_1x4},
+    {NULL, q8_micro_2x1, q8_micro_2x2, q8_micro_2x3, q8_micro_2x4}};
+#endif
+
+typedef struct {
+  const int8_t *xq;
+  const float *xs;
+  int m, k, gs, groups, count;
+  Q8GemmBackend backend;
+  GemmQ8Segment segment[GEMM_MAX_SEGMENTS];
+} Q8GemmJob;
+
+/* acc[mb][32] = the Q8 sums of activation rows [m0, m0 + mb) against weight rows [n0, n0 + nc). */
+static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, int n0, int nc, int m0, int mb,
+                    float *acc) {
+  const int groups = job->groups;
+  const int8_t *x = job->xq + (size_t)m0 * (size_t)job->k;
+  const float *xs = job->xs + (size_t)m0 * (size_t)groups;
+  if (job->backend == Q8_GEMM_AMX) {
+    amx_q8_chunk(acc, 32, x, (size_t)job->k, xs, (size_t)groups, packed + (size_t)(n0 / 16) * (size_t)job->k * 16,
+                 w.s + (size_t)n0 * groups, (size_t)groups, mb, nc, job->k, job->gs, NULL);
+    return;
+  }
+  float tile[Q8_MR * Q8_NR];
+  for (int mi = 0; mi < mb; mi += Q8_MR) {
+    int mr = mb - mi < Q8_MR ? mb - mi : Q8_MR;
+    for (int ni = 0; ni < nc; ni += Q8_NR) {
+      int nr = nc - ni < Q8_NR ? nc - ni : Q8_NR;
+      const int8_t *wq = w.q + (size_t)(n0 + ni) * (size_t)job->k;
+      const float *wsc = w.s + (size_t)(n0 + ni) * (size_t)groups;
+      Q8Micro micro = q8_micro_portable;
+#if GEMM_AVX512
+      if (job->backend == Q8_GEMM_AVX512)
+        micro = q8_micro_table[mr][nr];
+#endif
+      micro(mr, nr, x + (size_t)mi * (size_t)job->k, (size_t)job->k, xs + (size_t)mi * (size_t)groups, (size_t)groups,
+            wq, (size_t)job->k, wsc, (size_t)groups, job->k, job->gs, tile);
+      for (int r = 0; r < mr; r++)
+        for (int c = 0; c < nr; c++)
+          acc[(size_t)(mi + r) * 32 + ni + c] = tile[r * Q8_NR + c];
+    }
+  }
+}
+
+static void q8_gemm_chunks(const void *p, int s, int first, int last) {
+  const Q8GemmJob *job = p;
+  const GemmQ8Segment *seg = &job->segment[s];
+  const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
+  _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
+  for (int chunk = first; chunk < last; chunk++) {
+    int n0 = chunk * chunk_n, nc = seg->n - n0 < chunk_n ? seg->n - n0 : chunk_n;
+    for (int m0 = 0; m0 < job->m; m0 += Q8_MB) {
+      int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
+      q8_sums(job, seg->w, seg->pw, n0, nc, m0, mb, acc);
+      if (seg->kind == GEMM_SWIGLU)
+        q8_sums(job, seg->w3, seg->pw3, n0, nc, m0, mb, gate);
+      for (int r = 0; r < mb; r++) {
+        float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
+        const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
+        for (int c = 0; c < nc; c++) {
+          if (seg->kind == GEMM_ADD)
+            out[c] += sum[c];
+          else if (seg->kind == GEMM_SWIGLU)
+            out[c] = silu_gate(sum[c], g[c]);
+          else
+            out[c] = sum[c];
+        }
+      }
+    }
+  }
+}
+
+Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count) {
+  if (gs % 64 == 0) {
+    int packed = GEMM_AMX && gemm_amx_active();
+    for (int s = 0; s < count && packed; s++)
+      packed = segments[s].pw && (segments[s].kind != GEMM_SWIGLU || segments[s].pw3);
+    if (packed)
+      return Q8_GEMM_AMX;
+#if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
+    if (kernels_avx512_active())
+      return Q8_GEMM_AVX512;
+#endif
+  }
+  return Q8_GEMM_PORTABLE;
+}
+
+static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
+                        const GemmQ8Segment *segments, int count) {
+  if (count < 1 || count > GEMM_MAX_SEGMENTS)
+    fail("GEMM needs 1..%d segments, got %d", GEMM_MAX_SEGMENTS, count);
+  if (gs <= 0 || k % gs)
+    fail("Q8 GEMM: K=%d is not a multiple of the group size %d", k, gs);
+  for (int s = 0; s < count; s++)
+    if (segments[s].kind == GEMM_SWIGLU && !segments[s].w3.q)
+      fail("GEMM_SWIGLU needs a second weight matrix");
+  if (m <= 0 || k <= 0)
+    return;
+  Q8GemmJob job = {.xq = xq, .xs = xs, .m = m, .k = k, .gs = gs, .groups = k / gs, .count = count, .backend = backend};
+  int chunks[GEMM_MAX_SEGMENTS];
+  const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16;
+  for (int s = 0; s < count; s++) {
+    job.segment[s] = segments[s];
+    chunks[s] = (segments[s].n + chunk_n - 1) / chunk_n;
+  }
+  kernels_parallel_segments(count, chunks, q8_gemm_chunks, &job);
+}
+
+void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count) {
+  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count);
+}
+
+/* Test hook: one named backend. Returns 0 when it is not compiled in. The caller must know the CPU can run it. */
+int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
+                           const GemmQ8Segment *segments, int count) {
+  if ((backend == Q8_GEMM_AMX && !GEMM_AMX) || (backend == Q8_GEMM_AVX512 && !GEMM_AVX512))
+    return 0;
+  if (backend != Q8_GEMM_PORTABLE && gs % 64)
+    return 0;
+  q8_gemm_run(backend, xq, xs, m, k, gs, segments, count);
+  return 1;
+}
+
+/* Test hook: the exact int32 group dots the AMX chunk kernel produces, dots[(g * m + r) * n + c]. */
+int k_gemm_q8_amx_dots_test(int32_t *dots, const int8_t *xq, int m, int k, int gs, const int8_t *packed, int n) {
+#if GEMM_AMX
+  const int groups = k / gs;
+  const size_t zeros = (size_t)(m > n ? m : n) * (size_t)groups + 1;
+  float *scales = calloc(zeros * 2, sizeof(float)), *out = calloc((size_t)32 * 32, sizeof(float));
+  int32_t *probe = calloc((size_t)groups * 32 * 32, sizeof(int32_t));
+  if (!scales || !out || !probe)
+    fail("cannot allocate the probe buffers");
+  for (int m0 = 0; m0 < m; m0 += 32)
+    for (int n0 = 0; n0 < n; n0 += 32) {
+      int mb = m - m0 < 32 ? m - m0 : 32, nc = n - n0 < 32 ? n - n0 : 32;
+      amx_q8_chunk(out, 32, xq + (size_t)m0 * k, (size_t)k, scales, (size_t)groups,
+                   packed + (size_t)(n0 / 16) * (size_t)k * 16, scales + zeros, (size_t)groups, mb, nc, k, gs, probe);
+      for (int g = 0; g < groups; g++)
+        for (int r = 0; r < mb; r++)
+          for (int c = 0; c < nc; c++)
+            dots[((size_t)g * m + m0 + r) * n + n0 + c] = probe[((size_t)g * 32 + r) * 32 + c];
+    }
+  free(scales), free(out), free(probe);
+  return 1;
+#else
+  (void)dots, (void)xq, (void)m, (void)k, (void)gs, (void)packed, (void)n;
+  return 0;
+#endif
+}
+
+/* ---- packing int8 matrices on the worker team (C6) --------------------------------------------------------------- */
+
+typedef struct {
+  const PackS8 *jobs;
+  int count;
+} PackAllS8;
+
+static void pack_s8_chunks(const void *p, int s, int first, int last) {
+  const PackAllS8 *all = p;
+  (void)s;
+  int base = 0;
+  for (int i = 0; i < all->count && base < last; i++) {
+    const PackS8 *job = &all->jobs[i];
+    int tiles = (job->rows + 15) / 16;
+    if (base + tiles > first)
+      pack_s8_vnni_tiles(job->dst, job->w, job->rows, job->cols, job->ld, first > base ? first - base : 0,
+                         last < base + tiles ? last - base : tiles);
+    base += tiles;
+  }
+}
+
+void pack_s8_vnni_many(const PackS8 *jobs, int count) {
+  PackAllS8 all = {jobs, count};
+  long long tiles = 0;
+  for (int i = 0; i < count; i++)
+    tiles += (jobs[i].rows + 15) / 16;
+  if (tiles > INT32_MAX)
+    fail("too many weight tiles to pack: %lld", tiles);
+  int chunks = (int)tiles;
+  kernels_parallel_segments(1, &chunks, pack_s8_chunks, &all);
 }

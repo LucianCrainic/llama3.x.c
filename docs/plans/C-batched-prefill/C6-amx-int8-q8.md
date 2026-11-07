@@ -12,7 +12,10 @@ semantics**:
 The result must agree with the AVX-512 Q8 batched path within the kernel budget. W8A8
 comes first. W8A32 stays a separate AVX-512 path.
 
-Status: **planned**. Branch: `feature/prefill-c6-amx-int8`.
+Status: **implemented locally; hardware check pending** (2026-11-07). Branch: `feature/prefill-c6-amx-int8` (worked on
+in the `tp-local-c` worktree). The batched Q8 forward, the tiled AVX-512 VNNI oracle, the AMX-INT8 W8A8 kernel, packing,
+fallbacks and the W8A32 rule are in. The AVX-512 VNNI kernel and the AMX kernel have run only on instruction models
+(`tests/avx512_emul.h`, `tests/amx_emul.h`); neither has executed on real hardware: §6.
 
 ## 2. Depends on / unblocks
 
@@ -91,8 +94,11 @@ These run on all platforms with scalar oracles; AMX cases run on AMX hosts only.
 
 ## 6. Cluster run
 
-`cresco8-prefill.sbatch STAGE=check PHASE=C6`. **Estimated** at 60 minutes. It needs
-the user's go-ahead to submit.
+`cresco8-prefill.sbatch STAGE=check PHASE=C6` (with `MODELS=...`; `PRECISIONS=int8` is enough). **Estimated** at 60 minutes.
+It needs the user's go-ahead to submit. **Open, not submitted**: `phase_C6` is written and verified with `DRY_RUN=1`. The
+first time the AVX-512 VNNI tile kernel and the AMX-INT8 kernel run on hardware is `test-q8` there (it records PASS only
+if both ran). At the 2048-token prompt only the last position is compared (`--last-only` needs the per-token path as A), so
+AMX-INT8 is compared with the per-token Q8 path there and with the batched AVX-512 path on the 86-token prompt.
 
 | Run | Gate or record |
 | --- | --- |
@@ -100,6 +106,44 @@ the user's go-ahead to submit.
 | `compare_engines.py` AVX-512 Q8 batched vs per-token Q8 | Same gate |
 | `validate.py` Q8 recording | max_abs vs HF ≤ per-token Q8 value + 1e-3 |
 | Short sweep: 8B Q8, 2048-token prompt, M ∈ {32, 64, 128, 256} | Prefill tok/s recorded |
+
+### Local results (2026-11-07, macOS arm64, no AVX-512, no AMX)
+
+| Check | Result |
+| --- | --- |
+| `test-q8`: `k_quantize_rows` (parallel, one call for M rows) vs the per-token quantizer | bitwise equal int8 values and scales |
+| `test-q8`, scalar instruction set: portable batched GEMM vs the per-row GEMV (`k_matmul_q8`, `_add`, `_swiglu`) | **bitwise** equal |
+| `test-q8` / `test-q8-emul`: portable, AVX-512 VNNI tile kernel and AMX-INT8 against a double reference from the dequantized operands, `gs` ∈ {2, 4, 32, 64, 128}, m, n tails, padded `ldc`, 1, 3, 7 workers, all four kinds | within `2e-5·Σ\|w·x\| + 1e-6`; padding untouched |
+| `test-q8-emul`: AMX int32 group dots vs the scalar int32 dots | **exactly** equal (with activations and weights in [-127, 127]); 3 deliberate mutations of the kernels were caught |
+| `test-q8-emul`: pick logic | AMX only for `gs % 64 == 0`; otherwise the portable backend, within budget |
+| `test-q8-engine[-emul]`, fixture (dim 128, hidden 256, `gs` 64, plus a `gs` 32 checkpoint), 24 positions, all logits | scalar batched prefill equals the per-token forward **bitwise**, for any split; AMX-INT8 (tile model) vs the portable batched forward: max_abs 6.0e-7, max_rel 7.5e-5; bitwise independent of the split; per-token path unchanged by `amx`; W8A32 stays per row; `gs = 32` falls back to the portable GEMM |
+| `tests/test_runtime.py` | `runq-amx-emul` report: `kernels_prefill = amx-int8`, `packed_weights_peak` equals the padded size formula; W8A32 logs `W8A32 prefill uses avx512` and reports no batched kernel |
+
+### Implementation notes
+
+- **Where it runs.** `k_gemm_q8` in `src/gemm.c` is the batched W8A8 driver; `runq.c` gets `forward_layer_batch` (quantize
+  each row with `k_quantize` through `k_quantize_rows`, QKV / Wo / W1+W3 / W2 as GEMM segments, K and V written straight
+  into the cache, `k_attention_batch`). It is used when `prefill_gemm` is on (`LLAMA_PREFILL_BATCH` > 1 and the AVX-512 or
+  AMX kernels, or `LLAMA_PREFILL_GEMM=on`) and the activations are W8A8. The attention workspace is now sized for
+  `max_batch` rows, and the quantized activation rows are padded to whole 32-row blocks (the AMX kernel loads 16 rows per
+  tile).
+- **Backends.** `amx-int8` (`gs % 64 == 0`, packed weights), `avx512-q8` (`gs % 64 == 0`; the oracle and the "avx512-q8"
+  ladder rung of C7: 2 activation rows by 4 weight rows per VNNI tile, `|x|` unsigned and the weight carrying `x`'s sign,
+  as in `dots_q8_body`), and `portable-q8` (any `gs`; the scalar GEMV's arithmetic). `Model.prefill_kernel` names the one in
+  use and is the report's `runtime.kernels_prefill`.
+- **Rescale order.** Per group, `acc = fmaf((float)i32 * xs, ws, acc)`, the operand order of `dots_q8_body`
+  (`fmadd(mul(cvt(i32), xs), ws, acc)`), not the `ws * xs` the first draft of this document wrote. Not bitwise equal to the
+  GEMV, because the GEMV keeps 16 lane accumulators and reduces at the end; the AMX kernel sums whole-group dots.
+- **Packing.** `pack_s8_vnni_many` on the worker team into a `ROLE_PACKED` region (budget-checked, read-only, verified), the
+  checkpoint's `[row][group]` scales read in place. The report shows `packed_weights_peak` and `weight_pack`.
+- **W8A32.** `LLAMA_Q8_ACTIVATIONS=fp32` turns the batched GEMM off for the Q8 engine altogether (the per-row AVX-512 W8A32
+  kernel runs, as today) and logs `W8A32 prefill uses avx512` when amx is selected. There is no batched W8A32 kernel.
+- **Fallback.** `gs % 64 != 0` with amx or AVX-512 logs the fallback and uses the portable batched GEMM (which is what the
+  GEMV itself does for W8A8 at such group sizes).
+- **Classifier.** The all-position classifier of `runq` stays on the per-row Q8 GEMV.
+- **Rescale overhead (§8).** First version, not tuned: each group stores the 16 x 16 int32 tiles to a stack buffer and rescales
+  in plain C that the compiler vectorizes (the kernel's target includes AVX-512). The mitigations of §8 are the first thing
+  to try if the cluster measurement is far from the roofline.
 
 ## 7. Exit criteria
 

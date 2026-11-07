@@ -81,4 +81,19 @@ void runmem_free(RunMemory *rm, void *pointer);
 void runmem_release(RunMemory *rm);
 void runmem_kv_stats(const RunMemory *rm, size_t active_bytes, int verify, KvStats *out);
 
+/* ---- Packed weights (C5) -----------------------------------------------------------------------------------------
+ * The BF16 VNNI copy of the FP32 matrices lives in its own bound region (ROLE_PACKED) on the weights node of the
+ * placement mode (unbound in file mode). Open it with the total size so the per-socket HBM budget is checked before
+ * any byte is packed, carve matrices from it, fill them, then seal: the region is accounted as packed_weights, made
+ * read-only and its page placement verified. */
+typedef struct {
+  NumaRegion region;
+  const char *mode;
+  size_t used, budget_claimed;
+} PackedStore;
+void packed_open(PackedStore *ps, size_t bytes, const char *what);
+void *packed_take(PackedStore *ps, size_t bytes); /* 64-byte aligned, zeroed memory; fails past the reserved size */
+void packed_seal(PackedStore *ps);
+void packed_close(PackedStore *ps);
+
 #endif
