@@ -7,6 +7,7 @@
 #include "profile.h"
 #include "runtime.h"
 #include "shards.h"
+#include "tp.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,13 @@ typedef struct {
   float *value_cache; // (layer, seq_len, kv_dim); cache persists for this sequence
 } RunState;
 
+/* The BF16 VNNI copy of one layer's matrices (C5), packed at load when LLAMA_PRECISION=bf16. */
+typedef struct {
+  const uint16_t *wq, *wk, *wv, *wo, *w1, *w2, *w3;
+} PackedLayer;
+
+static int bf16_mode; /* One model per CLI process: LLAMA_PRECISION=bf16 (C5). */
+
 typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
   TransformerWeights weights; // the weights of the model
@@ -59,6 +67,13 @@ typedef struct {
   WeightStore store;          // where those bytes live now: the mapping, or owned regions (A4)
   RunMemory mem;              // where the run state and KV caches live (A5)
   RunState state;             // buffers for the "wave" of activations in the forward pass
+  Tp *tp;                     // LLAMA_SOCKETS=2: the two-socket engine, which owns weights, KV and activations (B5)
+  // BF16 mode (C5): packed weights, their stores, and the aligned panel the activations are converted into.
+  PackedLayer *packed; // (layer)
+  PackedStore packed_store, packed_classifier;
+  const uint16_t *packed_wcls; // packed lazily, by the first LOGITS_ALL request
+  AlignedBuffer panel;
+  int bf16, state_batch; // BF16 mode; the largest batch the panel is sized for
   // Mapping ownership: weights borrow this region until engine_free().
   int fd;           // file descriptor for memory mapping
   float *data;      // memory mapped data pointer
@@ -135,12 +150,22 @@ static void read_checkpoint(const char *path, Config *config, TransformerWeights
   checkpoint_map(path, 0, config, &shared, &gs, fd, data, file_size, manifest);
   metrics.checkpoint_s = monotonic_seconds() - start;
   /* Placement time is reported on its own, not as checkpoint_load. */
+  if (tp_sockets_requested() == 2) { /* the shards are loaded by tp_create, straight from the file */
+    metrics.checkpoint_ready = 1;
+    return;
+  }
   weights_open(store, *fd, data, *file_size, manifest);
   memory_map_weights(weights, manifest, store);
   metrics.checkpoint_ready = 1;
 }
 
 static void free_transformer(Transformer *t) {
+  tp_free(t->tp);
+  memory_free(t->packed);
+  packed_close(&t->packed_store);
+  packed_close(&t->packed_classifier);
+  if (t->panel.base)
+    aligned_buffer_free(&t->panel);
   // close the memory mapping
   if (t->data != MAP_FAILED) {
     munmap(t->data, t->file_size);
@@ -167,6 +192,77 @@ static RunState row_state(RunState *s, const Config *p, int i) {
   row.q += (size_t)i * p->dim;
   row.rope += (size_t)i * 2 * p->head_dim;
   return row;
+}
+
+/* ---- BF16 mode (C5) ---------------------------------------------------------------------------------------------- */
+
+/* Packs every layer's seven matrices into one bound region, on the worker team, after the per-socket budget check. */
+static void pack_weights(Transformer *t) {
+  const Config *p = &t->config;
+  const TransformerWeights *w = &t->weights;
+  double start = monotonic_seconds();
+  size_t dim = (size_t)p->dim, kv = (size_t)p->head_dim * p->n_kv_heads, hidden = (size_t)p->hidden_dim;
+  const size_t rows[7] = {dim, kv, kv, dim, hidden, dim, hidden}, cols[7] = {dim, dim, dim, dim, dim, hidden, dim};
+  size_t per_layer = 0;
+  for (int i = 0; i < 7; i++)
+    per_layer += bf16_vnni_elements((int)rows[i], (int)cols[i]) * sizeof(uint16_t);
+  packed_open(&t->packed_store, checked_mul(per_layer, (size_t)p->n_layers), "the packed BF16 weights");
+  t->packed = memory_alloc((size_t)p->n_layers, sizeof(PackedLayer), MEM_METADATA);
+  PackBf16 *jobs = memory_alloc(checked_mul((size_t)p->n_layers, 7), sizeof(PackBf16), MEM_METADATA);
+  for (size_t l = 0; l < (size_t)p->n_layers; l++) {
+    const float *src[7] = {w->wq + l * dim * dim,   w->wk + l * kv * dim,     w->wv + l * kv * dim,
+                           w->wo + l * dim * dim,   w->w1 + l * hidden * dim, w->w2 + l * dim * hidden,
+                           w->w3 + l * hidden * dim};
+    uint16_t *dst[7];
+    for (int i = 0; i < 7; i++) {
+      dst[i] = packed_take(&t->packed_store, bf16_vnni_elements((int)rows[i], (int)cols[i]) * sizeof(uint16_t));
+      jobs[l * 7 + i] = (PackBf16){dst[i], src[i], (int)rows[i], (int)cols[i], cols[i]};
+    }
+    t->packed[l] = (PackedLayer){dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6]};
+  }
+  pack_bf16_vnni_many(jobs, p->n_layers * 7);
+  memory_free(jobs);
+  packed_seal(&t->packed_store);
+  size_t max_k = dim > hidden ? dim : hidden;
+  aligned_buffer_alloc(&t->panel, k_gemm_bf16_panel_bytes(t->state_batch, (int)max_k), MEM_ACTIVATION);
+  metrics.weight_pack_s += monotonic_seconds() - start;
+  metrics.weight_packed = 1;
+  LOG(LOG_INFO, "packed %zu bytes of BF16 weights in %.2f s", t->packed_store.region.logical_bytes,
+      monotonic_seconds() - start);
+}
+
+/* The classifier is packed on the first request for all-position logits; the default last-row classifier stays FP32. */
+static void pack_classifier(Transformer *t) {
+  const Config *p = &t->config;
+  double start = monotonic_seconds();
+  packed_open(&t->packed_classifier, bf16_vnni_elements(p->vocab_size, p->dim) * sizeof(uint16_t),
+              "the packed BF16 classifier");
+  uint16_t *dst = packed_take(&t->packed_classifier, bf16_vnni_elements(p->vocab_size, p->dim) * sizeof(uint16_t));
+  PackBf16 job = {dst, t->weights.wcls, p->vocab_size, p->dim, (size_t)p->dim};
+  pack_bf16_vnni_many(&job, 1);
+  packed_seal(&t->packed_classifier);
+  t->packed_wcls = dst;
+  metrics.weight_pack_s += monotonic_seconds() - start;
+  LOG(LOG_INFO, "packed %zu bytes of BF16 classifier in %.2f s", t->packed_classifier.region.logical_bytes,
+      monotonic_seconds() - start);
+}
+
+/* One projection: the FP32 GEMM, or in BF16 mode the same segments on the packed weights. */
+static void project(Transformer *t, const float *a, int lda, int m, int k, const GemmSegment *seg, int count,
+                    const uint16_t *const *packed, const uint16_t *const *packed3) {
+  if (!t->bf16) {
+    k_gemm_f32(a, lda, m, k, seg, count);
+    return;
+  }
+  GemmBf16Segment b[GEMM_MAX_SEGMENTS];
+  for (int i = 0; i < count; i++)
+    b[i] = (GemmBf16Segment){.c = seg[i].c,
+                             .ldc = seg[i].ldc,
+                             .w = packed[i],
+                             .w3 = packed3 ? packed3[i] : NULL,
+                             .n = seg[i].n,
+                             .kind = seg[i].kind};
+  k_gemm_bf16(a, lda, m, k, b, count, &t->panel);
 }
 
 static void forward_embedding(Transformer *t, RunState *s, int token, int pos) {
@@ -228,6 +324,8 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
   int dim = p->dim, kv_dim = p->head_dim * p->n_kv_heads, hidden_dim = p->hidden_dim, head_size = p->head_dim;
   size_t loff = l * p->seq_len * kv_dim;
   float *kc = s->key_cache + loff, *vc = s->value_cache + loff;
+  static const PackedLayer none;
+  const PackedLayer *pl = t->bf16 ? &t->packed[l] : &none;
 
   for (int i = 0; i < count; i++)
     PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_att_weight + l * dim, dim,
@@ -238,24 +336,25 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
        .kind = GEMM_STORE},
       {.c = vc + (size_t)pos0 * kv_dim, .ldc = kv_dim, .w = w->wv + l * dim * kv_dim, .ldw = (size_t)dim, .n = kv_dim,
        .kind = GEMM_STORE}};
-  PROFILE(PHASE_QKV, k_gemm_f32(s->xb, dim, count, dim, qkv, 3));
+  PROFILE(PHASE_QKV,
+          project(t, s->xb, dim, count, dim, qkv, 3, (const uint16_t *const[]){pl->wq, pl->wk, pl->wv}, NULL));
   for (int i = 0; i < count; i++)
     PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
                                      s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
   PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
                                              head_size, p->seq_len, pos0, count));
   GemmSegment wo = {.c = s->x, .ldc = dim, .w = w->wo + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_ADD};
-  PROFILE(PHASE_WO, k_gemm_f32(s->xb, dim, count, dim, &wo, 1));
+  PROFILE(PHASE_WO, project(t, s->xb, dim, count, dim, &wo, 1, &pl->wo, NULL));
 
   for (int i = 0; i < count; i++)
     PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_ffn_weight + l * dim, dim,
                                      p->norm_eps));
   GemmSegment up = {.c = s->hb, .ldc = hidden_dim, .w = w->w1 + l * dim * hidden_dim, .w3 = w->w3 + l * dim * hidden_dim,
                     .ldw = (size_t)dim, .n = hidden_dim, .kind = GEMM_SWIGLU};
-  PROFILE(PHASE_W1_W3, k_gemm_f32(s->xb, dim, count, dim, &up, 1));
+  PROFILE(PHASE_W1_W3, project(t, s->xb, dim, count, dim, &up, 1, &pl->w1, &pl->w3));
   GemmSegment down = {.c = s->x, .ldc = dim, .w = w->w2 + l * dim * hidden_dim, .ldw = (size_t)hidden_dim, .n = dim,
                       .kind = GEMM_ADD};
-  PROFILE(PHASE_W2, k_gemm_f32(s->hb, hidden_dim, count, hidden_dim, &down, 1));
+  PROFILE(PHASE_W2, project(t, s->hb, hidden_dim, count, hidden_dim, &down, 1, &pl->w2, NULL));
 }
 
 static float *forward_logits(Transformer *t, RunState *s) {
@@ -284,6 +383,17 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   Transformer *t = model->implementation;
   Config *p = &t->config;
   RunState *s = &t->state;
+  if (t->tp) { /* per-token on two sockets; D1 adds the batched path */
+    float *logits = NULL;
+    if (want == LOGITS_ALL && !s->batch_logits)
+      s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
+    for (int i = 0; i < count; i++) {
+      logits = tp_forward(t->tp, tokens[i], pos0 + i);
+      if (want == LOGITS_ALL)
+        memcpy(s->batch_logits + (size_t)i * p->vocab_size, logits, (size_t)p->vocab_size * sizeof(float));
+    }
+    return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? s->batch_logits : logits;
+  }
   if (want == LOGITS_ALL && !s->batch_logits)
     s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
   for (int i = 0; i < count; i++) {
@@ -292,7 +402,9 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   }
   /* A row reads only its own activations and this layer's preceding KV rows.
    * Layer-major execution is therefore bitwise equivalent to token-major. */
-  int gemm = model->prefill_gemm && count > 1;
+  /* In BF16 mode even a single-row batch runs the BF16 GEMM, so a prompt's precision does not depend on how it was
+   * split. */
+  int gemm = model->prefill_gemm && (count > 1 || t->bf16);
   for (size_t l = 0; l < (size_t)p->n_layers; l++) {
     if (gemm) {
       forward_layer_batch(t, s, l, pos0, count);
@@ -305,6 +417,18 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   }
   if (want == LOGITS_NONE)
     return NULL;
+  if (want == LOGITS_ALL && t->bf16) {
+    /* All-position logits use the BF16 GEMM on a lazily packed classifier; the last-row classifier stays FP32. */
+    if (!t->packed_wcls)
+      pack_classifier(t);
+    for (int i = 0; i < count; i++)
+      PROFILE(PHASE_RMSNORM, k_rmsnorm(s->x + (size_t)i * p->dim, s->x + (size_t)i * p->dim,
+                                       t->weights.rms_final_weight, p->dim, p->norm_eps));
+    GemmBf16Segment cls = {
+        .c = s->batch_logits, .ldc = p->vocab_size, .w = t->packed_wcls, .n = p->vocab_size, .kind = GEMM_STORE};
+    PROFILE(PHASE_CLASSIFIER, k_gemm_bf16(s->x, p->dim, count, p->dim, &cls, 1, &t->panel));
+    return s->batch_logits;
+  }
   for (int i = want == LOGITS_ALL ? 0 : count - 1; i < count; i++) {
     RunState row = row_state(s, p, i);
     if (want == LOGITS_ALL)
@@ -333,13 +457,35 @@ void engine_load_context(Model *model, const char *path, int context) {
   t->config.seq_len = context ? context : (t->config.seq_len < 4096 ? t->config.seq_len : 4096);
   model->config = t->config;
   double start = monotonic_seconds();
+  model->prefill_bf16 = prefill_precision(0);
   prefill_configure(model);
-  malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
+  if (tp_sockets_requested() == 2) {
+    if (model->prefill_bf16)
+      fail("LLAMA_PRECISION=bf16 is not supported with LLAMA_SOCKETS=2: the two-socket FP32 forward has no batched path yet");
+    model->prefill_gemm = 0;
+    model->prefill_kernel = kernels_name();
+    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0, 0);
+    munmap(t->data, t->file_size); /* the shards were read with pread */
+    t->data = MAP_FAILED;
+    model->mapped_bytes = 0;
+  } else {
+    malloc_run_state(&t->state, &t->config, model->max_batch, &t->mem);
+    bf16_mode = t->bf16 = model->prefill_bf16;
+    model->prefill_kernel = t->bf16 ? (kernels_amx_active() ? "amx-bf16" : "bf16-reference") : kernels_name();
+    if (t->bf16) {
+      t->state_batch = model->max_batch;
+      pack_weights(t);
+    }
+  }
   metrics.runtime_s = monotonic_seconds() - start;
   metrics.runtime_ready = 1;
 }
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;
+  if (t->tp) {
+    tp_kv_stats(t->tp, position, out);
+    return;
+  }
   size_t kv_dim = (size_t)t->config.head_dim * t->config.n_kv_heads;
   size_t active = checked_mul(checked_mul(checked_mul(2, (size_t)t->config.n_layers), (size_t)position), kv_dim * sizeof(float));
   runmem_kv_stats(&t->mem, active, verify, out);
@@ -347,7 +493,8 @@ void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
 float *engine_forward(Model *model, int token, int position) {
   if (token < 0 || token >= model->config.vocab_size || position < 0 || position >= model->config.seq_len)
     fail("forward input out of range: token=%d position=%d", token, position);
-  return forward(model->implementation, token, position);
+  Transformer *t = model->implementation;
+  return t->tp ? tp_forward(t->tp, token, position) : forward(t, token, position);
 }
 void engine_free(Model *model) {
   if (model->implementation) {
@@ -358,7 +505,7 @@ void engine_free(Model *model) {
   }
 }
 const char *engine_precision(void) {
-  return "fp32";
+  return bf16_mode ? "bf16_from_fp32" : "fp32";
 }
 int engine_group_size(void) {
   return 0;

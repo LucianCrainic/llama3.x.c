@@ -1,6 +1,8 @@
 #ifndef LLAMA_WORKERS_H
 #define LLAMA_WORKERS_H
 
+#include "numa.h"
+
 /* Persistent worker teams: the only scheduler. Threads are created once (pool_start) and wait for jobs; the caller
  * of team_run is worker 0 of its team and does its share instead of sleeping. Workers synchronize with a
  * generation-counted barrier built on C11 atomics: they spin for a bounded time, then sched_yield. Workers must not
@@ -41,5 +43,46 @@ typedef struct {
 int pool_summary_count(void);
 const TeamSummary *pool_summary(int index);
 int team_affinity_verified(const Team *team);
+
+/* ---- Cross-socket reduction (B4) -------------------------------------------------------------------------------
+ * Combines the two teams' partial outputs and adds them to each team's own residual once:
+ *   residual_s[i] += partial_0[i] + partial_1[i]      (the operand order is the same on both sockets)
+ * Per reduction (generation g, counted per exchange from 1):
+ *   1. the coordinator of socket s calls exchange_partial: it waits until the peer has consumed the buffer's previous
+ *      occupant (generation g - 2), then returns partial_s[g & 1] for the local projection to write;
+ *   2. the team meets a local barrier, the leader publishes ready_s = g (release);
+ *   3. every worker waits for ready_peer >= g (acquire), then adds its disjoint element range of both partials;
+ *   4. after a second local barrier the leader publishes consumed_s = g (release).
+ * Each socket writes only its own residual. ready and consumed sit on separate 64-byte lines. The two sockets'
+ * coordinators run concurrently (each is worker 0 of its own team, so team 1 needs a thread of its own to call
+ * team_run). */
+typedef struct Exchange Exchange;
+
+/* Bytes a socket's partial buffers occupy; a region passed to exchange_create must hold at least this. */
+size_t exchange_region_bytes(int elements_max);
+/* Needs a started pool with two teams. socket_regions[s] (NULL, or NULL entries = heap) holds socket s's buffers
+ * and is owned by the caller, who releases it only after exchange_destroy. */
+Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2]);
+/* Waits for the last consumed acknowledgment of both sockets (or the abort flag), then frees the exchange. */
+void exchange_destroy(Exchange *exchange);
+/* Once per reduction, by the coordinator of `socket`, before the job that writes the partial; blocks until the
+ * buffer is free. Returns NULL after an abort. Calls for one socket must alternate with exchange_reduce_add. */
+float *exchange_partial(Exchange *exchange, int socket);
+/* Called by every worker of `socket` inside a TeamFn, after the local projection wrote `elements` values to the
+ * pointer exchange_partial returned. A no-op after an abort. */
+void exchange_reduce_add(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements);
+/* Process-wide and irreversible in production (it is workers_abort): every wait loop of the exchange and of the
+ * team barriers returns, and the results of the generation in flight are garbage. */
+void exchange_abort(Exchange *exchange);
+/* Seconds the leader of `socket` spent adding (step 3) and waiting (steps 2-4 barriers and ready), when timing is on.
+ */
+void exchange_set_timing(Exchange *exchange, int on);
+void exchange_timing(const Exchange *exchange, int socket, double *reduce_seconds, double *wait_seconds);
+
+/* fail() sets this before running exit handlers, so no wait loop outlives the memory it spins on. After it, stop
+ * the pool; barrier and exchange state is not consistent any more. workers_abort_clear is for tests only. */
+void workers_abort(void);
+int workers_aborted(void);
+void workers_abort_clear(void);
 
 #endif

@@ -32,6 +32,11 @@ def main():
     parser.add_argument('--greedy-steps', type=int, default=8)
     parser.add_argument('--chat-date', default='26 Jul 2024')
     parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--batch', type=int, metavar='M',
+                        help='C probe logits through the batched prefill path, microbatch M (C5/C6); the environment '
+                             '(LLAMA_PRECISION, LLAMA_KERNELS, LLAMA_PREFILL_BATCH) reaches the probe unchanged')
+    parser.add_argument('--record-only', action='store_true',
+                        help='write the comparison, greedy tokens included, but exit 0 whatever it shows (BF16 mode)')
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     hf = AutoModelForCausalLM.from_pretrained(args.hf, torch_dtype=torch.float32,
@@ -45,8 +50,12 @@ def main():
             os.sched_setaffinity(0, INITIAL_AFFINITY)
         return subprocess.check_output(command, **kwargs)
     def c_logits(tokens):
-        return np.frombuffer(probe_output([str(probe), args.checkpoint, *map(str, tokens)]),
-                             dtype='<f4').reshape(len(tokens), -1)
+        if args.batch:
+            output = probe_output([str(probe), 'batch', args.checkpoint, *map(str, tokens)],
+                                  env={**os.environ, 'LLAMA_PREFILL_BATCH': str(args.batch), 'LLAMA_PREFILL_LOGITS': 'all'})
+        else:
+            output = probe_output([str(probe), args.checkpoint, *map(str, tokens)])
+        return np.frombuffer(output, dtype='<f4').reshape(len(tokens), -1)
     def ref_logits(tokens):
         with torch.inference_mode():
             return hf(torch.tensor([tokens])).logits[0].numpy()
@@ -84,7 +93,7 @@ def main():
             token = int(ref_logits(rp)[-1].argmax()); rp.append(token); rdone = token in stop_ids
             if rdone: break
         match = cp == rp
-        if args.precision == 'fp32': passed &= match
+        if args.precision == 'fp32' and not args.record_only: passed &= match
         generation.append(dict(mode=mode, match=match, c_tokens=cp[len(prefix):], reference_tokens=rp[len(prefix):],
                                c_stopped=cdone, reference_stopped=rdone))
     # FP32 requires identical greedy tokens as well as the specified tensor
@@ -93,10 +102,11 @@ def main():
         probe_affinity=sorted(INITIAL_AFFINITY) if INITIAL_AFFINITY else None,
         torch=torch.__version__, transformers=__import__('transformers').__version__,
         tolerance=dict(atol=args.max_abs, rtol=args.rtol), chat_template_match=chat_match,
+        batch=args.batch, record_only=args.record_only,
         comparisons=records, generation=generation)
     Path(args.output).write_text(json.dumps(result, indent=2, ensure_ascii=False)+'\n')
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0 if passed else 1
+    return 0 if passed or args.record_only else 1
 
 if __name__ == '__main__':
     sys.exit(main())

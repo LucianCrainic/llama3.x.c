@@ -1,9 +1,10 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
-Plan date: 1 November 2026. Status as of 7 November 2026: Waves 1 and 2 (M1, M2) are complete and validated on the cluster, apart from the A6
-campaign; the Wave 3 code (B1-B6, C4-C7) is written and tested locally on separate, not yet merged branches and has not run on
-the cluster; D has not started. See the milestone
-table in §4 and each phase document's status line.
+Plan date: 1 November 2026. Status as of 7 November 2026: Waves 1 and 2 (M1, M2) are complete and validated on the
+cluster, apart from the A6 campaign. In Wave 3, B1-B6 (two-socket tensor parallelism) and C4-C7 (AMX enablement, the BF16
+precision mode, batched Q8 with AMX-INT8, the campaign scripts) are implemented and tested locally, B on the virtual
+topology and C on macOS against instruction models, with none of that code yet run on the cluster; B7 and Waves 4-5 (D)
+have not started. See the milestone table in §4 and each phase document's status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
 
@@ -138,7 +139,7 @@ Milestone status:
 | --- | --- | --- |
 | M1 | **complete** (2026-11-07) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%, Hugging Face gate under `teams` passes for 1B and 8B FP32). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. `make test` is green on Linux. Not part of M1 and still open: the F3 acceptance comparison with the kernels script |
 | M2 | **complete** (2026-11-07) | Engine-owned HBM placement is bitwise identical to the staged baseline on 1B and 8B, FP32 and Q8_0, `omp` and `teams`, and verified on the requested node ([A4](A-numa-placement/A4-owned-weight-loader.md), [A5](A-numa-placement/A5-kv-and-workspace-placement.md) cluster results). Batched FP32 prefill matches per-token: bitwise on the reference path ([C1](C-batched-prefill/C1-batched-forward-api.md)), within 4.8e-4 max \|Δlogit\| and 100% argmax with the AVX-512 GEMM and batched attention ([C2](C-batched-prefill/C2-avx512-fp32-gemm.md), [C3](C-batched-prefill/C3-batched-causal-attention-and-kv.md)); 8B prefill at a 2048-token prompt is 10.5x faster at M = 64 with unchanged decode. Not part of M2's gate and still open: the A6 campaign |
-| M3 | planned | — |
+| M3 | **partly implemented locally; no cluster evidence** (2026-11-07) | B1-B6 and C4-C6 code and tests are in (merged into `develop`); `phase_C4`-`phase_C7` and `phase_B1`-`phase_B6` are dry-run-verified. Track B: the cross-socket exchange, shard planning and packing, partial-output kernels, socket-local attention, and the FP32 and Q8 two-socket forward behind `LLAMA_SOCKETS=2`, tested on macOS with `LLAMA_TOPOLOGY=virtual:2xT` (scalar kernels; ASAN/UBSAN and TSAN clean): bitwise exchange and shard reconstruction, logits within 4e-6 of the one-socket path for FP32 and within 1.1e-5 for Q8 (W8A8 and W8A32). Track C: C4, C5, C6 pass on macOS against software models of the AMX tile instructions and of the AVX-512 integer subset. Never executed on real hardware: the AMX tile kernels, the AVX-512 VNNI Q8 kernel of C6, and the AVX-512 half of the new B kernel tests. Open: all cluster `check`s (`cresco8-tp.sbatch PHASE=B1..B6`, and `cresco8-prefill.sbatch PHASE="C4 C5 C6"`), the C7 campaign, pinned reduction latency, per-socket page verification of KV, and B7. `LLAMA_SOCKETS=2` does not combine with `LLAMA_PRECISION=bf16` or the batched Q8 GEMM (the two-socket forward runs per token until D1) |
 | M4 | planned | — |
 | M5 | planned | — |
 

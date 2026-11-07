@@ -1,4 +1,5 @@
 #include "app.h"
+#include "gemm.h"
 #include "kernels.h"
 #include "loader.h"
 #include "numa.h"
@@ -150,12 +151,12 @@ static void write_v2_sections(FILE *f) {
   const char *thp = region_thp_default() ? "on" : "off";
   fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
   string(f, kernels_backend_name());
-  fputs(",\n    \"sockets\": 1,\n    \"placement\": ", f);
+  fprintf(f, ",\n    \"sockets\": %d,\n    \"placement\": ", metrics.sockets ? metrics.sockets : 1);
   string(f, placement_active());
   fputs(",\n    \"thp\": ", f);
   string(f, thp);
   fputs(",\n    \"precision_mode\": ", f);
-  string(f, engine_precision());
+  string(f, !strcmp(engine_precision(), "bf16_from_fp32") ? "bf16" : engine_precision());
   fputs(",\n    \"prefill_batch\": ", f);
   if (metrics.runtime_ready)
     fprintf(f, "%d", engine_max_batch(&model));
@@ -164,7 +165,7 @@ static void write_v2_sections(FILE *f) {
   fputs(",\n    \"prefill_logits\": ", f);
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fputs(",\n    \"kernels_prefill\": ", f);
-  string(f, metrics.runtime_ready && model.prefill_gemm ? kernels_name() : NULL);
+  string(f, metrics.runtime_ready && model.prefill_gemm ? model.prefill_kernel : NULL);
   fputs("\n  }", f);
 
   const Topology *topology;
@@ -355,6 +356,8 @@ void write_report(void) {
     string(f, kernels_name());
   else
     fputs("null", f);
+  fputs(",\n    \"amx_permission\": ", f);
+  string(f, gemm_amx_permission());
   fputs(",\n    \"openmp_max_threads\": ", f);
 #ifdef _OPENMP
   fprintf(f, "%d", omp_get_max_threads());
@@ -406,8 +409,8 @@ void write_report(void) {
          metrics.output_tokens > 0, 1);
   timing(f, "average_decode_step", metrics.decode_steps ? metrics.decode_s / metrics.decode_steps : 0,
          metrics.decode_steps > 0, 1);
-  /* weight_pack arrives with weight packing (C5); the placement timings come from the owned loader (A4). */
-  timing(f, "weight_pack", 0, 0, 1);
+  /* weight_pack is the BF16 packing of C5; the placement timings come from the owned loader (A4). */
+  timing(f, "weight_pack", metrics.weight_pack_s, metrics.weight_packed, 1);
   timing(f, "placement_populate", metrics.placement_populate_s, metrics.placement_owned, 1);
   timing(f, "placement_verify", metrics.placement_verify_s, metrics.placement_owned, 0);
   fputs("  },\n  \"throughput_tokens_per_second\": {\n    \"prefill\": ", f);

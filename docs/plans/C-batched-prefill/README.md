@@ -45,6 +45,16 @@ track does not change decode.
 | C6 | [AMX-INT8 for Q8_0](C6-amx-int8-q8.md) | W8A8 AMX with per-group rescale | Agreement with the AVX-512 Q8 batched path |
 | C7 | [One-socket prefill campaign](C7-one-socket-prefill-campaign.md) | Prefill and decode measured per stage | Speedup and crossover report |
 
+## Status (7 November 2026)
+
+| Phase | Implemented | Tested locally | Open (needs the cluster, not run) |
+| --- | --- | --- | --- |
+| C1-C3 | yes | yes (bitwise, kernel budgets; AVX-512 microkernel only on an emulation) | `STAGE=check PHASE=C1`, `C2`, `C3` |
+| C4 | `KERNELS_AMX`, permission, tile config, BF16 / int8 tile kernels, packing helpers | packing on every platform; tile kernels on the software tile model (exact int32, BF16 within 2e-6); `-arch x86_64` build | `STAGE=check PHASE=C4`: real `tdpbf16ps` / `tdpbssd`, `arch_prctl`, GCC 11 build, tile TFLOP/s |
+| C5 | `LLAMA_PRECISION=bf16`, packing, driver, references, report | RNE conversion bitwise; GEMM vs double; engine: decode unchanged, split-independent, tile model == scalar reference | `STAGE=check PHASE=C5`: error vs FP32 and HF, the provisional gate, budget on HBM |
+| C6 | batched Q8 forward, AVX-512 VNNI tile kernel, AMX-INT8, packing, W8A32 rule | exact int32 dots on the tile model; kernels vs double; scalar batched forward bitwise == per-token | `STAGE=check PHASE=C6`: VNNI and AMX kernels on hardware, agreement on 1B / 8B, rescale overhead |
+| C7 | `phase_C7` (and `C4`-`C6`) in `cresco8-prefill.sbatch` | `DRY_RUN=1` only | the campaign (`STAGE=bench PHASE=C7`, about 5 h) after C4-C6 pass |
+
 ## Track exit gate (milestone M3, prefill half)
 
 - **Correctness.** All four prefill kernels pass their gates:

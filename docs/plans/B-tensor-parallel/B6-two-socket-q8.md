@@ -11,7 +11,31 @@ Extend the two-socket forward pass to `runq` with the existing Q8_0 semantics:
 
 The partitions stay aligned to groups (study §5.4, §6.2).
 
-Status: **planned**. Branch: `feature/tp-b6-q8`.
+Status: **implemented and tested locally on the virtual topology (macOS, scalar kernels); nothing run on the cluster**.
+Branch: `feature/tp-local-b` (commit `feat: add the two-socket Q8_0 forward`).
+
+**Open risk:** as B5, B6 stands on B1/B4 placement and latency that have never run on real sockets, and on A4's pending
+cluster check. The AVX-512 Q8 kernels that B6 drives through the new `ld` argument (B2) have only been type-checked.
+
+Implementation notes:
+
+- **Same module.** `forward_q8` in `src/tp.c`, reached from `runq.c` exactly as `run.c` reaches the FP32 path
+  (`tp_create(..., quantized = 1, GS, fp32_activations)`); `GS` stays file-static in `runq.c` and `tp.c` gets the group
+  size from the checkpoint. `LLAMA_Q8_ACTIVATIONS=fp32` selects W8A32 as before.
+- **Quantization rule.** QKV, W1/W3 and the classifier quantize the full normalized input on each socket (identical on
+  both). Wo and W2 quantize only the owned slice (`dim/2` of the attention output, `hidden/2` of the FFN activation),
+  which starts on a group boundary, so its groups and scales are the original ones. The kernel tests assert that slice
+  quantization equals the corresponding groups of a full quantization bitwise (B2).
+- **Q8 embedding.** One row dequantized from the owner's vocabulary shard (tied) or the global shard (untied), as
+  `runq.c` does.
+- **Rejection.** The `gs = 16` fixture (`dim/S = 8`) fails with the B1 message ("group size 16 does not divide the
+  per-socket slices"), before any region is reserved.
+- **Tests** (`tests/test_tp.py`). `probe-int8` with `LLAMA_SOCKETS=2` against one socket, W8A8 and W8A32, shared,
+  unshared and odd-vocabulary fixtures, T = 1, 3, 7, within the fixture budget (`abs 2e-6 + rel 2e-5`; **measured**
+  worst case 1.05e-5 absolute on a logit of 6.8, W8A32); the batched entry point; identical greedy generation;
+  `LLAMA_TP_CHECK=1` throughout; the `gs = 16` rejection.
+- **Not done here.** `compare_engines.py` and `validate.py` runs on 1B and 8B (the HF numbers next to the one-socket
+  values), and the 8B smoke benchmark with profiling (`cresco8-tp.sbatch PHASE=B6`, dry-run verified).
 
 ## 2. Depends on / unblocks
 

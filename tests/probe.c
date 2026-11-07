@@ -75,8 +75,22 @@ int main(int argc, char **argv) {
     engine_load(&model, argv[2]);
     int steps = atoi(argv[3]), pos = 0;
     float *logits = NULL;
-    for (int i = 4; i < argc; i++)
-      logits = engine_forward(&model, atoi(argv[i]), pos++);
+    /* With LLAMA_PREFILL_BATCH > 1 the prompt goes through the batched prefill (C5/C6); decode stays per token. */
+    if (engine_max_batch(&model) > 1) {
+      int n = argc - 4;
+      int *prompt = memory_alloc(n, sizeof(int), MEM_PROMPT);
+      for (int i = 0; i < n; i++)
+        prompt[i] = atoi(argv[i + 4]);
+      for (int i = 0; i < n;) {
+        int count = n - i < engine_max_batch(&model) ? n - i : engine_max_batch(&model);
+        logits = engine_forward_batch(&model, prompt + i, count, i, i + count == n ? LOGITS_LAST : LOGITS_NONE);
+        i += count;
+      }
+      pos = n;
+      memory_free(prompt);
+    } else
+      for (int i = 4; i < argc; i++)
+        logits = engine_forward(&model, atoi(argv[i]), pos++);
     for (int i = 0; i < steps; i++) {
       int token = sample_argmax(logits, model.config.vocab_size);
       printf("%d\n", token);

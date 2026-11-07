@@ -1,9 +1,12 @@
 /* Kernel regression: every available instruction set against double-precision
  * references, and bitwise agreement for RoPE and activation quantization. */
 #include "kernels.h"
+#include "numa.h"
 #include "workers.h"
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -355,18 +358,433 @@ static void test_attention_batch(void) {
       }
 }
 
-int main(void) {
+/* ---- Shard kernels (B2): partial outputs, column slices, row slices and padded rows -------------------------------
+ */
+
+static int bitwise_expected(void) {
+  /* The AVX-512 GEMV reduces a block of four rows differently from one to three rows, so a row computed in another
+   * block position can differ in the last bits. Only the scalar kernels keep the exact per-row order. */
+  return !strcmp(kernels_name(), "scalar");
+}
+
+static void test_partial_f32(void) {
+  const int shapes[][2] = {{64, 5}, {96, 9}, {200, 4}, {1024, 7}};
+  for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+    int n = shapes[s][0], d = shapes[s][1], half = n / 2;
+    for (int pad = 0; pad < 2; pad++) {
+      size_t ld = (size_t)half + (pad ? 16 : 0);
+      float *x = zeroed(n, sizeof(float)), *w = zeroed((size_t)n * d, sizeof(float));
+      float *w0 = zeroed(ld * d, sizeof(float)), *w1 = zeroed(ld * d, sizeof(float));
+      float *p0 = zeroed(d, sizeof(float)), *p1 = zeroed(d, sizeof(float)), *full = zeroed(d, sizeof(float));
+      float *base = zeroed(d, sizeof(float));
+      double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double));
+      fill(x, n, 1);
+      fill(w, (size_t)n * d, 1);
+      fill(base, d, 4);
+      for (size_t i = 0; i < ld * d; i++)
+        w0[i] = w1[i] = NAN; /* padding must never be read */
+      for (int i = 0; i < d; i++) {
+        memcpy(w0 + i * ld, w + (size_t)i * n, half * sizeof(float));
+        memcpy(w1 + i * ld, w + (size_t)i * n + half, (n - half) * sizeof(float));
+        for (int j = 0; j < n; j++) {
+          ref[i] += (double)w[(size_t)i * n + j] * x[j];
+          mag[i] += fabs((double)w[(size_t)i * n + j] * x[j]);
+        }
+      }
+      for (int i = 0; i < d; i++)
+        p0[i] = p1[i] = 1e30f; /* PARTIAL overwrites, like STORE */
+      k_matmul_ld(p0, x, w0, ld, half, d, K_PARTIAL);
+      k_matmul_ld(p1, x + half, w1, ld, n - half, d, K_PARTIAL);
+      for (int i = 0; i < d; i++)
+        check("partial.sum", (double)p0[i] + (double)p1[i], ref[i], 2e-5 * mag[i] + 1e-6);
+      /* Row slices of the full tensor: the shard's rows are the full product's rows. */
+      k_matmul(full, x, w, n, d);
+      int split = d / 2;
+      memcpy(p0, base, d * sizeof(float));
+      k_matmul_ld(p0, x, w, (size_t)n, n, split, K_STORE);
+      k_matmul_ld(p0 + split, x, w + (size_t)split * n, (size_t)n, n, d - split, K_STORE);
+      for (int i = 0; i < d; i++) {
+        checks++;
+        if (bitwise_expected() ? memcmp(&p0[i], &full[i], sizeof(float)) != 0
+                               : fabs((double)p0[i] - full[i]) > 2e-5 * mag[i] + 1e-6) {
+          if (failures++ < 20)
+            fprintf(stderr, "row slice [%s]: row %d differs from the full product\n", current, i);
+        }
+      }
+      /* K_ADD with padded rows accumulates; SWIGLU on padded rows matches the unpadded pair form. */
+      memcpy(p1, base, d * sizeof(float));
+      k_matmul_ld(p1, x, w0, ld, half, d, K_ADD);
+      for (int i = 0; i < d; i++) {
+        double ref0 = 0, mag0 = 0;
+        for (int j = 0; j < half; j++) {
+          ref0 += (double)w[(size_t)i * n + j] * x[j];
+          mag0 += fabs((double)w[(size_t)i * n + j] * x[j]);
+        }
+        check("partial.add", p1[i], base[i] + ref0, 2e-5 * (mag0 + fabs(base[i])) + 1e-6);
+      }
+      float *gated = zeroed(d, sizeof(float)), *unpadded = zeroed(d, sizeof(float));
+      float *w3 = zeroed(ld * d, sizeof(float)), *w3_plain = zeroed((size_t)half * d, sizeof(float));
+      for (size_t i = 0; i < ld * d; i++)
+        w3[i] = NAN;
+      for (int i = 0; i < d; i++)
+        for (int j = 0; j < half; j++)
+          w3[i * ld + j] = w3_plain[(size_t)i * half + j] = uniform();
+      k_matmul_swiglu_ld(gated, x, w0, w3, ld, half, d);
+      float *w0_plain = zeroed((size_t)half * d, sizeof(float));
+      for (int i = 0; i < d; i++)
+        memcpy(w0_plain + (size_t)i * half, w0 + i * ld, half * sizeof(float));
+      k_matmul_swiglu(unpadded, x, w0_plain, w3_plain, half, d);
+      for (int i = 0; i < d; i++) {
+        checks++;
+        if (memcmp(&gated[i], &unpadded[i], sizeof(float)) && failures++ < 20)
+          fprintf(stderr, "swiglu_ld [%s]: padded and packed rows differ at %d\n", current, i);
+      }
+      free(gated), free(unpadded), free(w3), free(w3_plain), free(w0_plain);
+      free(x), free(w), free(w0), free(w1), free(p0), free(p1), free(full), free(base), free(ref), free(mag);
+    }
+  }
+}
+
+static void test_partial_q8(void) {
+  const int gss[] = {4, 16, 64, 128};
+  const int n = 512, d = 7, half = n / 2;
+  for (size_t g = 0; g < sizeof(gss) / sizeof(*gss); g++) {
+    int gs = gss[g], groups = n / gs, hg = half / gs;
+    for (int pad = 0; pad < 2; pad++) {
+      size_t ld = (size_t)half + (pad ? (size_t)gs : 0), sld = ld / gs;
+      float *x = zeroed(n, sizeof(float)), *ws = zeroed((size_t)d * groups, sizeof(float));
+      int8_t *wq = zeroed((size_t)n * d, 1);
+      int8_t *w0q = zeroed(ld * d, 1), *w1q = zeroed(ld * d, 1);
+      float *w0s = zeroed(sld * d, sizeof(float)), *w1s = zeroed(sld * d, sizeof(float));
+      fill(x, n, 3);
+      for (size_t i = 0; i < (size_t)n * d; i++)
+        wq[i] = (int8_t)(uniform() * 127.0f);
+      for (int i = 0; i < d * groups; i++)
+        ws[i] = 0.001f + 0.01f * fabsf(uniform());
+      memset(w0q, 127, ld * d), memset(w1q, 127, ld * d); /* padding */
+      for (size_t i = 0; i < sld * d; i++)
+        w0s[i] = w1s[i] = NAN;
+      for (int i = 0; i < d; i++) {
+        memcpy(w0q + i * ld, wq + (size_t)i * n, half);
+        memcpy(w1q + i * ld, wq + (size_t)i * n + half, half);
+        memcpy(w0s + i * sld, ws + (size_t)i * groups, hg * sizeof(float));
+        memcpy(w1s + i * sld, ws + (size_t)i * groups + hg, hg * sizeof(float));
+      }
+      int8_t *xq = zeroed(n, 1);
+      float *xs = zeroed(groups, sizeof(float));
+      k_quantize(xq, xs, x, n, gs);
+      /* Each half's activations are quantized from the owned slice alone, at the original group boundaries. */
+      int8_t *xq0 = zeroed(half, 1), *xq1 = zeroed(half, 1);
+      float *xs0 = zeroed(hg, sizeof(float)), *xs1 = zeroed(hg, sizeof(float));
+      k_quantize(xq0, xs0, x, half, gs);
+      k_quantize(xq1, xs1, x + half, half, gs);
+      checks += 2;
+      if ((memcmp(xq0, xq, half) || memcmp(xq1, xq + half, half) || memcmp(xs0, xs, hg * sizeof(float)) ||
+           memcmp(xs1, xs + hg, hg * sizeof(float))) &&
+          failures++ < 20)
+        fprintf(stderr, "quantize slices [%s]: differ from the full quantization (gs %d)\n", current, gs);
+      for (int mode = 0; mode < 2; mode++) {
+        double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double));
+        for (int i = 0; i < d; i++)
+          for (int gi = 0; gi < groups; gi++) {
+            double a = 0, am = 0;
+            for (int j = gi * gs; j < (gi + 1) * gs; j++) {
+              double xv = mode ? x[j] : xq[j];
+              a += wq[(size_t)i * n + j] * xv;
+              am += fabs(wq[(size_t)i * n + j] * xv);
+            }
+            double sx = mode ? 1.0 : xs[gi];
+            ref[i] += a * ws[i * groups + gi] * sx;
+            mag[i] += am * ws[i * groups + gi] * sx;
+          }
+        K8Input in0 = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq0, xs0, x};
+        K8Input in1 = mode ? (K8Input){NULL, NULL, x + half} : (K8Input){xq1, xs1, x + half};
+        K8Weight a = {w0q, w0s}, b = {w1q, w1s};
+        float *p0 = zeroed(d, sizeof(float)), *p1 = zeroed(d, sizeof(float)), *both = zeroed(d, sizeof(float));
+        for (int i = 0; i < d; i++)
+          p0[i] = p1[i] = 1e30f;
+        k_matmul_q8_ld(p0, &in0, &a, ld, half, d, gs, K_PARTIAL);
+        k_matmul_q8_ld(p1, &in1, &b, ld, half, d, gs, K_PARTIAL);
+        const char *name = mode ? "q8_partial_w8a32" : "q8_partial_w8a8";
+        for (int i = 0; i < d; i++)
+          check(name, (double)p0[i] + (double)p1[i], ref[i], 2e-5 * mag[i] + 1e-6);
+        /* Padded rows and packed rows give the same bits, and ADD accumulates. */
+        K8Input full_in = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq, xs, x};
+        K8Weight plain = {wq, ws};
+        k_matmul_q8(both, &full_in, plain, n, d, gs);
+        for (int i = 0; i < d; i++)
+          check(name, both[i], ref[i], 2e-5 * mag[i] + 1e-6);
+        float *add = zeroed(d, sizeof(float));
+        for (int i = 0; i < d; i++)
+          add[i] = 0.5f;
+        k_matmul_q8_ld(add, &in0, &a, ld, half, d, gs, K_ADD);
+        for (int i = 0; i < d; i++) {
+          checks++;
+          if (fabsf(add[i] - 0.5f - p0[i]) > 1e-4f * (fabsf(p0[i]) + 1) && failures++ < 20)
+            fprintf(stderr, "%s [%s]: ADD differs from PARTIAL plus the base at %d\n", name, current, i);
+        }
+        free(add), free(p0), free(p1), free(both), free(ref), free(mag);
+      }
+      free(x), free(ws), free(wq), free(w0q), free(w1q), free(w0s), free(w1s), free(xq), free(xs), free(xq0), free(xq1),
+          free(xs0), free(xs1);
+    }
+  }
+}
+
+static void test_partial(void) {
+  test_partial_f32();
+  test_partial_q8();
+}
+
+/* Two coordinator threads, each bound to its own team, run kernels at the same time. */
+typedef struct {
+  int socket, failed;
+} TwoTeams;
+
+static void *two_team_main(void *p) {
+  TwoTeams *job = p;
+  kernels_set_thread_team(pool_team(job->socket));
+  unsigned long long local = 0x9E3779B97F4A7C15ull * (unsigned)(job->socket + 1);
+  const int n = 200, d = 37;
+  float *x = zeroed(n, sizeof(float)), *w = zeroed((size_t)n * d, sizeof(float)), *out = zeroed(d, sizeof(float));
+  for (int i = 0; i < n; i++)
+    x[i] = (float)((local = local * 6364136223846793005ull + 1) >> 40) / (float)(1 << 24) - 0.5f;
+  for (int i = 0; i < n * d; i++)
+    w[i] = (float)((local = local * 6364136223846793005ull + 1) >> 40) / (float)(1 << 24) - 0.5f;
+  for (int rep = 0; rep < 300; rep++) {
+    k_matmul(out, x, w, n, d);
+    for (int i = 0; i < d; i++) {
+      double ref = 0, mag = 0;
+      for (int j = 0; j < n; j++) {
+        ref += (double)w[(size_t)i * n + j] * x[j];
+        mag += fabs((double)w[(size_t)i * n + j] * x[j]);
+      }
+      if (fabs(out[i] - ref) > 2e-5 * mag + 1e-6)
+        job->failed++;
+    }
+  }
+  kernels_set_thread_team(NULL);
+  free(x), free(w), free(out);
+  return NULL;
+}
+
+static void test_two_teams(void) {
+  PoolConfig config = {.teams = 2, .threads = {3, 2}, .cpus = {NULL, NULL}};
+  pool_start(&config);
+  TwoTeams job[2] = {{0, 0}, {1, 0}};
+  pthread_t thread;
+  assert(!pthread_create(&thread, NULL, two_team_main, &job[1]));
+  two_team_main(&job[0]);
+  pthread_join(thread, NULL);
+  checks += 2;
+  if ((job[0].failed || job[1].failed) && failures++ < 20)
+    fprintf(stderr, "two teams [%s]: %d + %d results out of budget\n", current, job[0].failed, job[1].failed);
+  pool_stop();
+}
+
+/* ---- Socket-local attention (B3) ----------------------------------------------------------------------------------
+ * Each socket holds K/V for its own KV heads only, in a [position][kv_dim / S] cache, and attends for its own query
+ * heads with local counts on its own team. The concatenation of the sockets' outputs must equal the full attention. */
+enum { GUARD = 64 };
+
+typedef struct {
+  int socket, sockets, heads, kv_heads, hd, pos, seq;
+  const float *q, *kc, *vc;
+  float *out;    /* the full output; this socket writes its own heads */
+  int bad_guard; /* a guard float next to the local cache changed */
+  int chunks;    /* chunk count the local work reported */
+  int workers;
+} SplitJob;
+
+static void *split_main(void *p) {
+  SplitJob *job = p;
+  kernels_set_thread_team(job->sockets > 1 ? pool_team(job->socket) : NULL);
+  int hl = job->heads / job->sockets, kl = job->kv_heads / job->sockets, hd = job->hd, kv_local = kl * hd,
+      kv_full = job->kv_heads * hd;
+  size_t cells = (size_t)job->seq * kv_local;
+  float *k_all = zeroed(cells + 2 * GUARD, sizeof(float)), *v_all = zeroed(cells + 2 * GUARD, sizeof(float));
+  for (int i = 0; i < GUARD; i++)
+    k_all[i] = v_all[i] = k_all[GUARD + cells + i] = v_all[GUARD + cells + i] = NAN;
+  float *kl_cache = k_all + GUARD, *vl_cache = v_all + GUARD;
+  for (int t = 0; t < job->seq; t++) {
+    memcpy(kl_cache + (size_t)t * kv_local, job->kc + (size_t)t * kv_full + (size_t)job->socket * kv_local,
+           kv_local * sizeof(float));
+    memcpy(vl_cache + (size_t)t * kv_local, job->vc + (size_t)t * kv_full + (size_t)job->socket * kv_local,
+           kv_local * sizeof(float));
+  }
+  float *att = zeroed((size_t)hl * job->seq, sizeof(float));
+  AttentionWork work; /* caller memory: memory_alloc's accounting belongs to one thread */
+  float *work_memory = zeroed(k_attention_bytes(hl, kl, hd, job->seq) / sizeof(float) + 1, sizeof(float));
+  k_attention_init_in(&work, hl, kl, hd, job->seq, work_memory); /* sized from this thread's team */
+  k_attention(job->out + (size_t)job->socket * hl * hd, job->q + (size_t)job->socket * hl * hd, kl_cache, vl_cache, att,
+              &work, hl, kl, hd, job->seq, job->pos);
+  job->chunks = k_attention_chunk_count(&work, kl, job->pos);
+  job->workers = work.workers;
+  for (int i = 0; i < GUARD; i++)
+    if (!isnan(k_all[i]) || !isnan(k_all[GUARD + cells + i]) || !isnan(v_all[i]) || !isnan(v_all[GUARD + cells + i]))
+      job->bad_guard++;
+  k_attention_free(&work);
+  kernels_set_thread_team(NULL);
+  free(k_all), free(v_all), free(att), free(work_memory);
+  return NULL;
+}
+
+static void test_attention_split(void) {
+  const int positions[] = {0, 31, 32, 255, 256, 1000, 4095};
+  const int heads = 8, kv_heads = 4, hd = 16, kv_full = kv_heads * hd;
+  int team_sizes[8] = {1, 3, 7};
+  size_t team_size_count = 3;
+  const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "1,56": two teams of that size each */
+  if (override && *override) {
+    team_size_count = 0;
+    for (char *copy = strdup(override), *token = strtok(copy, ","); token && team_size_count < 8;
+         token = strtok(NULL, ","))
+      team_sizes[team_size_count++] = atoi(token);
+  }
+  for (size_t ti = 0; ti < team_size_count; ti++) {
+    PoolConfig config = {.teams = 2, .threads = {team_sizes[ti], team_sizes[ti]}, .cpus = {NULL, NULL}};
+    pool_start(&config);
+    for (size_t pi = 0; pi < sizeof(positions) / sizeof(*positions); pi++) {
+      int pos = positions[pi], seq = pos + 4;
+      float *q = zeroed((size_t)heads * hd, sizeof(float)), *full = zeroed((size_t)heads * hd, sizeof(float));
+      float *split = zeroed((size_t)heads * hd, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+      float *kc = zeroed((size_t)seq * kv_full, sizeof(float)), *vc = zeroed((size_t)seq * kv_full, sizeof(float));
+      fill(q, (size_t)heads * hd, 2);
+      fill(kc, (size_t)seq * kv_full, 2);
+      fill(vc, (size_t)seq * kv_full, 1);
+      AttentionWork work;
+      k_attention_init(&work, heads, kv_heads, hd, seq); /* main thread: no team bound, default backend */
+      k_attention(full, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos);
+      k_attention_free(&work);
+      SplitJob job[2];
+      for (int s = 0; s < 2; s++)
+        job[s] = (SplitJob){.socket = s,
+                            .sockets = 2,
+                            .heads = heads,
+                            .kv_heads = kv_heads,
+                            .hd = hd,
+                            .pos = pos,
+                            .seq = seq,
+                            .q = q,
+                            .kc = kc,
+                            .vc = vc,
+                            .out = split};
+      pthread_t thread;
+      assert(!pthread_create(&thread, NULL, split_main, &job[1]));
+      split_main(&job[0]);
+      pthread_join(thread, NULL);
+      for (int i = 0; i < heads * hd; i++)
+        check("attention.split", split[i], full[i], 2e-5);
+      checks += 2;
+      if ((job[0].bad_guard || job[1].bad_guard) && failures++ < 20)
+        fprintf(stderr, "attention split [%s]: local cache guard overwritten (position %d)\n", current, pos);
+      if ((job[0].workers != team_sizes[ti] || job[1].workers != team_sizes[ti] || job[0].chunks < 1 ||
+           job[0].chunks != job[1].chunks) &&
+          failures++ < 20)
+        fprintf(stderr, "attention split [%s]: per-team work sized %d/%d for teams of %d\n", current, job[0].workers,
+                job[1].workers, team_sizes[ti]);
+      free(q), free(full), free(split), free(att), free(kc), free(vc);
+    }
+    pool_stop();
+  }
+}
+
+/* Attention time per socket on socket-local caches at the 8B shape (16 query heads and 4 KV heads per socket), for the
+ * B3 cluster check: both sockets attend at the same time on their own teams, at several contexts. */
+typedef struct {
+  int socket, context, reps;
+  atomic_int *go;
+  double median;
+  int chunks, workers;
+} BenchJob;
+
+static int compare_seconds(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x > y) - (x < y);
+}
+
+static void *bench_attention_main(void *p) {
+  BenchJob *job = p;
+  kernels_set_thread_team(pool_team(job->socket));
+  const int hl = 16, kl = 4, hd = 128, kv_local = kl * hd, seq = job->context + 1;
+  float *q = zeroed((size_t)hl * hd, sizeof(float)), *out = zeroed((size_t)hl * hd, sizeof(float));
+  float *kc = zeroed((size_t)seq * kv_local, sizeof(float)), *vc = zeroed((size_t)seq * kv_local, sizeof(float));
+  float *att = zeroed((size_t)hl * seq, sizeof(float));
+  double *samples = zeroed(job->reps, sizeof(double));
+  fill(q, (size_t)hl * hd, 2);
+  fill(kc, (size_t)seq * kv_local, 2);
+  fill(vc, (size_t)seq * kv_local, 1);
+  AttentionWork work;
+  float *work_memory = zeroed(k_attention_bytes(hl, kl, hd, seq) / sizeof(float) + 1, sizeof(float));
+  k_attention_init_in(&work, hl, kl, hd, seq, work_memory);
+  atomic_fetch_add(job->go, 1);
+  while (atomic_load(job->go) < 2)
+    ;
+  for (int r = 0; r < job->reps; r++) {
+    double start = monotonic_seconds();
+    k_attention(out, q, kc, vc, att, &work, hl, kl, hd, seq, job->context);
+    samples[r] = monotonic_seconds() - start;
+  }
+  qsort(samples, (size_t)job->reps, sizeof(double), compare_seconds);
+  job->median = samples[job->reps / 2];
+  job->chunks = k_attention_chunk_count(&work, kl, job->context);
+  job->workers = work.workers;
+  k_attention_free(&work);
+  kernels_set_thread_team(NULL);
+  free(q), free(out), free(kc), free(vc), free(att), free(samples), free(work_memory);
+  return NULL;
+}
+
+static void bench_attention(int threads) {
+  const Topology *topology = numa_topology();
+  const int *cpus[2] = {NULL, NULL};
+  if (topology->nsockets == 2 && topology->socket[0].cpus && topology->socket[0].ncpus >= threads &&
+      topology->socket[1].ncpus >= threads) {
+    cpus[0] = topology->socket[0].cpus;
+    cpus[1] = topology->socket[1].cpus;
+  }
+  PoolConfig config = {.teams = 2, .threads = {threads, threads}, .cpus = {cpus[0], cpus[1]}};
+  pool_start(&config);
+  const int contexts[] = {512, 8192, 32768};
+  for (size_t c = 0; c < sizeof(contexts) / sizeof(*contexts); c++) {
+    atomic_int go = 0;
+    BenchJob job[2];
+    for (int s = 0; s < 2; s++)
+      job[s] = (BenchJob){.socket = s, .context = contexts[c], .reps = 200, .go = &go};
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, bench_attention_main, &job[1]));
+    bench_attention_main(&job[0]);
+    pthread_join(thread, NULL);
+    printf("{\"kernel\": \"%s\", \"threads\": %d, \"pinned\": %d, \"context\": %d, \"chunks\": %d, "
+           "\"median_us\": [%.1f, %.1f]}\n",
+           kernels_name(), threads, cpus[0] != NULL, contexts[c], job[0].chunks, job[0].median * 1e6,
+           job[1].median * 1e6);
+  }
+  pool_stop();
+}
+
+int main(int argc, char **argv) {
+  if (argc >= 2 && !strcmp(argv[1], "bench-attention")) {
+    kernels_init();
+    bench_attention(argc > 2 ? atoi(argv[2]) : 4);
+    return 0;
+  }
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
-  float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
-  int8_t *quantized[2] = {zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1)};
-  float *scales[2] = {zeroed(Q8_VALUES, sizeof(float)), zeroed(Q8_VALUES, sizeof(float))};
+  float *rope[3] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float)),
+                    zeroed(ROPE_FLOATS, sizeof(float))};
+  int8_t *quantized[3] = {zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1)};
+  float *scales[3] = {zeroed(Q8_VALUES, sizeof(float)), zeroed(Q8_VALUES, sizeof(float)),
+                      zeroed(Q8_VALUES, sizeof(float))};
   size_t rope_used = 0;
-  int ran[2] = {0, 0};
-  const KernelIsa isas[2] = {KERNELS_SCALAR, KERNELS_AVX512};
-  for (int i = 0; i < 2; i++) {
+  int ran[3] = {0, 0, 0};
+  /* The amx level runs every kernel on its AVX-512 path (AMX only touches the batched GEMM tiles), so this repeats the
+   * whole suite under LLAMA_KERNELS=amx; it is skipped where AMX or its permission is unavailable (C4). */
+  const KernelIsa isas[3] = {KERNELS_SCALAR, KERNELS_AVX512, KERNELS_AMX};
+  const char *const isa_names[3] = {"scalar", "avx512", "amx"};
+  for (int i = 0; i < 3; i++) {
     unsigned long long seed = rng;
     if (!kernels_select(isas[i])) {
-      printf("kernels: %s unavailable on this CPU, skipped\n", i ? "avx512" : "scalar");
+      printf("kernels: %s unavailable on this CPU, skipped\n", isa_names[i]);
       continue;
     }
     current = kernels_name();
@@ -377,18 +795,23 @@ int main(void) {
     rope_used = test_rope(rope[i]);
     test_attention();
     test_attention_batch();
+    test_partial();
+    test_two_teams();
+    test_attention_split();
     rng = seed; /* identical inputs for every instruction set */
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
   }
-  if (ran[0] && ran[1]) {
-    current = "scalar vs avx512";
+  for (int other = 1; other < 3; other++) {
+    if (!(ran[0] && ran[other]))
+      continue;
+    current = other == 1 ? "scalar vs avx512" : "scalar vs amx";
     checks += 3;
-    if (memcmp(rope[0], rope[1], rope_used * sizeof(float)) && failures++ < 20)
+    if (memcmp(rope[0], rope[other], rope_used * sizeof(float)) && failures++ < 20)
       fprintf(stderr, "rope [%s]: results differ bitwise\n", current);
-    if (memcmp(quantized[0], quantized[1], Q8_VALUES) && failures++ < 20)
+    if (memcmp(quantized[0], quantized[other], Q8_VALUES) && failures++ < 20)
       fprintf(stderr, "quantize [%s]: int8 values differ bitwise\n", current);
-    if (memcmp(scales[0], scales[1], Q8_VALUES * sizeof(float)) && failures++ < 20)
+    if (memcmp(scales[0], scales[other], Q8_VALUES * sizeof(float)) && failures++ < 20)
       fprintf(stderr, "quantize [%s]: scales differ bitwise\n", current);
   }
   /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
@@ -405,7 +828,7 @@ int main(void) {
   int8_t *scratch_q = zeroed(Q8_VALUES, 1);
   float *scratch_s = zeroed(Q8_VALUES, sizeof(float));
   static char label[64];
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     if (!ran[i])
       continue;
     kernels_select(isas[i]);
@@ -421,6 +844,7 @@ int main(void) {
       test_norm();
       test_attention();
       test_attention_batch();
+      test_partial();
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();
@@ -429,7 +853,8 @@ int main(void) {
   free(scratch_q), free(scratch_s);
   for (int i = 0; i < MEM_COUNT; i++)
     assert(memory_current[i] == 0);
-  free(rope[0]), free(rope[1]), free(quantized[0]), free(quantized[1]), free(scales[0]), free(scales[1]);
+  for (int i = 0; i < 3; i++)
+    free(rope[i]), free(quantized[i]), free(scales[i]);
   printf("kernels: %d checks, %d failures\n", checks, failures);
   return failures != 0;
 }

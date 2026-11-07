@@ -12,7 +12,9 @@ Make AMX available as a runtime-selected ISA level without adding dependencies:
 
 Nothing in the forward pass uses AMX yet. That comes in C5 and C6.
 
-Status: **planned**. Branch: `feature/prefill-c4-amx-enable`.
+Status: **implemented locally; AMX hardware check pending** (2026-11-07). Branch: `feature/prefill-c4-amx-enable`
+(worked on in the `tp-local-c` worktree). Everything below is in; what has run is listed in §5, and what needs a
+real AMX node is the open cluster check in §6.
 
 ## 2. Depends on / unblocks
 
@@ -97,13 +99,66 @@ Both take a `Shard` (B1), so one-socket and two-socket packing share the same co
 ## 6. Cluster run
 
 `cresco8-prefill.sbatch STAGE=check PHASE=C4`. **Estimated** at 20 minutes. It needs
-the user's go-ahead to submit.
+the user's go-ahead to submit. **Open, not submitted**: `phase_C4` is written and verified with `DRY_RUN=1`; no AMX
+instruction has run yet.
+
+`phase_C4` runs `test-amx`, `test-amx-emul`, `test-kernels` and `test-gemm` at 1 and 56 workers (both now repeat their suite
+at the `amx` level) and `amx-bench` (`tests/amx_bench.c`); it records PASS only when the output shows the hardware tiles
+(`amx: hardware tiles, permission granted`) and `kernels: amx teams:56 ok`, so an `amx unavailable` skip cannot pass.
 
 | Run | Gate or record |
 | --- | --- |
 | `test-kernels` with `LLAMA_KERNELS=amx` at 1 and 56 workers | `amx ok` |
 | Permission report | `ARCH_GET_XCOMP_PERM` shows XTILEDATA |
 | Tile microbenchmark: one core and 56 cores, BF16 and INT8, L2-resident operands | **Measured** TFLOP/s and TOPS vs the **measured** 112 TF / 225 TOPS peaks |
+
+### Local results (2026-11-07, macOS arm64, no AMX)
+
+| Check | Result |
+| --- | --- |
+| `make test` (`test-amx`, `test-amx-emul`, Python suites) | green; `test-amx` prints `amx unavailable: ...` and skips the tile kernels |
+| `test-amx-emul`: BF16 tile GEMM, 7 x 6 x 11 shapes, tails in m, n and k, a leading dimension wider than the padded K | worst error 1.1e-7 of Σ\|w·x\| against a 2e-6 budget |
+| `test-amx-emul`: INT8 tile GEMM, same shapes, values in [-128, 127] | exact int32 equality |
+| `test-amx-emul`: 6 worker threads, 3 rounds, each configuring its own tiles | pass |
+| Packing helpers, every platform | unpacked through the tile geometry, bitwise equal, padding zero, `_tiles` range forms identical |
+| `-arch x86_64` build of `src/gemm.c`, `src/kernels_simd.c` and `tests/amx.c`, run under Rosetta | compiles clean; the CPUID path reports `this CPU does not report AMX-TILE, AMX-BF16 and AMX-INT8` |
+
+Not exercised locally, because they need an AMX CPU on Linux: the real `_tile_*` instructions, the
+`arch_prctl(ARCH_REQ_XCOMP_PERM)` request and `ARCH_GET_XCOMP_PERM` read-back, and GCC 11.4.1 compiling the
+intrinsics. The emulation model (`tests/amx_emul.h`) accumulates each K pair as even product then odd product with one
+FP32 rounding per addition; the hardware's order inside a pair is not specified, which is why the BF16 budget is
+2e-6 and not zero.
+
+### Implementation notes
+
+- **ISA level.** `KERNELS_AMX` sits above `KERNELS_AVX512` in `include/kernels.h`. The `isa` the other kernels branch
+  on stays `KERNELS_AVX512` when AMX is selected; AMX state lives in `gemm.c` (`gemm_amx_active()`), so no AVX-512 kernel
+  changed. Edits to `src/kernels_simd.c` are limited to `supported()`, `kernels_select()`, `kernels_init()`,
+  `kernels_name()`, `kernels_amx_active()` and one `gemm_amx_thread_release()` call in `kernels_backend_free()`.
+- **Detection.** CPUID leaf 7 subleaf 0 EDX bits 22, 24 and 25 directly, not `__builtin_cpu_supports`, so the result
+  does not depend on the compiler's list of feature names. AVX-512 F/BW/DQ/VL/VNNI is required too.
+- **Permission.** `gemm_amx_unavailable()` issues the request once (in `kernels_init`, before the worker team exists)
+  and reads it back with `ARCH_GET_XCOMP_PERM`. The result is `build.amx_permission` in the report: `not requested`,
+  `granted`, `denied` or `unsupported`.
+- **Tile configuration.** All eight tiles are 16 rows of 64 bytes (the same configuration serves BF16 and int8). A
+  thread configures at its first AMX call; the key destructor releases the tiles when a worker exits, and
+  `kernels_backend_free()` releases the coordinator's. No change to `src/workers.c` was needed.
+- **Packing layout.** A tile of 16 output channels is stored K-pair-major (BF16) or K-quad-major (int8), so one tile
+  load is a contiguous 1 KiB: BF16 element `nt * kp * 16 + (k / 32) * 512`, int8 byte `nt * kp * 16 + (k / 64) * 1024`,
+  with K and the channels zero-padded (`kp` = K rounded up to 32 or 64). The helpers take plain `(rows, cols, ld)`
+  pointers. A B1 `Shard` is a (row range, column range) copy of the same `W[out][in]` matrix with its own stride
+  (`ld` = `cols`), so the call is `pack_*(dst, shard->q, shard->rows, shard->cols, shard->ld)`;
+  `pack_bf16_job_from_shard` and `pack_s8_job_from_shard` build that job (with a check that the shard is a bound ROWS or
+  COLS shard of the right dtype), and `pack_*_vnni_many` takes one job per shard. Added on the integration branch
+  `feature/tp-merge-b-c`; `tests/shards.c` checks, for every ROWS and COLS shard of 96 plans (FP32 and Q8, one and two
+  sockets), that the job's bytes equal packing the matching slice of the source tensor in place. Not done: the engines
+  still pack whole matrices (`run.c`, `runq.c`), and the two-socket path (`src/tp.c`) does not pack at all, so
+  `LLAMA_SOCKETS=2` with `LLAMA_PRECISION=bf16` is rejected until D1 wires a packed forward per socket. A Q8 shard's
+  group scales stay in `shard->s` and are read in place, as `K8Weight` does.
+- **Microkernel contract.** `A` must be zero-padded and readable up to whole tiles, `C` has room for whole 16 x 16
+  tiles. The C5 and C6 drivers own that padding in their aligned A panels.
+- **Workspace.** `aligned_buffer_alloc()` carves a 64-byte-aligned range out of an accounted `memory_alloc`; the C5
+  packed weights use a bound region instead.
 
 ## 7. Exit criteria
 

@@ -4,16 +4,22 @@
  *   test-workers fail-worker           a worker calls fail(): the process must exit, not hang
  *   test-workers fail-leader           the leader calls fail() with idle workers
  *   test-workers affinity [N]          pin N workers to allowed CPUs (Linux) and print the read-back as JSON
- *   test-workers bench-barrier [ROUNDS] per-barrier cost for team sizes 2..N (measurement, not a test) */
+ *   test-workers bench-barrier [ROUNDS] per-barrier cost for team sizes 2..N (measurement, not a test)
+ *   test-workers exchange GENS [T0 T1 E]   cross-socket reduction stress, bitwise against a serial reference
+ *   test-workers bench-exchange [GENS] [T] one reduction's latency (median, p99) for decode and prefill sizes
+ *   test-workers exchange-fail-worker      a socket-1 worker calls fail() mid-generation: exit, not hang
+ *   test-workers exchange-fail-leader      the socket-0 coordinator calls fail() while socket 1 waits for it */
 #include "workers.h"
 #include "numa.h"
 #include "runtime.h"
 #include <assert.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
   atomic_int visits[64];
@@ -190,8 +196,304 @@ static void bench_barrier(int rounds, int max_threads) {
   }
 }
 
+/* ---- Cross-socket reduction (B4) --------------------------------------------------------------------------------
+ * Two coordinator threads (the main thread for socket 0, a pthread for socket 1) drive two teams through G
+ * generations. Every generation's partials are a function of (seed, g, socket, i), so a buffer overwritten before the
+ * peer consumed it, or read before it was ready, changes some residual bit. */
+static unsigned hash32(unsigned x) {
+  x ^= x >> 16;
+  x *= 0x7feb352dU;
+  x ^= x >> 15;
+  x *= 0x846ca68bU;
+  x ^= x >> 16;
+  return x;
+}
+static float partial_value(unsigned seed, unsigned g, int socket, int i) {
+  unsigned h = hash32(seed ^ hash32(g * 0x9E3779B1U + (unsigned)socket * 0x85EBCA6BU + (unsigned)i * 0xC2B2AE35U));
+  return (float)(int)h * (1.0f / 2147483648.0f);
+}
+
+typedef struct {
+  Exchange *exchange;
+  int socket, elements, generations;
+  unsigned seed;
+  unsigned delay_permille, delay_us; /* chance per protocol step and longest sleep */
+  int fail_at, fail_worker;          /* generation at which to call fail(); fail_worker -1 = the coordinator */
+  float *residual;
+} Side;
+
+typedef struct {
+  Side *side;
+  unsigned generation;
+  float *partial;
+} GenJob;
+
+static void inject(unsigned *state, const Side *side) {
+  *state = hash32(*state + 0x6D2B79F5U);
+  if (*state % 1000 < side->delay_permille)
+    usleep(*state / 1000 % (side->delay_us + 1));
+  else if (*state % 11 == 0)
+    sched_yield();
+}
+
+static void generation_fn(const void *p, int worker, int workers) {
+  const GenJob *job = p;
+  Side *side = job->side;
+  unsigned state = side->seed + 0x9E3779B9U * (unsigned)(worker + 1) + job->generation * 7919U;
+  int i0 = (int)((long long)side->elements * worker / workers),
+      i1 = (int)((long long)side->elements * (worker + 1) / workers);
+  inject(&state, side);
+  if ((int)job->generation == side->fail_at && worker == side->fail_worker)
+    fail("injected failure in exchange worker %d of socket %d", worker, side->socket);
+  for (int i = i0; i < i1; i++)
+    job->partial[i] = partial_value(side->seed, job->generation, side->socket, i);
+  inject(&state, side); /* a late ready */
+  exchange_reduce_add(side->exchange, side->socket, worker, workers, side->residual, side->elements);
+  inject(&state, side); /* a late next projection */
+}
+
+static void run_side(Side *side) {
+  Team *team = pool_team(side->socket);
+  unsigned state = side->seed ^ 0xA5A5A5A5U;
+  for (int g = 1; g <= side->generations; g++) {
+    inject(&state, side);
+    if (g == side->fail_at && side->fail_worker < 0)
+      fail("injected failure in the coordinator of socket %d", side->socket);
+    float *partial = exchange_partial(side->exchange, side->socket);
+    if (!partial)
+      return; /* aborted */
+    GenJob job = {side, (unsigned)g, partial};
+    team_run(team, generation_fn, &job);
+  }
+}
+
+static void *side_main(void *p) {
+  run_side(p);
+  return NULL;
+}
+
+typedef struct {
+  int threads[2], elements, generations;
+  unsigned delay_permille[2], delay_us[2];
+  int use_regions, fail_at, fail_worker;
+} ExchangeCase;
+
+static void exchange_case(const ExchangeCase *c) {
+  PoolConfig config = {.teams = 2, .threads = {c->threads[0], c->threads[1]}, .cpus = {NULL, NULL}};
+  pool_start(&config);
+  NumaRegion regions[2] = {{0}, {0}};
+  NumaRegion *use[2] = {NULL, NULL};
+  if (c->use_regions)
+    for (int s = 0; s < 2; s++) {
+      region_reserve(&regions[s], exchange_region_bytes(c->elements), s, -1, ROLE_WORK, 0);
+      use[s] = &regions[s];
+    }
+  Exchange *e = exchange_create(c->elements, use);
+  float *initial = memory_alloc((size_t)c->elements, sizeof(float), MEM_ACTIVATION);
+  float *reference = memory_alloc((size_t)c->elements, sizeof(float), MEM_ACTIVATION);
+  Side side[2];
+  for (int i = 0; i < c->elements; i++)
+    initial[i] = partial_value(99, 0, 2, i);
+  memcpy(reference, initial, (size_t)c->elements * sizeof(float));
+  for (int s = 0; s < 2; s++) {
+    side[s] = (Side){.exchange = e,
+                     .socket = s,
+                     .elements = c->elements,
+                     .generations = c->generations,
+                     .seed = 1234,
+                     .delay_permille = c->delay_permille[s],
+                     .delay_us = c->delay_us[s],
+                     .fail_at = c->fail_at,
+                     .fail_worker = c->fail_worker,
+                     .residual = memory_alloc((size_t)c->elements, sizeof(float), MEM_ACTIVATION)};
+    side[s].fail_at = c->fail_at && ((s == 1) == (c->fail_worker >= 0)) ? c->fail_at : 0; /* one socket fails */
+    memcpy(side[s].residual, initial, (size_t)c->elements * sizeof(float));
+  }
+  pthread_t thread;
+  assert(!pthread_create(&thread, NULL, side_main, &side[1]));
+  if (c->fail_at)
+    pthread_detach(thread); /* fail() ends the process; nothing joins the coordinator of socket 1 */
+  run_side(&side[0]);
+  if (!c->fail_at)
+    pthread_join(thread, NULL);
+  for (int g = 1; g <= c->generations; g++)
+    for (int i = 0; i < c->elements; i++)
+      reference[i] += partial_value(1234, (unsigned)g, 0, i) + partial_value(1234, (unsigned)g, 1, i);
+  for (int s = 0; s < 2; s++) {
+    for (int i = 0; i < c->elements; i++)
+      if (memcmp(&side[s].residual[i], &reference[i], sizeof(float))) {
+        fprintf(stderr, "socket %d element %d differs from the serial reference\n", s, i);
+        abort();
+      }
+    memory_free(side[s].residual);
+  }
+  memory_free(reference);
+  memory_free(initial);
+  exchange_destroy(e);
+  for (int s = 0; s < 2; s++)
+    region_release(&regions[s]);
+  pool_stop();
+  for (int i = 0; i < MEM_COUNT; i++)
+    assert(memory_current[i] == 0);
+}
+
+static void unit_exchange(int scale) {
+  const int teams[] = {1, 3, 7};
+  const int sizes[] = {1, 7, 4096, 4096 * 64};
+  for (size_t t = 0; t < sizeof(teams) / sizeof(*teams); t++)
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(*sizes); k++) {
+      ExchangeCase c = {
+          .threads = {teams[t], teams[t]}, .elements = sizes[k], .generations = 1000 * scale / 100, .fail_worker = -1};
+      if (sizes[k] > 4096)
+        c.generations /= 5;
+      c.use_regions = (int)((t + k) & 1);
+      exchange_case(&c);
+    }
+  /* Different team sizes, and a slow producer or a slow consumer on either socket: the fast side runs ahead by two
+   * generations and must then block until the peer acknowledges the buffer it wants to reuse. */
+  ExchangeCase skew = {.threads = {3, 1}, .elements = 4096, .generations = 300 * scale / 100, .fail_worker = -1};
+  exchange_case(&skew);
+  for (int slow = 0; slow < 2; slow++) {
+    ExchangeCase c = {.threads = {3, 3}, .elements = 257, .generations = 400 * scale / 100, .fail_worker = -1};
+    c.delay_permille[slow] = 300;
+    c.delay_us[slow] = 300;
+    exchange_case(&c);
+  }
+  ExchangeCase both = {.threads = {2, 5},
+                       .elements = 1000,
+                       .generations = 400 * scale / 100,
+                       .fail_worker = -1,
+                       .delay_permille = {150, 150},
+                       .delay_us = {100, 400}};
+  exchange_case(&both);
+}
+
+typedef struct {
+  Exchange *exchange;
+  atomic_int done;
+} AbortSide;
+
+static void *abort_later(void *p) {
+  usleep(50000);
+  exchange_abort(((AbortSide *)p)->exchange);
+  return NULL;
+}
+
+static void unit_exchange_abort(void) {
+  PoolConfig config = {.teams = 2, .threads = {3, 3}, .cpus = {NULL, NULL}};
+  pool_start(&config);
+  Exchange *e = exchange_create(64, NULL);
+  float residual[64] = {0};
+  Side side = {
+      .exchange = e, .socket = 0, .elements = 64, .generations = 1, .seed = 5, .fail_worker = -1, .residual = residual};
+  AbortSide abort_side = {.exchange = e};
+  pthread_t thread;
+  /* Socket 1 never publishes: socket 0's workers wait for ready_1 until the abort releases them. */
+  assert(!pthread_create(&thread, NULL, abort_later, &abort_side));
+  run_side(&side);
+  pthread_join(thread, NULL);
+  assert(workers_aborted());
+  /* A coordinator blocked on the reuse rule is released too, and gets no buffer. */
+  workers_abort_clear();
+  assert(exchange_partial(e, 1) && exchange_partial(e, 1)); /* generations 1 and 2 do not wait */
+  assert(!pthread_create(&thread, NULL, abort_later, &abort_side));
+  assert(exchange_partial(e, 1) == NULL); /* generation 3 waits for consumed_0 >= 1 */
+  pthread_join(thread, NULL);
+  exchange_destroy(e); /* returns despite the unacknowledged generations */
+  pool_stop();
+  workers_abort_clear();
+  for (int i = 0; i < MEM_COUNT; i++)
+    assert(memory_current[i] == 0);
+}
+
+static int compare_double(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x > y) - (x < y);
+}
+
+/* Latency of one reduction as seen by socket 0's coordinator: partial write, both barriers, the peer wait and the add.
+ * Workers are pinned to the sockets' CPUs when the topology has two real sockets with enough of them. */
+static void bench_exchange(int generations, int threads) {
+  const Topology *topology = numa_topology();
+  const int *cpus[2] = {NULL, NULL};
+  if (topology->nsockets == 2 && topology->socket[0].cpus && topology->socket[1].cpus &&
+      topology->socket[0].ncpus >= threads && topology->socket[1].ncpus >= threads) {
+    cpus[0] = topology->socket[0].cpus;
+    cpus[1] = topology->socket[1].cpus;
+  }
+  const int sizes[] = {4096, 4096 * 16, 4096 * 64, 4096 * 256};
+  for (size_t k = 0; k < sizeof(sizes) / sizeof(*sizes); k++) {
+    PoolConfig config = {.teams = 2, .threads = {threads, threads}, .cpus = {cpus[0], cpus[1]}};
+    pool_start(&config);
+    NumaRegion regions[2] = {{0}, {0}};
+    NumaRegion *use[2] = {&regions[0], &regions[1]};
+    for (int s = 0; s < 2; s++) {
+      int node = topology->nsockets == 2 && cpus[0] ? topology->socket[s].hbm_node : -1;
+      region_reserve(&regions[s], exchange_region_bytes(sizes[k]), s, node, ROLE_WORK, 0);
+    }
+    Exchange *e = exchange_create(sizes[k], use);
+    Side side[2];
+    for (int s = 0; s < 2; s++)
+      side[s] = (Side){.exchange = e,
+                       .socket = s,
+                       .elements = sizes[k],
+                       .generations = generations,
+                       .seed = 7,
+                       .fail_worker = -1,
+                       .residual = memory_alloc((size_t)sizes[k], sizeof(float), MEM_ACTIVATION)};
+    double *samples = memory_alloc((size_t)generations, sizeof(double), MEM_ACTIVATION);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, side_main, &side[1]));
+    Team *team = pool_team(0);
+    for (int g = 1; g <= generations; g++) {
+      double start = monotonic_seconds();
+      float *partial = exchange_partial(e, 0);
+      GenJob job = {&side[0], (unsigned)g, partial};
+      team_run(team, generation_fn, &job);
+      samples[g - 1] = monotonic_seconds() - start;
+    }
+    pthread_join(thread, NULL);
+    qsort(samples, (size_t)generations, sizeof(double), compare_double);
+    printf("{\"threads\": %d, \"elements\": %d, \"pinned\": %d, \"generations\": %d, \"median_us\": %.2f, "
+           "\"p99_us\": %.2f}\n",
+           threads, sizes[k], cpus[0] != NULL, generations, samples[generations / 2] * 1e6,
+           samples[(size_t)generations * 99 / 100] * 1e6);
+    memory_free(samples);
+    for (int s = 0; s < 2; s++)
+      memory_free(side[s].residual);
+    exchange_destroy(e);
+    for (int s = 0; s < 2; s++)
+      region_release(&regions[s]);
+    pool_stop();
+  }
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 2 && !strcmp(argv[1], "bench-exchange")) {
+    bench_exchange(argc > 2 ? atoi(argv[2]) : 20000, argc > 3 ? atoi(argv[3]) : 4);
+    return 0;
+  }
+  if (argc >= 2 && !strcmp(argv[1], "exchange")) {
+    ExchangeCase c = {.threads = {argc > 3 ? atoi(argv[3]) : 3, argc > 4 ? atoi(argv[4]) : 3},
+                      .elements = argc > 5 ? atoi(argv[5]) : 4096,
+                      .generations = argc > 2 ? atoi(argv[2]) : 1000,
+                      .fail_worker = -1,
+                      .delay_permille = {50, 50},
+                      .delay_us = {200, 200}};
+    exchange_case(&c);
+    return 0;
+  }
+  if (argc == 2 && (!strcmp(argv[1], "exchange-fail-worker") || !strcmp(argv[1], "exchange-fail-leader"))) {
+    ExchangeCase c = {.threads = {3, 3}, .elements = 4096, .generations = 100, .fail_at = 17};
+    c.fail_worker = !strcmp(argv[1], "exchange-fail-worker") ? 1 : -1;
+    c.delay_permille[0] = c.delay_permille[1] = 50;
+    c.delay_us[0] = c.delay_us[1] = 100;
+    exchange_case(&c);
+    return 3; /* unreachable: fail() exits */
+  }
   if (argc == 1 || (argc == 2 && atoi(argv[1]) > 0)) {
+    unit_exchange(100);
+    unit_exchange_abort();
     unit_lifecycle();
     unit_rows();
     barrier_stress(argc == 2 ? atoi(argv[1]) : 20000, 5);
