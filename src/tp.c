@@ -376,7 +376,9 @@ static int placement_node(const char *mode, const SocketTopo *socket, int embedd
 }
 
 static void verify_bound(NumaRegion *r, const char *mode) {
-  if (r->node < 0)
+  /* A region that was never reserved (the global one of a model with a tied embedding) is zero-initialised, which reads
+   * as node 0: there is nothing to verify. */
+  if (r->node < 0 || !r->mapping_base)
     return;
   PageCheck check = {0};
   if (region_verify(r, region_verify_samples_default(), &check) != 0) {

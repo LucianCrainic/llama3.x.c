@@ -261,6 +261,31 @@ static void run_matrix(const char *label) {
          failures == before ? "all within budget" : "FAILED");
 }
 
+/* Real layers are far larger than the matrix above (K up to 14336, N up to 14336, M = 64 microbatches): sizes that cross
+ * several M blocks, N chunks and many K groups, with edges that are not multiples of the tile or chunk sizes. */
+static void run_large(const char *label) {
+  const int shapes[][4] = {{64, 130, 2048, 64}, {64, 33, 8192, 64}, {37, 520, 1024, 64}, {128, 70, 2048, 128},
+                           {64, 600, 4096, 64}, {96, 257, 3072, 64},
+                           /* K sweep up to the largest layer input of the 8B model, then M and N edges */
+                           {16, 48, 128, 64}, {16, 48, 512, 64}, {16, 48, 1024, 64}, {16, 48, 2048, 64},
+                           {16, 48, 4096, 64}, {16, 48, 8192, 64}, {16, 48, 14336, 64}, {64, 4096, 2048, 64},
+                           {64, 14336, 4096, 64}, {53, 1024, 2048, 64}};
+  int before = failures;
+  for (size_t i = 0; i < sizeof(shapes) / sizeof(*shapes); i++) {
+    Case c;
+    make_case(&c, shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3]);
+    check_quantize(&c);
+    free(check_backend(&c, Q8_GEMM_PORTABLE, 0));
+    free(check_backend(&c, Q8_GEMM_AVX512, 0));
+    if (amx_usable()) {
+      free(check_backend(&c, Q8_GEMM_AMX, 0));
+      check_amx_dots(&c);
+    }
+    free_case(&c);
+  }
+  printf("q8: %s: real-size shapes: %s\n", label, failures == before ? "all within budget" : "FAILED");
+}
+
 int main(void) {
   /* Scalar instruction set: portable batched Q8 == per-row GEMV, bit for bit. */
   kernels_select(KERNELS_SCALAR);
@@ -276,14 +301,27 @@ int main(void) {
            failures ? "FAILED" : "ok");
   }
   run_matrix("single thread");
-  const int team_sizes[] = {3, 7};
-  for (size_t t = 0; t < 2; t++) {
+  run_large("single thread");
+  int team_sizes[8] = {3, 7};
+  size_t team_count = 2;
+  const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "28,56" for full-socket teams on the cluster */
+  if (override && *override) {
+    team_count = 0;
+    for (const char *q = override; *q && team_count < 8;) {
+      team_sizes[team_count++] = atoi(q);
+      while (*q && *q != ',')
+        q++;
+      q += *q == ',';
+    }
+  }
+  for (size_t t = 0; t < team_count; t++) {
     PoolConfig config = {.teams = 1, .threads = {team_sizes[t], 0}, .cpus = {NULL, NULL}};
     pool_start(&config);
     kernels_set_team(pool_team(0));
     char label[32];
     snprintf(label, sizeof(label), "teams:%d", team_sizes[t]);
     run_matrix(label);
+    run_large(label);
     kernels_set_team(NULL);
     pool_stop();
   }

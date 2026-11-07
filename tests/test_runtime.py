@@ -359,8 +359,12 @@ class RuntimeTests(unittest.TestCase):
         result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
                                  '-i', 'A', '-t', '0'], capture_output=True, text=True,
                                 env={**os.environ, 'LLAMA_KERNELS': 'amx'})
-        if result.returncode:  # this host has no AMX or the kernel refuses the permission
-            self.assertIn('LLAMA_KERNELS=amx requested, but AMX is unavailable', result.stderr)
+        # An FP32 checkpoint never runs AMX without LLAMA_PRECISION=bf16, so this request fails on every host: with the
+        # availability reason where there is no AMX (or the kernel refuses the permission), with the mode guard where
+        # there is (the guard comes first on AMX hosts).
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue('LLAMA_KERNELS=amx requested, but AMX is unavailable' in result.stderr or
+                        'requires LLAMA_PRECISION=bf16' in result.stderr, result.stderr)
         result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
                                  '-i', 'A', '-t', '0'], capture_output=True, text=True,
                                 env={**os.environ, 'LLAMA_KERNELS': 'bogus'})
