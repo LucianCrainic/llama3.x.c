@@ -13,7 +13,10 @@ with AMX-BF16.
 FP32 execution is never changed silently. Without `LLAMA_PRECISION=bf16`, nothing in
 this phase is active.
 
-Status: **planned**. Branch: `feature/prefill-c5-amx-bf16`.
+Status: **implemented locally; cluster check pending** (2026-11-07). Branch: `feature/prefill-c5-amx-bf16` (worked
+on in the `tp-local-c` worktree). The mode, packing, GEMM driver, scalar reference forward, report fields and guards
+are in and tested on macOS (portable reference and the software tile model). The AMX hardware run, the error
+characterization against FP32 and HF, and therefore the final error gate, are open: §6.
 
 ## 2. Depends on / unblocks
 
@@ -97,6 +100,45 @@ the user's go-ahead to submit.
 | `validate.py --hf` in BF16 mode | Recorded vs HF |
 | Packing time, packed bytes, per-socket budget | **Measured** |
 | Short sweep: 8B, 2048-token prompt, M ∈ {32, 64, 128, 256} | Prefill tok/s recorded |
+
+### Local results (2026-11-07, macOS arm64, no AMX)
+
+| Check | Result |
+| --- | --- |
+| `test-bf16`: FP32 to BF16 conversion vs an independent round-to-nearest-even reference built from the two neighbouring values | bitwise equal on ties at every exponent (and ±1 around each tie), ±0, ±Inf, NaN (signalling, payload below the BF16 bits, quieted, sign kept), the largest finite value and its tie to infinity, the denormal range, a stride sweep of the whole 32-bit space and 1e6 random values |
+| `test-bf16`: `k_gemm_bf16` (STORE, ADD, SWIGLU, PARTIAL; m, n, k tails; padded `ldc`) vs a double reference on BF16-rounded operands, 1, 3 and 7 workers | within `2e-6·Σ\|w·x\|` (SWIGLU: the composite bound of `tests/gemm.c`); padding between rows untouched |
+| `test-bf16-emul`: the AMX path on the software tile model vs the portable reference | **bit for bit** equal on all of the above (the model adds every K pair in ascending order, and a BF16 product is exact in FP32) |
+| `test-bf16-engine[-emul]`, synthetic fixture, 24 positions, all-position logits | per-token (decode) logits in BF16 mode equal the FP32 model **bitwise**; BF16 logits are bitwise independent of the microbatch split (M = 2, 7, whole); emulated AMX equals the scalar BF16 reference forward (max\|Δ\| = 0). BF16 vs FP32 on this fixture: max_abs 1.5e-3, rms 3.7e-4, argmax agreement 1/24 (the fixture's logits are near-flat noise; recorded, not gated) |
+| `tests/test_runtime.py` | mode validation, guards, report fields, packed-region accounting (`packed_weights_peak` equals the padded size formula under `LLAMA_PLACEMENT=ddr`), FP32 default unchanged |
+| `make test`, `make MODE=sanitize test` | green on macOS (see the final run in the README) |
+
+Not exercised locally: the real `tdpbf16ps` instruction (its in-pair summation order may differ from the model's in the
+last bit, which is the reason for the 2e-6 budget on hardware), the 1B and 8B models, the Hugging Face comparison, and
+everything about speed.
+
+### Implementation notes
+
+- **Selection.** `LLAMA_PRECISION=bf16` (default `fp32`; `run` only, `runq` rejects it). It needs `LLAMA_PREFILL_BATCH` of
+  2 or more and is incompatible with `LLAMA_PREFILL_GEMM=off`, both rejected with a message. With `LLAMA_KERNELS=amx`
+  the AMX tiles run; with any other kernel set the portable BF16 GEMM runs (logged as slow, reported as
+  `kernels_prefill: "bf16-reference"`, and it is what the tests use as the scalar reference). `LLAMA_KERNELS=amx` on an
+  FP32 checkpoint without `LLAMA_PRECISION=bf16` fails: `LLAMA_KERNELS=amx on an FP32 checkpoint requires
+  LLAMA_PRECISION=bf16: FP32 execution never changes precision silently`. `LLAMA_BF16_DROP_FP32` is rejected.
+- **What runs in BF16.** QKV, Wo, W1/W3, W2 of the batched path, including a batch of one row (so a prompt's result does
+  not depend on how it was split; the decode path `engine_forward` never uses the packed weights). The last-row
+  classifier stays FP32; `LOGITS_ALL` runs one BF16 GEMM on a classifier packed on first use (accounted, logged).
+- **Packing.** At load, on the worker team, into one `ROLE_PACKED` region (`packed_open/take/seal` in `src/loader.c`):
+  bound to the placement mode's weights node, claimed against `LLAMA_HBM_BUDGET_GIB` before any byte is packed,
+  read-only afterwards and page-verified like the other regions. `packed_weights_peak` is the region size,
+  `timing_seconds.weight_pack` the time. The B1 `Shard` descriptor is not used yet: the loop packs the whole matrices;
+  with shards, the same `pack_bf16_vnni_many` job list takes one entry per shard (see the C4 note).
+- **Report.** `runtime.precision_mode` is `bf16` (the engine's `engine_precision()` returns `bf16_from_fp32`),
+  `runtime.kernels_prefill` is `amx-bf16` or `bf16-reference`, `build.amx_permission`, `memory_bytes.packed_weights_peak`,
+  `timing_seconds.weight_pack`.
+- **Conversion.** Integer round-to-nearest-even; denormals are converted, not flushed; NaN stays NaN (quieted). The
+  AVX512-BF16 instruction `vcvtneps2bf16` is deliberately not used: it flushes denormal inputs, which would break the
+  bitwise equality with the reference. Measure the conversion cost on the cluster (§8) before deciding whether a
+  vectorized integer version is needed.
 
 ## 7. Exit criteria
 

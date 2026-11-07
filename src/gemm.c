@@ -585,3 +585,148 @@ int k_gemm_f32_simd_test(const float *a, int lda, int m, int k, const GemmSegmen
 void k_gemm_f32_portable(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc) {
   gemm_run(a, lda, m, k, segments, count, kc, micro_portable);
 }
+
+/* ---- BF16 GEMM (C5) --------------------------------------------------------------------------------------------- */
+
+/* The reference tile kernel: the same contract and the same result as amx_bf16_tile_gemm, in plain C. Every product of
+ * two BF16 values is exact in FP32, and the sum runs in ascending K, so this is the scalar BF16 reference ("convert,
+ * then multiply in FP32") and it equals the software tile model bit for bit. */
+static void bf16_micro_portable(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n,
+                                int k) {
+  const size_t kp = round_up((size_t)k, 32);
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++) {
+      const uint16_t *b = bp + (size_t)(j / 16) * kp * 16 + (size_t)(j % 16) * 2;
+      float sum = 0.0f;
+      for (int l = 0; l < k; l++)
+        sum += f32_from_bf16(a[(size_t)i * lda + l]) * f32_from_bf16(b[(size_t)(l / 2) * 32 + (size_t)(l & 1)]);
+      c[(size_t)i * ldc + j] = sum;
+    }
+}
+
+typedef void (*Bf16Micro)(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k);
+
+typedef struct {
+  const float *src;
+  uint16_t *panel;
+  size_t src_ld, panel_ld;
+  int m, k, count;
+  GemmBf16Segment segment[GEMM_MAX_SEGMENTS];
+  Bf16Micro micro;
+} Bf16Job;
+
+/* One chunk is one panel row: the activations of one token converted to BF16 (round to nearest even), the K padding
+ * zeroed, and the padding rows below the last token zeroed too. */
+static void bf16_convert_rows(const void *p, int s, int first, int last) {
+  const Bf16Job *job = p;
+  (void)s;
+  for (int row = first; row < last; row++) {
+    uint16_t *dst = job->panel + (size_t)row * job->panel_ld;
+    int done = 0;
+    if (row < job->m) {
+      const float *src = job->src + (size_t)row * job->src_ld;
+      for (; done < job->k; done++)
+        dst[done] = bf16_from_f32(src[done]);
+    }
+    memset(dst + done, 0, ((size_t)job->panel_ld - (size_t)done) * sizeof(uint16_t));
+  }
+}
+
+enum { BF16_NC = 32, BF16_MB = 32 };
+
+static void bf16_chunks(const void *p, int s, int first, int last) {
+  const Bf16Job *job = p;
+  const GemmBf16Segment *seg = &job->segment[s];
+  const size_t tile = round_up((size_t)job->k, 32) * 16;
+  _Alignas(64) float acc[BF16_MB * 32], gate[BF16_MB * 32];
+  for (int chunk = first; chunk < last; chunk++) {
+    int n0 = chunk * BF16_NC, nc = seg->n - n0 < BF16_NC ? seg->n - n0 : BF16_NC;
+    const uint16_t *w = seg->w + (size_t)(n0 / 16) * tile;
+    for (int m0 = 0; m0 < job->m; m0 += BF16_MB) {
+      int mb = job->m - m0 < BF16_MB ? job->m - m0 : BF16_MB;
+      const uint16_t *a = job->panel + (size_t)m0 * job->panel_ld;
+      job->micro(acc, 32, a, job->panel_ld, w, mb, nc, job->k);
+      if (seg->kind == GEMM_SWIGLU)
+        job->micro(gate, 32, a, job->panel_ld, seg->w3 + (size_t)(n0 / 16) * tile, mb, nc, job->k);
+      for (int r = 0; r < mb; r++) {
+        float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
+        const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
+        for (int c = 0; c < nc; c++) {
+          if (seg->kind == GEMM_ADD)
+            out[c] += sum[c];
+          else if (seg->kind == GEMM_SWIGLU)
+            out[c] = silu_gate(sum[c], g[c]);
+          else
+            out[c] = sum[c];
+        }
+      }
+    }
+  }
+}
+
+size_t k_gemm_bf16_panel_bytes(int m, int k) {
+  return round_up((size_t)(m > 0 ? m : 1), 16) * (round_up((size_t)(k > 0 ? k : 1), 32) + 32) * sizeof(uint16_t);
+}
+
+void k_gemm_bf16(const float *a, int lda, int m, int k, const GemmBf16Segment *segments, int count,
+                 AlignedBuffer *panel) {
+  if (count < 1 || count > GEMM_MAX_SEGMENTS)
+    fail("GEMM needs 1..%d segments, got %d", GEMM_MAX_SEGMENTS, count);
+  for (int s = 0; s < count; s++)
+    if (!segments[s].w || (segments[s].kind == GEMM_SWIGLU && !segments[s].w3))
+      fail("BF16 GEMM segment %d has no packed weights", s);
+  if (m <= 0 || k <= 0)
+    return;
+  if (panel->bytes < k_gemm_bf16_panel_bytes(m, k))
+    fail("BF16 activation panel holds %zu bytes but %zu are needed", panel->bytes, k_gemm_bf16_panel_bytes(m, k));
+  Bf16Job job = {.src = a,
+                 .panel = panel->data,
+                 .src_ld = (size_t)lda,
+                 .panel_ld = round_up((size_t)k, 32) + 32,
+                 .m = m,
+                 .k = k,
+                 .count = count,
+                 .micro = gemm_amx_active() ? amx_bf16_tile_gemm : bf16_micro_portable};
+  int rows = (int)round_up((size_t)m, 16);
+  kernels_parallel_segments(1, &rows, bf16_convert_rows, &job);
+  int chunks[GEMM_MAX_SEGMENTS];
+  for (int s = 0; s < count; s++) {
+    job.segment[s] = segments[s];
+    chunks[s] = (segments[s].n + BF16_NC - 1) / BF16_NC;
+  }
+  kernels_parallel_segments(count, chunks, bf16_chunks, &job);
+}
+
+/* ---- packing many matrices on the worker team ----------------------------------------------------------------------
+ */
+
+typedef struct {
+  const PackBf16 *jobs;
+  int count;
+} PackAll;
+
+/* A chunk is one 16-row tile; chunk numbers run over the tiles of all matrices laid end to end. */
+static void pack_bf16_chunks(const void *p, int s, int first, int last) {
+  const PackAll *all = p;
+  (void)s;
+  int base = 0;
+  for (int i = 0; i < all->count && base < last; i++) {
+    const PackBf16 *job = &all->jobs[i];
+    int tiles = (job->rows + 15) / 16;
+    if (base + tiles > first)
+      pack_bf16_vnni_tiles(job->dst, job->w, job->rows, job->cols, job->ld, first > base ? first - base : 0,
+                           last < base + tiles ? last - base : tiles);
+    base += tiles;
+  }
+}
+
+void pack_bf16_vnni_many(const PackBf16 *jobs, int count) {
+  PackAll all = {jobs, count};
+  long long tiles = 0;
+  for (int i = 0; i < count; i++)
+    tiles += (jobs[i].rows + 15) / 16;
+  if (tiles > INT32_MAX)
+    fail("too many weight tiles to pack: %lld", tiles);
+  int chunks = (int)tiles;
+  kernels_parallel_segments(1, &chunks, pack_bf16_chunks, &all);
+}

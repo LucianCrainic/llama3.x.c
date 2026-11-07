@@ -87,4 +87,30 @@ typedef struct {
 void aligned_buffer_alloc(AlignedBuffer *buffer, size_t bytes, MemoryKind kind);
 void aligned_buffer_free(AlignedBuffer *buffer);
 
+/* ---- BF16 GEMM (C5) ------------------------------------------------------------------------------------------------
+ * The activations are converted to BF16 (round to nearest even) into a 64-byte-aligned panel, the weights come
+ * pre-packed by pack_bf16_vnni, the sums are FP32 and the epilogues are the FP32 ones. With LLAMA_KERNELS=amx the tile
+ * microkernel runs; otherwise a portable reference with the same result (bit for bit on the software tile model). */
+typedef struct {
+  float *c; /* m x n output, row-major, leading dimension ldc */
+  int ldc;
+  const uint16_t *w;  /* n x k weights packed by pack_bf16_vnni for this k */
+  const uint16_t *w3; /* GEMM_SWIGLU only: the second packed matrix */
+  int n;
+  GemmKind kind;
+} GemmBf16Segment;
+/* Bytes the panel must hold for up to m rows of k values. */
+size_t k_gemm_bf16_panel_bytes(int m, int k);
+void k_gemm_bf16(const float *a, int lda, int m, int k, const GemmBf16Segment *segments, int count,
+                 AlignedBuffer *panel);
+
+/* Packs many matrices with the active worker team (or OpenMP, or serially). */
+typedef struct {
+  uint16_t *dst;
+  const float *w;
+  int rows, cols;
+  size_t ld;
+} PackBf16;
+void pack_bf16_vnni_many(const PackBf16 *jobs, int count);
+
 #endif

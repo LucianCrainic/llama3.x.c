@@ -66,6 +66,17 @@ $(BUILD_DIR)/test-amx: tests/amx.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 # The same test with the AMX tile instructions replaced by the software model of tests/amx_emul.h.
 $(BUILD_DIR)/test-amx-emul: tests/amx.c tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/amx.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-bf16: tests/bf16.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/bf16.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-bf16-emul: tests/bf16.c tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/bf16.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-bf16-engine: tests/bf16_engine.c src/run.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/bf16_engine.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-bf16-engine-emul: tests/bf16_engine.c src/run.c tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/bf16_engine.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+# The CLI with the AMX tile instructions on the software model, for the report, mode-guard and fixture tests.
+$(BUILD_DIR)/run-amx-emul: src/run.c tests/amx_emul.h $(COMMON) $(APP) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX -DBUILD_MODE='"$(MODE)"' -DBUILD_FLAGS='"emulated AMX"' $(CFLAGS) src/run.c $(COMMON) $(APP) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/gemm-bench: tests/gemm_bench.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gemm_bench.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-manifest: tests/manifest.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
@@ -80,12 +91,14 @@ $(BUILD_DIR)/test-prefill-fp32: tests/prefill.c src/run.c $(COMMON) $(HEADERS) $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-prefill-int8: tests/prefill.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
+test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
 	$(BUILD_DIR)/test-kernels
 	$(BUILD_DIR)/test-gemm
 	$(BUILD_DIR)/test-gemm-emul
 	$(BUILD_DIR)/test-amx
 	$(BUILD_DIR)/test-amx-emul
+	$(BUILD_DIR)/test-bf16
+	$(BUILD_DIR)/test-bf16-emul
 	$(BUILD_DIR)/test-manifest
 	$(BUILD_DIR)/test-regions
 	$(BUILD_DIR)/test-workers

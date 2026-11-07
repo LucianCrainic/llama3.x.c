@@ -370,6 +370,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->implementation = t;
   kernels_init();
   kernels_backend_init();
+  prefill_precision(1); /* LLAMA_PRECISION=bf16 is an error here */
   const char *activations = getenv("LLAMA_Q8_ACTIVATIONS");
   if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
     fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");

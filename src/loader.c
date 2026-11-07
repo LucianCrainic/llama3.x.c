@@ -411,3 +411,32 @@ void runmem_kv_stats(const RunMemory *rm, size_t active_bytes, int verify, KvSta
   out->verified = 1;
   out->resident_bytes = (size_t)(resident + 0.5);
 }
+
+/* ---- packed weights (C5) ---------------------------------------------------------------------------------------- */
+
+void packed_open(PackedStore *ps, size_t bytes, const char *what) {
+  const char *mode = placement_mode();
+  *ps = (PackedStore){.mode = mode};
+  int node = strcmp(mode, "file") ? choose_nodes(mode, 0).weights_node : -1;
+  ps->budget_claimed = budget_claim(mode, node, bytes, what);
+  reserve(&ps->region, bytes ? bytes : 1, node, ROLE_PACKED, mode);
+}
+
+void *packed_take(PackedStore *ps, size_t bytes) {
+  size_t at = checked_add(ps->used, (size_t)(CACHE_LINE - 1)) / CACHE_LINE * CACHE_LINE;
+  if (!ps->region.mapping_base || checked_add(at, bytes) > ps->region.logical_bytes)
+    fail("packed weight store overflow: %zu bytes requested at offset %zu of %zu", bytes, at, ps->region.logical_bytes);
+  ps->used = at + bytes;
+  return (char *)ps->region.data + at;
+}
+
+void packed_seal(PackedStore *ps) {
+  region_mark_populated(&ps->region);
+  region_protect(&ps->region);
+  verify_region(&ps->region, ps->mode);
+}
+
+void packed_close(PackedStore *ps) {
+  region_release(&ps->region);
+  budget_release(&ps->budget_claimed);
+}

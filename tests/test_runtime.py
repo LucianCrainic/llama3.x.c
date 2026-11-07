@@ -35,7 +35,7 @@ class RuntimeTests(unittest.TestCase):
         fixture = fixture or self.shared
         report = self.root/'result.json'
         report.unlink(missing_ok=True)
-        model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
+        model = fixture/('int8.bin' if engine == 'runq' else 'fp32.bin')
         command = [str(BUILD/engine), str(model), '-z', str(fixture/'tokenizer.bin'),
                    '-i', 'A', '--seed', '123', '-t', '0', '--json', str(report), *map(str,args)]
         result = subprocess.run(command, input=stdin, text=True, capture_output=True, timeout=30,
@@ -283,7 +283,7 @@ class RuntimeTests(unittest.TestCase):
 
     def logits(self, engine, fixture, tokens, env, batch=None):
         probe = BUILD/('probe-fp32' if engine == 'run' else 'probe-int8')
-        model = fixture/('fp32.bin' if engine == 'run' else 'int8.bin')
+        model = fixture/('int8.bin' if engine == 'runq' else 'fp32.bin')
         command = [str(probe)] + (['batch'] if batch else []) + [str(model), *map(str, tokens)]
         extra = {'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'all'} if batch else {}
         result = subprocess.run(command, capture_output=True, timeout=60, env={**os.environ, **extra, **env})
@@ -361,6 +361,76 @@ class RuntimeTests(unittest.TestCase):
                                  '-i', 'A', '-t', '0'], capture_output=True, text=True,
                                 env={**os.environ, 'LLAMA_KERNELS': 'bogus'})
         self.assertIn('LLAMA_KERNELS must be auto, scalar, avx512 or amx', result.stderr)
+
+    # ---- C5: the explicit BF16 precision mode
+    def test_bf16_mode_is_explicit_and_validated(self):
+        for engine, env, text in (
+                ('run', {'LLAMA_PRECISION': 'half'}, 'LLAMA_PRECISION must be fp32 or bf16'),
+                ('runq', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4'}, 'applies to FP32 checkpoints'),
+                ('run', {'LLAMA_PRECISION': 'bf16'}, 'set LLAMA_PREFILL_BATCH to 2 or more'),
+                ('run', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4', 'LLAMA_PREFILL_GEMM': 'off'},
+                 'LLAMA_PREFILL_GEMM=off')):
+            with self.subTest(engine=engine, env=env):
+                _, data = self.execute(engine, success=False, env=env)
+                self.assertIn(text, data['error'])
+        # fp32 spelled out is the default: same report fields as with the knob unset.
+        _, data = self.execute('run', env={'LLAMA_PRECISION': 'fp32'})
+        self.assertEqual(data['runtime']['precision_mode'], 'fp32')
+        self.assertIsNone(data['timing_seconds']['weight_pack'])
+        self.assertEqual(data['memory_bytes']['packed_weights_peak'], 0)
+        # Without AMX the explicit mode runs the portable BF16 reference and says so.
+        env = {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4', 'LLAMA_KERNELS': 'scalar'}
+        _, data = self.execute('run', '--benchmark', '--no-text', '-i', 'A long enough prompt', env=env)
+        self.assertEqual(data['runtime']['precision_mode'], 'bf16')
+        self.assertEqual(data['runtime']['kernels_prefill'], 'bf16-reference')
+        self.assertGreater(data['memory_bytes']['packed_weights_peak'], 0)
+        self.assertIsNotNone(data['timing_seconds']['weight_pack'])
+
+    def test_amx_on_fp32_requires_the_bf16_mode(self):
+        binary = BUILD/'run-amx-emul'  # the CLI with the AMX tiles on the software model; works on any host
+        if not binary.exists():
+            self.skipTest('run-amx-emul was not built')
+        command = [str(binary), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'), '-i', 'A', '-t', '0']
+        result = subprocess.run(command, capture_output=True, text=True, env={**os.environ, 'LLAMA_KERNELS': 'amx'})
+        self.assertGreater(result.returncode, 0)
+        self.assertIn('LLAMA_KERNELS=amx on an FP32 checkpoint requires LLAMA_PRECISION=bf16', result.stderr)
+        env = {'LLAMA_KERNELS': 'amx', 'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4'}
+        _, data = self.execute('run-amx-emul', '--benchmark', '--no-text', '-i', 'A long enough prompt', env=env)
+        self.assertEqual(data['runtime']['precision_mode'], 'bf16')
+        self.assertEqual(data['runtime']['kernels_prefill'], 'amx-bf16')
+        self.assertEqual(data['build']['kernels'], 'amx')
+        self.assertGreater(data['memory_bytes']['packed_weights_peak'], 0)
+
+    def test_bf16_packed_weights_are_accounted_per_region(self):
+        env = {**self.OWNED, 'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4', 'LLAMA_KERNELS': 'scalar'}
+        _, data = self.execute('run', '--benchmark', '--no-text', '-i', 'A long enough prompt', env=env)
+        packed = [r for r in data['regions'] if r['role'] == 'packed']
+        self.assertEqual(len(packed), 1)
+        # Seven matrices per layer, each padded to whole 16-row tiles and 32-value K blocks, two bytes a value.
+        d, h, layers, heads, kvheads = CONFIG[:5]
+        kv = d // heads * kvheads
+        pad = lambda rows, cols: -(-rows // 16) * 16 * (-(-cols // 32) * 32) * 2
+        expected = layers * (pad(d, d) * 2 + pad(kv, d) * 2 + pad(h, d) * 2 + pad(d, h))
+        self.assertEqual(data['memory_bytes']['packed_weights_peak'], expected)
+        self.assertGreaterEqual(packed[0]['bytes'], expected)
+        self.assertEqual(data['runtime']['placement'], 'ddr')
+        # The FP32 copy stays: decode reads it.
+        self.assertGreater(data['memory_bytes']['owned_weights_peak'], 0)
+        # Dropping the FP32 copy is reserved for a future BF16 decode GEMV.
+        _, data = self.execute('run', success=False, env={'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4',
+                                                          'LLAMA_BF16_DROP_FP32': '1'})
+        self.assertIn('LLAMA_BF16_DROP_FP32', data['error'])
+
+    def test_bf16_engine_decode_unchanged_and_split_independent(self):
+        fixture = create(self.root/'bf16', seq_len=64)
+        for binary in ('test-bf16-engine', 'test-bf16-engine-emul'):
+            with self.subTest(binary=binary):
+                if not (BUILD/binary).exists():
+                    self.skipTest(f'{binary} was not built')
+                result = subprocess.run([str(BUILD/binary), str(fixture/'fp32.bin')], capture_output=True, text=True,
+                                        timeout=120)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('bf16 engine: ok', result.stdout)
 
     # ---- A5: KV cache and workspace placement ------------------------------------------------------------------
     def test_kv_accounting_matches_the_formula(self):
