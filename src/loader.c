@@ -107,7 +107,7 @@ typedef struct {
 } CopyJob;
 
 /* Reads exactly `length` bytes at `offset`, retrying short reads and EINTR. */
-static int read_exact(int fd, char *dst, size_t length, size_t offset, size_t max_read) {
+int loader_read_exact(int fd, char *dst, size_t length, size_t offset, size_t max_read) {
   while (length) {
     size_t want = length < max_read ? length : max_read;
     ssize_t got = pread(fd, dst, want, (off_t)offset);
@@ -139,7 +139,7 @@ static void copy_slice(const void *job_, int worker, int workers) {
       char *dst = (char *)job->ws->region[s->embedding].data + s->dst_offset;
       for (size_t at = from; at < to && !job->status[worker];) {
         size_t piece = to - at < job->chunk ? to - at : job->chunk;
-        job->status[worker] = read_exact(job->fd, dst + at, piece, s->src_begin + at, job->max_read);
+        job->status[worker] = loader_read_exact(job->fd, dst + at, piece, s->src_begin + at, job->max_read);
         at += piece;
       }
     }

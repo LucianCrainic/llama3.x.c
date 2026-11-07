@@ -12,7 +12,50 @@ socket's bound region, and populate it with that socket's team.
 Correctness is shown by reconstructing every original tensor exactly. B1 changes no
 computation.
 
-Status: **planned**. Branch: `feature/tp-b1-shards`.
+Status: **implemented and tested locally (macOS, virtual regions); cluster `check` pending, and it inherits A4's
+open cluster check**. Branch: `feature/tp-local-b` (commit `feat: add shard descriptors and packing`).
+
+Implementation notes:
+
+- **API** (`include/shards.h`, `src/shards.c`): `shards_plan_try`/`shards_plan` (validates, takes the `Config` for the
+  head counts), `shards_find`, `shards_bind`, `shards_load`, `shards_free`. The proposed signatures changed:
+  - `shards_load(set, fd, socket, team)` loads one socket's shards with that socket's team (`NULL` = calling thread);
+    GLOBAL shards load with socket 0. It uses plain `calloc`/`malloc`, not `memory_alloc`, so the two sockets'
+    coordinators may load concurrently without touching the engine's global accounting.
+  - Placement is planned separately from loading: `shards_plan` lays out each socket's shards back to back (values,
+    then scales, each 64-byte aligned) and reports `region_bytes[s]` and `global_bytes`; the caller reserves the
+    regions and calls `shards_bind`. The `Shard` descriptor gained `alias` (tied classifier shard that also serves the
+    embedding) and `q_offset`/`s_offset`.
+- **Partitions** exactly as §4.1. FP32 norms are `COPY` on every socket, also in Q8 files. Every other weight is
+  `ROWS` or `COLS`; the vocabulary split gives the remainder to the last socket; a tied model has no `GLOBAL` shard
+  (the classifier's `ROWS` shards carry `alias`), an untied one has one `GLOBAL` embedding.
+- **S = 1 is the same code**: the planner and loader take no special branch (`ROWS` shards with the full range,
+  `COLS` shards with the full column range, which is a plain copy).
+- **Rejection** (with messages): sockets other than 1 or 2; `n_kv_heads` or `n_heads` not splittable into complete
+  GQA groups; `hidden_dim` or `dim` odd for S = 2; Q8 group size not dividing `dim/S` or `hidden/S` (never
+  re-quantized); a group size different from the checkpoint's. `gs = 3` cannot reach B1 with `dim = 16`, because the
+  engine's own check (`dim % gs`) comes first; the test uses `dim = 24`, `gs = 8` (`dim/S = 12`).
+- **Packing.** `ROWS`/`COPY`/`GLOBAL`: one read of the values and one of the scales per shard, split by bytes among the
+  team's workers (the same slicing as the owned loader, sharing `loader_read_exact`). `COLS`: blocks of complete source
+  rows are read into scratch (`scratch_limit`, default 64 MiB, at least one row) and each worker packs the rows it
+  read, so a block costs one barrier. `scratch_peak[s]`, `rows_seconds[s]` and `cols_seconds[s]` carry the numbers the
+  report needs.
+- **Tests** (`tests/shards.c`, `make test`). 96 reconstruction cases: S = 1 and 2, FP32 and Q8 with gs 2, 4, 8, shared
+  and unshared, odd (37) and even (128) vocabulary, team sizes 1, 3 and 7 (and no team), plus a 7-row scratch block;
+  a larger GQA case (6 heads, 2 KV heads). Every value and every scale of every tensor is rebuilt from the shards and
+  compared **bitwise** with the file bytes; coverage is exactly once (twice for `COPY`). Ownership: with portable
+  regions, each shard's values and scales lie inside its socket's region (or the global area), 64-byte aligned. Scratch
+  never exceeds the limit. ASAN/UBSAN and TSAN clean.
+- **Not done here.**
+  - **A4's `weights_open` is not routed through `shards_load` yet.** Its `WeightStore` addresses weights by file
+    offset, and every kernel pointer is built from that. Moving it to shard pointers changes how `run.c`/`runq.c`
+    address weights, which is B5's wiring, and must be bitwise-checked against the staged baseline that A4's pending
+    cluster check establishes. Until then S = 1 and S = 2 share `shards_plan`/`shards_load`, and the engine's default
+    path is unchanged. **Open risk: B1 builds on A4, whose cluster check is still pending.**
+  - The format record in the report (packing version `SHARD_PACKING_VERSION`, partition, source identity, shard
+    shapes) is not written yet; B5 adds it with the other `LLAMA_SOCKETS=2` report fields.
+  - Cluster: the 8B reconstruction against the source file (test-only mode), per-node page verification of the shards,
+    and the measured row-copy and column-pack times (`cresco8-tp.sbatch PHASE=B1`).
 
 ## 2. Depends on / unblocks
 

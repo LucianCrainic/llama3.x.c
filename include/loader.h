@@ -34,6 +34,10 @@ typedef struct {
  * not an alias of it) is the only embedding-class tensor. Returns the segment count and the byte size of the weights and embedding regions. */
 int weights_plan(const TensorManifest *m, WeightSegment *seg, size_t *weights_bytes, size_t *embedding_bytes);
 
+/* Reads exactly `length` bytes at `offset` into dst in pieces of at most max_read, retrying short reads and EINTR.
+ * Returns 0, an errno, or -1 for an unexpected end of file. Also used by the shard loader (B1). */
+int loader_read_exact(int fd, char *dst, size_t length, size_t offset, size_t max_read);
+
 /* LLAMA_PLACEMENT validated: "file" when unset; fails on anything but file, ddr or hbm. */
 const char *placement_mode(void);
 /* The mode the loaded model actually uses ("file" before any load), for the report. */
