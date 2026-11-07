@@ -13,7 +13,7 @@ OpenMP path numerically and in speed. The same interface later carries:
 The user decision requires that no separate scheduler be introduced for prefill, so
 this is the only scheduler the plans use.
 
-Status: **implemented; cluster check done except the Hugging Face gate** (see Cluster results). Branch: `feature/found-f2-worker-teams` (stacked on A3).
+Status: **implemented; cluster check passed, including the Hugging Face gate under `teams`** (see Cluster results).
 
 Implementation notes:
 
@@ -190,9 +190,21 @@ on HBM node 2, `numactl --cpunodebind=0`, 56 threads, `short.txt`, 128 generated
 - **Pinning.** 56 workers pinned to cores 0-55; every read-back equals its assignment (`affinity_verified`).
 - **Barrier cost** (unpinned team, 200000 rounds): 0.36 µs at 2 threads, 1.1 at 4, 2.1 at 8, 2.6 at 16, 4.7 at 32,
   3.5 at 56. `barrier 1000000 56` (random delays) passes.
-- **Not run.** The Hugging Face gate (`validate.py`) under `teams`: there is no torch/transformers environment on the
-  cluster any more, so `HF_GATE=0` skipped it. The transitive argument (teams agrees with omp within 2.5e-5, and omp
-  passed the gate in the earlier campaign) is recorded, not substituted for the gate. TSAN is clean locally only.
+- **Hugging Face gate, direct (2026-11-07).** The shared `llama_env` on the cluster already provides torch 2.8.0+xpu,
+  transformers 4.55.0 and tiktoken; the earlier "no torch environment" was a wrong lookup. Job 5693907, commit
+  `4385a8a`, 56 threads on socket 0, `LLAMA_BACKEND=teams LLAMA_THREADS=56` (the engine logs `LLAMA_BACKEND=teams`
+  in every probe), budget atol/rtol 1e-3, FP32:
+
+  | Model | Prompts | max abs Δlogit | Argmax agreement | Tokenizer / chat template | Generated tokens vs HF |
+  | --- | ---: | ---: | ---: | --- | --- |
+  | 1B FP32 | 4 | 2.5e-5 | 100% | match | match (base and instruct) |
+  | 8B FP32 | 4 | 1.0e-4 | 100% | match | match (base and instruct) |
+
+  The same gate under the default OpenMP backend (job 5622322, commit `bc7da43`) gave 2.0e-5 (1B) and 1.6e-4 (8B),
+  so `teams` is at least as close to Hugging Face as OpenMP. Q8_0 is not repeated under `teams`: it is bitwise
+  identical to OpenMP at every position (above), and its Hugging Face deviation is recorded without gating (1B w8a32
+  passes its budget; 1B w8a8 exceeds it by 17% on one prompt, 92% argmax agreement, as an OpenMP-backend result;
+  the 8B Q8 gates did not finish within that job's time limit). TSAN is clean locally only.
 ## 7. Exit criteria
 
 - **Kernel parity:** every kernel passes at all tested worker counts, scalar and

@@ -13,8 +13,7 @@ This phase delivers the evidence plumbing that every later campaign needs:
 
 Each phase then adds only the run matrix for its own experiments.
 
-Status: **implemented; cluster check run (acceptance comparison pending)**. Branch:
-`feature/found-f3-reporting-campaigns` (stacked on F2).
+Status: **implemented; cluster check run; `make test` green on Linux (acceptance comparison with the kernels script not done)**.
 
 Implementation notes:
 
@@ -179,8 +178,11 @@ The library, `check_stage`, the Flat-mode check, `make test` and the F2/A phases
 cresco8-hbm14 (`environment.txt`, `flat-mode.json`, `test.log`, `phase-results.txt`, `build-config-*.txt` per job);
 the Flat-mode check passed and the v2 reports of the 24 benchmark runs were summarized by `summarize_campaign.py`
 (`F2/summary.md`). `PHASE` lists, `expect`, `HF_GATE` and the optional `MODELS` came out of these runs. Not done: the
-acceptance comparison with a `cresco8-kernels.sbatch STAGE=check` run of the same commit, and a re-run showing
-`make test` green on Linux after the last test fix.
+acceptance comparison with a `cresco8-kernels.sbatch STAGE=check` run of the same commit. It is not a criterion of
+milestone M1 and stays open. `make test` is green on Linux after the last test fix (jobs 5622322, commit `bc7da43`,
+and 5693907, commit `4385a8a`: `phase-results.txt` records `PASS make-test`; the second job's `test.log` ends with
+the Python tool tests 22 OK, 1 skipped). Job 5693907 also added `GATE_ENV`/`GATE_TAG` to `validate_models`, so the
+Hugging Face gate can run the engine under another backend environment.
 ## 7. Exit criteria
 
 - Schema v2 is emitted and the v1 consumers are updated.
