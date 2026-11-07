@@ -1,7 +1,8 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
-Plan date: 1 November 2026. Status as of 7 November 2026: Wave 1 (M1) is complete; Wave 2 (M2) is implemented
-and tested locally, with its cluster checks still to run; Waves 3-5 (B, C4-C7, D) have not started. See the milestone
+Plan date: 1 November 2026. Status as of 7 November 2026: Waves 1 and 2 (M1, M2) are complete and validated on the cluster, apart from the A6
+campaign; the Wave 3 code (B1-B6, C4-C7) is written and tested locally on separate, not yet merged branches and has not run on
+the cluster; D has not started. See the milestone
 table in §4 and each phase document's status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
@@ -136,7 +137,7 @@ Milestone status:
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M1 | **complete** (2026-11-07) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%, Hugging Face gate under `teams` passes for 1B and 8B FP32). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. `make test` is green on Linux. Not part of M1 and still open: the F3 acceptance comparison with the kernels script |
-| M2 | **implemented locally; cluster checks pending** (2026-11-01) | A4, A5, C1, C2, C3 code and tests are in; A6 is a dry-run-verified matrix. Open: the cluster `check` of A4, A5, C1, C2, C3 and the A6 campaign |
+| M2 | **complete** (2026-11-07) | Engine-owned HBM placement is bitwise identical to the staged baseline on 1B and 8B, FP32 and Q8_0, `omp` and `teams`, and verified on the requested node ([A4](A-numa-placement/A4-owned-weight-loader.md), [A5](A-numa-placement/A5-kv-and-workspace-placement.md) cluster results). Batched FP32 prefill matches per-token: bitwise on the reference path ([C1](C-batched-prefill/C1-batched-forward-api.md)), within 4.8e-4 max \|Δlogit\| and 100% argmax with the AVX-512 GEMM and batched attention ([C2](C-batched-prefill/C2-avx512-fp32-gemm.md), [C3](C-batched-prefill/C3-batched-causal-attention-and-kv.md)); 8B prefill at a 2048-token prompt is 10.5x faster at M = 64 with unchanged decode. Not part of M2's gate and still open: the A6 campaign |
 | M3 | planned | — |
 | M4 | planned | — |
 | M5 | planned | — |

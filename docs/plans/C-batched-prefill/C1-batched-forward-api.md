@@ -10,7 +10,7 @@ The first implementation is a **reference** that calls today's single-token kern
 once per row. Its logits at the final position must be **bitwise** equal to the
 per-token path, so all later kernel phases have an exact oracle.
 
-Status: **implemented; cluster check pending**. Branch: `feature/prefill-c1-batch-api`.
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -116,6 +116,23 @@ the user's go-ahead to submit.
 | --- | --- |
 | `compare_engines.py` 1B and 8B FP32/INT8, M = 1 vs M = 32, `all` logits | Bitwise identical |
 | Prefill speed, 8B FP32, 86-token and 2048-token prompts | **Measured** gain from the skipped classifier only (expected about 7% on 8B per the **modeled** share) |
+
+### Cluster results (2026-11-07)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Two jobs:
+5693938 (commit `fec5f44`, `m2-prefill-20261107-1`) and the re-run 5693952 (commit `3f94f34`, `m2-prefill-20261107-2`,
+5 min), results under `~/PFS/lpor`.
+
+- **First run, a test-matrix flaw.** All eight FP32 bitwise comparisons failed (max |Δlogit| 1.1e-5 on 1B, 1.4e-4 on 8B,
+  argmax 100%, the same for M = 7 and M = 32 and already at position 0). On AVX-512 hosts the default batched FP32 path is
+  the C2 GEMM (`LLAMA_PREFILL_GEMM=auto`), which sums in another order than the GEMV, so a bitwise check of that path is
+  wrong. Its agreement is C2's budget gate (passed, see C2). The Q8 comparisons were bitwise identical in that run.
+- **Re-run, the reference path.** With `LLAMA_PREFILL_GEMM=off` on the batched side for FP32, all 18 comparisons are
+  **bitwise identical** (max |Δlogit| 0.0 at all 53 positions): 1B and 8B, FP32 and Q8_0, `omp` and `teams`, M = 7 and
+  M = 32, plus Q8 W8A32 at M = 32. The matrix now pins this setting (`phase_C1`).
+- **Skipped classifier** (8B FP32, 2048-token prompt, per-token M = 1, median of 3): prefill 16.5 tok/s with `last`
+  against 15.4 with `all` (+7.1%, the **modeled** ~7%); 1B 111.8 against 89.9 (+24%, the classifier is a larger share of
+  a small model).
 
 ## 7. Exit criteria
 
