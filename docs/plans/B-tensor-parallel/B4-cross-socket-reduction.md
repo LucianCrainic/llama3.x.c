@@ -49,8 +49,9 @@ Implementation notes:
 - **Verified locally.** `make test`, `make MODE=sanitize` and `make MODE=tsan OPENMP=0` on `test-workers`: no reports.
   Mutations (ready published before the local barrier, swapped operand order) are caught by the exactness check.
 - **Open (cluster).** Pinned latency for E = 4096 and 4096 × {16, 64, 256} on 2 × {14, 28, 56} workers with the
-  buffers on HBM 2 and 3, against the per-token budget of §7; remote-push alternative of §8; `cresco8-tp.sbatch
-  PHASE=B4`. This Mac's median of 4 µs for E = 4096 (4+4 unpinned workers) is not evidence for CRESCO8.
+  buffers on HBM 2 and 3, against the per-token budget of §7; remote-push alternative of §8 (not implemented); `cresco8-tp.sbatch PHASE=B4`
+  (dry-run verified: stress at 2 × 14/28/56 workers, `test-workers bench-exchange`, and a summary that prints the
+  64-reduction cost against 10% of 27 ms). This Mac's median of 4 µs for E = 4096 (4+4 unpinned workers) is not evidence for CRESCO8.
 
 ## 2. Depends on / unblocks
 

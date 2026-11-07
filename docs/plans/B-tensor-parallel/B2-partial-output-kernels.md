@@ -47,7 +47,7 @@ Implementation notes:
   `tests/avx512_emul.h` covers only the GEMM microkernel), so the changed AVX-512 Q8 code is reviewed, not executed.
 - **Open (cluster).** `test-kernels` on AVX-512 with team sizes 1, 28 and 56 (`LLAMA_TEST_TEAMS`), looking for
   `avx512 ok` and 0 failures, which also covers the new Q8 `ld` argument; the existing Q8 results on AVX-512 (logits
-  of the 1B/8B Q8 gate) must be unchanged, since `ld == n` there; `cresco8-tp.sbatch PHASE=B2`.
+  of the 1B/8B Q8 gate) must be unchanged, since `ld == n` there; `cresco8-tp.sbatch PHASE=B2` (dry-run verified; it runs `LLAMA_TEST_TEAMS=1,28,56` and requires `avx512 ok` and `avx512 teams:56 ok`).
 
 ## 2. Depends on / unblocks
 

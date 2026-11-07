@@ -27,8 +27,10 @@ Implementation notes:
 - **Not done here (B5).** The engine's per-socket KV regions (`ROLE_KV_K`/`ROLE_KV_V` on the socket's HBM node, an A5
   `RunMemory` per socket), per-team `att` buffers in the socket's `ROLE_WORK` region, the coordinator's position and
   RoPE-table broadcast, and the lifecycle tests (cache reset, context limit, multi-turn) all need the two-socket forward.
-- **Open (cluster).** The attention kernel tests with 2 × 56 pinned workers and the AVX-512 half of the test;
-  attention task time per socket at contexts 512, 8192 and 32768 (`cresco8-tp.sbatch PHASE=B3`).
+- **Open (cluster).** The attention kernel tests with 2 × 56 workers and the AVX-512 half of the test
+  (`LLAMA_TEST_TEAMS=1,56` sets the team sizes of `test_attention_split`), and the attention time per socket at contexts
+  512, 8192 and 32768 with the 8B local shape and the chunk count (`test-kernels bench-attention THREADS`, pinned when
+  the topology has two sockets; **measured** here only as a smoke run). `cresco8-tp.sbatch PHASE=B3` (dry-run verified).
 
 ## 2. Depends on / unblocks
 

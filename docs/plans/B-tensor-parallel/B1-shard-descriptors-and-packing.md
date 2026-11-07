@@ -54,8 +54,11 @@ Implementation notes:
     path is unchanged. **Open risk: B1 builds on A4, whose cluster check is still pending.**
   - The format record in the report (packing version `SHARD_PACKING_VERSION`, partition, source identity, shard
     shapes) is not written yet; B5 adds it with the other `LLAMA_SOCKETS=2` report fields.
-  - Cluster: the 8B reconstruction against the source file (test-only mode), per-node page verification of the shards,
-    and the measured row-copy and column-pack times (`cresco8-tp.sbatch PHASE=B1`).
+  - Cluster (`cresco8-tp.sbatch PHASE=B1`, dry-run verified): `test-shards verify FILE fp32|int8 hbm 56` is the test-only
+    mode of §6. It shards a real checkpoint over both sockets (the machine's topology, teams pinned, regions bound),
+    compares every shard with the file bitwise, verifies all pages of each region and prints the row-copy and
+    column-pack times and the scratch peak as JSON; it also runs on the virtual topology (checked here on the `tp`
+    fixtures, FP32 and Q8, shared, unshared and odd vocabulary). Still to be run on 1B and 8B.
 
 ## 2. Depends on / unblocks
 

@@ -35,7 +35,7 @@ Implementation notes:
   worst case 1.05e-5 absolute on a logit of 6.8, W8A32); the batched entry point; identical greedy generation;
   `LLAMA_TP_CHECK=1` throughout; the `gs = 16` rejection.
 - **Not done here.** `compare_engines.py` and `validate.py` runs on 1B and 8B (the HF numbers next to the one-socket
-  values), and the 8B smoke benchmark with profiling (`cresco8-tp.sbatch PHASE=B6`).
+  values), and the 8B smoke benchmark with profiling (`cresco8-tp.sbatch PHASE=B6`, dry-run verified).
 
 ## 2. Depends on / unblocks
 

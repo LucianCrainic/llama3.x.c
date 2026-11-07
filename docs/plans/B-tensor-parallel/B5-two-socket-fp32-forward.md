@@ -59,7 +59,9 @@ Implementation notes:
 - **Not done here.** The multi-turn chat and stop-token tests of `test_runtime.py` with `LLAMA_SOCKETS=2`; the
   `compare_engines.py` harness (not in this tree; `test_tp.py` plays its role on the fixtures); the 1B/8B cluster gates,
   HF validation under two sockets, per-socket page verification, and the smoke benchmark with the per-phase breakdown
-  (`cresco8-tp.sbatch PHASE=B5`). The coordinator of socket 1 spins and yields between tokens, like the teams; the
+  (`cresco8-tp.sbatch PHASE=B5`, dry-run verified: `compare_engines.py` one socket vs two, the Hugging Face gate without
+  the one-socket `numactl` binding, a profiled smoke run, and a weights-placement check of both sockets: socket 0 on node
+  2, socket 1 on node 3, 100% verified; KV pages are not verified yet). The coordinator of socket 1 spins and yields between tokens, like the teams; the
   cost is part of the B7 measurement.
 
 ## 2. Depends on / unblocks
