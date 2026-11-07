@@ -7,8 +7,11 @@ model, prompt length and microbatch size, with decode measured **separately** to
 no regression. Then choose defaults (`LLAMA_PREFILL_BATCH` and the prefill kernel per
 precision) from the evidence.
 
-Status: **planned**. Branch: `feature/prefill-c7-campaign` (scripts and results docs
-only).
+Status: **script written, dry-run verified; nothing run** (2026-11-07). Branch: `feature/prefill-c7-campaign` (scripts
+and results docs only). `phase_C7` in `scripts/cresco8-prefill.sbatch` implements §4.1 and §4.2 (pass structure in the
+comment above `c7_best`); `DRY_RUN=1` prints 245 launches per model (with the dry run's placeholder best sizes) and 16 correctness gates. The results documents
+`docs/batched-prefill.md` and `docs/batched-prefill-validation.md` and the choice of defaults wait for the run; it needs
+C4-C6 to have passed on the hardware first.
 
 ## 2. Depends on / unblocks
 
@@ -60,7 +63,14 @@ each rung, at the chosen M values.
 
 ## 5. Local tests
 
-None beyond C1–C6. Run the script dry run.
+None beyond C1–C6. Run the script dry run:
+
+```text
+DRY_RUN=1 SLURM_JOB_ID=1 ROOT=$PWD OUT=/tmp/c7-dry PYTHON=python3 PHASE="C4 C5 C6 C7" \
+  MODELS="m1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b" bash scripts/cresco8-prefill.sbatch
+```
+
+(done 2026-11-07: exit 0, every run label parses with `tools/summarize_campaign.py`).
 
 ## 6. Cluster run
 
@@ -72,6 +82,25 @@ As in §4.1. `summary.md` reports, per rung, model, prompt and M:
   ~370 / ~1,800 / ~4,600 tok/s for AVX FP32 / AMX-BF16 / AMX-INT8);
 - the attention share;
 - decode tok/s from the separate runs.
+
+### Implementation notes (script)
+
+- **Rungs** are the `c_rung` environments: `per_token` and `per_token_q8` (`LLAMA_PREFILL_BATCH=1`, AVX-512 kernels),
+  `avx512_fp32`, `amx_bf16`, `avx512_q8`, `amx_int8`, `avx512_q8_w8a32`. Run labels carry the rung in `-k...` and the
+  precision field is `fp32`, `bf16`, `int8` or `w8a32`, which `tools/summarize_campaign.py` already parses.
+- **Passes** (per model and precision, checkpoints staged on HBM node 2, one at a time): gates; M sweep at 2048 tokens (M ∈
+  {16, 32, 64, 128, 256} for the batched rungs, 1 for the baselines, {1, 64} for W8A32), repeats interleaved; best two M per
+  rung read back from the sweep reports (`c7_best`); prompts 86 / 512 / 8192 at M = 1 and the best two; 14 and 28 threads at
+  the best M; decode runs of 128 tokens; one `LLAMA_PROFILE=1` repeat at 2048 and 8192 tokens, summarized in
+  `C7/phase-shares.txt`.
+- **Differences from §4.1**, all to keep to the time budget or because a piece does not exist yet: the per-token baselines run
+  once (not 3 times) at 8192 tokens and on 14 and 28 threads; the decode runs prefill 2048 tokens in the same process (the
+  report times prefill and decode apart) because `--warm-context` (B7) does not exist; at 2048 tokens the gates compare the
+  last position only (1 GB of logits per side otherwise), and the AMX-INT8 gate there is against per-token, not against the
+  batched AVX-512 path (`compare_engines.py --last-only` needs A to be per-token). BF16 comparisons are recorded
+  (`expect any`) until C5 has set its provisional gate.
+- **Estimate.** About 5 hours for 1B and 8B, dominated by the per-token baselines (8B FP32 about 85 minutes of it): submit
+  with `--time=06:00:00`; the script header asks for 04:00:00.
 
 ## 7. Exit criteria
 

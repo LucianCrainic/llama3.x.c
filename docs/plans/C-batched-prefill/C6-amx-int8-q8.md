@@ -94,8 +94,11 @@ These run on all platforms with scalar oracles; AMX cases run on AMX hosts only.
 
 ## 6. Cluster run
 
-`cresco8-prefill.sbatch STAGE=check PHASE=C6`. **Estimated** at 60 minutes. It needs
-the user's go-ahead to submit.
+`cresco8-prefill.sbatch STAGE=check PHASE=C6` (with `MODELS=...`; `PRECISIONS=int8` is enough). **Estimated** at 60 minutes.
+It needs the user's go-ahead to submit. **Open, not submitted**: `phase_C6` is written and verified with `DRY_RUN=1`. The
+first time the AVX-512 VNNI tile kernel and the AMX-INT8 kernel run on hardware is `test-q8` there (it records PASS only
+if both ran). At the 2048-token prompt only the last position is compared (`--last-only` needs the per-token path as A), so
+AMX-INT8 is compared with the per-token Q8 path there and with the batched AVX-512 path on the 86-token prompt.
 
 | Run | Gate or record |
 | --- | --- |

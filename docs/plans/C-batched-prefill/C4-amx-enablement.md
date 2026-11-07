@@ -99,7 +99,12 @@ Both take a `Shard` (B1), so one-socket and two-socket packing share the same co
 ## 6. Cluster run
 
 `cresco8-prefill.sbatch STAGE=check PHASE=C4`. **Estimated** at 20 minutes. It needs
-the user's go-ahead to submit.
+the user's go-ahead to submit. **Open, not submitted**: `phase_C4` is written and verified with `DRY_RUN=1`; no AMX
+instruction has run yet.
+
+`phase_C4` runs `test-amx`, `test-amx-emul`, `test-kernels` and `test-gemm` at 1 and 56 workers (both now repeat their suite
+at the `amx` level) and `amx-bench` (`tests/amx_bench.c`); it records PASS only when the output shows the hardware tiles
+(`amx: hardware tiles, permission granted`) and `kernels: amx teams:56 ok`, so an `amx unavailable` skip cannot pass.
 
 | Run | Gate or record |
 | --- | --- |

@@ -1,8 +1,10 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
 Plan date: 1 November 2026. Status as of 7 November 2026: Wave 1 (M1) is complete; Wave 2 (M2) is implemented
-and tested locally, with its cluster checks still to run; Waves 3-5 (B, C4-C7, D) have not started. See the milestone
-table in §4 and each phase document's status line.
+and tested locally, with its cluster checks still to run; in Wave 3, the cluster-free part of Track C (C4-C7: AMX
+enablement, the BF16 precision mode, batched Q8 with AMX-INT8, and the campaign scripts) is implemented and tested on
+macOS against instruction models, with nothing yet run on AMX hardware; Track B and Waves 4-5 (D) have not started. See
+the milestone table in §4 and each phase document's status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
 
@@ -137,7 +139,7 @@ Milestone status:
 | --- | --- | --- |
 | M1 | **complete** (2026-11-07) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%, Hugging Face gate under `teams` passes for 1B and 8B FP32). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. `make test` is green on Linux. Not part of M1 and still open: the F3 acceptance comparison with the kernels script |
 | M2 | **implemented locally; cluster checks pending** (2026-11-01) | A4, A5, C1, C2, C3 code and tests are in; A6 is a dry-run-verified matrix. Open: the cluster `check` of A4, A5, C1, C2, C3 and the A6 campaign |
-| M3 | planned | — |
+| M3 | **partly implemented locally; no cluster evidence** (2026-11-07) | Track C: C4, C5, C6 code and tests are in and pass on macOS (software models of the AMX tile instructions and of the AVX-512 integer subset; `make test` and `make MODE=sanitize test`), `phase_C4`-`phase_C7` are dry-run-verified. Never executed on real hardware: the AMX tile kernels, the AVX-512 FP32 GEMM of C2 and the AVX-512 VNNI Q8 kernel of C6. Open: the cluster `check` of C4, C5, C6 (after the M2 checks of C1-C3) and the C7 campaign. Track B (B1-B7) is not part of this row yet |
 | M4 | planned | — |
 | M5 | planned | — |
 

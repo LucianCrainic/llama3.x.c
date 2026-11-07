@@ -91,8 +91,13 @@ in FP32) runs everywhere.
 
 ## 6. Cluster run
 
-`cresco8-prefill.sbatch STAGE=check PHASE=C5`. **Estimated** at 60 minutes. It needs
-the user's go-ahead to submit.
+`cresco8-prefill.sbatch STAGE=check PHASE=C5` (with `MODELS=...` for the model part; `PRECISIONS=fp32` is enough).
+**Estimated** at 60 minutes. It needs the user's go-ahead to submit. **Open, not submitted**: `phase_C5` is written and
+verified with `DRY_RUN=1`. It records (it does not gate) every BF16 comparison and writes `bf16-error.md` with max_abs, rms
+and argmax agreement per prompt and for the FP32 AVX-512 GEMM reference next to it. Two small tool changes serve it:
+`tools/validate.py --batch M --record-only` (logits through the batched path; exit 0 whatever the comparison shows) and
+`tests/probe.c generate` (prefills the prompt through the batched path when `LLAMA_PREFILL_BATCH` > 1, so the greedy
+agreement is BF16 too). The packing-time run uses `LLAMA_PLACEMENT=hbm` and so depends on the A4/A5 cluster checks.
 
 | Run | Gate or record |
 | --- | --- |

@@ -357,16 +357,21 @@ static void test_attention_batch(void) {
 
 int main(void) {
   enum { ROPE_FLOATS = 1 << 16, Q8_VALUES = 1 << 14 };
-  float *rope[2] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float))};
-  int8_t *quantized[2] = {zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1)};
-  float *scales[2] = {zeroed(Q8_VALUES, sizeof(float)), zeroed(Q8_VALUES, sizeof(float))};
+  float *rope[3] = {zeroed(ROPE_FLOATS, sizeof(float)), zeroed(ROPE_FLOATS, sizeof(float)),
+                    zeroed(ROPE_FLOATS, sizeof(float))};
+  int8_t *quantized[3] = {zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1), zeroed(Q8_VALUES, 1)};
+  float *scales[3] = {zeroed(Q8_VALUES, sizeof(float)), zeroed(Q8_VALUES, sizeof(float)),
+                      zeroed(Q8_VALUES, sizeof(float))};
   size_t rope_used = 0;
-  int ran[2] = {0, 0};
-  const KernelIsa isas[2] = {KERNELS_SCALAR, KERNELS_AVX512};
-  for (int i = 0; i < 2; i++) {
+  int ran[3] = {0, 0, 0};
+  /* The amx level runs every kernel on its AVX-512 path (AMX only touches the batched GEMM tiles), so this repeats the
+   * whole suite under LLAMA_KERNELS=amx; it is skipped where AMX or its permission is unavailable (C4). */
+  const KernelIsa isas[3] = {KERNELS_SCALAR, KERNELS_AVX512, KERNELS_AMX};
+  const char *const isa_names[3] = {"scalar", "avx512", "amx"};
+  for (int i = 0; i < 3; i++) {
     unsigned long long seed = rng;
     if (!kernels_select(isas[i])) {
-      printf("kernels: %s unavailable on this CPU, skipped\n", i ? "avx512" : "scalar");
+      printf("kernels: %s unavailable on this CPU, skipped\n", isa_names[i]);
       continue;
     }
     current = kernels_name();
@@ -381,14 +386,16 @@ int main(void) {
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
   }
-  if (ran[0] && ran[1]) {
-    current = "scalar vs avx512";
+  for (int other = 1; other < 3; other++) {
+    if (!(ran[0] && ran[other]))
+      continue;
+    current = other == 1 ? "scalar vs avx512" : "scalar vs amx";
     checks += 3;
-    if (memcmp(rope[0], rope[1], rope_used * sizeof(float)) && failures++ < 20)
+    if (memcmp(rope[0], rope[other], rope_used * sizeof(float)) && failures++ < 20)
       fprintf(stderr, "rope [%s]: results differ bitwise\n", current);
-    if (memcmp(quantized[0], quantized[1], Q8_VALUES) && failures++ < 20)
+    if (memcmp(quantized[0], quantized[other], Q8_VALUES) && failures++ < 20)
       fprintf(stderr, "quantize [%s]: int8 values differ bitwise\n", current);
-    if (memcmp(scales[0], scales[1], Q8_VALUES * sizeof(float)) && failures++ < 20)
+    if (memcmp(scales[0], scales[other], Q8_VALUES * sizeof(float)) && failures++ < 20)
       fprintf(stderr, "quantize [%s]: scales differ bitwise\n", current);
   }
   /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
@@ -405,7 +412,7 @@ int main(void) {
   int8_t *scratch_q = zeroed(Q8_VALUES, 1);
   float *scratch_s = zeroed(Q8_VALUES, sizeof(float));
   static char label[64];
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     if (!ran[i])
       continue;
     kernels_select(isas[i]);
@@ -429,7 +436,8 @@ int main(void) {
   free(scratch_q), free(scratch_s);
   for (int i = 0; i < MEM_COUNT; i++)
     assert(memory_current[i] == 0);
-  free(rope[0]), free(rope[1]), free(quantized[0]), free(quantized[1]), free(scales[0]), free(scales[1]);
+  for (int i = 0; i < 3; i++)
+    free(rope[i]), free(quantized[i]), free(scales[i]);
   printf("kernels: %d checks, %d failures\n", checks, failures);
   return failures != 0;
 }
