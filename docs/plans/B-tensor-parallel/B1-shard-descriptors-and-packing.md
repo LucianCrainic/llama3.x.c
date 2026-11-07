@@ -13,7 +13,7 @@ Correctness is shown by reconstructing every original tensor exactly. B1 changes
 computation.
 
 Status: **implemented and tested locally (macOS, virtual regions); cluster `check` pending, and it inherits A4's
-open cluster check**. Branch: `feature/tp-local-b` (commit `feat: add shard descriptors and packing`).
+open cluster check**. Branch: `feature/tp-local-b` (commit `feat: add shard descriptors, validation and row/column packing`).
 
 Implementation notes:
 
