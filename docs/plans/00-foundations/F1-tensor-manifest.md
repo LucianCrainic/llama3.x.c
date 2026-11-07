@@ -20,8 +20,8 @@ scheduler or descriptor family (see the user decision in the [README](../README.
 Inference behaviour does not change: weights are still read from the file mapping, at
 exactly the pointers used today.
 
-Status: **implemented, local tests pass** (not yet merged). Branch:
-`feature/found-f1-tensor-manifest`.
+Status: **implemented, merged; local and Linux tests pass** (`tests/manifest.c`, `test_runtime.py`; the Linux run is part of
+the `make test` of the M1 cluster check).
 
 Implementation notes (deviations from the proposal above):
 

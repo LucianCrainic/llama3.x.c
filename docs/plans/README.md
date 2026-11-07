@@ -1,6 +1,8 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
-Plan date: 1 November 2026. Status: **planned**. No phase has started.
+Plan date: 1 November 2026. Status as of 7 November 2026: Wave 1 (M1) is complete; Wave 2 (M2) is implemented
+and tested locally, with its cluster checks still to run; Waves 3-5 (B, C4-C7, D) have not started. See the milestone
+table in §4 and each phase document's status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. Plan branch:
 `feature/numa-tp-prefill`.
 
