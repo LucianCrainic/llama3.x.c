@@ -22,8 +22,9 @@ int tp_sockets_requested(void);
 int tp_check_topology(const char *placement);
 
 /* Plans the shards, reserves and loads the regions, and starts the socket-1 coordinator. The pool must hold two
- * teams. `quantized` selects the Q8_0 path with group size gs. */
-Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs);
+ * teams. `quantized` selects the Q8_0 path with group size gs; fp32_activations is W8A32 (LLAMA_Q8_ACTIVATIONS=fp32).
+ */
+Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations);
 float *tp_forward(Tp *tp, int token, int pos);
 void tp_kv_stats(const Tp *tp, int position, KvStats *out);
 /* What the report records. */

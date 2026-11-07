@@ -34,6 +34,7 @@ class TensorParallelTests(unittest.TestCase):
             'unshared': create(root/'unshared', shared=False, config=TP_CONFIG, gs=4),
             'odd': create(root/'odd', config=TP_ODD_CONFIG, gs=4),
         }
+        cls.fixtures['gs16'] = create(root/'gs16', config=TP_CONFIG, gs=16)
         cls.one_kv = create(root/'one-kv', shared=True)
 
     @classmethod
@@ -70,6 +71,25 @@ class TensorParallelTests(unittest.TestCase):
             for threads in (1, 3, 7):
                 with self.subTest(fixture=name, threads=threads):
                     self.assert_agree(one, self.logits('fp32', name, None, 2, threads), vocab)
+
+    def test_q8_logits_agree_with_one_socket(self):
+        for activations in ('int8', 'fp32'):  # W8A8 and W8A32
+            for name, vocab in [('shared', TP_CONFIG[5]), ('unshared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])]:
+                one = self.logits('int8', name, None, 1, LLAMA_Q8_ACTIVATIONS=activations)
+                for threads in (1, 3, 7):
+                    with self.subTest(activations=activations, fixture=name, threads=threads):
+                        two = self.logits('int8', name, None, 2, threads, LLAMA_Q8_ACTIVATIONS=activations)
+                        self.assert_agree(one, two, vocab)
+
+    def test_q8_batched_entry_and_generation(self):
+        for activations in ('int8', 'fp32'):
+            with self.subTest(activations=activations):
+                one = self.logits('int8', 'shared', 'batch', 1, LLAMA_Q8_ACTIVATIONS=activations)
+                two = self.logits('int8', 'shared', 'batch', 2, LLAMA_PREFILL_BATCH='3', LLAMA_Q8_ACTIVATIONS=activations)
+                self.assert_agree(one, two, TP_CONFIG[5])
+                tokens = self.probe('int8', 'unshared', 'generate', 1, LLAMA_Q8_ACTIVATIONS=activations)
+                self.assertGreaterEqual(len(tokens.split()), 8)
+                self.assertEqual(tokens, self.probe('int8', 'unshared', 'generate', 2, LLAMA_Q8_ACTIVATIONS=activations))
 
     def test_fp32_batched_prefill_entry_agrees(self):
         one = self.logits('fp32', 'shared', 'batch', 1)
@@ -110,9 +130,11 @@ class TensorParallelTests(unittest.TestCase):
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_TOPOLOGY': 'virtual:1x3'}, 'allowed CPUs in only 1'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_PLACEMENT': 'hbm'}, 'virtual'),
         ]
+        cases.append((self.fixtures['gs16']/'int8.bin', environment(2), 'group size 16 does not divide'))
         for model, env, text in cases:
             with self.subTest(text=text):
-                result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '65'], capture_output=True, timeout=60, env=env)
+                probe = 'probe-int8' if str(model).endswith('int8.bin') else 'probe-fp32'
+                result = subprocess.run([str(BUILD/probe), str(model), '65'], capture_output=True, timeout=60, env=env)
                 self.assertEqual(result.returncode, 1, result.stderr.decode())
                 self.assertIn(text, result.stderr.decode())
 

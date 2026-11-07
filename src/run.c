@@ -354,7 +354,7 @@ void engine_load_context(Model *model, const char *path, int context) {
   prefill_configure(model);
   if (tp_sockets_requested() == 2) {
     model->prefill_gemm = 0;
-    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0);
+    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0, 0);
     munmap(t->data, t->file_size); /* the shards were read with pread */
     t->data = MAP_FAILED;
     model->mapped_bytes = 0;

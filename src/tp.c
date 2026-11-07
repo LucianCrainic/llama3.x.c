@@ -32,7 +32,7 @@ typedef struct {
 
 struct Tp {
   Config c;
-  int quantized, gs, check;
+  int quantized, gs, check, fp32_activations;
   ShardSet set;
   NumaRegion global;
   TpSocket s[SOCKETS];
@@ -148,6 +148,23 @@ static const float *norm_weight(const Tp *tp, TensorRole role, int layer, int so
   return sh->q;
 }
 
+/* The shard and row that hold `token`'s embedding (tied: the owner's vocabulary shard; untied: the global shard). */
+static const Shard *embedding_shard(const Tp *tp, int token, int *row) {
+  const Shard *cls = shards_find(&tp->set, T_WCLS, -1, 0);
+  if (cls->alias) {
+    for (int s = 0; s < SOCKETS; s++) {
+      const Shard *sh = shards_find(&tp->set, T_WCLS, -1, s);
+      if (token >= sh->row0 && token < sh->row0 + sh->rows) {
+        *row = token - sh->row0;
+        return sh;
+      }
+    }
+    fail("token %d is outside the vocabulary shards", token);
+  }
+  *row = token;
+  return shards_find(&tp->set, T_EMBED, -1, 0);
+}
+
 static const float *embedding_row(const Tp *tp, int token) {
   const Shard *cls = shards_find(&tp->set, T_WCLS, -1, 0);
   if (cls->alias) { /* tied: the row lives in the vocabulary shard of its owner */
@@ -213,6 +230,74 @@ static void forward_fp32(Tp *tp, int s) {
   SPROFILE(PHASE_CLASSIFIER, k_matmul(tp->logits + cls->row0, sk->x, cls->q, dim, cls->rows));
 }
 
+/* Q8_0 (B6): the same group size, scales and activation rule as runq.c. Row shards quantize the full normalized input,
+ * which is identical on both sockets; Wo and W2 quantize only the owned slice, which starts on a group boundary, so
+ * its groups are exactly the original groups. */
+static K8Weight q8_weight(const Shard *sh) {
+  return (K8Weight){(const int8_t *)sh->q, sh->s};
+}
+
+static K8Input q8_input(const Tp *tp, int8_t *q, float *scales, const float *x, int n) {
+  if (tp->fp32_activations)
+    return (K8Input){NULL, NULL, x};
+  k_quantize(q, scales, x, n, tp->gs);
+  return (K8Input){q, scales, x};
+}
+
+static void forward_q8(Tp *tp, int s) {
+  TpSocket *sk = &tp->s[s];
+  const Config *p = &tp->c;
+  int dim = p->dim, hd = p->head_dim, gs = tp->gs, hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS,
+      kvl = kl * hd;
+  int hidden_l = p->hidden_dim / SOCKETS, token = tp->token, pos = tp->pos;
+  int row;
+  const Shard *embed = embedding_shard(tp, token, &row);
+  SPROFILE(PHASE_EMBED, for (int i = 0; i < dim; i++) sk->x[i] =
+                            ((const int8_t *)embed->q)[(size_t)row * dim + i] * embed->s[((size_t)row * dim + i) / gs]);
+  SPROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, sk->rope));
+  for (int l = 0; l < p->n_layers; l++) {
+    SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
+    K8Input in;
+    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
+    size_t layer = (size_t)l * p->seq_len * kvl;
+    float *k = sk->key_cache + layer + (size_t)pos * kvl, *v = sk->value_cache + layer + (size_t)pos * kvl;
+    K8Weight wq = q8_weight(shards_find(&tp->set, T_WQ, l, s)), wk = q8_weight(shards_find(&tp->set, T_WK, l, s)),
+             wv = q8_weight(shards_find(&tp->set, T_WV, l, s));
+    SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / SOCKETS, kvl, gs));
+    SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
+    SPROFILE(PHASE_ATTENTION, k_attention(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
+                                          &sk->attention, hl, kl, hd, p->seq_len, pos));
+    const Shard *wo = shards_find(&tp->set, T_WO, l, s);
+    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->xb, dim / SOCKETS));
+    float *partial = exchange_partial(tp->exchange, s);
+    if (!partial)
+      return;
+    K8Weight wo_weight = q8_weight(wo);
+    SPROFILE(PHASE_WO, k_matmul_q8_ld(partial, &in, &wo_weight, wo->ld, dim / SOCKETS, dim, gs, K_PARTIAL);
+             reduce(tp, sk, sk->x, dim));
+
+    SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
+    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
+    K8Weight w1 = q8_weight(shards_find(&tp->set, T_W1, l, s)), w3 = q8_weight(shards_find(&tp->set, T_W3, l, s));
+    SPROFILE(PHASE_W1_W3, k_matmul_q8_swiglu(sk->hb, &in, w1, w3, dim, hidden_l, gs));
+    const Shard *w2 = shards_find(&tp->set, T_W2, l, s);
+    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->hb, hidden_l));
+    partial = exchange_partial(tp->exchange, s);
+    if (!partial)
+      return;
+    K8Weight w2_weight = q8_weight(w2);
+    SPROFILE(PHASE_W2, k_matmul_q8_ld(partial, &in, &w2_weight, w2->ld, hidden_l, dim, gs, K_PARTIAL);
+             reduce(tp, sk, sk->x, dim));
+    if (sk->debug)
+      memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
+  }
+  SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->x, sk->x, norm_weight(tp, T_RMS_FINAL, -1, s), dim, p->norm_eps));
+  K8Input in;
+  SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->x, dim));
+  const Shard *cls = shards_find(&tp->set, T_WCLS, -1, s);
+  SPROFILE(PHASE_CLASSIFIER, k_matmul_q8(tp->logits + cls->row0, &in, q8_weight(cls), dim, cls->rows, gs));
+}
+
 /* Carves the socket's activations out of its work region and sizes the attention work from its team. Runs on the
  * socket's coordinator, so the pages are first written by the socket that uses them. */
 static void setup_socket(Tp *tp, int s) {
@@ -236,8 +321,9 @@ static void setup_socket(Tp *tp, int s) {
   if (tp->quantized) {
     CARVE(sk->xq, p->dim, int8_t);
     CARVE(sk->xs, p->dim / tp->gs, float);
-    CARVE(sk->aq, p->hidden_dim / SOCKETS, int8_t);
-    CARVE(sk->as, p->hidden_dim / SOCKETS / tp->gs, float);
+    int slice = (p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / SOCKETS; /* attention output or FFN hidden */
+    CARVE(sk->aq, slice, int8_t);
+    CARVE(sk->as, slice / tp->gs, float);
   }
   float *attention_memory;
   CARVE(attention_memory, k_attention_bytes(hl, kl, p->head_dim, p->seq_len) / sizeof(float) + 1, float);
@@ -252,11 +338,12 @@ static void setup_socket(Tp *tp, int s) {
 static size_t work_bytes(const Tp *tp) {
   const Config *p = &tp->c;
   int hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS;
-  size_t bytes = 64 * 16;
+  size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / SOCKETS;
+  size_t bytes = 64 * 16; /* alignment of each buffer */
   bytes += (size_t)(2 * p->dim + p->hidden_dim / SOCKETS + p->dim / SOCKETS + 2 * p->head_dim) * sizeof(float);
   bytes += (size_t)hl * p->seq_len * sizeof(float);
-  bytes += p->dim + (size_t)p->dim / (tp->gs ? tp->gs : 1) * sizeof(float) + p->hidden_dim / SOCKETS +
-           (size_t)p->hidden_dim / SOCKETS / (tp->gs ? tp->gs : 1) * sizeof(float);
+  if (tp->quantized) /* xq, xs, aq, as */
+    bytes += (size_t)p->dim + (size_t)p->dim / tp->gs * sizeof(float) + slice + slice / tp->gs * sizeof(float);
   bytes += k_attention_bytes(hl, kl, p->head_dim, p->seq_len) + 64;
   return bytes;
 }
@@ -270,7 +357,10 @@ static void socket_command(Tp *tp, int socket) {
     shards_load(&tp->set, tp->loader_fd, socket, tp->s[socket].team);
     break;
   case CMD_FORWARD:
-    forward_fp32(tp, socket);
+    if (tp->quantized)
+      forward_q8(tp, socket);
+    else
+      forward_fp32(tp, socket);
     break;
   case CMD_STOP:
     break;
@@ -304,12 +394,11 @@ static void verify_bound(NumaRegion *r, const char *mode) {
          check.queried - check.on_node, check.queried, r->node);
 }
 
-Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs) {
-  if (quantized)
-    fail("LLAMA_SOCKETS=2 supports FP32 checkpoints only so far");
+Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations) {
   Tp *tp = memory_alloc(1, sizeof(*tp), MEM_METADATA);
   tp->c = *p;
   tp->quantized = quantized;
+  tp->fp32_activations = fp32_activations;
   tp->gs = quantized ? gs : 0;
   tp->loader_fd = fd;
   const char *check = getenv("LLAMA_TP_CHECK");
