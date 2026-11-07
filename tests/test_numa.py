@@ -230,6 +230,20 @@ class WorkerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn(text, result.stderr)
 
+    def test_exchange_stress(self):
+        for teams, elements in [((1, 1), 7), ((3, 3), 4096), ((7, 7), 1), ((2, 5), 4096 * 16)]:
+            with self.subTest(teams=teams, elements=elements):
+                result = self.run_workers('exchange', 2000, *teams, elements, timeout=300)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fail_during_a_reduction_ends_the_process(self):
+        for mode, text in [('exchange-fail-worker', 'exchange worker 1 of socket 1'),
+                           ('exchange-fail-leader', 'coordinator of socket 0')]:
+            with self.subTest(mode=mode):
+                result = self.run_workers(mode, timeout=30)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(text, result.stderr)
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'pinning is Linux-only')
     def test_pinned_workers_read_back_their_cpu(self):
         result = self.run_workers('affinity', 4)

@@ -5,16 +5,20 @@ import struct
 from pathlib import Path
 
 CONFIG = (4, 8, 2, 2, 1, 128010, 32)
+# B: two KV heads and an even/odd vocabulary, so the model can be split over two sockets; Q8 group size 4 keeps the
+# per-socket column slices (8 and 16) aligned to groups.
+TP_CONFIG = (16, 32, 2, 4, 2, 128010, 64)
+TP_ODD_CONFIG = (16, 32, 2, 4, 2, 128011, 64)
 
 
 def floats(n, phase):
     return array.array('f', (0.12 * math.sin(i * 0.71 + phase) for i in range(n)))
 
 
-def create(root, shared=True, zero=False, stop=None, seq_len=None):
+def create(root, shared=True, zero=False, stop=None, seq_len=None, config=None, gs=2):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    d, h, layers, heads, kvheads, v, seq = CONFIG
+    d, h, layers, heads, kvheads, v, seq = config or CONFIG
     if seq_len is not None:
         seq = seq_len
     kv = d // heads * kvheads
@@ -24,7 +28,7 @@ def create(root, shared=True, zero=False, stop=None, seq_len=None):
     weights = [emb] + [floats(n, phase + layer) for n, phase in matrices for layer in range(layers)]
     if not shared:
         classifier = array.array('f', [0] * (v*d))
-        classifier[65*d:66*d] = array.array('f', [10, -10, 10, -10])
+        classifier[65*d:66*d] = array.array('f', [10, -10] * (d // 2))
         weights.append(classifier)
     if stop:
         if shared:
@@ -51,7 +55,6 @@ def create(root, shared=True, zero=False, stop=None, seq_len=None):
         f.write(bytes(seq*(d//heads)*4))
         if not shared:
             f.write(weights[-1].tobytes())
-    gs = 2
     with (root/'int8.bin').open('wb') as f:
         header = struct.pack('<Ii7iBi', 0x616b3432, 2, d, h, layers, heads, kvheads, v, seq, int(shared), gs)
         f.write(header + bytes(256-len(header)))

@@ -41,6 +41,17 @@ static int team_count;
 static TeamSummary summaries[2];
 static int summary_count;
 static _Thread_local int in_pool_thread;
+static atomic_int abort_flag;
+
+void workers_abort(void) {
+  atomic_store_explicit(&abort_flag, 1, memory_order_release);
+}
+int workers_aborted(void) {
+  return atomic_load_explicit(&abort_flag, memory_order_acquire);
+}
+void workers_abort_clear(void) {
+  atomic_store_explicit(&abort_flag, 0, memory_order_release);
+}
 
 static inline void relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -231,7 +242,15 @@ void team_barrier(Team *team) {
     atomic_store_explicit(&team->barrier_count.value, 0, memory_order_relaxed);
     atomic_store_explicit(&team->barrier_generation.value, generation + 1, memory_order_release);
   } else {
-    wait_change(&team->barrier_generation, generation);
+    for (unsigned spins = 0; atomic_load_explicit(&team->barrier_generation.value, memory_order_acquire) == generation;
+         spins++) {
+      if (workers_aborted())
+        return;
+      if (spins < SPIN_LIMIT)
+        relax();
+      else
+        sched_yield();
+    }
   }
 }
 
@@ -253,4 +272,142 @@ int pool_summary_count(void) {
 }
 const TeamSummary *pool_summary(int index) {
   return index >= 0 && index < summary_count ? &summaries[index] : NULL;
+}
+
+/* ---- Cross-socket reduction (B4) -------------------------------------------------------------------------------- */
+
+struct Exchange {
+  int elements_max;
+  size_t stride; /* floats between the two buffers of a socket, a multiple of a cache line */
+  Team *team[2];
+  float *buffer[2][2]; /* [socket][generation & 1] */
+  void *heap[2];       /* NULL when the socket's buffers sit in a caller-owned region */
+  Counter ready[2];    /* ready[s] = g: socket s finished writing partial g */
+  Counter consumed[2]; /* consumed[s] = g: socket s finished reading the peer's partial g */
+  unsigned issued[2];  /* generation handed out by exchange_partial; written by the coordinator, read by workers */
+  atomic_int timing;
+  double reduce_seconds[2], wait_seconds[2]; /* leader of each socket only */
+};
+
+size_t exchange_region_bytes(int elements_max) {
+  size_t line = 64 / sizeof(float);
+  size_t stride = (((size_t)elements_max + line - 1) / line) * line;
+  return 2 * stride * sizeof(float);
+}
+
+Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2]) {
+  if (elements_max < 1)
+    fail("invalid exchange size %d", elements_max);
+  if (team_count != 2)
+    fail("the cross-socket exchange needs a pool of two teams");
+  Exchange *e = memory_alloc(1, sizeof(*e), MEM_METADATA);
+  e->elements_max = elements_max;
+  size_t bytes = exchange_region_bytes(elements_max);
+  e->stride = bytes / (2 * sizeof(float));
+  for (int s = 0; s < 2; s++) {
+    e->team[s] = teams[s];
+    char *base;
+    NumaRegion *region = socket_regions ? socket_regions[s] : NULL;
+    if (region) {
+      if (!region->data || region->data_bytes < bytes)
+        fail("exchange region of socket %d holds %zu bytes, %zu needed", s, region->data ? region->data_bytes : 0,
+             bytes);
+      base = region->data;
+    } else {
+      e->heap[s] = memory_alloc(bytes + 64, 1, MEM_ACTIVATION);
+      base = (char *)(((uintptr_t)e->heap[s] + 63) & ~(uintptr_t)63);
+    }
+    if ((uintptr_t)base % 64)
+      fail("exchange buffers of socket %d are not cache-line aligned", s);
+    e->buffer[s][0] = (float *)base;
+    e->buffer[s][1] = e->buffer[s][0] + e->stride;
+  }
+  return e;
+}
+
+/* Spins until *counter >= target (modular), or the abort flag; returns 0 on abort. */
+static int wait_at_least(const Counter *counter, unsigned target) {
+  for (unsigned spins = 0;; spins++) {
+    if ((int)(atomic_load_explicit(&counter->value, memory_order_acquire) - target) >= 0)
+      return 1;
+    if (workers_aborted())
+      return 0;
+    if (spins < SPIN_LIMIT)
+      relax();
+    else
+      sched_yield();
+  }
+}
+
+void exchange_destroy(Exchange *e) {
+  if (!e)
+    return;
+  for (int s = 0; s < 2; s++)
+    wait_at_least(&e->consumed[s], e->issued[s]); /* the peer may still be reading our last partial */
+  for (int s = 0; s < 2; s++)
+    memory_free(e->heap[s]);
+  memory_free(e);
+}
+
+static int exchange_check_socket(const Exchange *e, int socket) {
+  if (!e || socket < 0 || socket > 1)
+    fail("invalid exchange or socket %d", socket);
+  return 1 - socket;
+}
+
+float *exchange_partial(Exchange *e, int socket) {
+  int peer = exchange_check_socket(e, socket);
+  double start = atomic_load_explicit(&e->timing, memory_order_relaxed) ? monotonic_seconds() : 0.0;
+  unsigned g = ++e->issued[socket];
+  /* The buffer's previous occupant is generation g - 2; the peer must have consumed it. */
+  if (g > 2 && !wait_at_least(&e->consumed[peer], g - 2))
+    return NULL;
+  if (start)
+    e->wait_seconds[socket] += monotonic_seconds() - start;
+  return e->buffer[socket][g & 1];
+}
+
+void exchange_reduce_add(Exchange *e, int socket, int worker, int workers, float *residual, int elements) {
+  int peer = exchange_check_socket(e, socket);
+  if (workers != team_size(e->team[socket]) || worker < 0 || worker >= workers || elements < 0 ||
+      elements > e->elements_max)
+    fail("invalid exchange reduction: worker %d of %d, %d elements (maximum %d)", worker, workers, elements,
+         e->elements_max);
+  if (workers_aborted())
+    return;
+  unsigned g = e->issued[socket];
+  int timed = worker == 0 && atomic_load_explicit(&e->timing, memory_order_relaxed);
+  double t0 = timed ? monotonic_seconds() : 0.0;
+  team_barrier(e->team[socket]); /* 1. every worker finished writing the local partial */
+  if (worker == 0)
+    atomic_store_explicit(&e->ready[socket].value, g, memory_order_release); /* 2 */
+  if (!wait_at_least(&e->ready[peer], g))                                    /* 3 */
+    return;
+  double t1 = timed ? monotonic_seconds() : 0.0;
+  const float *p0 = e->buffer[0][g & 1], *p1 = e->buffer[1][g & 1];
+  int i0 = (int)((long long)elements * worker / workers), i1 = (int)((long long)elements * (worker + 1) / workers);
+  for (int i = i0; i < i1; i++)
+    residual[i] += p0[i] + p1[i];
+  double t2 = timed ? monotonic_seconds() : 0.0;
+  team_barrier(e->team[socket]); /* 4. every worker of this socket finished reading both partials */
+  if (worker == 0)
+    atomic_store_explicit(&e->consumed[socket].value, g, memory_order_release);
+  if (timed) {
+    e->wait_seconds[socket] += (t1 - t0) + (monotonic_seconds() - t2);
+    e->reduce_seconds[socket] += t2 - t1;
+  }
+}
+
+void exchange_abort(Exchange *e) {
+  (void)e;
+  workers_abort();
+}
+
+void exchange_set_timing(Exchange *e, int on) {
+  atomic_store_explicit(&e->timing, on, memory_order_relaxed);
+}
+
+void exchange_timing(const Exchange *e, int socket, double *reduce_seconds, double *wait_seconds) {
+  *reduce_seconds = e->reduce_seconds[socket];
+  *wait_seconds = e->wait_seconds[socket];
 }

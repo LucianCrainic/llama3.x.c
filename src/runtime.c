@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include "shards.h"
+#include "workers.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -48,6 +49,7 @@ _Noreturn void fail(const char *format, ...) {
     for (;;)
       pause();
   }
+  workers_abort(); /* wait loops must not spin on memory the exit handlers release */
   va_list args;
   va_start(args, format);
   vsnprintf(failure_message, sizeof(failure_message), format, args);

@@ -13,7 +13,56 @@ cover:
 
 Its logits must agree with the one-socket reference within the FP32 budget.
 
-Status: **planned**. Branch: `feature/tp-b5-fp32-forward`.
+Status: **implemented and tested locally on the virtual topology (macOS, scalar kernels, ASAN/UBSAN, TSAN); nothing
+run on the cluster**. Branch: `feature/tp-local-b` (commit `feat: add the two-socket FP32 forward behind
+LLAMA_SOCKETS=2`).
+
+**Open risk:** B5 sits on A4's owned-weight conventions (regions, strict placement, verification), whose cluster check is
+still pending, and on B4's latency and B1's HBM placement, which have never run on real sockets.
+
+Implementation notes:
+
+- **Module.** `include/tp.h`, `src/tp.c`, compiled into both executables (`COMMON`). `run.c` calls it when
+  `LLAMA_SOCKETS=2`: `read_checkpoint` skips the owned loader, `engine_load_context` calls `tp_create`, then unmaps the
+  file (the shards were read with `pread`); `engine_forward`, `engine_forward_batch` (per token, with `LOGITS_ALL`
+  copies) and `engine_kv_stats` dispatch to it. The single-socket state is not allocated in that mode, and
+  `prefill_gemm` is forced off (D1 owns the two-socket batch path). With `LLAMA_SOCKETS` unset or 1 no line of `tp.c`
+  runs.
+- **Pool.** `kernels_backend_init` builds two teams when `LLAMA_SOCKETS=2`: per-socket CPUs from the topology (virtual:
+  unpinned), `LLAMA_THREADS` per team, a clear failure for a missing teams backend, an unknown value, or fewer than two
+  sockets (`numa_check_placement`).
+- **Coordinators.** The caller is the coordinator of socket 0; `tp.c` runs a thread as coordinator of socket 1
+  (`kernels_set_thread_team`). Commands (`SETUP`, `LOAD`, `FORWARD`, `STOP`) run on both coordinators through a
+  release/acquire generation channel, so even startup (carving, `shards_load`) runs on each socket's own team.
+- **Per token.** Exactly the flow of §4.1, one `team_run` per kernel (the first-version form): embedding row copied into
+  each socket's own residual (tied: from the owner's vocabulary shard; untied: the global shard), RoPE table computed on
+  each socket, QKV on row shards into the local KV, local attention, `K_PARTIAL` Wo into `exchange_partial`'s buffer,
+  `exchange_reduce_add`, FFN with the pair SwiGLU on `hidden/2` rows, `K_PARTIAL` W2, second reduction, final norm,
+  vocabulary-row classifier writing each socket's range of one logits buffer (the remote-write form).
+- **Regions.** Per socket: weights (`ROLE_WEIGHTS`, read-only after the load), `ROLE_KV_K`/`ROLE_KV_V`, a `ROLE_WORK`
+  region carved by the owning coordinator, and the exchange region; the untied embedding in one global region. Node
+  choice: `LLAMA_PLACEMENT=file` unbound, `ddr`/`hbm` the socket's node (the embedding always DDR), strict verification
+  with `region_verify`. The HBM budget check of A4 is not applied yet.
+- **Checks and report.** `LLAMA_TP_CHECK=1` copies each socket's residual after every layer and fails with the layer
+  number if they differ in a single bit. The report says `sockets: 2` and lists both teams; only socket 0 times its
+  phases (`Wo` and `W2` include their reductions); the dedicated `reduce`/`barrier_wait` phases are not in the report
+  yet (`exchange_timing` exists).
+- **Fixture and tests.** `tests/fixtures.py` gains `TP_CONFIG` (dim 16, hidden 32, 2 layers, 4 heads, 2 KV heads,
+  vocabulary 128010, context 64), an odd-vocabulary variant, and a `gs` argument; it also fixes the unshared fixture for
+  `dim != 4`. `tests/test_tp.py` (part of `make test`) runs `LLAMA_SOCKETS=2`, `virtual:2xT` with T = 1, 3, 7 against the
+  one-socket teams backend for the shared, unshared and odd-vocabulary models: logits within `abs 2e-6 + rel 2e-5`
+  (**measured** worst case 3.8e-6 absolute on logits up to 6.8), argmax agreement, the batched entry point with batch
+  1, 3 and `LOGITS_ALL`, greedy 16-token generation identical (unshared fixture, where the argmax has a margin), the CLI
+  `run` producing the same text and a completed report, `LLAMA_TP_CHECK=1` throughout, and the rejections (one KV head,
+  teams backend missing, bad `LLAMA_SOCKETS`, one-socket topology, `hbm` on a virtual topology). ASAN/UBSAN and TSAN runs
+  of `test_tp.py` are clean.
+- **Not done here.** The multi-turn chat and stop-token tests of `test_runtime.py` with `LLAMA_SOCKETS=2`; the
+  `compare_engines.py` harness (not in this tree; `test_tp.py` plays its role on the fixtures); the 1B/8B cluster gates,
+  HF validation under two sockets, per-socket page verification, and the smoke benchmark with the per-phase breakdown
+  (`cresco8-tp.sbatch PHASE=B5`, dry-run verified: `compare_engines.py` one socket vs two, the Hugging Face gate without
+  the one-socket `numactl` binding, a profiled smoke run, and a weights-placement check of both sockets: socket 0 on node
+  2, socket 1 on node 3, 100% verified; KV pages are not verified yet). The coordinator of socket 1 spins and yields between tokens, like the teams; the
+  cost is part of the B7 measurement.
 
 ## 2. Depends on / unblocks
 

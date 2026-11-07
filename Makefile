@@ -34,9 +34,9 @@ ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
 LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
-COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/profile.c src/numa.c src/shards.c src/workers.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
+COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/profile.c src/numa.c src/shards.c src/workers.c src/tp.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
-HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/gemm.h include/loader.h include/prefill.h
+HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h
 # Regenerate the configuration stamp only when flags change; changing OPENMP or
 # CC must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE
@@ -67,6 +67,8 @@ $(BUILD_DIR)/test-manifest: tests/manifest.c $(COMMON) $(HEADERS) $(BUILD_DIR)/c
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/manifest.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-workers: tests/workers.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/workers.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/test-shards: tests/shards.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/shards.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-regions: tests/regions.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/regions.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/numa_probe: tests/numa_probe.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
@@ -75,15 +77,17 @@ $(BUILD_DIR)/test-prefill-fp32: tests/prefill.c src/run.c $(COMMON) $(HEADERS) $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-prefill-int8: tests/prefill.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
+test: all $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/test-shards $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
 	$(BUILD_DIR)/test-kernels
 	$(BUILD_DIR)/test-gemm
 	$(BUILD_DIR)/test-gemm-emul
 	$(BUILD_DIR)/test-manifest
+	$(BUILD_DIR)/test-shards
 	$(BUILD_DIR)/test-regions
 	$(BUILD_DIR)/test-workers
 	python3 tests/test_runtime.py $(BUILD_DIR)
 	python3 tests/test_numa.py $(BUILD_DIR)
+	python3 tests/test_tp.py $(BUILD_DIR)
 	BUILD_DIR=$(BUILD_DIR) python3 tests/test_tools.py
 clean:
 	rm -rf build
