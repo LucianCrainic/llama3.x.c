@@ -2,6 +2,7 @@
  * Scalar paths reproduce the original per-engine loops exactly. OpenMP regions
  * live only in plain functions; ISA-specific work runs in target-attributed
  * helpers called once per row block, so no outlined region needs AVX-512. */
+#include "gemm.h"
 #include "kernels.h"
 #include "numa.h"
 #include "workers.h"
@@ -35,6 +36,8 @@ void kernels_set_team(Team *team) {
 static int supported(KernelIsa which) {
   if (which == KERNELS_SCALAR)
     return 1;
+  if (which == KERNELS_AMX)
+    return gemm_amx_unavailable() == NULL;
 #if HAVE_AVX512
   __builtin_cpu_init();
   return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
@@ -48,7 +51,9 @@ static int supported(KernelIsa which) {
 int kernels_select(KernelIsa which) {
   if (!supported(which))
     return 0;
-  isa = which;
+  /* AMX runs on top of the AVX-512 kernels: the isa stays AVX-512, and the GEMM drivers look at gemm_amx_active(). */
+  isa = which == KERNELS_AMX ? (supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR) : which;
+  gemm_amx_enable(which == KERNELS_AMX);
   initialized = 1;
   return 1;
 }
@@ -62,8 +67,11 @@ void kernels_init(void) {
   } else if (!strcmp(request, "avx512")) {
     if (!kernels_select(KERNELS_AVX512))
       fail("LLAMA_KERNELS=avx512 requested, but AVX-512 F/BW/DQ/VL/VNNI is unavailable");
+  } else if (!strcmp(request, "amx")) {
+    if (!kernels_select(KERNELS_AMX))
+      fail("LLAMA_KERNELS=amx requested, but AMX is unavailable: %s", gemm_amx_unavailable());
   } else {
-    fail("LLAMA_KERNELS must be auto, scalar or avx512");
+    fail("LLAMA_KERNELS must be auto, scalar, avx512 or amx");
   }
   LOG(LOG_DEBUG, "compute kernels: %s", kernels_name());
 }
@@ -71,13 +79,17 @@ void kernels_init(void) {
 const char *kernels_name(void) {
   if (!initialized)
     return NULL;
-  return isa == KERNELS_AVX512 ? "avx512" : "scalar";
+  return gemm_amx_active() ? "amx" : isa == KERNELS_AVX512 ? "avx512" : "scalar";
 }
 
 enum { BLOCK = 4 }; // rows per GEMV kernel call
 
 int kernels_avx512_active(void) {
   return isa == KERNELS_AVX512;
+}
+
+int kernels_amx_active(void) {
+  return gemm_amx_active();
 }
 
 typedef struct {
@@ -1295,5 +1307,6 @@ void kernels_backend_free(void) {
     return;
   kernels_set_team(NULL);
   pool_stop();
+  gemm_amx_thread_release(); /* the coordinator's tiles; the workers released theirs when they exited */
   backend_started = 0;
 }

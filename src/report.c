@@ -1,4 +1,5 @@
 #include "app.h"
+#include "gemm.h"
 #include "kernels.h"
 #include "loader.h"
 #include "numa.h"
@@ -355,6 +356,8 @@ void write_report(void) {
     string(f, kernels_name());
   else
     fputs("null", f);
+  fputs(",\n    \"amx_permission\": ", f);
+  string(f, gemm_amx_permission());
   fputs(",\n    \"openmp_max_threads\": ", f);
 #ifdef _OPENMP
   fprintf(f, "%d", omp_get_max_threads());

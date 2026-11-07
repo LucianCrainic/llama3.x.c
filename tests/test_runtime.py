@@ -347,6 +347,21 @@ class RuntimeTests(unittest.TestCase):
         _, data = self.execute('run', env={'LLAMA_PREFILL_GEMM': 'maybe'}, success=False)
         self.assertIn('LLAMA_PREFILL_GEMM', data['error'])
 
+    def test_amx_is_explicit_and_fails_clearly_when_unavailable(self):
+        """C4: `auto` never picks amx; an explicit request is honoured or fails with the reason (no silent fallback)."""
+        _, data = self.execute('run', env={'LLAMA_KERNELS': 'auto'})
+        self.assertNotEqual(data['build']['kernels'], 'amx')
+        self.assertEqual(data['build']['amx_permission'], 'not requested')
+        result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                 '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                env={**os.environ, 'LLAMA_KERNELS': 'amx'})
+        if result.returncode:  # this host has no AMX or the kernel refuses the permission
+            self.assertIn('LLAMA_KERNELS=amx requested, but AMX is unavailable', result.stderr)
+        result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                 '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                env={**os.environ, 'LLAMA_KERNELS': 'bogus'})
+        self.assertIn('LLAMA_KERNELS must be auto, scalar, avx512 or amx', result.stderr)
+
     # ---- A5: KV cache and workspace placement ------------------------------------------------------------------
     def test_kv_accounting_matches_the_formula(self):
         layers, kv_dim, seq = CONFIG[2], CONFIG[0] // CONFIG[3] * CONFIG[4], CONFIG[-1]

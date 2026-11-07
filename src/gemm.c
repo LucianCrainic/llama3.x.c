@@ -1,10 +1,15 @@
 /* Batched FP32 GEMM (C2). One driver, two microkernels: a portable one (also the scalar instruction set) and an
  * AVX-512 4x4 dot-product tile. The driver splits every segment's N into chunks of NC weight rows that are
  * distributed over the workers; a chunk loops over blocks of M rows and blocks of K, collects each block's tile sums
- * in a small scratch and applies the epilogue once all of K has been summed. */
+ * in a small scratch and applies the epilogue once all of K has been summed.
+ *
+ * AMX (C4): ISA detection and the Linux tile-data permission, per-thread tile configuration, the BF16 and INT8 tile
+ * microkernels and the VNNI packing helpers. The `amx` target attribute is used only in this file. */
 #include "gemm.h"
 #include "kernels.h"
 #include <math.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -183,6 +188,368 @@ static void gemm_run(const float *a, int lda, int m, int k, const GemmSegment *s
   }
   kernels_parallel_segments(count, chunks, gemm_chunks, &job);
 }
+
+/* ---- AMX (C4) ---------------------------------------------------------------------------------------------------
+ * GEMM_EMULATE_AMX swaps the tile instructions for the software model in tests/amx_emul.h, so the loops below run
+ * on any host. The macros take literal tile numbers, as the hardware intrinsics require. */
+#if defined(GEMM_EMULATE_AMX)
+#include "../tests/amx_emul.h"
+#define GEMM_AMX 1
+#define GEMM_AMX_EMULATED 1
+#define AMX_TARGET
+#define AMX_LOADCFG(p) emul_tile_loadconfig(p)
+#define AMX_RELEASE() emul_tile_release()
+#define AMX_ZERO(t) emul_tile_zero(t)
+#define AMX_LOADD(t, p, stride) emul_tile_loadd(t, p, (long)(stride))
+#define AMX_STORED(t, p, stride) emul_tile_stored(t, p, (long)(stride))
+#define AMX_DPBF16PS(c, a, b) emul_tile_dpbf16ps(c, a, b)
+#define AMX_DPBSSD(c, a, b) emul_tile_dpbssd(c, a, b)
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) &&                                              \
+    (__has_include(<amxtileintrin.h>) || __has_include(<amxintrin.h>))
+#include <cpuid.h>
+#include <immintrin.h>
+#define GEMM_AMX 1
+#define GEMM_AMX_EMULATED 0
+#define AMX_TARGET __attribute__((target("amx-tile,amx-bf16,amx-int8")))
+#define AMX_LOADCFG(p) _tile_loadconfig(p)
+#define AMX_RELEASE() _tile_release()
+#define AMX_ZERO(t) _tile_zero(t)
+#define AMX_LOADD(t, p, stride) _tile_loadd(t, p, stride)
+#define AMX_STORED(t, p, stride) _tile_stored(t, p, stride)
+#define AMX_DPBF16PS(c, a, b) _tile_dpbf16ps(c, a, b)
+#define AMX_DPBSSD(c, a, b) _tile_dpbssd(c, a, b)
+#else
+#define GEMM_AMX 0
+#define GEMM_AMX_EMULATED 0
+#endif
+
+#if GEMM_AMX && !GEMM_AMX_EMULATED && defined(__linux__)
+#include <errno.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#if __has_include(<asm/prctl.h>)
+#include <asm/prctl.h>
+#endif
+/* The documented values (Linux 5.16 and later), used when the installed headers predate them. */
+#ifndef ARCH_GET_XCOMP_PERM
+#define ARCH_GET_XCOMP_PERM 0x1022
+#endif
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#define XFEATURE_XTILEDATA 18
+_Static_assert(ARCH_GET_XCOMP_PERM == 0x1022 && ARCH_REQ_XCOMP_PERM == 0x1023, "arch_prctl XCOMP_PERM request codes");
+#define AMX_PERMISSION_SYSCALL 1
+#endif
+
+static int amx_active;
+static const char *amx_permission_name = "not requested";
+#if GEMM_AMX && !GEMM_AMX_EMULATED
+static int amx_checked;
+static char amx_reason[256];
+#endif
+
+#if GEMM_AMX && !GEMM_AMX_EMULATED
+/* CPUID leaf 7, subleaf 0, EDX: bit 22 AMX-BF16, bit 24 AMX-TILE, bit 25 AMX-INT8. Read directly rather than through
+ * __builtin_cpu_supports, whose AMX names depend on the compiler version. */
+static int cpu_has_amx(void) {
+  unsigned a, b, c, d;
+  if (__get_cpuid_max(0, NULL) < 7)
+    return 0;
+  __cpuid_count(7, 0, a, b, c, d);
+  const unsigned need = (1u << 22) | (1u << 24) | (1u << 25);
+  return (d & need) == need;
+}
+#endif
+
+/* NULL when AMX can be used, else why not. Requests the kernel's tile-data permission on the first call; that must
+ * happen before any worker thread executes a tile instruction, and kernels_init() is that point. */
+const char *gemm_amx_unavailable(void) {
+#if !GEMM_AMX
+  return "this build has no AMX support (it needs x86-64 and a compiler with the AMX intrinsics, GCC 11 or later)";
+#elif GEMM_AMX_EMULATED
+  return NULL;
+#else
+  if (amx_checked)
+    return amx_reason[0] ? amx_reason : NULL;
+  amx_checked = 1;
+  __builtin_cpu_init();
+  if (!cpu_has_amx()) {
+    amx_permission_name = "unsupported";
+    snprintf(amx_reason, sizeof(amx_reason), "this CPU does not report AMX-TILE, AMX-BF16 and AMX-INT8");
+  } else if (!(__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+               __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") &&
+               __builtin_cpu_supports("avx512vnni"))) {
+    snprintf(amx_reason, sizeof(amx_reason), "AVX-512 F/BW/DQ/VL/VNNI is unavailable");
+  } else {
+#ifdef AMX_PERMISSION_SYSCALL
+    unsigned long permitted = 0;
+    if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
+      amx_permission_name = "denied";
+      snprintf(amx_reason, sizeof(amx_reason),
+               "the kernel refused permission for AMX tile data (arch_prctl ARCH_REQ_XCOMP_PERM: %s)", strerror(errno));
+    } else if (syscall(SYS_arch_prctl, ARCH_GET_XCOMP_PERM, &permitted) != 0 ||
+               !(permitted & (1ul << XFEATURE_XTILEDATA))) {
+      amx_permission_name = "denied";
+      snprintf(amx_reason, sizeof(amx_reason), "arch_prctl ARCH_GET_XCOMP_PERM does not show XTILEDATA as permitted");
+    } else {
+      amx_permission_name = "granted";
+    }
+#else
+    amx_permission_name = "unsupported";
+    snprintf(amx_reason, sizeof(amx_reason), "the tile-data permission request is implemented for Linux only");
+#endif
+  }
+  return amx_reason[0] ? amx_reason : NULL;
+#endif
+}
+
+const char *gemm_amx_permission(void) {
+  return amx_permission_name;
+}
+
+void gemm_amx_enable(int on) {
+  amx_active = on;
+}
+
+int gemm_amx_active(void) {
+  return amx_active;
+}
+
+int gemm_amx_compiled(void) {
+  return GEMM_AMX;
+}
+
+int gemm_amx_emulated(void) {
+  return GEMM_AMX_EMULATED;
+}
+
+/* ---- BF16 conversion and VNNI packing (portable) ---------------------------------------------------------------- */
+
+/* Round to nearest even on the 16 dropped bits; denormals convert like any other value (they are not flushed); a NaN
+ * stays a NaN (quieted, sign and top payload bits kept); infinities are exact; values at or above the midpoint to
+ * 2^128 round to infinity. */
+uint16_t bf16_from_f32(float x) {
+  uint32_t u;
+  memcpy(&u, &x, sizeof(u));
+  if ((u & 0x7fffffffu) > 0x7f800000u)
+    return (uint16_t)((u >> 16) | 0x0040u);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+
+float f32_from_bf16(uint16_t v) {
+  uint32_t u = (uint32_t)v << 16;
+  float x;
+  memcpy(&x, &u, sizeof(x));
+  return x;
+}
+
+static size_t round_up(size_t v, size_t to) {
+  return (v + to - 1) / to * to;
+}
+
+size_t bf16_vnni_elements(int rows, int cols) {
+  return round_up((size_t)rows, 16) * round_up((size_t)cols, 32);
+}
+
+size_t s8_vnni_bytes(int rows, int cols) {
+  return round_up((size_t)rows, 16) * round_up((size_t)cols, 64);
+}
+
+/* Tile `nt` holds weight rows [16 nt, 16 nt + 16). Inside it, K pair p (columns 2p, 2p+1) is a row of 16 channel
+ * pairs: dst[((nt * kp/2 + p) * 16 + c) * 2 + e] = bf16(w[16 nt + c][2p + e]), with kp = cols rounded up to 32. A
+ * tile load of 16 pair rows (32 values of K) then starts at element nt * kp * 16 + (k / 32) * 512 and is contiguous. */
+void pack_bf16_vnni_tiles(uint16_t *dst, const float *w, int rows, int cols, size_t ld, int first, int last) {
+  size_t kp = round_up((size_t)cols, 32);
+  for (int nt = first; nt < last; nt++)
+    for (size_t p = 0; p < kp / 2; p++)
+      for (int c = 0; c < 16; c++)
+        for (int e = 0; e < 2; e++) {
+          size_t row = (size_t)nt * 16 + (size_t)c, col = 2 * p + (size_t)e;
+          dst[((size_t)nt * (kp / 2) + p) * 32 + (size_t)c * 2 + (size_t)e] =
+              row < (size_t)rows && col < (size_t)cols ? bf16_from_f32(w[row * ld + col]) : 0;
+        }
+}
+
+void pack_bf16_vnni(uint16_t *dst, const float *w, int rows, int cols, size_t ld) {
+  pack_bf16_vnni_tiles(dst, w, rows, cols, ld, 0, (rows + 15) / 16);
+}
+
+/* The same for int8 with VNNI quads: dst[((nt * kp/4 + q) * 16 + c) * 4 + e] = w[16 nt + c][4q + e], kp = cols
+ * rounded up to 64, so a tile load starts at byte nt * kp * 16 + (k / 64) * 1024. */
+void pack_s8_vnni_tiles(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld, int first, int last) {
+  size_t kp = round_up((size_t)cols, 64);
+  for (int nt = first; nt < last; nt++)
+    for (size_t q = 0; q < kp / 4; q++)
+      for (int c = 0; c < 16; c++)
+        for (int e = 0; e < 4; e++) {
+          size_t row = (size_t)nt * 16 + (size_t)c, col = 4 * q + (size_t)e;
+          dst[((size_t)nt * (kp / 4) + q) * 64 + (size_t)c * 4 + (size_t)e] =
+              row < (size_t)rows && col < (size_t)cols ? w[row * ld + col] : 0;
+        }
+}
+
+void pack_s8_vnni(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld) {
+  pack_s8_vnni_tiles(dst, w, rows, cols, ld, 0, (rows + 15) / 16);
+}
+
+/* ---- aligned workspace ------------------------------------------------------------------------------------------ */
+
+void aligned_buffer_alloc(AlignedBuffer *buffer, size_t bytes, MemoryKind kind) {
+  buffer->base = memory_alloc(checked_add(bytes, 63), 1, kind);
+  buffer->data = (void *)(((uintptr_t)buffer->base + 63) & ~(uintptr_t)63);
+  buffer->bytes = bytes;
+}
+
+void aligned_buffer_free(AlignedBuffer *buffer) {
+  memory_free(buffer->base);
+  *buffer = (AlignedBuffer){0};
+}
+
+/* ---- tile configuration and microkernels ------------------------------------------------------------------------ */
+
+#if GEMM_AMX
+/* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
+ * and a 16 x 16 FP32 or int32 C block. Tiles 0-3 hold C (m block x n block), 4-5 the A blocks, 6-7 the B blocks. */
+typedef struct {
+  uint8_t palette_id, start_row, reserved[14];
+  uint16_t colsb[16];
+  uint8_t rows[16];
+} TileConfig;
+_Static_assert(sizeof(TileConfig) == 64, "the tile configuration is 64 bytes");
+
+static _Thread_local int amx_thread_ready;
+static pthread_key_t amx_key;
+static pthread_once_t amx_key_once = PTHREAD_ONCE_INIT;
+
+AMX_TARGET static void amx_thread_exit(void *unused) {
+  (void)unused;
+  AMX_RELEASE();
+}
+
+static void amx_key_create(void) {
+  pthread_key_create(&amx_key, amx_thread_exit);
+}
+
+/* Configures this thread's tiles at its first AMX job. A worker's tile state ends with the thread (the key's destructor
+ * releases it explicitly); the coordinator thread calls gemm_amx_thread_release() when the engine is torn down. */
+AMX_TARGET static void amx_thread_configure(void) {
+  if (amx_thread_ready)
+    return;
+  TileConfig config __attribute__((aligned(64))) = {.palette_id = 1};
+  for (int t = 0; t < 8; t++) {
+    config.rows[t] = 16;
+    config.colsb[t] = 64;
+  }
+  AMX_LOADCFG(&config);
+  amx_thread_ready = 1;
+  pthread_once(&amx_key_once, amx_key_create);
+  pthread_setspecific(amx_key, &amx_thread_ready);
+}
+
+AMX_TARGET void gemm_amx_thread_release(void) {
+  if (!amx_thread_ready)
+    return;
+  AMX_RELEASE();
+  amx_thread_ready = 0;
+  pthread_setspecific(amx_key, NULL);
+}
+
+/* C[m][n] = sum_k A[m][k] * B[n][k] for m, n <= 32, with 2 x 2 C tiles in flight. A is BF16 row-major with leading
+ * dimension lda (elements) and must be readable, zero-padded, up to ceil(m, 16) rows and ceil(k, 32) columns. B is
+ * packed by pack_bf16_vnni for the same k; bp points at the first of its (at most two) 16-column tiles. C needs room
+ * for whole 16 x 16 tiles (ceil(m, 16) rows by ceil(n, 16) columns); only the first m x n values are meaningful. */
+AMX_TARGET void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m,
+                                   int n, int k) {
+  amx_thread_configure();
+  const size_t kp = round_up((size_t)k, 32), tile = kp * 16;
+  const int wide = n > 16, tall = m > 16;
+  AMX_ZERO(0);
+  if (wide)
+    AMX_ZERO(1);
+  if (tall) {
+    AMX_ZERO(2);
+    if (wide)
+      AMX_ZERO(3);
+  }
+  for (size_t k0 = 0; k0 < kp; k0 += 32) {
+    AMX_LOADD(4, a + k0, lda * sizeof(uint16_t));
+    if (tall)
+      AMX_LOADD(5, a + 16 * lda + k0, lda * sizeof(uint16_t));
+    AMX_LOADD(6, bp + (k0 / 32) * 512, 64);
+    if (wide)
+      AMX_LOADD(7, bp + tile + (k0 / 32) * 512, 64);
+    AMX_DPBF16PS(0, 4, 6);
+    if (wide)
+      AMX_DPBF16PS(1, 4, 7);
+    if (tall) {
+      AMX_DPBF16PS(2, 5, 6);
+      if (wide)
+        AMX_DPBF16PS(3, 5, 7);
+    }
+  }
+  AMX_STORED(0, c, ldc * sizeof(float));
+  if (wide)
+    AMX_STORED(1, c + 16, ldc * sizeof(float));
+  if (tall) {
+    AMX_STORED(2, c + 16 * ldc, ldc * sizeof(float));
+    if (wide)
+      AMX_STORED(3, c + 16 * ldc + 16, ldc * sizeof(float));
+  }
+}
+
+/* The same for signed int8: C[m][n] = sum_k A[m][k] * B[n][k] as exact int32, K in blocks of 64. A is readable up to
+ * ceil(k, 64) columns, zero-padded; B is packed by pack_s8_vnni. */
+AMX_TARGET void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n,
+                                 int k) {
+  amx_thread_configure();
+  const size_t kp = round_up((size_t)k, 64), tile = kp * 16;
+  const int wide = n > 16, tall = m > 16;
+  AMX_ZERO(0);
+  if (wide)
+    AMX_ZERO(1);
+  if (tall) {
+    AMX_ZERO(2);
+    if (wide)
+      AMX_ZERO(3);
+  }
+  for (size_t k0 = 0; k0 < kp; k0 += 64) {
+    AMX_LOADD(4, a + k0, lda);
+    if (tall)
+      AMX_LOADD(5, a + 16 * lda + k0, lda);
+    AMX_LOADD(6, bp + (k0 / 64) * 1024, 64);
+    if (wide)
+      AMX_LOADD(7, bp + tile + (k0 / 64) * 1024, 64);
+    AMX_DPBSSD(0, 4, 6);
+    if (wide)
+      AMX_DPBSSD(1, 4, 7);
+    if (tall) {
+      AMX_DPBSSD(2, 5, 6);
+      if (wide)
+        AMX_DPBSSD(3, 5, 7);
+    }
+  }
+  AMX_STORED(0, c, ldc * sizeof(int32_t));
+  if (wide)
+    AMX_STORED(1, c + 16, ldc * sizeof(int32_t));
+  if (tall) {
+    AMX_STORED(2, c + 16 * ldc, ldc * sizeof(int32_t));
+    if (wide)
+      AMX_STORED(3, c + 16 * ldc + 16, ldc * sizeof(int32_t));
+  }
+}
+#else
+void gemm_amx_thread_release(void) {}
+void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k) {
+  (void)c, (void)ldc, (void)a, (void)lda, (void)bp, (void)m, (void)n, (void)k;
+  fail("AMX tile kernels are not compiled into this build");
+}
+void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n, int k) {
+  (void)c, (void)ldc, (void)a, (void)lda, (void)bp, (void)m, (void)n, (void)k;
+  fail("AMX tile kernels are not compiled into this build");
+}
+#endif
 
 int k_gemm_kc(void) {
 #if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)

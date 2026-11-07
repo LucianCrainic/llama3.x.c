@@ -1,7 +1,9 @@
 #ifndef LLAMA_GEMM_H
 #define LLAMA_GEMM_H
 
+#include "runtime.h"
 #include <stddef.h>
+#include <stdint.h>
 
 /* Batched FP32 GEMM on the checkpoint's W[out][in] layout (C2): C[m][n] (op)= A[m][k] . W[n][k]^T for M activation
  * rows at once, so every weight row is streamed once per microbatch instead of once per token. The epilogues match
@@ -37,5 +39,52 @@ void k_gemm_f32_portable(const float *a, int lda, int m, int k, const GemmSegmen
 int k_gemm_f32_simd_test(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc);
 /* The K block the active instruction set uses (LLAMA_GEMM_KC overrides the AVX-512 default of 1024). */
 int k_gemm_kc(void);
+
+/* ---- AMX (C4) ------------------------------------------------------------------------------------------------------
+ * LLAMA_KERNELS=amx selects AMX for the batched GEMM tiles only; everything else keeps running on the AVX-512 kernels.
+ * Tile instructions need CPU support and, on Linux, the kernel's permission for tile data (arch_prctl). The amx level
+ * is never chosen by `auto`. */
+/* NULL when AMX is usable, else the reason. The first call asks the kernel for the tile-data permission; make it
+ * before any worker thread can execute a tile instruction. */
+const char *gemm_amx_unavailable(void);
+/* "not requested", "granted", "denied" or "unsupported", for the report. */
+const char *gemm_amx_permission(void);
+void gemm_amx_enable(int on); /* set by the kernel selection */
+int gemm_amx_active(void);
+int gemm_amx_compiled(void); /* the build has AMX code (real or emulated) */
+int gemm_amx_emulated(void); /* ... and it runs on the software tile model (test builds) */
+/* Releases the calling thread's tile state. Worker threads release it themselves when they exit. */
+void gemm_amx_thread_release(void);
+
+/* FP32 to BF16 with round to nearest even (see gemm.c for NaN, denormal and overflow behaviour), and back. */
+uint16_t bf16_from_f32(float x);
+float f32_from_bf16(uint16_t v);
+
+/* Packing for the tile microkernels. W is rows x cols row-major (W[out][in]) with leading dimension ld (elements).
+ * Rows are grouped in tiles of 16 and zero-padded, as is K (to 32 for BF16 pairs, 64 for int8 quads). The helpers take
+ * plain (rows, cols, ld) pointers; adapt them to a Shard once B1 lands. The _tiles forms pack tiles [first, last) so a
+ * worker team can split the work. */
+size_t bf16_vnni_elements(int rows, int cols);
+size_t s8_vnni_bytes(int rows, int cols);
+void pack_bf16_vnni(uint16_t *dst, const float *w, int rows, int cols, size_t ld);
+void pack_bf16_vnni_tiles(uint16_t *dst, const float *w, int rows, int cols, size_t ld, int first, int last);
+void pack_s8_vnni(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld);
+void pack_s8_vnni_tiles(int8_t *dst, const int8_t *w, int rows, int cols, size_t ld, int first, int last);
+
+/* Tile microkernels: C[m][n] = A[m][k] . B[n][k]^T for m, n <= 32. A is row-major with leading dimension lda in
+ * elements and must be zero-padded and readable up to ceil(m, 16) rows by ceil(k, 32) (BF16) or ceil(k, 64) (int8)
+ * columns; bp is the packed B for the same k (at most two 16-column tiles); C has room for whole 16 x 16 tiles. The
+ * BF16 result is an FP32 sum in ascending K; the int8 result is exact int32. Both fail unless AMX code is compiled in,
+ * and the caller must have made sure the CPU can run it (gemm_amx_unavailable() == NULL). */
+void amx_bf16_tile_gemm(float *c, size_t ldc, const uint16_t *a, size_t lda, const uint16_t *bp, int m, int n, int k);
+void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t lda, const int8_t *bp, int m, int n, int k);
+
+/* A 64-byte-aligned workspace carved out of an accounted allocation (memory_alloc itself aligns to 16 bytes). */
+typedef struct {
+  void *base, *data;
+  size_t bytes;
+} AlignedBuffer;
+void aligned_buffer_alloc(AlignedBuffer *buffer, size_t bytes, MemoryKind kind);
+void aligned_buffer_free(AlignedBuffer *buffer);
 
 #endif
