@@ -151,8 +151,9 @@ cresco8-hbm14, job 5622320, commit `7faa81d` (`results/m1-check-20261101-3/A1`).
   because it sets a task memory policy, not the cpuset. The planned "restricted `--membind=0,2`" variation therefore
   cannot show a restricted allowed set; a real one needs a cpuset (not reproducible here), and that path is covered by
   the fixture tests only.
-- The Linux fixture tests pass except one test that assumed identical environments imply identical ISA (fixed in
-  `tests/test_tools.py`; not yet re-run on Linux).
+- The Linux fixture tests passed except one test that assumed identical environments imply identical ISA (fixed in
+  `tests/test_tools.py`). Re-run on Linux (job 5622322, commit `bc7da43`): `make test` passes, `test_numa.py` 23 tests
+  OK, `test_tools.py` OK.
 ## 7. Exit criteria
 
 - On hbm14 the classification is correct: through numaperf, or through the explicit
