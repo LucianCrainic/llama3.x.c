@@ -178,6 +178,7 @@ run_engine() {
 validate_gate() {
   local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
   shift 5
+  local gate_env=$*
   if dry_run; then
     printf 'VALIDATE %s %s %s env=%s\n' "$name" "$precision" "$label" "$*" | tee -a "$OUT/dry-run.txt"
     return 0
@@ -189,7 +190,7 @@ validate_gate() {
     --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
     --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
     > "$OUT/correctness-$name-$label.stdout" 2> "$OUT/correctness-$name-$label.stderr" || status=$?
-  printf '%s %s exit=%s\n' "$name" "$label" "$status" >> "$OUT/correctness-status.txt"
+  printf '%s %s exit=%s%s\n' "$name" "$label" "$status" "${gate_env:+ env=$gate_env}" >> "$OUT/correctness-status.txt"
   return "$status"
 }
 
@@ -202,9 +203,12 @@ make_prompt() {
 }
 
 # validate_models: the correctness gate of every model and precision, as in the kernel campaign. HF_GATE=0 skips it
-# (and records that) where no Python environment with torch and transformers exists.
+# (and records that) where no Python environment with torch and transformers exists. GATE_ENV (space-separated
+# KEY=VALUE words, e.g. "LLAMA_BACKEND=teams LLAMA_THREADS=56") runs the engine under test with that environment, and
+# GATE_TAG (e.g. -teams) is appended to the label of every gate so the result files stay apart from the default gate's.
 validate_models() {
-  local entry name artifacts hf precision
+  local entry name artifacts hf precision env_words tag=${GATE_TAG:-}
+  read -r -a env_words <<< "${GATE_ENV:-}"
   if [[ ${HF_GATE:-1} == 0 ]]; then
     echo 'HF_GATE=0: Hugging Face validation was not run (no torch/transformers environment)' | tee "$OUT/no-hf-gate.txt"
     return 0
@@ -217,10 +221,10 @@ validate_models() {
     IFS=: read -r name artifacts hf <<< "$entry"
     for precision in $PRECISIONS; do
       if [[ $precision == fp32 ]]; then
-        validate_gate "$name" "$artifacts" "$hf" fp32 fp32
+        validate_gate "$name" "$artifacts" "$hf" fp32 "fp32$tag" ${env_words[@]+"${env_words[@]}"}
       else
-        validate_gate "$name" "$artifacts" "$hf" int8 w8a8 || true
-        validate_gate "$name" "$artifacts" "$hf" int8 w8a32 LLAMA_Q8_ACTIVATIONS=fp32 || true
+        validate_gate "$name" "$artifacts" "$hf" int8 "w8a8$tag" ${env_words[@]+"${env_words[@]}"} || true
+        validate_gate "$name" "$artifacts" "$hf" int8 "w8a32$tag" ${env_words[@]+"${env_words[@]}"} LLAMA_Q8_ACTIVATIONS=fp32 || true
       fi
     done
   done
