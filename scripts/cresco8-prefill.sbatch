@@ -486,9 +486,8 @@ phase_C6() {
 # LLAMA_BACKEND=teams against checkpoints staged on its HBM, REPEATS interleaved repeats, 32 generated tokens so decode is
 # measured but not dominant. The gates of C2, C3, C5 and C6 run first on the 2048-token prompt; a failed gate stops the
 # benchmark. Passes: (1) gates; (2) M sweep at 2048; (3) the best two M per rung from (2); (4) the other prompt lengths at
-# M = 1 and those two; (5) 14 and 28 threads at the best M; (6) separate decode runs, 128 tokens after the 2048-token
-# prefill (the report times prefill and decode apart; the untimed --warm-context 2048 of B7 does not exist yet, so the
-# prefill is in the same process, not in the timed decode); (7) one LLAMA_PROFILE=1 repeat per rung. The per-token baselines
+# M = 1 and those two; (5) 14 and 28 threads at the best M; (6) separate decode runs, 128 tokens from a retained
+# context of 2048 tokens (--warm-context, an untimed prefill in the rung's own setting); (7) one LLAMA_PROFILE=1 repeat per rung. The per-token baselines
 # run once at 8192 tokens and on 14 and 28 threads. Estimated at about 5 hours for 1B and 8B (the baselines dominate: 8B FP32
 # per token is about 85 minutes of it): submit with a --time of at least 06:00:00 (the script header asks for 04:00:00).
 
@@ -598,9 +597,10 @@ phase_C7() {
               "$tokenizer" p=2048 c=2304
           done
         done
-        # (6) decode: 128 generated tokens after the 2048-token prefill, in the rung's own prefill setting.
+        # (6) decode: 128 generated tokens from a retained context of 2048 tokens (--warm-context, untimed, in the rung's own
+        # prefill setting), then the 86-token chat prompt.
         for ((rep = 1; rep <= REPEATS; rep++)); do
-          CONTEXT=2304 GENERATION=128 c_launch "$name" "$rung" "$best" 56 "$rep" "$OUT/prompt-2048.txt" "$staged" "$tokenizer" \
+          CONTEXT=2304 GENERATION=128 WARM=2048 c_launch "$name" "$rung" "$best" 56 "$rep" "$OUT/short.txt" "$staged" "$tokenizer" \
             p=2048 c=2304 x=dec
         done
         # (7) one profiled repeat: GEMM, attention, conversion, rescale and packing time.
@@ -625,6 +625,225 @@ for path in sorted(glob.glob(f'{sys.argv[1]}/*-xprof-1.json')):
     print(f'{Path(path).stem}: forward {forward:.2f}s; {shares}')
 PY
   fi
+}
+
+# ---- D: two-socket batched prefill and the final campaign -------------------------------------------------------------
+# Two sockets run with no job-wide CPU or memory binding (each team pins itself, each region binds itself); one socket is
+# bound to socket 0. Both use engine-owned HBM placement (A6's anon-hbm) from a checkpoint staged on DDR node 0, so the one
+# and two socket numbers of a phase differ only in LLAMA_SOCKETS. D_THP follows A6 (default off).
+EXPLICIT='explicit:0/2/0,1/3/1'
+D_THP=${D_THP:-off}
+D_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm "LLAMA_THP=$D_THP")
+
+# d_launch NAME RUNG M SOCKETS REP PROMPT STAGED TOKENIZER [LABEL_WORDS...] [-- ENV_WORDS...]: one launch of a rung on one
+# or two sockets, REP selecting the repetition so a caller can interleave. A label word x=prof makes the run profiled
+# (the caller adds LLAMA_PROFILE=1); its per-socket lines are then logged.
+d_launch() {
+  local name=$1 rung=$2 m=$3 sockets=$4 rep=$5 prompt=$6 staged=$7 tokenizer=$8 label_words=() env_words=() side=label label
+  local cpu= perf=0 log=warn
+  shift 8
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=env; elif [[ $side == label ]]; then label_words+=("$1"); else env_words+=("$1"); fi
+    shift
+  done
+  c_rung "$rung" "$m"
+  [[ $sockets == 2 ]] || cpu=0
+  [[ $rep != 1 ]] || perf=$PERF
+  [[ " ${label_words[*]-} " != *" x=prof "* ]] || log=info
+  label=$(run_label "$name" "$RUNG_PREC" teams hbm "$sockets" 56 "m=$m" "k=$rung" ${label_words[@]+"${label_words[@]}"})
+  CPU_BIND=$cpu REP=$rep LOG_LEVEL=$log run_engine "$label" "$RUNG_ENGINE" "$staged" "$tokenizer" "$prompt" 1 "$perf" \
+    "${D_ENV[@]}" "LLAMA_SOCKETS=$sockets" "${RUNG_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
+}
+
+# d_rungs PRECISION: the batched rungs of D1 (the baselines and W8A32 stay per token; their agreement is in the gates).
+d_rungs() {
+  if [[ $1 == fp32 ]]; then echo avx512_fp32 amx_bf16; else echo avx512_q8 amx_int8; fi
+}
+
+# ---- D1: two-socket batched prefill ---------------------------------------------------------------------------------
+# (1) Agreement of two sockets with one socket at the same rung, M = 64, prompts of 86 tokens (every position) and 2048
+# (last position): FP32 1e-3 strict; W8A8 (AVX-512 VNNI and AMX-INT8) the statistical gate of the library; W8A32 strict
+# (it stays per token); BF16 recorded only until C5 has fixed its gate. (2) The Hugging Face gate of FP32 with
+# LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64. (3) Placement of each two-socket rung: shards, packed shards and KV caches
+# verified on their sockets' nodes. (4) The M sweep at 2048 tokens: two sockets at M in {16, 32, 64, 128, 256}, one socket
+# at {64, 256} for the same node state, REPEATS interleaved repeats, then one profiled run per two-socket point (per-socket
+# GEMM, attention, exchange and wait times in the .stderr files). (5) Decode after a two-socket prefill, 128 tokens
+# after the 2048-token prompt, to compare with B7. About 2 hours for 1B and 8B; a failed gate stops the benchmark.
+d1_gates() {
+  local dir=$1 name=$2 artifacts=$3 hf=$4 precision staged rung m=64 n tokens
+  local a b
+  for precision in $PRECISIONS; do
+    staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+    for rung in $(d_rungs "$precision") $([[ $precision == fp32 ]] || echo avx512_q8_w8a32); do
+      c_rung "$rung" "$m"
+      a=("${D_ENV[@]}" LLAMA_SOCKETS=1 "${RUNG_ENV[@]}")
+      b=("${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 "${RUNG_ENV[@]}")
+      for n in short 2048; do
+        CMP_TOKENS="$dir/$name-tokens$([[ $n == short ]] || echo "-$n").txt"
+        B_FLAGS=(--max-abs 1e-3 --batch-a "$m" --batch-b "$m")
+        B_EXPECT=ok
+        case $rung in
+          avx512_q8 | amx_int8) B_FLAGS=("${W8A8_GATE[@]}" --batch-a "$m" --batch-b "$m") ;;
+          avx512_q8_w8a32) B_FLAGS=(--max-abs 1e-3) ;;
+          amx_bf16)
+            B_EXPECT=any
+            B_FLAGS+=(--max-abs 1e30)
+            ;;
+        esac
+        if [[ $n != short ]]; then
+          case $rung in
+            avx512_q8 | amx_int8) B_FLAGS=("${W8A8_GATE_LAST[@]}" --batch-a "$m" --batch-b "$m" --last-only) ;;
+            *) B_FLAGS+=(--last-only) ;;
+          esac
+        fi
+        b_compare "$dir" "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" "$staged" "d1-$rung-m$m-prompt$n" "${a[@]}" -- "${b[@]}"
+      done
+    done
+    B_FLAGS=() B_EXPECT=ok CMP_TOKENS=
+    if [[ $precision == fp32 && ${HF_GATE:-1} != 0 ]]; then
+      tp_validate "$name" "$artifacts" "$hf" fp32 fp32-2s-b64 "${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64 \
+        LLAMA_PREFILL_GEMM=on && record_result "hf-$name-fp32-2s-b64" PASS || record_result "hf-$name-fp32-2s-b64" FAIL
+    elif [[ $precision == fp32 ]]; then
+      echo "HF_GATE=0: the Hugging Face gate with LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64 was not run for $name" |
+        tee -a "$dir/no-hf-gate.txt"
+    fi
+    unstage_model_on 0 "$name" "$precision"
+  done
+}
+
+# d1_placement DIR NAME PRECISION STAGED TOKENIZER: one two-socket run per batched rung, its regions checked.
+d1_placement() {
+  local dir=$1 name=$2 precision=$3 staged=$4 tokenizer=$5 rung label opts
+  for rung in $(d_rungs "$precision"); do
+    CONTEXT=2304 GENERATION=16 d_launch "$name" "$rung" 64 2 1 "$OUT/short.txt" "$staged" "$tokenizer" x=place
+    dry_run && continue
+    c_rung "$rung" 64
+    label=$(run_label "$name" "$RUNG_PREC" teams hbm 2 56 m=64 "k=$rung" x=place)
+    opts=kv
+    [[ $rung != amx_bf16 && $rung != amx_int8 ]] || opts="kv packed"
+    # shellcheck disable=SC2086
+    if tp_placement "$OUT/$label-1.json" $opts > "$dir/placement-$name-$rung.txt"; then
+      record_result "placement-$name-$rung" PASS
+    else
+      record_result "placement-$name-$rung" FAIL "$(grep ^FAIL "$dir/placement-$name-$rung.txt" | head -3)"
+    fi
+  done
+}
+
+phase_D1() {
+  local dir="$OUT/D1" entry name artifacts hf precision staged tokenizer rung m rep reps=$((REPEATS < 3 ? REPEATS : 3))
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no D1 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  c_prompts "$dir" 2048
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    d1_gates "$dir" "$name" "$artifacts" "$hf"
+  done
+  if ! dry_run && grep -q '^FAIL \(compare-.*-d1-\|hf-.*-2s-b64\)' "$OUT/phase-results.txt" 2> /dev/null; then
+    echo 'a D1 correctness gate failed: no benchmark was run' | tee "$dir/gate-failed.txt"
+    return 0
+  fi
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      d1_placement "$dir" "$name" "$precision" "$staged" "$tokenizer"
+      # (4) the M sweep, interleaved: every point once per repeat.
+      for ((rep = 1; rep <= reps; rep++)); do
+        for rung in $(d_rungs "$precision"); do
+          for m in 16 32 64 128 256; do
+            CONTEXT=2304 GENERATION=32 d_launch "$name" "$rung" "$m" 2 "$rep" "$OUT/prompt-2048.txt" "$staged" "$tokenizer" p=2048
+          done
+          for m in 64 256; do
+            CONTEXT=2304 GENERATION=32 d_launch "$name" "$rung" "$m" 1 "$rep" "$OUT/prompt-2048.txt" "$staged" "$tokenizer" p=2048
+          done
+        done
+      done
+      for rung in $(d_rungs "$precision"); do
+        for m in 16 32 64 128 256; do
+          CONTEXT=2304 GENERATION=1 d_launch "$name" "$rung" "$m" 2 1 "$OUT/prompt-2048.txt" "$staged" "$tokenizer" p=2048 x=prof -- \
+            LLAMA_PROFILE=1
+        done
+        # (5) decode from a retained context of 2048 tokens built by the rung's own two-socket prefill.
+        for ((rep = 1; rep <= reps; rep++)); do
+          CONTEXT=2560 GENERATION=128 WARM=2048 d_launch "$name" "$rung" 64 2 "$rep" "$OUT/short.txt" "$staged" "$tokenizer" p=2048 x=dec
+        done
+      done
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+}
+
+# ---- D2: the final campaign ------------------------------------------------------------------------------------------
+# The headline points of every feature from one commit and one node state: sockets {1, 2} x the rungs of both precisions x
+# prompts {86, 2048, 8192} (prefill, TTFT; 32 generated tokens), and decode from retained contexts of 512 and 8192 tokens
+# (128 tokens, --warm-context) for FP32, W8A8 and W8A32. REPEATS interleaved repeats, placement verified in every report,
+# perf counters on the first repeat. M per rung is the C7 choice for one socket and the D1 choice for two: set
+# D2_M1="avx512_fp32=64 amx_bf16=256 ..." and D2_M2 likewise (default 64 for every rung, which the evidence replaces).
+# Estimated at 5-6 hours for 1B and 8B (the per-token baselines at 8192 tokens dominate): submit with --time=07:00:00 or
+# split MODELS. If node time is short, run 8B at 2048 tokens first and record what was skipped.
+d2_m() { # SOCKETS RUNG
+  local words=$([[ $1 == 1 ]] && echo "${D2_M1:-}" || echo "${D2_M2:-}") word
+  for word in $words; do
+    [[ $word != "$2="* ]] || { echo "${word#*=}"; return 0; }
+  done
+  echo 64
+}
+
+d2_rungs() { # PRECISION
+  if [[ $1 == fp32 ]]; then echo per_token avx512_fp32 amx_bf16; else echo per_token_q8 avx512_q8 amx_int8; fi
+}
+
+phase_D2() {
+  local dir="$OUT/D2" entry name artifacts hf precision staged tokenizer rung m rep n sockets ctx prompt decode_rung
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no D2 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  c_prompts "$dir" 2048,8192
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        for n in 86 2048 8192; do
+          prompt="$OUT/prompt-$n.txt"
+          [[ $n != 86 ]] || prompt="$OUT/short.txt"
+          for sockets in 1 2; do
+            for rung in $(d2_rungs "$precision"); do
+              m=1
+              [[ $rung == per_token || $rung == per_token_q8 ]] || m=$(d2_m "$sockets" "$rung")
+              ctx=$((n > 86 ? n + 256 : 2304))
+              CONTEXT=$ctx GENERATION=32 d_launch "$name" "$rung" "$m" "$sockets" "$rep" "$prompt" "$staged" "$tokenizer" "p=$n"
+            done
+          done
+        done
+        # Decode from retained contexts, in the rung that builds the context fastest (the decode kernel is the same).
+        for ctx in 512 8192; do
+          for sockets in 1 2; do
+            if [[ $precision == fp32 ]]; then
+              CONTEXT=$((ctx + 256)) GENERATION=128 WARM=$ctx d_launch "$name" avx512_fp32 64 "$sockets" "$rep" "$OUT/short.txt" \
+                "$staged" "$tokenizer" "p=$ctx" x=dec
+            else
+              CONTEXT=$((ctx + 256)) GENERATION=128 WARM=$ctx d_launch "$name" avx512_q8 64 "$sockets" "$rep" "$OUT/short.txt" \
+                "$staged" "$tokenizer" "p=$ctx" x=dec
+              CONTEXT=$((ctx + 256)) GENERATION=128 WARM=$ctx d_launch "$name" avx512_q8_w8a32 1 "$sockets" "$rep" "$OUT/short.txt" \
+                "$staged" "$tokenizer" "p=$ctx" x=dec
+            fi
+          done
+        done
+      done
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
 }
 
 if ! dry_run; then

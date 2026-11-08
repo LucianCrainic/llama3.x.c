@@ -541,6 +541,70 @@ typedef struct {
   int socket, failed;
 } TwoTeams;
 
+/* B7: the packed four-row layout. Packing, the STORE / ADD / PARTIAL epilogues, SWIGLU and QKV against double-precision
+ * references and against the row layout on every instruction set; column counts that are not multiples of 16 exercise the zero padding of the last block. */
+static void test_packed4(void) {
+  const int shapes[][2] = {{16, 4}, {8, 4}, {37, 8}, {64, 12}, {96, 16}, {200, 20}, {1000, 8}, {2048, 16}};
+  for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+    const int n = shapes[s][0], d = shapes[s][1];
+    for (int stride_extra = 0; stride_extra < 2; stride_extra++) {
+      const size_t ld = (size_t)n + (size_t)stride_extra * 5;
+      float *x = zeroed(n, sizeof(float)), *w = zeroed(d * ld, sizeof(float)), *w3 = zeroed(d * ld, sizeof(float));
+      float *out = zeroed(d, sizeof(float)), *rows_out = zeroed(d, sizeof(float)), *base = zeroed(d, sizeof(float));
+      float *wp = zeroed(k_pack4_floats(d, n), sizeof(float)), *w3p = zeroed(k_pack4_floats(d, n), sizeof(float));
+      float *k = zeroed(d, sizeof(float)), *v = zeroed(d, sizeof(float));
+      double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double)), *ref3 = zeroed(d, sizeof(double)),
+             *mag3 = zeroed(d, sizeof(double));
+      fill(x, n, 1.0f), fill(w, d * ld, 0.5f), fill(w3, d * ld, 0.5f), fill(base, d, 1.0f);
+      Pack4Job jobs[2] = {{wp, w, d, n, ld}, {w3p, w3, d, n, ld}};
+      k_pack4_many(jobs, 2);
+      /* The layout itself: [group][column block][row][16 floats], the last block zero-padded. */
+      checks++;
+      for (int r = 0; r < d; r++)
+        for (int j = 0; j < ((n + 15) / 16) * 16; j++) {
+          float want = j < n ? w[(size_t)r * ld + j] : 0.0f;
+          float got = wp[(size_t)(r / 4) * ((n + 15) / 16) * 64 + (size_t)(j / 16) * 64 + (size_t)(r % 4) * 16 + j % 16];
+          if (want != got && failures++ < 20)
+            fprintf(stderr, "pack4 [%s] n=%d row %d column %d: %g != %g\n", current, n, r, j, got, want);
+        }
+      for (int i = 0; i < d; i++)
+        for (int j = 0; j < n; j++) {
+          ref[i] += (double)w[(size_t)i * ld + j] * x[j];
+          mag[i] += fabs((double)w[(size_t)i * ld + j] * x[j]);
+          ref3[i] += (double)w3[(size_t)i * ld + j] * x[j];
+          mag3[i] += fabs((double)w3[(size_t)i * ld + j] * x[j]);
+        }
+      for (int kind = K_STORE; kind <= K_PARTIAL; kind++) {
+        const char *name = kind == K_STORE ? "p4.store" : kind == K_ADD ? "p4.add" : "p4.partial";
+        memcpy(out, base, d * sizeof(float));
+        memcpy(rows_out, base, d * sizeof(float));
+        k_matmul_p4(out, x, wp, n, d, kind);
+        k_matmul_ld(rows_out, x, w, ld, n, d, kind);
+        for (int i = 0; i < d; i++) {
+          double expected = (kind == K_ADD ? base[i] : 0.0) + ref[i];
+          check(name, out[i], expected, 2e-5 * (mag[i] + (kind == K_ADD ? fabs(base[i]) : 0.0)) + 1e-6);
+          /* Against the row layout: within the kernel budget everywhere. Bitwise equality is the AVX-512 kernels' property
+           * (the same operations on the same lanes, only other addresses), checked on the cluster; the scalar fallbacks are
+           * compiled loops whose floating-point contraction may differ by an ulp between the two layouts. */
+          check(name, out[i], rows_out[i], 2e-5 * (mag[i] + (kind == K_ADD ? fabs(base[i]) : 0.0)) + 1e-6);
+        }
+      }
+      k_matmul_swiglu_p4(out, x, wp, w3p, n, d);
+      for (int i = 0; i < d; i++)
+        check("p4.swiglu", out[i], silu(ref[i]) * ref3[i],
+              2e-5 * (mag[i] * (fabs(ref3[i]) + 1) + mag3[i] * (fabs(ref[i]) + 1)) + 1e-6);
+      k_matmul_qkv_p4(out, k, v, x, wp, w3p, wp, n, d, d);
+      for (int i = 0; i < d; i++) {
+        check("p4.qkv.q", out[i], ref[i], 2e-5 * mag[i] + 1e-6);
+        check("p4.qkv.k", k[i], ref3[i], 2e-5 * mag3[i] + 1e-6);
+        check("p4.qkv.v", v[i], ref[i], 2e-5 * mag[i] + 1e-6);
+      }
+      free(x), free(w), free(w3), free(out), free(rows_out), free(base), free(wp), free(w3p), free(k), free(v);
+      free(ref), free(mag), free(ref3), free(mag3);
+    }
+  }
+}
+
 static void *two_team_main(void *p) {
   TwoTeams *job = p;
   kernels_set_thread_team(pool_team(job->socket));
@@ -796,6 +860,7 @@ int main(int argc, char **argv) {
     test_attention();
     test_attention_batch();
     test_partial();
+    test_packed4();
     test_two_teams();
     test_attention_split();
     rng = seed; /* identical inputs for every instruction set */
@@ -845,6 +910,7 @@ int main(int argc, char **argv) {
       test_attention();
       test_attention_batch();
       test_partial();
+      test_packed4();
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();

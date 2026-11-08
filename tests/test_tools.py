@@ -62,6 +62,148 @@ class CampaignSummaryTests(unittest.TestCase):
         for bad in ('correctness-1b-fp32', '1b-fp32-omp-file-s1-t56', 'x-fp16-omp-file-s1-t1-1'):
             self.assertIsNone(sc.parse_label(bad))
 
+    def dry_run(self, script, phases, models=('m1b', 'm8b')):
+        """Runs one campaign script with DRY_RUN=1 and returns its RUN lines; every run label must parse."""
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        from summarize_campaign import parse_label
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': phases,
+                   'MODELS': ' '.join(f'{m}:/a/{m}:/hf/{m}' for m in models)}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        runs = [line for line in result.stdout.splitlines() if line.startswith('RUN ')]
+        for line in runs:
+            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
+        return runs
+
+    def test_campaign_scripts_dry_run_and_their_labels_parse(self):
+        """L6: the B7, C7, D1 and D2 matrices print without running anything, with labels the summarizer understands."""
+        b7 = self.dry_run('cresco8-tp.sbatch', 'B7')
+        self.assertEqual(len(b7), 192)  # 96 launches per model: gates aside, see phase_B7
+        self.assertTrue(all('warm=' in line and 'warm=0 ' not in line for line in b7))
+        self.assertEqual({line.split('warm=')[1].split()[0] for line in b7}, {'512', '8192', '32768'})
+        self.assertTrue(any('-s2-t14-' in line for line in b7) and any('xctl' in line for line in b7))
+        self.assertTrue(any('xp4 ' in line and 'LLAMA_FP32_LAYOUT=packed4' in line for line in b7))
+        self.assertTrue(all('LLAMA_PROFILE=1' in line for line in b7 if 'xp4prof' in line))
+        self.assertTrue(all('LLAMA_PROFILE=1' in line for line in b7 if 'xprof' in line))
+        d1 = self.dry_run('cresco8-prefill.sbatch', 'D1')
+        self.assertEqual(len(d1), 240)
+        self.assertTrue(any('-s2-' in line and 'kamx_bf16' in line for line in d1) and any('-s1-' in line for line in d1))
+        self.assertEqual({line.split('warm=')[1].split()[0] for line in d1}, {'0', '2048'})
+        d2 = self.dry_run('cresco8-prefill.sbatch', 'D2')
+        self.assertEqual(len(d2), 288)
+        self.assertEqual({line.split('warm=')[1].split()[0] for line in d2}, {'0', '512', '8192'})
+        c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
+        decode = [line for line in c7 if 'xdec' in line]
+        self.assertTrue(decode and all('warm=2048' in line for line in decode))
+
+    @staticmethod
+    def v2(prefill=None, decode=None, warm=0, sockets=1, ttft=1.0, steps=128, decode_seconds=None, model_file=32e9,
+           attention=None):
+        """A synthetic completed schema-v2 report of a campaign run."""
+        data = report(prefill or 0, decode or 0, ttft=ttft)
+        data['runtime'].update(sockets=sockets, placement='hbm')
+        data['parameters'] = {'warm_context': warm}
+        data['tokens'] = {'decode_steps': steps}
+        data['timing_seconds'].update(decode=decode_seconds if decode_seconds is not None else (steps / decode if decode else None))
+        data['prefill'] = {'tokens': 86}
+        data['memory_bytes'] = {'model_file': model_file}
+        if attention is not None:
+            data['profile_seconds'] = {'decode': {'forward': 10.0, 'attention': attention}}
+        return data
+
+    PROFILE = ('[INFO] tp decode socket {s} (128 tokens, ms/token, fused=1, reduce=flags): embedding=0.010 rmsnorm=1.000 '
+               'qkv=4.000 rope=0.100 attention={att} wo=3.000 w1_w3=12.000 w2=6.000 classifier=2.000 wo_mm=2.500 '
+               'w2_mm=5.000 x_straggler=0.300 x_peer={peer} x_add=0.100 x_close=0.500 x_buffer=0.000\n')
+
+    def test_campaign_tables_decode_prefill_socket_and_modeled(self):
+        import summarize_campaign as sc
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write = lambda name, data: (root/name).write_text(json.dumps(data))
+            for rep, (one, two) in enumerate([(16.0, 30.0), (16.3, 30.4), (16.1, 31.0)], 1):
+                write(f'8b-fp32-teams-hbm-s1-t56-p512-{rep}.json', self.v2(decode=one, warm=512))
+                write(f'8b-fp32-teams-hbm-s2-t56-p512-{rep}.json', self.v2(decode=two, warm=512, sockets=2))
+            write('8b-fp32-teams-hbm-s2-t14-p512-1.json', self.v2(decode=20.0, warm=512, sockets=2))
+            write('8b-fp32-omp-file-s2-t112-p512-xctl-1.json', self.v2(decode=7.0, warm=512, sockets=2))
+            write('8b-fp32-teams-hbm-s2-t56-p512-xp4-1.json', self.v2(decode=33.0, warm=512, sockets=2))
+            # A longer context where the gain is lost in the noise, and where the one-socket run is the faster.
+            for rep, (one, two) in enumerate([(10.0, 10.1), (10.2, 9.9)], 1):
+                write(f'8b-fp32-teams-hbm-s1-t56-p8192-{rep}.json', self.v2(decode=one, warm=8192))
+                write(f'8b-fp32-teams-hbm-s2-t56-p8192-{rep}.json', self.v2(decode=two, warm=8192, sockets=2))
+            # Profiled runs: one healthy, one whose socket 0 waits for its peer.
+            for label, peer, att in (('8b-fp32-teams-hbm-s2-t56-p512-xprof', 0.2, 2.0), ('1b-fp32-teams-hbm-s2-t56-p512-xprof', 9.0, 2.0)):
+                write(f'{label}-1.json', self.v2(decode=30.0, warm=512, sockets=2, decode_seconds=128 * 0.033, attention=7.0))
+                (root/f'{label}-1.stderr').write_text(self.PROFILE.format(s=0, att=att, peer=peer) +
+                                                      self.PROFILE.format(s=1, att=2.4, peer=4.0))
+            # Prefill: the per-token one-socket baseline, the GEMM on one socket and on two.
+            write('8b-fp32-teams-hbm-s1-t56-m1-p2048-kper_token-1.json', self.v2(prefill=16.0, ttft=128.0))
+            for rep, (one, two) in enumerate([(174.0, 300.0), (176.0, 310.0)], 1):
+                write(f'8b-fp32-teams-hbm-s1-t56-m64-p2048-kavx512_fp32-{rep}.json', self.v2(prefill=one, ttft=11.8))
+                write(f'8b-fp32-teams-hbm-s2-t56-m64-p2048-kavx512_fp32-{rep}.json', self.v2(prefill=two, ttft=6.9, sockets=2))
+            text = sc.summarize(root)
+        self.assertIn('| Warm ctx |', text)
+        lines = text.splitlines()
+        row = lambda needle: next(line for line in lines if line.startswith(needle))
+        # Decode by retained context: the gain 30.4 / 16.1 = 1.89, beyond variability; at 8192 it is not.
+        self.assertIn('### Decode tok/s by retained context', text)
+        d512 = row('| 8b | fp32 | 512 |')
+        self.assertIn('16.10 [16.00-16.30]', d512)
+        self.assertIn('30.40 [30.00-31.00]', d512)
+        self.assertIn('| 20.00 |', d512)
+        self.assertIn('| 7.00 |', d512)       # the control
+        self.assertIn('| 33.00 |', d512)       # two sockets from the packed4 copy
+        self.assertTrue(d512.rstrip().endswith('| 1.89 | yes | 1.09 |'), d512)    # packed4 / rows = 33.0 / 30.4
+        self.assertTrue(row('| 8b | fp32 | 8192 |').rstrip().endswith('| no | - |'))
+        # Prefill speedups and where two sockets win.
+        self.assertIn('### Prefill by rung, microbatch and sockets', text)
+        one = row('| 8b | fp32 | 2048 | avx512_fp32 | 64 | 1 |')
+        two = row('| 8b | fp32 | 2048 | avx512_fp32 | 64 | 2 |')
+        self.assertIn('| 10.94 |', one)         # 175 / 16
+        self.assertTrue(one.rstrip().endswith('| no |') or one.rstrip().endswith('| - |'))
+        self.assertTrue(two.rstrip().endswith('| yes |'), two)
+        # The per-socket table, its imbalance row and the modeled-against-measured row.
+        self.assertIn('### Per-socket decode phase times (ms per token)', text)
+        s0 = row('| 8b-fp32-teams-hbm-s2-t56-p512-xprof | 0 |')
+        self.assertIn('| 4.000 | 2.000 | 3.000 | 18.000 | 2.000 | 0.100 | 1.000 |', s0)   # qkv attn wo ffn cls reduce wait
+        imbalance = row('| 8b-fp32-teams-hbm-s2-t56-p512-xprof | imbalance |')
+        self.assertIn('| 0.000 | 0.400 |', imbalance)
+        self.assertIn('### Modeled against measured decode time (ms per token)', text)
+        healthy = row('| 8b-fp32-teams-hbm-s2-t56-p512-xprof | 33.00 |')
+        self.assertIn('| 33.91 | 103% | 26.67 | 81% | none |', healthy)   # 32e9 bytes / (2 x 600e9) = 26.67 ms
+        # Revisit triggers (study 10.4): socket 0 of the second run waits 9.8 ms of 33 for reductions, 9 ms of it for its peer.
+        flagged = row('| 1b-fp32-teams-hbm-s2-t56-p512-xprof | 33.00 |')
+        self.assertIn('reductions+waits 30% > 20%; peer wait 27% > 10%', flagged)
+        self.assertIn('### Where synchronization or attention dominates', text)
+        self.assertIn('attention 70% of the token', text)
+
+    def test_results_skeletons_match_the_summarizer(self):
+        """L9: the results documents of A6, B7, C7 and D2 and their validation records exist, say they are not a measurement,
+        and carry the column layout the summarizers produce, so the numbers can be pasted in unchanged."""
+        import summarize_campaign as sc
+        import campaign_tables as ct
+        with tempfile.TemporaryDirectory() as temp:
+            header = sc.summarize(Path(temp)).splitlines()[0]
+        names = ('numa-placement', 'tensor-parallel', 'batched-prefill', 'numa-tp-prefill-results')
+        for name in names:
+            text = (ROOT/'docs'/f'{name}.md').read_text()
+            validation = (ROOT/'docs'/f'{name}-validation.md').read_text()
+            self.assertIn('**Status: not run.**', text)
+            self.assertIn('**Status: not run.**', validation)
+            self.assertIn(header, text, name)
+            self.assertIn(f'({name}-validation.md)', text)
+            for section in ('## Provenance', '## Gates', '## Deviations from the plan', '## Raw data'):
+                self.assertIn(section, validation, (name, section))
+        tp = (ROOT/'docs'/'tensor-parallel.md').read_text()
+        self.assertIn('| ' + ' | '.join(ct.COLUMNS) + ' |', tp)
+        self.assertIn('Gain 2x56 / 1x56 | Beyond variability | packed4 / rows', tp)
+        self.assertIn('Revisit triggers', tp)
+        for name in ('batched-prefill', 'numa-tp-prefill-results'):
+            self.assertIn('| Model | Precision | Prompt | Rung | M | Sockets | Prefill tok/s | TTFT s | Speedup vs 1-socket per-token '
+                          '| 2s wins |', (ROOT/'docs'/f'{name}.md').read_text())
+
     def test_small_unverified_work_region_does_not_hide_a_verified_placement(self):
         import summarize_campaign as sc
         large = {'verified': 'full', 'pages_mismatched': 0, 'bytes': 2**30}

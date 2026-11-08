@@ -9,6 +9,8 @@ CONFIG = (4, 8, 2, 2, 1, 128010, 32)
 # per-socket column slices (8 and 16) aligned to groups.
 TP_CONFIG = (16, 32, 2, 4, 2, 128010, 64)
 TP_ODD_CONFIG = (16, 32, 2, 4, 2, 128011, 64)
+# B/D1 with a Q8 group size of 64, the AMX-INT8 minimum: each socket's slices (64 and 128 values) are whole groups.
+TP_WIDE_CONFIG = (128, 256, 2, 4, 2, 128010, 64)
 
 
 def floats(n, phase):

@@ -28,6 +28,8 @@ Implementation notes:
 - THP was `[always]` on hbm14 (A3), so "THP off" runs may already be huge-page backed; `thp_bytes` in `regions[]` is the
   evidence, not the knob.
 
+Results document skeleton (empty until the run): [`docs/numa-placement.md`](../../numa-placement.md) and its [validation record](../../numa-placement-validation.md).
+
 ## 2. Depends on / unblocks
 
 - Depends on: A5 and F3.

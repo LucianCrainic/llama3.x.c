@@ -13,8 +13,9 @@
 # without it the model gates are skipped and recorded.
 # PHASE is a space-separated list of phase ids ("B1 B4"); phase_<ID> functions below (or in the library) hold each
 # phase's matrix. PHASE=none runs only the common check. The exit status is non-zero if any expectation failed.
-# B1-B6 are `check` phases: B1 and B4 need no model; B5 and B6 compare LLAMA_SOCKETS=2 with one socket on MODELS. B7
-# (the decode campaign) is not here yet. DRY_RUN=1 prints the matrix without running anything.
+# B1-B6 are `check` phases: B1 and B4 need no model; B5 and B6 compare LLAMA_SOCKETS=2 with one socket on MODELS. B7 is
+# the decode campaign (STAGE=bench; see phase_B7 for the matrix and the time it needs). DRY_RUN=1 prints the matrix
+# without running anything.
 set -euo pipefail
 # Slurm runs a copy of this script, so the library is found through ROOT, not through the script's own path.
 : "${ROOT:?tree under test required}"
@@ -25,53 +26,7 @@ job_begin
 # On hbm14: S0 = cores 0-55, DDR 0, HBM 2; S1 = cores 56-111, DDR 1, HBM 3 (explicit map C/H/D = package/HBM/DDR).
 EXPLICIT='explicit:0/2/0,1/3/1'
 # Two sockets run with no job-wide CPU or memory binding: each team pins itself and each region binds itself.
-B_FLAGS=() # b_compare's budget when it is not the strict 1e-3 (W8A8 sets the statistical gate)
 TP_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm)
-
-# tp_validate NAME ARTIFACTS HF PRECISION LABEL [env...]: the Hugging Face gate without the one-socket numactl binding
-# of validate_gate. FP32 failure is fatal; INT8 is recorded against today's unchanged budget.
-tp_validate() {
-  local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
-  shift 5
-  if dry_run; then
-    printf 'VALIDATE %s %s %s env=%s\n' "$name" "$precision" "$label" "$*" | tee -a "$OUT/dry-run.txt"
-    return 0
-  fi
-  local extra=()
-  [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
-  (cd "$ROOT" && env "$@" "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
-    --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
-    --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
-    > "$OUT/correctness-$name-$label.stdout" 2> "$OUT/correctness-$name-$label.stderr" || status=$?
-  printf '%s %s exit=%s env=%s\n' "$name" "$label" "$status" "$*" >> "$OUT/correctness-status.txt"
-  return "$status"
-}
-
-# tp_placement REPORT: both sockets' weights regions fully verified on HBM 2 and HBM 3, an untied embedding on DDR 0.
-tp_placement() {
-  python3 - "$1" << 'PY'
-import json, sys
-report = json.load(open(sys.argv[1]))
-regions = report.get('regions') or []
-bad = 0
-def check(name, ok, detail=''):
-    global bad
-    bad += not ok
-    print(('PASS' if ok else 'FAIL'), name, detail)
-check('run completed', report.get('status') == 'completed', str(report.get('status')))
-check('two sockets', (report.get('runtime') or {}).get('sockets') == 2)
-for socket, node in ((0, 2), (1, 3)):
-    found = [r for r in regions if r['role'] == 'weights' and r['socket'] == socket]
-    check(f'socket {socket} weights: one region on node {node}, fully verified, nothing elsewhere or missing',
-          len(found) == 1 and found[0]['node'] == node and found[0]['verified'] == 'full' and
-          (found[0]['pages_queried'] or 0) > 0 and found[0]['pages_mismatched'] == 0 and found[0]['pages_missing'] == 0,
-          str(found))
-for r in regions:
-    if r['role'] == 'embedding':
-        check('global embedding on DDR node 0', r['node'] == 0 and r['verified'] == 'full' and r['pages_mismatched'] == 0, str(r))
-sys.exit(1 if bad else 0)
-PY
-}
 
 # ---- B1: shard descriptors and packing ---------------------------------------------------------------------------
 # The synthetic reconstruction tests on the hardware, then each model sharded over both sockets from a copy staged on
@@ -157,24 +112,6 @@ for threads in (14, 28, 56):
 PY
 }
 
-# b_compare DIR NAME PRECISION STAGED LABEL ENVA... -- ENVB...: logits of one configuration against another at every
-# position of the 86-token prompt (the gate of compare_engines.py: max |delta logit| <= 1e-3).
-b_compare() {
-  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=()
-  shift 5
-  while (($#)); do
-    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
-    shift
-  done
-  # One socket against two, C against C: no job-wide binding, so both teams can pin themselves. B_FLAGS replaces the strict
-  # budget (W8A8 uses the statistical gate of the library).
-  local flags=(--max-abs 1e-3)
-  [[ ${#B_FLAGS[@]} -eq 0 ]] || flags=("${B_FLAGS[@]}")
-  expect "compare-$name-$precision-$label" ok "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
-    "$ROOT/build/release/probe-$precision" --checkpoint "$staged" --tokens-file "$dir/$name-tokens.txt" "${args[@]}" \
-    "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
-}
-
 # b_smoke NAME PRECISION ENGINE STAGED TOKENIZER TAG ENV...: one profiled two-socket run (recorded, not a gate) and its
 # placement evidence; PHASE_ID selects the results directory.
 b_smoke() {
@@ -251,6 +188,163 @@ phase_B6() {
       fi
       PHASE_ID=6 b_smoke "$name" "$precision" runq "$staged" "$artifacts/tokenizer-v2.bin" smoke "${TP_ENV[@]}"
       unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+}
+
+# ---- B7: two-socket decode campaign ------------------------------------------------------------------------------
+# Decode of 128 tokens from a retained context (--warm-context N: an untimed batched prefill of N tokens, then the timed
+# 86-token chat prompt and the timed decode) on LLAMA_BACKEND=teams with engine-owned HBM placement. Configurations: one
+# socket x 56 (the A6 baseline: anon-hbm), two sockets x {14, 28, 42, 56} (workers per socket), and the control of the
+# old kernel campaign, 112 OpenMP threads without tensor parallelism on a copy interleaved over HBM 2 and 3. Precisions
+# FP32 and Q8 W8A8, and W8A32 at two sockets x 56 only. Contexts 512, 8192 and 32768 for the 56-worker configurations; the
+# worker-count sweep and the control run at 512 only, which keeps the campaign inside its time budget (the grid of
+# study 10.3 is trimmed the same way as C7's). FP32 also runs two sockets x 56 from the packed4 copy of the shards
+# (LLAMA_FP32_LAYOUT=packed4, decision L8; tag p4), at every context, with its own profiled run. REPEATS interleaved repeats (configurations alternate within a repeat),
+# plus one LLAMA_PROFILE=1 run per configuration and context whose per-socket profile lines (log level info) go to the
+# .stderr files, and perf counters on the first repeat. The LLAMA_TP_PARTITION=rows comparator is not built (decision L8:
+# only if B7 shows reductions plus waits above 20%). Gates first: one socket against two with batched prefill (the warm-up
+# path) and the strict W8A32 and statistical W8A8 gates; a failed gate stops the benchmark. THP follows A6: set B7_THP
+# (default off) to what A6 chose. Estimated at 4-6 hours for 1B and 8B; submit with --time=06:00:00 or split MODELS.
+B7_THP=${B7_THP:-off}
+B7_BATCH=${B7_BATCH:-64}
+B7_DECODE=128
+B7_CONTEXTS="512 8192 32768"
+
+# b7_config CONFIG PRECISION: sets B7_SOCKETS, B7_TPS (workers per socket, or total for the control), B7_BACKEND, B7_CPU,
+# B7_MEM, B7_PREC (the label's precision) and B7_ENV for a configuration name: 1s56, 2sT or ctl.
+b7_config() {
+  local config=$1
+  B7_MEM= B7_BACKEND=teams B7_PREC=$2
+  [[ $2 != w8a32 ]] || B7_ENV_EXTRA=(LLAMA_Q8_ACTIVATIONS=fp32)
+  [[ $2 == w8a32 ]] || B7_ENV_EXTRA=()
+  # A p4 suffix (FP32 only) streams the packed4 copy of the shards in decode (LLAMA_FP32_LAYOUT=packed4, decision L8).
+  if [[ $config == *p4 ]]; then
+    config=${config%p4}
+    B7_ENV_EXTRA+=(LLAMA_FP32_LAYOUT=packed4)
+  fi
+  case $config in
+    1s56 | 2s[0-9]*)
+      B7_SOCKETS=${config:0:1} B7_TPS=${config:2} B7_CPU=
+      [[ $B7_SOCKETS == 2 ]] || B7_CPU=0
+      B7_ENV=(LLAMA_BACKEND=teams "LLAMA_THREADS=$B7_TPS" OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm
+        "LLAMA_THP=$B7_THP" LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$B7_BATCH" "LLAMA_SOCKETS=$B7_SOCKETS") ;;
+    ctl)
+      B7_SOCKETS=2 B7_TPS=112 B7_BACKEND=omp B7_CPU=0,1 B7_MEM=2,3
+      B7_ENV=(LLAMA_BACKEND=omp OMP_NUM_THREADS=112 OMP_PROC_BIND=close OMP_PLACES=cores "LLAMA_PREFILL_BATCH=$B7_BATCH") ;;
+    *) die "unknown B7 configuration '$config'" ;;
+  esac
+  B7_ENV+=(${B7_ENV_EXTRA[@]+"${B7_ENV_EXTRA[@]}"})
+}
+
+# b7_launch NAME PRECISION CONFIG CONTEXT REP STAGED TOKENIZER [LABEL_WORDS...] [-- ENV_WORDS...]: one decode run from a
+# retained context of CONTEXT tokens; the label carries the context as p=. A word x=prof makes it the profiled run.
+b7_launch() {
+  local name=$1 precision=$2 config=$3 ctx=$4 rep=$5 staged=$6 tokenizer=$7 label_words=() env_words=() side=label label
+  local engine=run perf=0 log=warn
+  shift 7
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=env; elif [[ $side == label ]]; then label_words+=("$1"); else env_words+=("$1"); fi
+    shift
+  done
+  [[ $precision == fp32 ]] || engine=runq
+  b7_config "$config" "$precision"
+  [[ $rep != 1 ]] || perf=$PERF
+  [[ " ${label_words[*]-} " != *" x="*"prof "* ]] || log=info
+  label=$(run_label "$name" "$B7_PREC" "$B7_BACKEND" hbm "$B7_SOCKETS" "$B7_TPS" "p=$ctx" ${label_words[@]+"${label_words[@]}"})
+  [[ $config != ctl ]] || label=$(run_label "$name" "$B7_PREC" omp file 2 112 "p=$ctx" x=ctl)
+  CPU_BIND=$B7_CPU MEM_BIND=$B7_MEM REP=$rep CONTEXT=$((ctx + 256)) GENERATION=$B7_DECODE WARM=$ctx LOG_LEVEL=$log \
+    run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" 1 "$perf" "${B7_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
+}
+
+# b7_gates DIR NAME ARTIFACTS: the correctness gates, on a copy staged on DDR node 0.
+b7_gates() {
+  local dir=$1 name=$2 artifacts=$3 precision staged
+  for precision in $PRECISIONS; do
+    staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+    if [[ $precision == fp32 ]]; then
+      B_FLAGS=(--max-abs 1e-3 --batch-a "$B7_BATCH" --batch-b "$B7_BATCH")
+      b_compare "$dir" "$name" fp32 "$staged" b7-batched-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_PREFILL_GEMM=on -- \
+        "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_PREFILL_GEMM=on
+    else
+      B_FLAGS=("${W8A8_GATE[@]}" --batch-a "$B7_BATCH" --batch-b "$B7_BATCH")
+      b_compare "$dir" "$name" int8 "$staged" b7-w8a8-batched-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_PREFILL_GEMM=on -- \
+        "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_PREFILL_GEMM=on
+      B_FLAGS=(--max-abs 1e-3)
+      b_compare "$dir" "$name" int8 "$staged" b7-w8a32-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_Q8_ACTIVATIONS=fp32 -- \
+        "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_Q8_ACTIVATIONS=fp32
+    fi
+    if [[ $precision == fp32 ]]; then
+      # The packed4 decode layout does the same arithmetic as the row layout: bitwise, on the AVX-512 kernels, under a
+      # claiming schedule (the row layout then also forms whole four-row groups), on one socket's worth and on two.
+      B_FLAGS=(--bitwise)
+      b_compare "$dir" "$name" fp32 "$staged" b7-packed4-vs-rows-2s "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_GEMV_SCHED=dynamic -- \
+        "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_GEMV_SCHED=dynamic LLAMA_FP32_LAYOUT=packed4 LLAMA_TP_CHECK=1
+    fi
+    B_FLAGS=()
+    unstage_model_on 0 "$name" "$precision"
+  done
+}
+
+phase_B7() {
+  local dir="$OUT/B7" entry name artifacts hf precision staged tokenizer rep ctx config configs control
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no B7 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  a_models "$dir"
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    b7_gates "$dir" "$name" "$artifacts"
+  done
+  if ! dry_run && grep -q '^FAIL compare-.*-b7-' "$OUT/phase-results.txt" 2> /dev/null; then
+    echo 'a B7 correctness gate failed: no benchmark was run' | tee "$dir/gate-failed.txt"
+    return 0
+  fi
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        for ctx in $B7_CONTEXTS; do
+          configs="1s56 2s56"
+          [[ $ctx != 512 ]] || configs="1s56 2s14 2s28 2s42 2s56"
+          for config in $configs; do
+            b7_launch "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" "$config" "$ctx" "$rep" "$staged" "$tokenizer"
+          done
+          # FP32: the same two-socket decode from the packed4 copy of the shards (decision L8).
+          if [[ $precision == fp32 ]]; then
+            b7_launch "$name" fp32 2s56p4 "$ctx" "$rep" "$staged" "$tokenizer" x=p4
+          fi
+          # W8A32 at two sockets x 56 only; its warm-up runs per token, so not at the longest context.
+          if [[ $precision == int8 && $ctx != 32768 ]]; then
+            b7_launch "$name" w8a32 2s56 "$ctx" "$rep" "$staged" "$tokenizer"
+          fi
+        done
+      done
+      # One profiled run per configuration and context (per-socket phase times in the .stderr files).
+      for ctx in $B7_CONTEXTS; do
+        configs="1s56 2s56"
+        [[ $ctx != 512 ]] || configs="1s56 2s14 2s28 2s42 2s56"
+        for config in $configs; do
+          b7_launch "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" "$config" "$ctx" 1 "$staged" "$tokenizer" \
+            x=prof -- LLAMA_PROFILE=1
+        done
+        if [[ $precision == fp32 ]]; then
+          b7_launch "$name" fp32 2s56p4 "$ctx" 1 "$staged" "$tokenizer" x=p4prof -- LLAMA_PROFILE=1
+        fi
+      done
+      unstage_model_on 0 "$name" "$precision"
+      # The control: 112 threads, no tensor parallelism, the copy interleaved over HBM 2 and 3 (the old kernel campaign).
+      control="$shm/$name-$precision-hbm23.bin"
+      if dry_run; then :; else stage_checkpoint "$artifacts/$precision-v3.bin" "$control" --interleave=2,3; fi
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        b7_launch "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" ctl 512 "$rep" "$control" "$tokenizer"
+      done
+      dry_run || rm -f -- "$control" "$control.numa.txt"
     done
   done
   dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"

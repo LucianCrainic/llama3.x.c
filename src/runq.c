@@ -448,7 +448,9 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   Transformer *t = model->implementation;
   Config *p = &t->config;
   RunState *s = &t->state;
-  if (t->tp) { /* per-token on two sockets; D1 adds the batched path */
+  if (t->tp && count > 1 && model->prefill_gemm)
+    return tp_forward_batch(t->tp, tokens, count, pos0, want);
+  if (t->tp) { /* a single row, W8A32, or the GEMM switched off: per token on two sockets */
     float *logits = NULL;
     if (want == LOGITS_ALL && !s->batch_logits)
       s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
@@ -516,8 +518,19 @@ void engine_load_context(Model *model, const char *path, int context) {
   double start = monotonic_seconds();
   prefill_configure(model);
   if (tp_sockets_requested() == 2) {
-    model->prefill_gemm = 0; /* the two-socket path runs per token; D1 adds the batched one */
-    t->tp = tp_create(&t->config, &t->manifest, t->fd, 1, GS, fp32_activations);
+    /* D1: W8A8 microbatches run through the batched two-socket forward (the VNNI or portable Q8 GEMM; the AMX-INT8 rung
+     * needs packed shards, which come with the BF16 ones). W8A32 stays per token, as on one socket. */
+    if (fp32_activations)
+      model->prefill_gemm = 0;
+    else if (model->prefill_gemm)
+      model->prefill_kernel = kernels_amx_active() && GS % 64 == 0      ? "amx-int8"
+                              : kernels_avx512_active() && GS % 64 == 0 ? "avx512-q8"
+                                                                        : "portable-q8";
+    if (model->prefill_gemm && kernels_amx_active() && GS % 64)
+      LOG(LOG_INFO, "AMX-INT8 needs a group size that is a multiple of 64 (this checkpoint has %d): falling back", GS);
+    int amx_int8 = model->prefill_kernel && !strcmp(model->prefill_kernel, "amx-int8") && model->prefill_gemm;
+    t->tp = tp_create(&t->config, &t->manifest, t->fd, 1, GS, fp32_activations, model->prefill_gemm ? model->max_batch : 1,
+                      amx_int8 ? TP_PACK_INT8 : TP_PACK_NONE);
     munmap(t->data, t->file_size); /* the shards were read with pread */
     t->data = MAP_FAILED;
     model->mapped_bytes = 0;
@@ -550,7 +563,7 @@ void engine_load_context(Model *model, const char *path, int context) {
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;
   if (t->tp) {
-    tp_kv_stats(t->tp, position, out);
+    tp_kv_stats(t->tp, position, verify, out);
     return;
   }
   size_t kv_dim = (size_t)t->config.head_dim * t->config.n_kv_heads;

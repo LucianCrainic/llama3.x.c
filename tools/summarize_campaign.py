@@ -2,13 +2,17 @@
 
 Run labels follow {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}]
 [-k{kernel}][-x{tag}]-{rep}.json. Repeats of one label are reported as the median with the full range. Schema-v1 reports
-and unknown fields give '-' instead of failing. summarize_kernels.py stays for old campaigns.
+and unknown fields give '-' instead of failing. After the table, tools/campaign_tables.py adds the decode-scaling, prefill-speedup,
+per-socket phase, modeled-against-measured and crossover tables when the campaign has the data for them. summarize_kernels.py stays for old campaigns.
 """
 import json
 from pathlib import Path
 import re
 import statistics
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import campaign_tables  # noqa: E402
 
 LABEL = re.compile(r'^(?P<model>.+?)-(?P<precision>fp32|bf16|int8|w8a32)-(?P<backend>omp|teams)-'
                    r'(?P<placement>file|ddr|hbm)-s(?P<sockets>[12])-t(?P<threads>\d+)(?:-m(?P<m>\d+))?'
@@ -105,13 +109,13 @@ def summarize(root):
             continue
         label = path.stem[:path.stem.rindex('-')]
         groups.setdefault(label, (info, []))[1].append(path)
-    lines = ['| Configuration | Runs | Sockets | Placement | THP | M | Kernel | Precision | Prompt | TTFT s | Prefill tok/s '
+    lines = ['| Configuration | Runs | Sockets | Placement | THP | M | Kernel | Precision | Prompt | Warm ctx | TTFT s | Prefill tok/s '
              '| Decode tok/s | Decode phases | Reduce+wait | HBM read GB | DDR read GB | UPI rx data flits (M) |',
-             '| --- | ---: | ---: | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |']
+             '| --- | ---: | ---: | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |']
     for label, (info, paths) in groups.items():
         reports = [json.loads(p.read_text()) for p in paths]
         if any(r.get('status') != 'completed' for r in reports):
-            lines.append(f'| {label} | {len(reports)} | failed |' + ' |' * 14)
+            lines.append(f'| {label} | {len(reports)} | failed |' + ' |' * 15)
             continue
         first = reports[0]
         kernel = info['kernel'] or dig(first, 'build', 'kernels') or '-'
@@ -129,6 +133,7 @@ def summarize(root):
         lines.append('| ' + ' | '.join([
             label, str(len(reports)), info['sockets'], placement_status(first), thp, info['m'] or '-', kernel,
             dig(first, 'runtime', 'precision_mode') or info['precision'], info['prompt'] or '-',
+            str(dig(first, 'parameters', 'warm_context') or '-'),
             span([dig(r, 'timing_seconds', 'time_to_first_token') for r in reports], 3),
             span([dig(r, 'throughput_tokens_per_second', 'prefill') for r in reports]),
             span([dig(r, 'throughput_tokens_per_second', 'decode') for r in reports]),
@@ -136,6 +141,9 @@ def summarize(root):
     status = Path(root) / 'correctness-status.txt'
     if status.exists():
         lines += ['', 'Validation exit codes:', ''] + [f'- {line}' for line in status.read_text().splitlines()]
+    extra = campaign_tables.build({k: (i, [json.loads(p.read_text()) for p in ps]) for k, (i, ps) in groups.items()}, root)
+    if extra:
+        lines += [''] + extra
     return '\n'.join(lines) + '\n'
 
 

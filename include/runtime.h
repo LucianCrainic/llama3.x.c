@@ -157,6 +157,7 @@ typedef struct {
   size_t sampled_tokens, stop_tokens, turns;
   size_t prefill_microbatches, prefill_logits_rows;
   double placement_populate_s, placement_verify_s, verify_excluded_s;
+  double warm_s;        /* untimed --warm-context prefill (B7); excluded from prefill, TTFT and inference time */
   double weight_pack_s; /* BF16 packing at load (C5) */
   int weight_packed;
   KvStats kv_prompt, kv_final;

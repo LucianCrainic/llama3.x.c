@@ -13,6 +13,8 @@ comment above `c7_best`); `DRY_RUN=1` prints 245 launches per model (with the dr
 `docs/batched-prefill.md` and `docs/batched-prefill-validation.md` and the choice of defaults wait for the run; it needs
 C4-C6 to have passed on the hardware first.
 
+Results document skeleton (empty until the run): [`docs/batched-prefill.md`](../../batched-prefill.md) and its [validation record](../../batched-prefill-validation.md).
+
 ## 2. Depends on / unblocks
 
 - Depends on: C6 (all rungs) and F3. A6 is optional: if it is done, C7 runs on
@@ -93,9 +95,9 @@ As in §4.1. `summary.md` reports, per rung, model, prompt and M:
   rung read back from the sweep reports (`c7_best`); prompts 86 / 512 / 8192 at M = 1 and the best two; 14 and 28 threads at
   the best M; decode runs of 128 tokens; one `LLAMA_PROFILE=1` repeat at 2048 and 8192 tokens, summarized in
   `C7/phase-shares.txt`.
-- **Differences from §4.1**, all to keep to the time budget or because a piece does not exist yet: the per-token baselines run
-  once (not 3 times) at 8192 tokens and on 14 and 28 threads; the decode runs prefill 2048 tokens in the same process (the
-  report times prefill and decode apart) because `--warm-context` (B7) does not exist; at 2048 tokens the gates compare the
+- **Differences from §4.1**, all to keep to the time budget: the per-token baselines run once (not 3 times) at 8192 tokens and
+  on 14 and 28 threads; the decode runs use `--warm-context 2048` (L1, 8 November 2026: an untimed prefill in the rung's own
+  setting, then the 86-token chat prompt and 128 timed decode tokens); at 2048 tokens the gates compare the
   last position only (1 GB of logits per side otherwise), and the AMX-INT8 gate there is against per-token, not against the
   batched AVX-512 path (`compare_engines.py --last-only` needs A to be per-token). BF16 comparisons are recorded
   (`expect any`) until C5 has set its provisional gate.
