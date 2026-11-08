@@ -207,8 +207,9 @@ One socket against two at M = 64, on the 86-token prompt (every position) and on
 Diagnostic `D3` (8B, W8A8): one socket, AMX against AVX-512 (no second socket involved): max 1.41, rms 0.086 on 86 tokens, max 7.58, rms 0.115 on
 the last row of 2048; two sockets against one at the same AMX kernel 4.12 / 0.136 and 8.86 / 0.112; two sockets with M = 64 against M = 16: bitwise
 identical. The deviation is the W8A8 requantization noise floor, which grows with model and context, not a defect of the two-socket path, and the
-provisional bound was too tight: **`W8A8_GATE` revised to max 16, rms 0.2, argmax >= 0.9.** Open: the W8A32 comparison on the 2048-token prompt fails
-on both models with "logits of different sizes" (not reproduced locally; a repro job is needed); the Hugging Face gate with two sockets (HF_GATE=0
+provisional bound was too tight: **`W8A8_GATE` revised to max 16, rms 0.2, argmax >= 0.9.** The W8A32 comparison on the 2048-token prompt failed on both models with "logits of different sizes": a script bug (its flags dropped
+`--batch-a/--batch-b`, so both sides ran the per-token probe and `--last-only` trimmed only one), fixed and guarded by a dry-run test; it has
+not been re-run. Open: the Hugging Face gate with two sockets (HF_GATE=0
 here); the placement runs and the M sweep (not part of the gates-only job).
 
 ## 7. Exit criteria

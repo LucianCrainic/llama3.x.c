@@ -99,6 +99,19 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertEqual(self.dry_run('cresco8-tp.sbatch', 'B7', GATES_ONLY='1'), [])
         placement = self.dry_run('cresco8-prefill.sbatch', 'D1', GATES_ONLY='1')
         self.assertTrue(placement and len(placement) < 20 and all('xplace' in line for line in placement), placement)
+        # Every D1 comparison of the 2048-token prompt reads only the last row, so both sides must run the batched probe
+        # (job 5704685: W8A32 lost its --batch flags and the per-token side wrote every position).
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'D1', 'GATES_ONLY': '1', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
+            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
+                                 text=True, timeout=120).stdout
+        compares = [line for line in out.splitlines() if line.startswith('EXPECT compare-') and 'prompt2048' in line]
+        self.assertEqual(len(compares), 5)  # fp32, bf16, q8, int8, w8a32
+        for line in compares:
+            self.assertIn('--last-only', line)
+            self.assertIn('--batch-a 64', line, line)
+            self.assertIn('--batch-b 64', line, line)
         self.dry_run('cresco8-prefill.sbatch', 'D3')  # the W8A8 AMX diagnostic prints its comparisons and exits 0
         c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
         decode = [line for line in c7 if 'xdec' in line]
