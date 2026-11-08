@@ -390,6 +390,7 @@ phase_A6() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
 }
 
+require_phases
 if ! dry_run; then
   check_stage
   validate_models

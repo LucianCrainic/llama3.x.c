@@ -208,6 +208,21 @@ class CampaignSummaryTests(unittest.TestCase):
             self.assertIn('| Model | Precision | Prompt | Rung | M | Sockets | Prefill tok/s | TTFT s | Speedup vs 1-socket per-token '
                           '| 2s wins |', (ROOT/'docs'/f'{name}.md').read_text())
 
+    def test_a_phase_sent_to_the_wrong_script_fails_before_the_build(self):
+        """B7 lives in cresco8-tp.sbatch and D1 in cresco8-prefill.sbatch; a mismatch must not cost a build and `make test`."""
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        for script, phases, missing in (('cresco8-prefill.sbatch', 'D1 B7', 'B7'), ('cresco8-tp.sbatch', 'B7 D1', 'D1'),
+                                        ('cresco8-prefill.sbatch', 'C7 D3', 'D3')):
+            with tempfile.TemporaryDirectory() as temp:
+                env = {**os.environ, 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                       'PYTHON': sys.executable, 'PHASE': phases}  # not a dry run: the check must come before check_stage
+                result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True,
+                                        timeout=60)
+            self.assertNotEqual(result.returncode, 0, (script, phases))
+            self.assertIn(f'no run matrix for phase(s) {missing}', result.stderr)
+            self.assertNotIn('build', result.stdout.lower())
+
     def test_small_unverified_work_region_does_not_hide_a_verified_placement(self):
         import summarize_campaign as sc
         large = {'verified': 'full', 'pages_mismatched': 0, 'bytes': 2**30}
