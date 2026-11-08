@@ -191,26 +191,37 @@ the user's go-ahead to submit.
 | M sweep: 8B, prompt 2048, every rung, M ∈ {16, 32, 64, 128, 256}, profiled | **Measured** per-socket GEMM, attention, exchange and wait times; selects M per rung |
 | Decode after a two-socket prefill, measured separately | Equal to B7's two-socket decode within range |
 
-### Cluster results: gates (8 November 2026, partial)
+### Cluster results: gates and placement (8 November 2026)
 
-Jobs 5704683 and 5704685 (`PHASE=D1 D3 GATES_ONLY=1`, hbm14, trees 8310e50 and e763e08, `make test` skipped: it passed in job 5704671).
-One socket against two at M = 64, on the 86-token prompt (every position) and on the last row of 2048 tokens:
+hbm14, Flat mode, `PHASE=D1 GATES_ONLY=1 SKIP_TEST=1 HF_GATE=0` (`make test` passed in job 5704671 on the same code). Jobs 5704683 and 5704685
+(trees 8310e50 and e763e08) found two script problems and one gate that was too tight for 8B; **job 5704689 (tree cd31a67, 5 minutes, exit 0) passed
+all 20 comparisons and all 8 placement checks.** One socket against two at M = 64 (max |dlogit| / rms; the first column is the 86-token prompt at every
+position, the second the last row of the 2048-token prompt):
 
 | Rung | 1B | 8B |
 | --- | --- | --- |
-| AVX-512 FP32 GEMM (strict 1e-3) | 8e-6 / 5e-6, pass | 7e-5 / 8e-6, pass |
-| AMX-BF16 (recorded) | max 0.08 / 0.05, rms 0.012 / 0.016 | max 0.41 / 0.04, rms 0.020 / 0.008 |
-| AVX-512 Q8 W8A8 (statistical) | rms 0.063 / 0.041, pass | rms 0.063 / 0.046, pass |
-| AMX-INT8 W8A8 (statistical) | rms 0.064 / 0.041, pass | rms **0.136** / 0.042, max **4.12** on one position: failed the first bound (max 2.0) |
-| AVX-512 W8A32 (strict) | pass on 86 tokens | pass on 86 tokens |
+| AVX-512 FP32 GEMM (strict 1e-3) | 8e-6 / 5e-6 | 7e-5 / 8e-6 |
+| AMX-BF16 (recorded) | 0.08 / 0.05, rms 0.012 / 0.016 | 0.41 / 0.04, rms 0.020 / 0.008 |
+| AVX-512 Q8 W8A8 (statistical) | rms 0.063 / 0.041 | rms 0.063 / 0.046 |
+| AMX-INT8 W8A8 (statistical) | rms 0.064 / 0.041 | rms 0.136 (max 4.12 on one position) / 0.042 |
+| AVX-512 W8A32 (strict 1e-3) | pass / pass | pass / pass |
 
-Diagnostic `D3` (8B, W8A8): one socket, AMX against AVX-512 (no second socket involved): max 1.41, rms 0.086 on 86 tokens, max 7.58, rms 0.115 on
-the last row of 2048; two sockets against one at the same AMX kernel 4.12 / 0.136 and 8.86 / 0.112; two sockets with M = 64 against M = 16: bitwise
-identical. The deviation is the W8A8 requantization noise floor, which grows with model and context, not a defect of the two-socket path, and the
-provisional bound was too tight: **`W8A8_GATE` revised to max 16, rms 0.2, argmax >= 0.9.** The W8A32 comparison on the 2048-token prompt failed on both models with "logits of different sizes": a script bug (its flags dropped
-`--batch-a/--batch-b`, so both sides ran the per-token probe and `--last-only` trimmed only one), fixed and guarded by a dry-run test; it has
-not been re-run. Open: the Hugging Face gate with two sockets (HF_GATE=0
-here); the placement runs and the M sweep (not part of the gates-only job).
+The 8B AMX-INT8 deviation is the W8A8 requantization noise floor, not a defect of the two-socket path (diagnostic D3, job 5704685, 8B W8A8): **one
+socket**, AMX against AVX-512, max 1.41 and rms 0.086 on 86 tokens, 7.58 and 0.115 on the last row of 2048; two sockets against one at the same AMX
+kernel 4.12 / 0.136 and 8.86 / 0.112; two sockets with M = 64 against M = 16 bitwise identical, on both models and both prompts. The first provisional
+bound (max 2.0, rms 0.15, calibrated on 1B) was too tight; `W8A8_GATE` is now max 16, rms 0.2, argmax >= 0.9. The 2048-token comparisons first
+failed on a harness guard (`--last-only` needed a per-token side A) and, for W8A32, on a script bug (the flags lost `--batch-a/--batch-b`); both fixed
+and covered by tests.
+
+Placement (one two-socket run per batched rung, `tp_placement`): the weights of each socket are one region on its HBM node (2 and 3), fully verified, 0
+pages elsewhere or missing (8B: 14 GiB per socket); the packed shards of the AMX rungs (8B BF16: 6.5 GiB per socket) are fully verified on the same
+nodes; the KV caches of both sockets are verified with 0 pages on another node (the missing pages are positions not yet written); the untied embedding
+is on DDR node 0, fully verified. **Not verified:** the work region and the exchange buffers (about 10 MB per socket) are reserved on the socket's
+node but never fully populated, so the page query reports them unverified, as in the one-socket engine; D1's criterion lists the exchange buffers, and
+this is the one place it is not met. BF16 packing took 0.11 s for 13 GiB (the `weight_pack` timing).
+
+Open: the Hugging Face gate with two sockets (`HF_GATE=0` here); the M sweep, the profiled runs and the decode after prefill (the rest of `phase_D1`);
+the work and exchange regions' verification.
 
 ## 7. Exit criteria
 
