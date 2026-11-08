@@ -685,7 +685,7 @@ d1_gates() {
         B_EXPECT=ok
         case $rung in
           avx512_q8 | amx_int8) B_FLAGS=("${W8A8_GATE[@]}" --batch-a "$m" --batch-b "$m") ;;
-          avx512_q8_w8a32) B_FLAGS=(--max-abs 1e-3) ;;
+          avx512_q8_w8a32) B_FLAGS=(--max-abs 1e-3 --batch-a "$m" --batch-b "$m") ;; # batched interface, per row inside; --last-only needs it
           amx_bf16)
             B_EXPECT=any
             B_FLAGS+=(--max-abs 1e30)
