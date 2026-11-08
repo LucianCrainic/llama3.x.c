@@ -69,6 +69,7 @@ struct Tp {
   Config c;
   int quantized, gs, check, fp32_activations;
   const char *trace_path;
+  int reduce_flags; /* LLAMA_TP_REDUCE=flags (default, fused only): per-row flags instead of two team barriers */
   int fused; /* LLAMA_TP_FUSED (default 1): the partial projection and the reduction run in one team job */
   ShardSet set;
   NumaRegion global;
@@ -199,13 +200,19 @@ typedef struct {
   WorkerStamp *stamps;              /* fused, traced: one per member */
 } ProjectJob;
 
+static void rows_done_fn(void *p, int r0, int r1) {
+  const ProjectJob *job = p;
+  exchange_rows_done(job->tp->exchange, job->socket, r0, r1);
+}
+
 static void project_share(const ProjectJob *job, int worker, int workers) {
+  RowsDoneFn done = job->tp->reduce_flags ? rows_done_fn : NULL;
   if (job->wq)
     k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
-                          workers, (atomic_int *)&job->claim);
+                          workers, (atomic_int *)&job->claim, done, (void *)job);
   else
     k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
-                       (atomic_int *)&job->claim);
+                       (atomic_int *)&job->claim, done, (void *)job);
 }
 
 /* Fused form: every member computes its rows of the partial and goes straight into the reduction, whose first barrier
@@ -221,8 +228,12 @@ static void project_reduce_fn(const void *p, int worker, int workers) {
     stamp->proj_end = monotonic_seconds();
   if (start)
     *job->leader_seconds = (stamp ? stamp->proj_end : monotonic_seconds()) - start;
-  exchange_reduce_add_stamped(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
+  if (job->tp->reduce_flags)
+    exchange_reduce_add_flags(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
                               stamp ? &stamp->r : NULL);
+  else
+    exchange_reduce_add_stamped(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
+                                stamp ? &stamp->r : NULL);
 }
 
 /* Folds the members' stamps of the reduction that just ended into one record of the socket. */
@@ -279,6 +290,8 @@ static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
     job->stamps = sk->stamps;
     double disp = sk->stamps ? monotonic_seconds() : 0.0;
     team_run(sk->team, project_reduce_fn, job);
+    if (tp->reduce_flags)
+      exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
     if (sk->stamps)
       trace_record(tp, sk, job, slot - TP_WO_MM, disp, monotonic_seconds());
     *prof += leader;
@@ -570,6 +583,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   if (fused && *fused && strcmp(fused, "0") && strcmp(fused, "1"))
     fail("LLAMA_TP_FUSED must be 0 or 1");
   tp->fused = !(fused && !strcmp(fused, "0"));
+  const char *reduce = getenv("LLAMA_TP_REDUCE");
+  if (reduce && *reduce && strcmp(reduce, "flags") && strcmp(reduce, "barrier"))
+    fail("LLAMA_TP_REDUCE must be flags or barrier");
+  tp->reduce_flags = tp->fused && !(reduce && !strcmp(reduce, "barrier"));
   const char *trace = getenv("LLAMA_TP_TRACE");
   tp->trace_path = trace && *trace ? trace : NULL;
   if (tp->trace_path && !tp->fused)
@@ -717,8 +734,9 @@ static void log_profile(const Tp *tp) {
       continue;
     for (int s = 0; s < SOCKETS; s++) {
       char line[1024];
-      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token, fused=%d):",
-                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage], tp->fused);
+      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token, fused=%d, reduce=%s):",
+                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage], tp->fused,
+                                     tp->reduce_flags ? "flags" : "barrier");
       for (int i = 0; i < TP_SLOTS && used < sizeof(line); i++)
         if (tp->prof[s][stage][i] > 0)
           used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%.3f", names[i],

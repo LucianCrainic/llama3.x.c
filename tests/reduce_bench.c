@@ -1,6 +1,6 @@
 /* Where do Wo and W2 lose bandwidth? (measurement, not a test)
  *   reduce-bench [--sockets 1|2] [--threads N] [--model 8b|1b] [--precision fp32|q8] [--layers L] [--passes P]
- *                [--red fused|bars|none|xonly] [--stamps 0|1] [--tier hbm|ddr] [--gap-us U]
+ *                [--red fused|flags|bars|none|xonly] [--stamps 0|1] [--tier hbm|ddr] [--gap-us U]
  * Runs P passes over L synthetic decoder layers, one pinned team per socket, each layer being the three projections that
  * carry 85% of the weight bytes of a token, with the engine's kernels, row scheduling and exchange (src/tp.c does the same
  * sequence): quantize + Wo(+reduction), rmsnorm + quantize + W1/W3 (SwiGLU), quantize + W2(+reduction). Shard shapes are
@@ -8,6 +8,7 @@
  *   --red fused  the engine's fused form: every member projects its rows, then exchange_reduce_add (two sockets only)
  *   --red bars   the projection and the two local team barriers, no cross-socket exchange (isolates the local sync)
  *   --red none   the projection alone (isolates the kernel, its dispatch and join, and the row split)
+ *   --red flags  the fused form with per-row flags instead of the two team barriers (exchange_reduce_add_flags)
  *   --red xonly  no projection: the exchange alone inside the same team job (the reduction's own latency)
  * With --stamps 1 every member timestamps its steps (start, end of projection, the exchange's four steps) and the leader
  * folds them after each job: the log breaks Wo and W2 into dispatch, projection spread, barrier 1, peer wait, add, barrier
@@ -25,7 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { RED_FUSED, RED_BARS, RED_NONE, RED_XONLY };
+enum { RED_FUSED, RED_BARS, RED_NONE, RED_XONLY, RED_FLAGS };
 enum { P_QUANT_WO, P_WO, P_NORM_QUANT, P_W1W3, P_QUANT_W2, P_W2, P_COUNT };
 static const char *const phase_name[P_COUNT] = {"quant_wo", "wo", "norm_quant", "w1_w3", "quant_w2", "w2"};
 enum { GS = 64, MAX_ITER = 1 << 20, MAX_WORKERS = 256 };
@@ -98,22 +99,32 @@ static void socket_barrier(Context *c) {
 static Exchange *g_exchange;
 static Team *g_team[2];
 
+static void bench_rows_done(void *p, int r0, int r1) {
+  const Job *j = p;
+  exchange_rows_done(g_exchange, j->socket, r0, r1);
+}
+
 static void job_run(const void *p, int worker, int workers) {
   Job *j = (Job *)p;
   Stamp *st = j->stamps ? &j->stamps[worker] : NULL;
   if (st)
     st->start = monotonic_seconds();
   if (j->red != RED_XONLY) {
+    RowsDoneFn done = j->red == RED_FLAGS ? bench_rows_done : NULL;
     if (j->q8)
-      k_matmul_q8_ld_worker(j->partial, &j->input, &j->wq, j->ld, j->n, j->d, GS, K_PARTIAL, worker, workers, &j->claim);
+      k_matmul_q8_ld_worker(j->partial, &j->input, &j->wq, j->ld, j->n, j->d, GS, K_PARTIAL, worker, workers, &j->claim,
+                            done, j);
     else
-      k_matmul_ld_worker(j->partial, j->x, j->w, j->ld, j->n, j->d, K_PARTIAL, worker, workers, &j->claim);
+      k_matmul_ld_worker(j->partial, j->x, j->w, j->ld, j->n, j->d, K_PARTIAL, worker, workers, &j->claim, done, j);
+  } else if (j->red == RED_XONLY) {
   }
   if (st) {
     st->proj_end = monotonic_seconds();
     st->r.after_barrier1 = st->r.after_peer = st->r.after_add = st->r.after_barrier2 = st->proj_end;
   }
-  if (j->red == RED_FUSED || j->red == RED_XONLY) {
+  if (j->red == RED_FLAGS) {
+    exchange_reduce_add_flags(g_exchange, j->socket, worker, workers, j->residual, j->d, st ? &st->r : NULL);
+  } else if (j->red == RED_FUSED || j->red == RED_XONLY) {
     exchange_reduce_add_stamped(g_exchange, j->socket, worker, workers, j->residual, j->d, st ? &st->r : NULL);
   } else if (j->red == RED_BARS) {
     team_barrier(g_team[j->socket]);
@@ -174,12 +185,14 @@ static void project(Context *c, int s, Job *job, int kind, size_t iter) {
   job->partial = c->partial[s];
   atomic_init(&job->claim, 0);
   job->stamps = c->stamps ? c->stamp[s] : NULL;
-  if (c->red == RED_FUSED || c->red == RED_XONLY) {
+  if (c->red == RED_FUSED || c->red == RED_XONLY || c->red == RED_FLAGS) {
     job->partial = exchange_partial(c->exchange, s);
     assert(job->partial);
   }
   double disp = c->stamps ? monotonic_seconds() : 0.0;
   team_run(c->team[s], job_run, job);
+  if (c->red == RED_FLAGS)
+    exchange_reduce_finish(c->exchange, s);
   if (c->stamps && iter < c->iters)
     fold_stamps(c->stamp[s], c->threads, disp, monotonic_seconds(), &c->fold[s][kind][iter]);
 }
@@ -385,7 +398,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(k, "--red")) {
       red_name = v;
       red = !strcmp(v, "fused") ? RED_FUSED : !strcmp(v, "bars") ? RED_BARS : !strcmp(v, "none") ? RED_NONE
-            : !strcmp(v, "xonly") ? RED_XONLY : -1;
+            : !strcmp(v, "xonly") ? RED_XONLY : !strcmp(v, "flags") ? RED_FLAGS : -1;
     } else {
       fprintf(stderr, "unknown option %s\n", k);
       return 2;
@@ -394,7 +407,7 @@ int main(int argc, char **argv) {
   int dim = !strcmp(model, "8b") ? 4096 : !strcmp(model, "1b") ? 2048 : 0;
   int hidden = dim == 4096 ? 14336 : 8192;
   if (!dim || red < 0 || (sockets != 1 && sockets != 2) || threads < 1 || threads > MAX_WORKERS || layers < 1 ||
-      layers > 64 || passes < 1 || ((red == RED_FUSED || red == RED_XONLY) && sockets != 2)) {
+      layers > 64 || passes < 1 || ((red == RED_FUSED || red == RED_XONLY || red == RED_FLAGS) && sockets != 2)) {
     fprintf(stderr, "invalid options (fused and xonly need --sockets 2)\n");
     return 2;
   }

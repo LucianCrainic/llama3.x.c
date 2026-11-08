@@ -219,6 +219,7 @@ typedef struct {
   unsigned seed;
   unsigned delay_permille, delay_us; /* chance per protocol step and longest sleep */
   int fail_at, fail_worker;          /* generation at which to call fail(); fail_worker -1 = the coordinator */
+  int flags;                         /* the flag form: rows produced in interleaved chunks, no team barrier */
   float *residual;
 } Side;
 
@@ -245,6 +246,22 @@ static void generation_fn(const void *p, int worker, int workers) {
   inject(&state, side);
   if ((int)job->generation == side->fail_at && worker == side->fail_worker)
     fail("injected failure in exchange worker %d of socket %d", worker, side->socket);
+  if (side->flags) {
+    /* Rows in chunks of 5, dealt to the members differently on each socket and generation, as claiming would. */
+    const int chunk = 5, chunks = (side->elements + chunk - 1) / chunk;
+    for (int c = 0; c < chunks; c++) {
+      if ((c + (int)job->generation + side->socket) % workers != worker)
+        continue;
+      int r0 = c * chunk, r1 = r0 + chunk < side->elements ? r0 + chunk : side->elements;
+      for (int i = r0; i < r1; i++)
+        job->partial[i] = partial_value(side->seed, job->generation, side->socket, i);
+      inject(&state, side);
+      exchange_rows_done(side->exchange, side->socket, r0, r1);
+    }
+    exchange_reduce_add_flags(side->exchange, side->socket, worker, workers, side->residual, side->elements, NULL);
+    inject(&state, side);
+    return;
+  }
   for (int i = i0; i < i1; i++)
     job->partial[i] = partial_value(side->seed, job->generation, side->socket, i);
   inject(&state, side); /* a late ready */
@@ -264,6 +281,8 @@ static void run_side(Side *side) {
       return; /* aborted */
     GenJob job = {side, (unsigned)g, partial};
     team_run(team, generation_fn, &job);
+    if (side->flags)
+      exchange_reduce_finish(side->exchange, side->socket);
   }
 }
 
@@ -275,7 +294,7 @@ static void *side_main(void *p) {
 typedef struct {
   int threads[2], elements, generations;
   unsigned delay_permille[2], delay_us[2];
-  int use_regions, fail_at, fail_worker;
+  int use_regions, fail_at, fail_worker, flags;
 } ExchangeCase;
 
 static void exchange_case(const ExchangeCase *c) {
@@ -305,6 +324,7 @@ static void exchange_case(const ExchangeCase *c) {
                      .delay_us = c->delay_us[s],
                      .fail_at = c->fail_at,
                      .fail_worker = c->fail_worker,
+                     .flags = c->flags,
                      .residual = memory_alloc((size_t)c->elements, sizeof(float), MEM_ACTIVATION)};
     side[s].fail_at = c->fail_at && ((s == 1) == (c->fail_worker >= 0)) ? c->fail_at : 0; /* one socket fails */
     memcpy(side[s].residual, initial, (size_t)c->elements * sizeof(float));
@@ -340,32 +360,34 @@ static void exchange_case(const ExchangeCase *c) {
 static void unit_exchange(int scale) {
   const int teams[] = {1, 3, 7};
   const int sizes[] = {1, 7, 4096, 4096 * 64};
-  for (size_t t = 0; t < sizeof(teams) / sizeof(*teams); t++)
-    for (size_t k = 0; k < sizeof(sizes) / sizeof(*sizes); k++) {
-      ExchangeCase c = {
-          .threads = {teams[t], teams[t]}, .elements = sizes[k], .generations = 1000 * scale / 100, .fail_worker = -1};
-      if (sizes[k] > 4096)
-        c.generations /= 5;
-      c.use_regions = (int)((t + k) & 1);
+  for (int flags = 0; flags < 2; flags++)
+    for (size_t t = 0; t < sizeof(teams) / sizeof(*teams); t++)
+      for (size_t k = 0; k < sizeof(sizes) / sizeof(*sizes); k++) {
+        ExchangeCase c = {.threads = {teams[t], teams[t]},
+                          .elements = sizes[k],
+                          .generations = 1000 * scale / 100,
+                          .fail_worker = -1,
+                          .flags = flags};
+        if (sizes[k] > 4096)
+          c.generations /= 5;
+        c.use_regions = (int)((t + k) & 1);
+        exchange_case(&c);
+      }
+  for (int flags = 0; flags < 2; flags++) {
+    ExchangeCase skewed = {.threads = {3, 1}, .elements = 4096, .generations = 300 * scale / 100, .fail_worker = -1,
+                           .flags = flags};
+    exchange_case(&skewed);
+    for (int slow = 0; slow < 2; slow++) {
+      ExchangeCase c = {.threads = {3, 3}, .elements = 257, .generations = 400 * scale / 100, .fail_worker = -1,
+                        .flags = flags};
+      c.delay_permille[slow] = 300;
+      c.delay_us[slow] = 300;
       exchange_case(&c);
     }
-  /* Different team sizes, and a slow producer or a slow consumer on either socket: the fast side runs ahead by two
-   * generations and must then block until the peer acknowledges the buffer it wants to reuse. */
-  ExchangeCase skew = {.threads = {3, 1}, .elements = 4096, .generations = 300 * scale / 100, .fail_worker = -1};
-  exchange_case(&skew);
-  for (int slow = 0; slow < 2; slow++) {
-    ExchangeCase c = {.threads = {3, 3}, .elements = 257, .generations = 400 * scale / 100, .fail_worker = -1};
-    c.delay_permille[slow] = 300;
-    c.delay_us[slow] = 300;
-    exchange_case(&c);
+    ExchangeCase mixed = {.threads = {2, 5}, .elements = 1000, .generations = 400 * scale / 100, .fail_worker = -1,
+                          .flags = flags, .delay_permille = {150, 150}, .delay_us = {100, 400}};
+    exchange_case(&mixed);
   }
-  ExchangeCase both = {.threads = {2, 5},
-                       .elements = 1000,
-                       .generations = 400 * scale / 100,
-                       .fail_worker = -1,
-                       .delay_permille = {150, 150},
-                       .delay_us = {100, 400}};
-  exchange_case(&both);
 }
 
 typedef struct {
@@ -400,6 +422,17 @@ static void unit_exchange_abort(void) {
   assert(exchange_partial(e, 1) == NULL); /* generation 3 waits for consumed_0 >= 1 */
   pthread_join(thread, NULL);
   exchange_destroy(e); /* returns despite the unacknowledged generations */
+  /* The flag form: socket 0's members wait for the peer's row flags, which never come, until the abort releases them. */
+  workers_abort_clear();
+  Exchange *e2 = exchange_create(64, NULL);
+  Side flagged = {.exchange = e2, .socket = 0, .elements = 64, .generations = 1, .seed = 5, .fail_worker = -1,
+                  .flags = 1, .residual = residual};
+  AbortSide abort_flagged = {.exchange = e2};
+  assert(!pthread_create(&thread, NULL, abort_later, &abort_flagged));
+  run_side(&flagged);
+  pthread_join(thread, NULL);
+  assert(workers_aborted());
+  exchange_destroy(e2);
   pool_stop();
   workers_abort_clear();
   for (int i = 0; i < MEM_COUNT; i++)

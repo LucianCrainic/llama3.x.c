@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Spins before a waiter starts yielding. Futex parking is deferred until measurements justify it. */
@@ -29,12 +30,19 @@ struct Team {
   TeamFn fn;
   const void *job;
   Counter generation; /* leader publishes a job by bumping it */
-  Counter done;       /* workers finished with the current job */
+  Counter done;       /* workers finished with the current job (join by counter) */
+  void *done_flag_memory;
+  Counter *done_flag; /* per worker: the generation it finished (join by flags; index 0 unused) */
   Counter ready;      /* workers that finished starting up */
   Counter stop;
   Counter barrier_count, barrier_generation;
   unsigned published; /* leader's copy of generation */
 };
+
+/* How team_run learns that every member finished: a shared counter that all members increment (LLAMA_TEAM_JOIN=counter),
+ * or one flag line per member that the leader scans (flags, default): 55 increments of one line queue up for about 4 us
+ * when the members finish together, which every job of every layer pays. */
+static int join_flags = 1;
 
 static Team *teams[2];
 static int team_count;
@@ -138,7 +146,10 @@ static void *worker_main(void *p) {
     if (atomic_load_explicit(&team->stop.value, memory_order_acquire))
       return NULL;
     team->fn(team->job, worker, team->size);
-    atomic_fetch_add_explicit(&team->done.value, 1, memory_order_release);
+    if (join_flags)
+      atomic_store_explicit(&team->done_flag[worker].value, seen, memory_order_release);
+    else
+      atomic_fetch_add_explicit(&team->done.value, 1, memory_order_release);
   }
 }
 
@@ -153,6 +164,8 @@ static Team *team_create(int index, int threads, const int *cpus) {
     team->assigned[w] = cpus ? cpus[w] : -1;
     team->observed[w] = -1;
   }
+  team->done_flag_memory = memory_alloc((size_t)threads + 1, sizeof(Counter), MEM_METADATA);
+  team->done_flag = (Counter *)(((uintptr_t)team->done_flag_memory + 63) & ~(uintptr_t)63);
   team->threads = memory_alloc((size_t)threads, sizeof(pthread_t), MEM_METADATA);
   team->args = memory_alloc((size_t)threads, sizeof(*team->args), MEM_METADATA);
   if (cpus)
@@ -171,6 +184,10 @@ static Team *team_create(int index, int threads, const int *cpus) {
 void pool_start(const PoolConfig *config) {
   if (team_count)
     fail("worker pool already started");
+  const char *join = getenv("LLAMA_TEAM_JOIN");
+  if (join && *join && strcmp(join, "flags") && strcmp(join, "counter"))
+    fail("LLAMA_TEAM_JOIN must be flags or counter");
+  join_flags = !(join && !strcmp(join, "counter"));
   if (config->teams < 1 || config->teams > 2)
     fail("invalid team count %d: expected 1 or 2", config->teams);
   for (int t = 0; t < config->teams; t++)
@@ -204,6 +221,7 @@ void pool_stop(void) {
     for (int w = 1; w < team->size; w++)
       pthread_join(team->threads[w], NULL);
     memory_free(team->args);
+    memory_free(team->done_flag_memory);
     memory_free(team->threads);
     memory_free(team->observed);
     memory_free(team->assigned);
@@ -233,7 +251,12 @@ void team_run(Team *team, TeamFn fn, const void *job) {
   atomic_store_explicit(&team->done.value, 0, memory_order_relaxed);
   atomic_store_explicit(&team->generation.value, ++team->published, memory_order_release);
   fn(job, 0, team->size);
-  wait_reach(&team->done, (unsigned)(team->size - 1));
+  if (join_flags) {
+    for (int w = 1; w < team->size; w++)
+      wait_reach(&team->done_flag[w], team->published);
+  } else {
+    wait_reach(&team->done, (unsigned)(team->size - 1));
+  }
 }
 
 typedef struct {
@@ -302,6 +325,7 @@ struct Exchange {
   Team *team[2];
   float *buffer[2][2]; /* [socket][generation & 1] */
   void *heap[2];       /* NULL when the socket's buffers sit in a caller-owned region */
+  atomic_uint *flags[2]; /* [socket][row] = g: the row of socket's partial g is stored (flag form of the reduction) */
   Counter ready[2];    /* ready[s] = g: socket s finished writing partial g */
   Counter consumed[2]; /* consumed[s] = g: socket s finished reading the peer's partial g */
   unsigned issued[2];  /* generation handed out by exchange_partial; written by the coordinator, read by workers */
@@ -314,7 +338,7 @@ struct Exchange {
 size_t exchange_region_bytes(int elements_max) {
   size_t line = 64 / sizeof(float);
   size_t stride = (((size_t)elements_max + line - 1) / line) * line;
-  return 2 * stride * sizeof(float);
+  return 3 * stride * sizeof(float); /* two partial buffers, then one generation flag per row */
 }
 
 Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2]) {
@@ -325,7 +349,7 @@ Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2])
   Exchange *e = memory_alloc(1, sizeof(*e), MEM_METADATA);
   e->elements_max = elements_max;
   size_t bytes = exchange_region_bytes(elements_max);
-  e->stride = bytes / (2 * sizeof(float));
+  e->stride = bytes / (3 * sizeof(float));
   for (int s = 0; s < 2; s++) {
     e->team[s] = teams[s];
     char *base;
@@ -343,6 +367,8 @@ Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2])
       fail("exchange buffers of socket %d are not cache-line aligned", s);
     e->buffer[s][0] = (float *)base;
     e->buffer[s][1] = e->buffer[s][0] + e->stride;
+    e->flags[s] = (atomic_uint *)(e->buffer[s][0] + 2 * e->stride);
+    memset((void *)e->flags[s], 0, e->stride * sizeof(float));
   }
   return e;
 }
@@ -435,6 +461,58 @@ void exchange_reduce_add_stamped(Exchange *e, int socket, int worker, int worker
     phase[2] += t2 - t1;
     phase[3] += monotonic_seconds() - t2;
   }
+}
+
+void exchange_rows_done(Exchange *e, int socket, int r0, int r1) {
+  unsigned g = e->issued[socket];
+  atomic_uint *flags = e->flags[socket];
+  for (int i = r0; i < r1; i++)
+    atomic_store_explicit(&flags[i], g, memory_order_release);
+}
+
+/* Waits for the generation flags of rows [i0, i1) to reach g; 0 on abort. */
+static int wait_rows(const atomic_uint *flags, int i0, int i1, unsigned g) {
+  for (int i = i0; i < i1; i++)
+    for (unsigned spins = 0; (int)(atomic_load_explicit(&flags[i], memory_order_acquire) - g) < 0; spins++) {
+      if (workers_aborted())
+        return 0;
+      if (spins < SPIN_LIMIT)
+        relax();
+      else
+        sched_yield();
+    }
+  return 1;
+}
+
+void exchange_reduce_add_flags(Exchange *e, int socket, int worker, int workers, float *residual, int elements,
+                               ReduceStamps *stamps) {
+  int peer = exchange_check_socket(e, socket);
+  if (workers != team_size(e->team[socket]) || worker < 0 || worker >= workers || elements < 0 ||
+      elements > e->elements_max)
+    fail("invalid exchange reduction: worker %d of %d, %d elements (maximum %d)", worker, workers, elements,
+         e->elements_max);
+  if (workers_aborted())
+    return;
+  unsigned g = e->issued[socket];
+  int i0 = (int)((long long)elements * worker / workers), i1 = (int)((long long)elements * (worker + 1) / workers);
+  if (!wait_rows(e->flags[socket], i0, i1, g))
+    return;
+  if (stamps)
+    stamps->after_barrier1 = monotonic_seconds();
+  if (!wait_rows(e->flags[peer], i0, i1, g))
+    return;
+  if (stamps)
+    stamps->after_peer = monotonic_seconds();
+  const float *p0 = e->buffer[0][g & 1], *p1 = e->buffer[1][g & 1];
+  for (int i = i0; i < i1; i++)
+    residual[i] += p0[i] + p1[i];
+  if (stamps)
+    stamps->after_barrier2 = stamps->after_add = monotonic_seconds();
+}
+
+void exchange_reduce_finish(Exchange *e, int socket) {
+  exchange_check_socket(e, socket);
+  atomic_store_explicit(&e->consumed[socket].value, e->issued[socket], memory_order_release);
 }
 
 void exchange_abort(Exchange *e) {

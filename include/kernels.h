@@ -65,8 +65,12 @@ void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, i
  * job (every member calls it; the union is the team-level result, bitwise). Teams backend only. `claim` is a counter
  * shared by the members of this one job and zero before the team starts; with LLAMA_GEMV_SCHED=dynamic the members
  * claim rows from it (NULL means a static split). */
+/* `done`, when not NULL, is called as done(done_ctx, r0, r1) by the member that computed output rows [r0, r1), after
+ * those rows are stored, once per contiguous range it computed (a static split: once; claiming: once per claim). A
+ * following step can use it to start on rows whose producers are finished without waiting for the whole team. */
+typedef void (*RowsDoneFn)(void *ctx, int r0, int r1);
 void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind, int worker,
-                        int workers, atomic_int *claim);
+                        int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx);
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d);
 
 /* Q8_0: int8 rows with one FP32 scale per group of gs inputs. Values must lie in
@@ -92,7 +96,7 @@ void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, 
  * group boundaries (col0 % gs == 0), so W8A8 and W8A32 both see whole groups. */
 void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind);
 void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
-                           int worker, int workers, atomic_int *claim);
+                           int worker, int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx);
 void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
                            int d, int gs);
 

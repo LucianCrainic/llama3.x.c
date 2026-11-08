@@ -628,6 +628,8 @@ typedef struct {
   F32Segment segment[3];
   size_t ld; /* weight row stride in floats; 0 = n */
   atomic_int next; /* dynamic scheduling: the next unclaimed row (zero before the team starts) */
+  RowsDoneFn done; /* worker entry points only (one segment): called after each range of rows is stored */
+  void *done_ctx;
 } F32Job;
 
 static void f32_range(const F32Job *job, const F32Segment *seg, int r0, int r1) {
@@ -647,6 +649,8 @@ static void f32_range(const F32Job *job, const F32Segment *seg, int r0, int r1) 
         seg->out[i + r] = dots[r];
     }
   }
+  if (job->done)
+    job->done(job->done_ctx, r0, r1);
 }
 
 static void f32_rows(const void *p, int r0, int r1) {
@@ -733,20 +737,20 @@ static void f32_run(F32Job *job) {
 
 void k_matmul(float *out, const float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
-  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0, 0};
+  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_add(float *out, const float *x, const float *w, int n, int d) {
-  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0, 0};
+  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_qkv(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv, int n,
                   int dq, int dkv) {
-  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0};
+  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w3, int n, int d) {
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 
@@ -804,6 +808,8 @@ typedef struct {
   Q8Segment segment[3];
   size_t ld; /* weight row stride in values (a multiple of gs); 0 = n */
   atomic_int next;
+  RowsDoneFn done;
+  void *done_ctx;
 } Q8Job;
 
 static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
@@ -823,6 +829,8 @@ static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
         seg->out[i + r] = dots[r];
     }
   }
+  if (job->done)
+    job->done(job->done_ctx, r0, r1);
 }
 
 static void q8_rows(const void *p, int r0, int r1) {
@@ -873,20 +881,20 @@ static void q8_run(Q8Job *job) {
 }
 
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, 0};
+  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, 0};
+  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs) {
-  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, 0};
+  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL};
   q8_run(&job);
 }
 
@@ -902,18 +910,18 @@ void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, i
   check_epilogue(kind, "k_matmul_ld");
   if (ld < (size_t)n)
     fail("k_matmul_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0};
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, NULL, NULL};
   f32_run(&job);
 }
 /* The body of k_matmul_ld for one member of a team, to be called from inside a TeamFn on every member (the same row
  * split as the team-level call, so the results are bitwise equal). It lets the caller fuse the projection with a
  * following step into one team job. */
 void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind, int worker,
-                        int workers, atomic_int *claim) {
+                        int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx) {
   check_epilogue(kind, "k_matmul_ld_worker");
   if (ld < (size_t)n)
     fail("k_matmul_ld_worker: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0};
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, done, done_ctx};
   GemvSched sched = effective_f32(job_bytes_f32(&job));
   if (sched != SCHED_STATIC && claim && workers > 1)
     f32_team_claim(&job, claim, worker, workers, sched);
@@ -923,22 +931,22 @@ void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, i
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d) {
   if (ld < (size_t)n)
     fail("k_matmul_swiglu_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld, 0};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind) {
   check_epilogue(kind, "k_matmul_q8_ld");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0};
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
-                           int worker, int workers, atomic_int *claim) {
+                           int worker, int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx) {
   check_epilogue(kind, "k_matmul_q8_ld_worker");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld_worker: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0};
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0, done, done_ctx};
   if (gemv_sched_q8 != SCHED_STATIC && claim && workers > 1)
     q8_team_claim(&job, claim, worker, workers, gemv_sched_q8);
   else
@@ -948,7 +956,7 @@ void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, con
                            int d, int gs) {
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_swiglu_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, 0};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, 0, NULL, NULL};
   q8_run(&job);
 }
 

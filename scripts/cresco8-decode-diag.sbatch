@@ -15,6 +15,9 @@
 #   2s-sep  LLAMA_SOCKETS=2, LLAMA_TP_FUSED=0 (projection and reduction as two team jobs)
 #   2s      LLAMA_SOCKETS=2, fused (the default)
 #   2s-trace  like 2s, with LLAMA_TP_TRACE: a CSV with the timestamps of every worker for every Wo/W2 reduction
+#   2s-RJ     LLAMA_SOCKETS=2 with the reduction protocol R (b = LLAMA_TP_REDUCE=barrier, f = flags) and the team join J
+#             (c = LLAMA_TEAM_JOIN=counter, f = flags): 2s-bc is the build before the flag protocols, 2s-ff the new default;
+#             1s-c / 1s-f: one socket with join counter / flags; 2s-ff-trace: 2s-ff with LLAMA_TP_TRACE
 # REDUCE=1 first runs tests/reduce_bench.c (Wo, W1/W3 and W2 of synthetic layers on one or two sockets with the engine's
 # kernels and exchange; the reduction replaced by local barriers or by nothing, to separate kernel from sync from skew).
 # The info log of every two-socket launch carries the per-socket phase times and the split of the reduction.
@@ -61,16 +64,20 @@ if ! dry_run && [[ ${REDUCE:-0} == 1 ]]; then
   for model in 8b 1b; do
     for precision in fp32 q8; do
       args=(--model "$model" --precision "$precision" --threads "${REDUCE_THREADS:-56}" --layers 8 --passes "${REDUCE_PASSES:-100}")
-      for rep in 1 2; do
-        for stamps in 0 1; do
-          for red in none bars fused xonly; do
-            LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" --red "$red" --stamps "$stamps" \
-              >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" || echo "reduce-bench $model $precision $red $stamps failed" >> "$dir/failures.txt"
+      for rep in $(seq "${REDUCE_REPS:-1}"); do
+        for join in counter flags; do
+          for stamps in 0 1; do
+            for red in none bars fused flags xonly; do
+              LLAMA_TEAM_JOIN=$join LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" \
+                --red "$red" --stamps "$stamps" >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
+                echo "reduce-bench $model $precision $red $stamps $join failed" >> "$dir/failures.txt"
+            done
           done
-        done
-        for red in none bars; do
-          LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 1 "${args[@]}" --red "$red" --stamps 1 \
-            >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" || echo "reduce-bench s1 $model $precision $red failed" >> "$dir/failures.txt"
+          for red in none bars; do
+            LLAMA_TEAM_JOIN=$join LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 1 "${args[@]}" \
+              --red "$red" --stamps 1 >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
+              echo "reduce-bench s1 $model $precision $red $join failed" >> "$dir/failures.txt"
+          done
         done
       done
     done
@@ -137,6 +144,15 @@ for entry in ${DECODE_MODELS-$MODELS}; do
               "LLAMA_GEMV_SCHED=${config#1s-}" ;;
           2s-old) diag_run 2s-old "$OLD_ROOT" "$name-$precision-2s-old" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" ;;
           2s-sep) diag_run 2s-sep "$ROOT" "$name-$precision-2s-sep" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" LLAMA_TP_FUSED=0 ;;
+          1s-c | 1s-f)
+            diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$one" "$tokenizer" "$rep" 0 0 2 "${ONE_ENV[@]}" \
+              "LLAMA_TEAM_JOIN=$([[ $config == 1s-c ]] && echo counter || echo flags)" ;;
+          2s-[bf][cf] | 2s-ff-trace)
+            extra=()
+            [[ $config != 2s-ff-trace ]] || extra=("LLAMA_TP_TRACE=$dir/$name-$precision-$config-$rep.trace.csv")
+            diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
+              "LLAMA_TP_REDUCE=$([[ ${config:3:1} == b ]] && echo barrier || echo flags)" \
+              "LLAMA_TEAM_JOIN=$([[ ${config:4:1} == c ]] && echo counter || echo flags)" "${extra[@]}" ;;
           2s-trace) diag_run 2s-trace "$ROOT" "$name-$precision-2s-trace" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
             "LLAMA_TP_TRACE=$dir/$name-$precision-2s-trace-$rep.trace.csv" ;;
           2s) diag_run 2s "$ROOT" "$name-$precision-2s" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" ;;

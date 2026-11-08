@@ -85,6 +85,18 @@ typedef struct {
 /* exchange_reduce_add that also records the worker's step times in *stamps (NULL: none). */
 void exchange_reduce_add_stamped(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements,
                                  ReduceStamps *stamps);
+/* Flag form of the reduction (the fused projection, LLAMA_TP_REDUCE=flags): no team barrier at all. Each socket keeps one
+ * generation flag per output row next to its partial buffers. A member that finished output rows [r0, r1) of the partial
+ * calls exchange_rows_done (the kernels' RowsDoneFn, with the Exchange and socket as context via a thin wrapper); then,
+ * for its own add range, exchange_reduce_add_flags waits for the flags of those rows of BOTH sockets and adds, so it
+ * starts as soon as the producers of its rows are done and never waits for the rest of the team. Partial buffer reuse is
+ * still guarded by `consumed`, which the socket's coordinator publishes with exchange_reduce_finish after the team job
+ * has joined (every add of the generation is then finished). Same arithmetic and operand order as exchange_reduce_add.
+ * The generation is that of the last exchange_partial of the socket. Do not mix the two forms within one generation. */
+void exchange_rows_done(Exchange *exchange, int socket, int r0, int r1);
+void exchange_reduce_add_flags(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements,
+                               ReduceStamps *stamps);
+void exchange_reduce_finish(Exchange *exchange, int socket);
 /* Process-wide and irreversible in production (it is workers_abort): every wait loop of the exchange and of the
  * team barriers returns, and the results of the generation in flight are garbage. */
 void exchange_abort(Exchange *exchange);
