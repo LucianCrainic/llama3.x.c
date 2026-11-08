@@ -52,6 +52,34 @@ Implementation notes:
   (dry-run verified: stress at 2 × 14/28/56 workers, `test-workers bench-exchange`, and a summary that prints the
   64-reduction cost against 10% of 27 ms). This Mac's median of 4 µs for E = 4096 (4+4 unpinned workers) is not evidence for CRESCO8.
 
+### Flag form, join flags and dispatch fan-out (2026-11-08, Wo/W2 investigation)
+
+The two team barriers of the protocol above cost 3-3.5 us each at 56 workers per socket, the team join (55 increments of
+one counter) 4.6 us, and the dispatch 2-5 us, so a reduction cost 17-19 us beyond the projection (B7, second part of the
+findings). The engine's fused path therefore uses a barrier-free variant; the protocol above is kept as
+`LLAMA_TP_REDUCE=barrier` (and for the unfused form and the tests):
+
+- *Flags.* Each socket's exchange region also holds one `atomic_uint` generation flag per output row. A member that has
+  stored output rows [r0, r1) of the partial (the kernels call `RowsDoneFn` after every contiguous range they computed: one
+  call for a static split, one per claim otherwise) sets those flags to the generation (release): `exchange_rows_done`. For
+  its add range `[elements * w / W, elements * (w + 1) / W)`, `exchange_reduce_add_flags` waits (acquire) for the flags of
+  those rows on its own socket and on the peer, then adds `residual[i] += p0[i] + p1[i]`: the same arithmetic and operand
+  order. A member never waits for rows it does not add, and a static split with equal team sizes means it usually waits for
+  its own rows and the peer's matching rows only.
+- *Buffer reuse.* `consumed_s = g` is now published by the socket's coordinator after the team job joined
+  (`exchange_reduce_finish`): every add of generation g, on this socket, is finished then. The reuse rule of
+  `exchange_partial` (wait for `consumed_peer >= g - 2`) is unchanged and still protects the peer's reads of the buffer.
+  The flags are monotonic, so a flag of a newer generation also satisfies a late waiter of an older one.
+- *Join flags* (`LLAMA_TEAM_JOIN=flags`, default; `counter` is the old form): `team_run` waits for one flag line per member
+  instead of a counter, which also speeds up every other team job.
+- *Dispatch fan-out* (`LLAMA_TEAM_FANOUT`, default 8; 0 = flat): group heads relay the generation to their group.
+- *Tests.* `tests/workers.c` runs every exchange case in both forms (the flag form deals rows to members in interleaved
+  chunks that differ per socket and generation, like claiming, with random sleeps between the steps; bitwise against the
+  serial reference), plus an abort while members wait for peer flags; `tests/test_tp.py` checks the output is bitwise equal
+  across all combinations of the knobs and rejects bad values. ThreadSanitizer reports nothing on `test-workers`.
+- *Measured* (B7 findings): the cost beyond the slowest member's projection falls from 17-19 us to 4.5-9 us per
+  reduction; 8B Q8 decode on two sockets 87.3 -> 95.5 tok/s, 1B Q8 403 -> 467.
+
 ## 2. Depends on / unblocks
 
 - Depends on: F2 (teams, barriers, atomics conventions).
