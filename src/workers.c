@@ -31,6 +31,9 @@ struct Team {
   const void *job;
   Counter generation; /* leader publishes a job by bumping it */
   Counter done;       /* workers finished with the current job (join by counter) */
+  int fanout;
+  void *group_memory;
+  Counter *group_gen; /* per group of `fanout` workers: the generation its head relayed (group 0 unused) */
   void *done_flag_memory;
   Counter *done_flag; /* per worker: the generation it finished (join by flags; index 0 unused) */
   Counter ready;      /* workers that finished starting up */
@@ -43,6 +46,11 @@ struct Team {
  * or one flag line per member that the leader scans (flags, default): 55 increments of one line queue up for about 4 us
  * when the members finish together, which every job of every layer pays. */
 static int join_flags = 1;
+/* How a job reaches the members: with fanout 0 all of them spin on the leader's generation line, which the owner of the
+ * line serves one at a time (the last member starts 3-5 us late with 55 of them). With a fanout F > 0, workers
+ * F, 2F, ... are group heads that watch the leader's line and relay the generation on a line of their own to the F - 1
+ * members of their group; workers 1..F-1 watch the leader's line directly. LLAMA_TEAM_FANOUT=0|N (default 8). */
+static int dispatch_fanout = 8;
 
 static Team *teams[2];
 static int team_count;
@@ -142,7 +150,11 @@ static void *worker_main(void *p) {
   atomic_fetch_add_explicit(&team->ready.value, 1, memory_order_release);
   unsigned seen = 0;
   for (;;) {
-    seen = wait_change(&team->generation, seen);
+    int fanout = team->fanout;
+    int member = fanout && worker >= fanout && worker % fanout != 0; /* watches its group head's line */
+    seen = wait_change(member ? &team->group_gen[worker / fanout] : &team->generation, seen);
+    if (fanout && worker >= fanout && !member) /* a group head relays before anything else, stop included */
+      atomic_store_explicit(&team->group_gen[worker / fanout].value, seen, memory_order_release);
     if (atomic_load_explicit(&team->stop.value, memory_order_acquire))
       return NULL;
     team->fn(team->job, worker, team->size);
@@ -164,6 +176,9 @@ static Team *team_create(int index, int threads, const int *cpus) {
     team->assigned[w] = cpus ? cpus[w] : -1;
     team->observed[w] = -1;
   }
+  team->fanout = dispatch_fanout > 0 && threads > dispatch_fanout + 1 ? dispatch_fanout : 0;
+  team->group_memory = memory_alloc((size_t)threads / (size_t)(team->fanout ? team->fanout : 1) + 2, sizeof(Counter), MEM_METADATA);
+  team->group_gen = (Counter *)(((uintptr_t)team->group_memory + 63) & ~(uintptr_t)63);
   team->done_flag_memory = memory_alloc((size_t)threads + 1, sizeof(Counter), MEM_METADATA);
   team->done_flag = (Counter *)(((uintptr_t)team->done_flag_memory + 63) & ~(uintptr_t)63);
   team->threads = memory_alloc((size_t)threads, sizeof(pthread_t), MEM_METADATA);
@@ -188,6 +203,15 @@ void pool_start(const PoolConfig *config) {
   if (join && *join && strcmp(join, "flags") && strcmp(join, "counter"))
     fail("LLAMA_TEAM_JOIN must be flags or counter");
   join_flags = !(join && !strcmp(join, "counter"));
+  const char *fanout = getenv("LLAMA_TEAM_FANOUT");
+  dispatch_fanout = 8;
+  if (fanout && *fanout) {
+    char *end;
+    long value = strtol(fanout, &end, 10);
+    if (*end || value < 0 || value > 64)
+      fail("LLAMA_TEAM_FANOUT must be 0 (flat) or a group size up to 64");
+    dispatch_fanout = (int)value;
+  }
   if (config->teams < 1 || config->teams > 2)
     fail("invalid team count %d: expected 1 or 2", config->teams);
   for (int t = 0; t < config->teams; t++)
@@ -222,6 +246,7 @@ void pool_stop(void) {
       pthread_join(team->threads[w], NULL);
     memory_free(team->args);
     memory_free(team->done_flag_memory);
+    memory_free(team->group_memory);
     memory_free(team->threads);
     memory_free(team->observed);
     memory_free(team->assigned);

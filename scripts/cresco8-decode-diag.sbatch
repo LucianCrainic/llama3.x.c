@@ -18,6 +18,7 @@
 #   2s-RJ     LLAMA_SOCKETS=2 with the reduction protocol R (b = LLAMA_TP_REDUCE=barrier, f = flags) and the team join J
 #             (c = LLAMA_TEAM_JOIN=counter, f = flags): 2s-bc is the build before the flag protocols, 2s-ff the new default;
 #             1s-c / 1s-f: one socket with join counter / flags; 2s-ff-trace: 2s-ff with LLAMA_TP_TRACE
+#   1s-fanN / 2s-fanN / 2s-fanN-trace   the defaults (flags, flags) with LLAMA_TEAM_FANOUT=N (0 = flat dispatch)
 # REDUCE=1 first runs tests/reduce_bench.c (Wo, W1/W3 and W2 of synthetic layers on one or two sockets with the engine's
 # kernels and exchange; the reduction replaced by local barriers or by nothing, to separate kernel from sync from skew).
 # The info log of every two-socket launch carries the per-socket phase times and the split of the reduction.
@@ -61,23 +62,33 @@ if ! dry_run && [[ ${STREAM:-1} == 1 ]]; then
 fi
 
 if ! dry_run && [[ ${REDUCE:-0} == 1 ]]; then
+  # REDUCE_FANOUTS: team dispatch fan-outs to compare (0 = flat); the reduction and the join use their defaults (flags).
   for model in 8b 1b; do
     for precision in fp32 q8; do
       args=(--model "$model" --precision "$precision" --threads "${REDUCE_THREADS:-56}" --layers 8 --passes "${REDUCE_PASSES:-100}")
       for rep in $(seq "${REDUCE_REPS:-1}"); do
-        for join in counter flags; do
+        for fanout in ${REDUCE_FANOUTS:-0 8}; do
           for stamps in 0 1; do
-            for red in none bars fused flags xonly; do
-              LLAMA_TEAM_JOIN=$join LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" \
+            for red in none flags xonly; do
+              LLAMA_TEAM_FANOUT=$fanout LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" \
                 --red "$red" --stamps "$stamps" >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
-                echo "reduce-bench $model $precision $red $stamps $join failed" >> "$dir/failures.txt"
+                echo "reduce-bench $model $precision $red $stamps fanout $fanout failed" >> "$dir/failures.txt"
             done
           done
-          for red in none bars; do
-            LLAMA_TEAM_JOIN=$join LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 1 "${args[@]}" \
-              --red "$red" --stamps 1 >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
-              echo "reduce-bench s1 $model $precision $red $join failed" >> "$dir/failures.txt"
-          done
+          LLAMA_TEAM_FANOUT=$fanout LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 1 "${args[@]}" \
+            --red none --stamps 1 >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
+            echo "reduce-bench s1 $model $precision fanout $fanout failed" >> "$dir/failures.txt"
+        done
+        # Row scheduling of the projections (applies to every GEMV of the bench; compare the Wo and W2 columns).
+        for sched in static hybrid dynamic; do
+          LLAMA_GEMV_SCHED=$sched LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" \
+            --red flags --stamps 0 >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" ||
+            echo "reduce-bench sched $sched failed" >> "$dir/failures.txt"
+        done
+        # Which socket is slow, the hardware or the role? Team 0 on the second socket and team 1 on the first.
+        for swap in 0 1; do
+          LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" --red none --stamps 0 --swap "$swap" \
+            >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" || echo "reduce-bench swap $swap failed" >> "$dir/failures.txt"
         done
       done
     done
@@ -144,6 +155,18 @@ for entry in ${DECODE_MODELS-$MODELS}; do
               "LLAMA_GEMV_SCHED=${config#1s-}" ;;
           2s-old) diag_run 2s-old "$OLD_ROOT" "$name-$precision-2s-old" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" ;;
           2s-sep) diag_run 2s-sep "$ROOT" "$name-$precision-2s-sep" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" LLAMA_TP_FUSED=0 ;;
+          1s-fan[0-9]* | 2s-fan[0-9]* | 2s-fan[0-9]*-trace)
+            fan=${config#*fan}
+            fan=${fan%-trace}
+            extra=()
+            [[ $config != *-trace ]] || extra=("LLAMA_TP_TRACE=$dir/$name-$precision-$config-$rep.trace.csv")
+            if [[ $config == 1s-* ]]; then
+              diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$one" "$tokenizer" "$rep" 0 0 2 "${ONE_ENV[@]}" \
+                "LLAMA_TEAM_FANOUT=$fan"
+            else
+              diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
+                "LLAMA_TEAM_FANOUT=$fan" "${extra[@]}"
+            fi ;;
           1s-c | 1s-f)
             diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$one" "$tokenizer" "$rep" 0 0 2 "${ONE_ENV[@]}" \
               "LLAMA_TEAM_JOIN=$([[ $config == 1s-c ]] && echo counter || echo flags)" ;;

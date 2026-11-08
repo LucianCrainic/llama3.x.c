@@ -19,7 +19,21 @@ def med(values):
     return statistics.median(values) if values else float('nan')
 
 
+def label_joins(rows):
+    """Older reduce-bench output has no "join" field; the diag job ran 12 runs per join mode in a fixed order
+    (counter first, then flags) for every model/precision."""
+    index = 0
+    for r in rows:
+        if 'breakdown' in r:
+            continue
+        if 'join' not in r:
+            r['join'] = 'counter' if (index // 12) % 2 == 0 else 'flags'
+        index += 1
+    return rows
+
+
 def bench_tables(rows):
+    label_joins(rows)
     runs = [r for r in rows if 'breakdown' not in r]
     groups = {}
     for r in runs:
@@ -27,17 +41,17 @@ def bench_tables(rows):
     for (model, precision), items in groups.items():
         print(f'\n### reduce-bench {model} {precision} (synthetic layers, medians over the runs; us per phase, '
               f'GB/s = the phase\'s weight bytes of all sockets / time)\n')
-        print('| Sockets | Reduction | Stamps | Layer | Wo us | Wo GB/s | W1/W3 us | W1/W3 GB/s | W2 us | W2 GB/s |')
-        print('| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+        print('| Sockets | Reduction | Join | Fanout | Sched | Swap | Stamps | Layer | Wo us | Wo GB/s | W1/W3 us | W1/W3 GB/s | W2 us | W2 GB/s |')
+        print('| ---: | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
         keyed = {}
         for r in items:
-            keyed.setdefault((r['sockets'], r['red'], r['stamps']), []).append(r)
-        for (sockets, red, stamps), rs in sorted(keyed.items(), key=lambda kv: (kv[0][0], kv[0][2], kv[0][1])):
+            keyed.setdefault((r['sockets'], r['red'], r['join'], r.get('fanout', '-'), r.get('sched', '-'), r.get('swap', 0), r['stamps']), []).append(r)
+        for (sockets, red, join, fanout, sched, swap, stamps), rs in sorted(keyed.items(), key=lambda kv: (kv[0][0], kv[0][6], kv[0][1], kv[0][2], str(kv[0][3]), kv[0][4], kv[0][5])):
             for s in range(sockets):
                 key = f'socket{s}'
                 cell = lambda name: med([x[key][name] for x in rs])
                 label = red if sockets == 1 else f'{red} (socket {s})'
-                print(f'| {sockets} | {label} | {stamps} | {cell("layer_us"):.0f} | {cell("wo_us"):.0f} '
+                print(f'| {sockets} | {label} | {join} | {fanout} | {sched} | {swap} | {stamps} | {cell("layer_us"):.0f} | {cell("wo_us"):.0f} '
                       f'| {cell("wo_gbps"):.0f} | {cell("w1_w3_us"):.0f} | {cell("w1_w3_gbps"):.0f} '
                       f'| {cell("w2_us"):.0f} | {cell("w2_gbps"):.0f} |')
     brk = [r for r in rows if 'breakdown' in r]
@@ -57,7 +71,7 @@ def bench_tables(rows):
             continue
         if context is None or context.get('stamps') != 1 or context['sockets'] != 2:
             continue
-        print(f"| {context['model']} {context['precision']} {r['breakdown']} | {context['red']} | {r['socket']} "
+        print(f"| {context['model']} {context['precision']} {r['breakdown']} | {context['red']}/{context['join']}/f{context.get('fanout', '-')} | {r['socket']} "
               f"| {r['dispatch_max_us']:.1f} | {r['proj_first_us']:.1f} / {r['proj_mean_us']:.1f} / {r['proj_last_us']:.1f} "
               f"| {r['barrier1_done_us']:.1f} | {r['peer_wait_us']:.1f} | {r['peer_seen_last_us']:.1f} "
               f"| {r['add_done_us']:.1f} | {r['barrier2_done_us']:.1f} | {r['join_done_us']:.1f} "

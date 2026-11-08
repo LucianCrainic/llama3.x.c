@@ -1,6 +1,6 @@
 /* Where do Wo and W2 lose bandwidth? (measurement, not a test)
  *   reduce-bench [--sockets 1|2] [--threads N] [--model 8b|1b] [--precision fp32|q8] [--layers L] [--passes P]
- *                [--red fused|flags|bars|none|xonly] [--stamps 0|1] [--tier hbm|ddr] [--gap-us U]
+ *                [--red fused|flags|bars|none|xonly] [--stamps 0|1] [--tier hbm|ddr] [--gap-us U] [--swap 0|1]
  * Runs P passes over L synthetic decoder layers, one pinned team per socket, each layer being the three projections that
  * carry 85% of the weight bytes of a token, with the engine's kernels, row scheduling and exchange (src/tp.c does the same
  * sequence): quantize + Wo(+reduction), rmsnorm + quantize + W1/W3 (SwiGLU), quantize + W2(+reduction). Shard shapes are
@@ -13,7 +13,8 @@
  * With --stamps 1 every member timestamps its steps (start, end of projection, the exchange's four steps) and the leader
  * folds them after each job: the log breaks Wo and W2 into dispatch, projection spread, barrier 1, peer wait, add, barrier
  * 2 and join, and the skew between the sockets. Without LLAMA_TOPOLOGY pointing at two real sockets the threads are
- * unpinned and the memory unbound (a laptop run only checks that the program works). One JSON line per run. */
+ * unpinned and the memory unbound (--swap 1 puts team 0 on the second socket and team 1 on the first, to tell a slow
+ * socket from a slow role; a laptop run only checks that the program works). One JSON line per run. */
 #include "kernels.h"
 #include "numa.h"
 #include "runtime.h"
@@ -58,7 +59,7 @@ typedef struct {
 } Job;
 
 struct Context {
-  int sockets, threads, layers, passes, red, q8, stamps, dim, hidden, tier_ddr;
+  int sockets, threads, layers, passes, red, q8, stamps, dim, hidden, tier_ddr, swap;
   double gap_us;
   Team *team[2];
   NumaRegion region[2], xregion[2];
@@ -315,8 +316,12 @@ static void report(Context *c, const char *model, const char *red) {
   size_t n = c->iters;
   double gbps_phase[2][P_COUNT];
   printf("{\"model\": \"%s\", \"precision\": \"%s\", \"sockets\": %d, \"threads\": %d, \"red\": \"%s\", \"stamps\": %d, "
-         "\"layers\": %d, \"iters\": %zu",
-         model, c->q8 ? "q8" : "fp32", c->sockets, c->threads, red, c->stamps, c->layers, n);
+         "\"join\": \"%s\", \"fanout\": \"%s\", \"sched\": \"%s\", \"swap\": %d, \"layers\": %d, \"iters\": %zu",
+         model, c->q8 ? "q8" : "fp32", c->sockets, c->threads, red, c->stamps,
+         getenv("LLAMA_TEAM_JOIN") && *getenv("LLAMA_TEAM_JOIN") ? getenv("LLAMA_TEAM_JOIN") : "flags",
+         getenv("LLAMA_TEAM_FANOUT") && *getenv("LLAMA_TEAM_FANOUT") ? getenv("LLAMA_TEAM_FANOUT") : "8",
+         getenv("LLAMA_GEMV_SCHED") && *getenv("LLAMA_GEMV_SCHED") ? getenv("LLAMA_GEMV_SCHED") : "auto", c->swap,
+         c->layers, n);
   for (int s = 0; s < c->sockets; s++) {
     double layer_mean, layer_p99, layer_med = median(c->layer_s[s], n, 1, 0, &layer_mean, &layer_p99);
     printf(", \"socket%d\": {\"layer_us\": %.1f, \"layer_mean_us\": %.1f, \"layer_p99_us\": %.1f", s, layer_med * 1e6,
@@ -372,7 +377,7 @@ static void report(Context *c, const char *model, const char *red) {
 }
 
 int main(int argc, char **argv) {
-  int sockets = 2, threads = 56, layers = 8, passes = 40, red = RED_FUSED, stamps = 0, q8 = 0, tier_ddr = 0;
+  int sockets = 2, threads = 56, layers = 8, passes = 40, red = RED_FUSED, stamps = 0, q8 = 0, tier_ddr = 0, swap = 0;
   const char *model = "8b", *red_name = "fused";
   double gap = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -393,6 +398,8 @@ int main(int argc, char **argv) {
       stamps = atoi(v);
     else if (!strcmp(k, "--tier"))
       tier_ddr = !strcmp(v, "ddr");
+    else if (!strcmp(k, "--swap"))
+      swap = atoi(v) != 0;
     else if (!strcmp(k, "--gap-us"))
       gap = atof(v);
     else if (!strcmp(k, "--red")) {
@@ -424,13 +431,14 @@ int main(int argc, char **argv) {
   c->red = red;
   c->q8 = q8;
   c->stamps = stamps;
+  c->swap = swap;
   c->dim = dim;
   c->hidden = hidden;
   c->gap_us = gap;
   c->iters = (size_t)layers * passes;
   PoolConfig config = {.teams = sockets,
                        .threads = {threads, threads},
-                       .cpus = {real ? topology->socket[0].cpus : NULL, real ? topology->socket[1].cpus : NULL}};
+                       .cpus = {real ? topology->socket[swap].cpus : NULL, real ? topology->socket[1 - swap].cpus : NULL}};
   pool_start(&config);
   kernels_set_team(pool_team(0));
   for (int s = 0; s < sockets; s++)
@@ -451,7 +459,7 @@ int main(int argc, char **argv) {
     per_layer += (part[i] + 4095) / 4096 * 4096;
   size_t total = per_layer * (size_t)layers;
   for (int s = 0; s < sockets; s++) {
-    int node = real ? (tier_ddr ? topology->socket[s].ddr_node : topology->socket[s].hbm_node) : -1;
+    int node = real ? (tier_ddr ? topology->socket[s ^ swap].ddr_node : topology->socket[s ^ swap].hbm_node) : -1;
     region_reserve(&c->region[s], total, s, node, ROLE_WEIGHTS, region_thp_default());
     FillJob fill = {c->region[s].data, total, q8};
     team_run(c->team[s], fill_fn, &fill); /* first touch by the socket's own workers */
@@ -533,7 +541,7 @@ int main(int argc, char **argv) {
     c->norm_weight[i] = 1.0f;
   if (sockets == 2) {
     for (int s = 0; s < 2; s++) {
-      int node = real ? (tier_ddr ? topology->socket[s].ddr_node : topology->socket[s].hbm_node) : -1;
+      int node = real ? (tier_ddr ? topology->socket[s ^ swap].ddr_node : topology->socket[s ^ swap].hbm_node) : -1;
       region_reserve(&c->xregion[s], exchange_region_bytes(dim), s, node, ROLE_WORK, 0);
       memset(c->xregion[s].data, 0, c->xregion[s].data_bytes);
     }
