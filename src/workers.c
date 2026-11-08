@@ -109,6 +109,22 @@ static int pin_self(int cpu) {
 #endif
 }
 
+int team_adopt_leader(Team *team) {
+  if (!team->cpus)
+    return -1;
+  int cpu = pin_self(team->cpus[0]);
+  team->observed[0] = cpu;
+  return cpu;
+}
+
+int cpu_current(void) {
+#ifdef __linux__
+  return sched_getcpu();
+#else
+  return -1;
+#endif
+}
+
 static void *worker_main(void *p) {
   Team *team = ((WorkerArg *)p)->team;
   int worker = ((WorkerArg *)p)->worker;
@@ -163,6 +179,10 @@ void pool_start(const PoolConfig *config) {
   for (int t = 0; t < config->teams; t++)
     teams[t] = team_create(t, config->threads[t], config->cpus[t]);
   team_count = summary_count = config->teams;
+  /* team_create pinned this thread to the first CPU of each team in turn, so it now sits on the last team's socket.
+   * It is the leader of team 0: put it back. */
+  if (config->teams > 1 && config->cpus[0])
+    team_adopt_leader(teams[0]);
   for (int t = 0; t < team_count; t++) {
     TeamSummary *summary = &summaries[t];
     *summary = (TeamSummary){.index = t,
@@ -286,7 +306,9 @@ struct Exchange {
   Counter consumed[2]; /* consumed[s] = g: socket s finished reading the peer's partial g */
   unsigned issued[2];  /* generation handed out by exchange_partial; written by the coordinator, read by workers */
   atomic_int timing;
-  double reduce_seconds[2], wait_seconds[2]; /* leader of each socket only */
+  /* Leader of each socket only: [socket][0..4] = wait for the team's last partial write (barrier 1), wait for the peer's
+   * partial, the add, the closing barrier, and the wait for a free partial buffer in exchange_partial. */
+  double phase_seconds[2][5];
 };
 
 size_t exchange_region_bytes(int elements_max) {
@@ -363,7 +385,7 @@ float *exchange_partial(Exchange *e, int socket) {
   if (g > 2 && !wait_at_least(&e->consumed[peer], g - 2))
     return NULL;
   if (start)
-    e->wait_seconds[socket] += monotonic_seconds() - start;
+    e->phase_seconds[socket][4] += monotonic_seconds() - start;
   return e->buffer[socket][g & 1];
 }
 
@@ -379,6 +401,7 @@ void exchange_reduce_add(Exchange *e, int socket, int worker, int workers, float
   int timed = worker == 0 && atomic_load_explicit(&e->timing, memory_order_relaxed);
   double t0 = timed ? monotonic_seconds() : 0.0;
   team_barrier(e->team[socket]); /* 1. every worker finished writing the local partial */
+  double tb = timed ? monotonic_seconds() : 0.0;
   if (worker == 0)
     atomic_store_explicit(&e->ready[socket].value, g, memory_order_release); /* 2 */
   if (!wait_at_least(&e->ready[peer], g))                                    /* 3 */
@@ -393,8 +416,11 @@ void exchange_reduce_add(Exchange *e, int socket, int worker, int workers, float
   if (worker == 0)
     atomic_store_explicit(&e->consumed[socket].value, g, memory_order_release);
   if (timed) {
-    e->wait_seconds[socket] += (t1 - t0) + (monotonic_seconds() - t2);
-    e->reduce_seconds[socket] += t2 - t1;
+    double *phase = e->phase_seconds[socket];
+    phase[0] += tb - t0;
+    phase[1] += t1 - tb;
+    phase[2] += t2 - t1;
+    phase[3] += monotonic_seconds() - t2;
   }
 }
 
@@ -408,6 +434,11 @@ void exchange_set_timing(Exchange *e, int on) {
 }
 
 void exchange_timing(const Exchange *e, int socket, double *reduce_seconds, double *wait_seconds) {
-  *reduce_seconds = e->reduce_seconds[socket];
-  *wait_seconds = e->wait_seconds[socket];
+  const double *phase = e->phase_seconds[socket];
+  *reduce_seconds = phase[2];
+  *wait_seconds = phase[0] + phase[1] + phase[3] + phase[4];
+}
+
+void exchange_timing_detail(const Exchange *e, int socket, double seconds[5]) {
+  memcpy(seconds, e->phase_seconds[socket], sizeof(e->phase_seconds[socket]));
 }

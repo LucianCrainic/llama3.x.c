@@ -8,10 +8,13 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum { SOCKETS = 2, SPIN_LIMIT = 2048 };
+/* Per-socket profile slots: the engine's phases, then the projections that end in a reduction, timed on their own. */
+enum { TP_WO_MM = PHASE_COUNT, TP_W2_MM, TP_SLOTS };
 
 typedef enum { CMD_SETUP, CMD_LOAD, CMD_FORWARD, CMD_STOP } Command;
 
@@ -23,6 +26,7 @@ typedef struct {
   float *key_cache, *value_cache;      /* [layer][seq][kv_dim / 2] */
   AttentionWork attention;
   float *debug; /* LLAMA_TP_CHECK: x after every layer */
+  int leader_cpu; /* CPU the socket's coordinator ran on during setup (-1 unknown) */
   /* Q8 (B6) */
   int8_t *xq; /* quantized activations of the current projection input */
   float *xs;
@@ -33,6 +37,7 @@ typedef struct {
 struct Tp {
   Config c;
   int quantized, gs, check, fp32_activations;
+  int fused; /* LLAMA_TP_FUSED (default 1): the partial projection and the reduction run in one team job */
   ShardSet set;
   NumaRegion global;
   TpSocket s[SOCKETS];
@@ -45,6 +50,11 @@ struct Tp {
   _Alignas(64) atomic_uint command_generation;
   _Alignas(64) atomic_uint done_generation;
   unsigned issued;
+  /* LLAMA_PROFILE=1: seconds per socket, stage and slot; the exchange's five components (workers.h) per socket and
+   * stage, as deltas of the exchange's running totals; forward passes per stage. */
+  double prof[SOCKETS][STAGE_COUNT][TP_SLOTS];
+  double xch[SOCKETS][STAGE_COUNT][5], xch_last[SOCKETS][5];
+  size_t tokens[STAGE_COUNT];
   Command command;
   int token, pos, loader_fd;
 };
@@ -85,6 +95,8 @@ static void socket_command(Tp *tp, int socket);
 static void *coordinator_main(void *p) {
   Tp *tp = p;
   kernels_set_thread_team(tp->s[1].team);
+  /* This thread inherited the creator's single-CPU mask; it is the leader of team 1 and belongs on team 1's first CPU. */
+  team_adopt_leader(tp->s[1].team);
   unsigned seen = 0;
   for (;;) {
     unsigned now;
@@ -141,6 +153,62 @@ static void reduce(Tp *tp, TpSocket *sk, float *residual, int elements) {
   team_run(sk->team, reduce_fn, &job);
 }
 
+/* One projection that ends in the cross-socket reduction: Wo or W2, FP32 (`wq` NULL) or Q8. */
+typedef struct {
+  Tp *tp;
+  int socket, n, d, gs;
+  float *partial, *residual;
+  size_t ld;
+  const float *x, *w;               /* FP32 */
+  const K8Input *input;             /* Q8 */
+  const K8Weight *wq;               /* Q8; NULL for FP32 */
+  double *leader_seconds;           /* fused: the leader's own share of the projection */
+  atomic_int claim;                 /* fused: row counter shared by the members (zero before the team starts) */
+} ProjectJob;
+
+static void project_share(const ProjectJob *job, int worker, int workers) {
+  if (job->wq)
+    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
+                          workers, (atomic_int *)&job->claim);
+  else
+    k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
+                       (atomic_int *)&job->claim);
+}
+
+/* Fused form: every member computes its rows of the partial and goes straight into the reduction, whose first barrier
+ * is the join of the projection. One team dispatch and join instead of two. */
+static void project_reduce_fn(const void *p, int worker, int workers) {
+  const ProjectJob *job = p;
+  double start = worker == 0 && job->leader_seconds ? monotonic_seconds() : 0.0;
+  project_share(job, worker, workers);
+  if (start)
+    *job->leader_seconds = monotonic_seconds() - start;
+  exchange_reduce_add(job->tp->exchange, job->socket, worker, workers, job->residual, job->d);
+}
+
+static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
+  job->tp = tp;
+  atomic_init(&job->claim, 0);
+  job->socket = sk->socket;
+  job->residual = sk->x;
+  double *prof = &tp->prof[sk->socket][profile_stage][slot];
+  if (tp->fused) {
+    double leader = 0.0;
+    job->leader_seconds = profile_enabled ? &leader : NULL;
+    team_run(sk->team, project_reduce_fn, job);
+    *prof += leader;
+    return;
+  }
+  double start = profile_enabled ? monotonic_seconds() : 0.0;
+  if (job->wq)
+    k_matmul_q8_ld(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL);
+  else
+    k_matmul_ld(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL);
+  if (profile_enabled)
+    *prof += monotonic_seconds() - start;
+  reduce(tp, sk, sk->x, job->d);
+}
+
 static const float *norm_weight(const Tp *tp, TensorRole role, int layer, int socket) {
   const Shard *sh = shards_find(&tp->set, role, layer, socket);
   if (!sh)
@@ -179,14 +247,17 @@ static const float *embedding_row(const Tp *tp, int token) {
   return (const float *)embed->q + (size_t)token * tp->c.dim;
 }
 
-/* The profile counters are shared, so only socket 0 times its phases; socket 1 does the same work untimed. */
+/* The engine's profile counters are shared, so only socket 0 feeds them; every socket also keeps its own in tp->prof. */
 #define SPROFILE(phase, ...)                                                                                           \
   do {                                                                                                                 \
+    double sprofile_start_ = profile_enabled ? monotonic_seconds() : 0.0;                                              \
     if (s == 0) {                                                                                                      \
       PROFILE(phase, __VA_ARGS__);                                                                                     \
     } else {                                                                                                           \
       __VA_ARGS__;                                                                                                     \
     }                                                                                                                  \
+    if (profile_enabled)                                                                                               \
+      tp->prof[s][profile_stage][phase] += monotonic_seconds() - sprofile_start_;                                      \
   } while (0)
 
 static void forward_fp32(Tp *tp, int s) {
@@ -210,8 +281,8 @@ static void forward_fp32(Tp *tp, int s) {
     float *partial = exchange_partial(tp->exchange, s);
     if (!partial)
       return;
-    SPROFILE(PHASE_WO, k_matmul_ld(partial, sk->xb, wo->q, wo->ld, dim / SOCKETS, dim, K_PARTIAL);
-             reduce(tp, sk, sk->x, dim));
+    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .partial = partial, .ld = wo->ld, .x = sk->xb, .w = wo->q};
+    SPROFILE(PHASE_WO, project_reduce(tp, sk, &wo_job, TP_WO_MM));
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     const float *w1 = shards_find(&tp->set, T_W1, l, s)->q, *w3 = shards_find(&tp->set, T_W3, l, s)->q;
@@ -220,8 +291,8 @@ static void forward_fp32(Tp *tp, int s) {
     partial = exchange_partial(tp->exchange, s);
     if (!partial)
       return;
-    SPROFILE(PHASE_W2, k_matmul_ld(partial, sk->hb, w2->q, w2->ld, hidden_l, dim, K_PARTIAL);
-             reduce(tp, sk, sk->x, dim));
+    ProjectJob w2_job = {.n = hidden_l, .d = dim, .partial = partial, .ld = w2->ld, .x = sk->hb, .w = w2->q};
+    SPROFILE(PHASE_W2, project_reduce(tp, sk, &w2_job, TP_W2_MM));
     if (sk->debug)
       memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
   }
@@ -273,8 +344,9 @@ static void forward_q8(Tp *tp, int s) {
     if (!partial)
       return;
     K8Weight wo_weight = q8_weight(wo);
-    SPROFILE(PHASE_WO, k_matmul_q8_ld(partial, &in, &wo_weight, wo->ld, dim / SOCKETS, dim, gs, K_PARTIAL);
-             reduce(tp, sk, sk->x, dim));
+    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .gs = gs, .partial = partial, .ld = wo->ld, .input = &in,
+                         .wq = &wo_weight};
+    SPROFILE(PHASE_WO, project_reduce(tp, sk, &wo_job, TP_WO_MM));
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
@@ -286,8 +358,9 @@ static void forward_q8(Tp *tp, int s) {
     if (!partial)
       return;
     K8Weight w2_weight = q8_weight(w2);
-    SPROFILE(PHASE_W2, k_matmul_q8_ld(partial, &in, &w2_weight, w2->ld, hidden_l, dim, gs, K_PARTIAL);
-             reduce(tp, sk, sk->x, dim));
+    ProjectJob w2_job = {.n = hidden_l, .d = dim, .gs = gs, .partial = partial, .ld = w2->ld, .input = &in,
+                         .wq = &w2_weight};
+    SPROFILE(PHASE_W2, project_reduce(tp, sk, &w2_job, TP_W2_MM));
     if (sk->debug)
       memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
   }
@@ -352,6 +425,7 @@ static void socket_command(Tp *tp, int socket) {
   switch (tp->command) {
   case CMD_SETUP:
     setup_socket(tp, socket);
+    tp->s[socket].leader_cpu = cpu_current();
     break;
   case CMD_LOAD:
     shards_load(&tp->set, tp->loader_fd, socket, tp->s[socket].team);
@@ -407,6 +481,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   if (check && *check && strcmp(check, "0") && strcmp(check, "1"))
     fail("LLAMA_TP_CHECK must be 0 or 1");
   tp->check = check && !strcmp(check, "1");
+  const char *fused = getenv("LLAMA_TP_FUSED");
+  if (fused && *fused && strcmp(fused, "0") && strcmp(fused, "1"))
+    fail("LLAMA_TP_FUSED must be 0 or 1");
+  tp->fused = !(fused && !strcmp(fused, "0"));
   shards_plan(&tp->set, m, p, SOCKETS, gs);
   const char *mode = placement_mode();
   tp_check_topology(mode);
@@ -437,6 +515,8 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
                    region_thp_default());
   tp->exchange = exchange_create(p->dim, exchange_regions);
+  if (profile_enabled)
+    exchange_set_timing(tp->exchange, 1);
   tp->logits = memory_alloc((size_t)p->vocab_size, sizeof(float), MEM_ACTIVATION);
   if (tp->check)
     for (int s = 0; s < SOCKETS; s++)
@@ -446,6 +526,12 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   tp->started = 1;
 
   run_both(tp, CMD_SETUP);
+  for (int s = 0; s < SOCKETS; s++) {
+    int cpu = tp->s[s].leader_cpu, want = team_worker_cpu(tp->s[s].team, 0);
+    LOG(LOG_DEBUG, "socket %d coordinator runs on cpu %d (team leader assigned cpu %d)", s, cpu, want);
+    if (want >= 0 && cpu >= 0 && cpu != want)
+      LOG(LOG_WARN, "socket %d coordinator runs on cpu %d, not on its team leader cpu %d", s, cpu, want);
+  }
   void *base[SOCKETS] = {tp->s[0].weights.data, tp->s[1].weights.data};
   shards_bind(&tp->set, base, tp->global.data);
   double start = monotonic_seconds();
@@ -470,10 +556,50 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   return tp;
 }
 
+/* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
+ * including its reduction, wo_mm/w2_mm the projection alone (unfused: its team job; fused: the leader's own share, so the
+ * slowest member's lateness shows up as `straggler`). The exchange components are the leader's: straggler (waiting for
+ * the socket's last partial write), peer (waiting for the other socket), add, close (final barrier) and buffer (waiting
+ * for a free partial buffer). */
+static void log_profile(const Tp *tp) {
+  static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
+                                              "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
+                                              "wo_mm",     "w2_mm"};
+  static const char *const xnames[5] = {"straggler", "peer", "add", "close", "buffer"};
+  for (int stage = 0; stage < STAGE_COUNT; stage++) {
+    if (!tp->tokens[stage])
+      continue;
+    for (int s = 0; s < SOCKETS; s++) {
+      char line[1024];
+      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token, fused=%d):",
+                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage], tp->fused);
+      for (int i = 0; i < TP_SLOTS && used < sizeof(line); i++)
+        if (tp->prof[s][stage][i] > 0)
+          used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%.3f", names[i],
+                                   tp->prof[s][stage][i] * 1e3 / (double)tp->tokens[stage]);
+      for (int i = 0; i < 5 && used < sizeof(line); i++)
+        used += (size_t)snprintf(line + used, sizeof(line) - used, " x_%s=%.3f", xnames[i],
+                                 tp->xch[s][stage][i] * 1e3 / (double)tp->tokens[stage]);
+      LOG(LOG_INFO, "%s", line);
+    }
+  }
+}
+
 float *tp_forward(Tp *tp, int token, int pos) {
   tp->token = token;
   tp->pos = pos;
   run_both(tp, CMD_FORWARD);
+  if (profile_enabled && !workers_aborted()) {
+    tp->tokens[profile_stage]++;
+    for (int s = 0; s < SOCKETS; s++) {
+      double now[5];
+      exchange_timing_detail(tp->exchange, s, now);
+      for (int i = 0; i < 5; i++) {
+        tp->xch[s][profile_stage][i] += now[i] - tp->xch_last[s][i];
+        tp->xch_last[s][i] = now[i];
+      }
+    }
+  }
   if (tp->check && !workers_aborted())
     for (int l = 0; l < tp->c.n_layers; l++)
       if (memcmp(tp->s[0].debug + (size_t)l * tp->c.dim, tp->s[1].debug + (size_t)l * tp->c.dim,
@@ -502,6 +628,8 @@ void tp_free(Tp *tp) {
     run_both(tp, CMD_STOP);
     pthread_join(tp->thread, NULL);
   }
+  if (profile_enabled)
+    log_profile(tp);
   exchange_destroy(tp->exchange);
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];

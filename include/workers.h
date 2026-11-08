@@ -33,6 +33,12 @@ void team_barrier(Team *team);
 /* Pinning evidence. team_worker_cpu is the CPU the worker's affinity mask was read back as (-1 when it is not a
  * single CPU, or unpinned); team_affinity_verified is 1 when every worker was pinned and read back as assigned. */
 int team_worker_cpu(const Team *team, int worker);
+/* Pins the calling thread to the CPU of worker 0 of `team` (a no-op for an unpinned team) and returns the CPU it reads
+ * back as, or -1. The leader of a team is whichever thread calls team_run, so each such thread must adopt its team:
+ * pool_start pins its caller to every team in turn and leaves it on team 0, and a thread created later inherits that
+ * single-CPU mask. The CPU the calling thread is running on (-1 when unknown) is cpu_current(). */
+int team_adopt_leader(Team *team);
+int cpu_current(void);
 
 /* What the report records about each team. It is filled at pool_start and survives pool_stop. */
 enum { TEAM_SUMMARY_THREADS = 1024 };
@@ -78,6 +84,10 @@ void exchange_abort(Exchange *exchange);
  */
 void exchange_set_timing(Exchange *exchange, int on);
 void exchange_timing(const Exchange *exchange, int socket, double *reduce_seconds, double *wait_seconds);
+/* The same split further: seconds[0] waiting for the team's last partial write (the slowest member of the socket),
+ * [1] waiting for the peer socket's partial, [2] adding, [3] the closing barrier, [4] waiting for a free partial buffer
+ * in exchange_partial. Leader only. Read it only while no reduction is running. */
+void exchange_timing_detail(const Exchange *exchange, int socket, double seconds[5]);
 
 /* fail() sets this before running exit handlers, so no wait loop outlives the memory it spins on. After it, stop
  * the pool; barrier and exchange state is not consistent any more. workers_abort_clear is for tests only. */

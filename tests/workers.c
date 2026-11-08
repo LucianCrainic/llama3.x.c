@@ -468,6 +468,39 @@ static void bench_exchange(int generations, int threads) {
   }
 }
 
+#ifdef __linux__
+/* Two pinned one-thread teams on two allowed CPUs: pool_start must leave its caller on team 0's CPU, and a thread that
+ * adopts team 1 must run on team 1's CPU (it would otherwise share the single CPU it inherited from its creator). */
+static void *adopt_main(void *p) {
+  int *cpu = p;
+  *cpu = team_adopt_leader(pool_team(1));
+  sched_yield();
+  cpu[1] = cpu_current();
+  return NULL;
+}
+
+static void unit_leaders(void) {
+  int allowed[1024];
+  int n = numa_affinity_cpus(allowed, 1024);
+  if (n < 2) {
+    printf("leaders: skipped, fewer than two allowed CPUs\n");
+    return;
+  }
+  int c0[1] = {allowed[0]}, c1[1] = {allowed[n - 1]};
+  PoolConfig config = {.teams = 2, .threads = {1, 1}, .cpus = {c0, c1}};
+  pool_start(&config);
+  assert(cpu_current() == c0[0]);
+  assert(team_worker_cpu(pool_team(0), 0) == c0[0]);
+  int seen[2] = {-2, -2};
+  pthread_t thread;
+  assert(!pthread_create(&thread, NULL, adopt_main, seen));
+  pthread_join(thread, NULL);
+  assert(seen[0] == c1[0] && seen[1] == c1[0]);
+  assert(cpu_current() == c0[0]);
+  pool_stop();
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc >= 2 && !strcmp(argv[1], "bench-exchange")) {
     bench_exchange(argc > 2 ? atoi(argv[2]) : 20000, argc > 3 ? atoi(argv[3]) : 4);
@@ -496,6 +529,9 @@ int main(int argc, char **argv) {
     unit_exchange_abort();
     unit_lifecycle();
     unit_rows();
+#ifdef __linux__
+    unit_leaders();
+#endif
     barrier_stress(argc == 2 ? atoi(argv[1]) : 20000, 5);
     barrier_stress(20000, 2);
     barrier_stress(20000, 7);

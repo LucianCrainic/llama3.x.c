@@ -13,11 +13,11 @@ cover:
 
 Its logits must agree with the one-socket reference within the FP32 budget.
 
-Status: **implemented; agreement check passed, decode slower than one socket** (see Cluster results).
+Status: **implemented and validated on the cluster; two-socket decode is 1.86× one socket** (see Cluster results).
 
-**Open risk (updated 2026-11-08):** the conventions it sits on (A4 owned regions, B1 placement) and the exchange (B4) now
-pass their cluster checks, and the forward agrees with one socket. What is open is its speed: decode is slower than one
-socket (see Cluster results), and the reason is not yet known.
+**Open risk (updated 2026-11-08):** none left from B5 itself. The conventions it sits on (A4 owned regions, B1 placement) and
+the exchange (B4) pass their cluster checks, the forward agrees with one socket, and the decode slowdown seen in the first
+smoke run was a thread-pinning bug (fixed; see B7). What remains is performance work, tracked in B7.
 
 Implementation notes:
 
@@ -153,11 +153,13 @@ cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=ch
   1.0e-5 (1B) and 3.3e-5 (8B), argmax 100%. The smoke placement check passes on both models.
 - **Bug found by the check.** For a model with a tied embedding the global region is never reserved; its zeroed record read as
   a bound region on node 0 and strict placement failed (fixed in `4677bd5`).
-- **Speed, smoke only** (one launch, 86-token prompt, 128 tokens): decode 64.3 tok/s (1B) and 11.3 tok/s (8B), against
-  about 87 and 14.6-14.9 on one socket. **Two-socket decode is currently slower than one socket.** The decode profile
-  is dominated by the projections that end in the reduction (8B: W2 40%, Wo 25%, W1/W3 24%), yet the 64 measured
-  reductions per token account for only 3-4 ms of the 88 ms token (B4). The remaining loss has not been explained;
-  profiling the Wo/W2 column-shard kernels and the reduction wait per socket (`phase_seconds`) is the first step of B7.
+- **Speed.** The first smoke run showed decode slower than one socket (11.3 against 14.6-14.9 tok/s on 8B FP32). The cause
+  was that both socket leaders ran on one CPU (found and fixed 2026-11-08, details and measurements in B7). With the fix,
+  the fused reduction and the row scheduling of B7, 8B FP32 decodes at 30.2 tok/s on two sockets against 16.2 on one
+  (1B: 160.7 against 91.0).
+- **Re-check of the final tree** (job 5703488, `repo-decodefix7`): `make test` passes on the cluster with AVX-512, and
+  one socket against two agrees on 1B and 8B FP32 (8B: max |Δlogit| 4.5e-5, rms 2.9e-6, argmax 100%) with the placement
+  check passing.
 - **Not run.** The Hugging Face gate with `LLAMA_SOCKETS=2` (`HF_GATE=0`).
 
 ## 7. Exit criteria

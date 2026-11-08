@@ -2,6 +2,7 @@
 #define LLAMA_KERNELS_H
 
 #include "runtime.h"
+#include <stdatomic.h>
 
 /* Compute kernels shared by both engines. kernels_init() selects one instruction
  * set per process: AVX-512 (F/BW/DQ/VL/VNNI + FMA) when the CPU and OS support it,
@@ -60,6 +61,12 @@ void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w
  * not use K_ADD. SWIGLU keeps its pair form. For Q8, ld must be a multiple of gs. */
 typedef enum { K_STORE, K_ADD, K_PARTIAL, K_SWIGLU } KernelEpilogue;
 void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind);
+/* The share of k_matmul_ld / k_matmul_q8_ld of member `worker` of `workers`, for a caller that is already inside a team
+ * job (every member calls it; the union is the team-level result, bitwise). Teams backend only. `claim` is a counter
+ * shared by the members of this one job and zero before the team starts; with LLAMA_GEMV_SCHED=dynamic the members
+ * claim rows from it (NULL means a static split). */
+void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind, int worker,
+                        int workers, atomic_int *claim);
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d);
 
 /* Q8_0: int8 rows with one FP32 scale per group of gs inputs. Values must lie in
@@ -84,6 +91,8 @@ void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, 
 /* Shard variants of the above. A column slice's activations are quantized from the owned slice only, at the original
  * group boundaries (col0 % gs == 0), so W8A8 and W8A32 both see whole groups. */
 void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind);
+void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
+                           int worker, int workers, atomic_int *claim);
 void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
                            int d, int gs);
 

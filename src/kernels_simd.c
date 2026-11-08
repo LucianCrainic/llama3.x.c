@@ -67,7 +67,39 @@ int kernels_select(KernelIsa which) {
   return 1;
 }
 
+/* How a team splits the rows of one GEMV. Static: each member takes one contiguous share, so one slow member (a memory
+ * channel under contention, an interrupt) holds the whole team at the join. Dynamic: members claim chunks of rows from a
+ * shared counter, so the fast ones take over what the slow one has not reached, but no member streams a long contiguous
+ * run any more. Hybrid: each member first takes a contiguous share of three quarters of the rows, then all claim the
+ * rest in small chunks. A claim starts on a multiple of BLOCK rows, so every row sits in the same four-row group
+ * whatever the team size or the timing. LLAMA_GEMV_SCHED=static|dynamic|hybrid|auto selects it for the FP32 and the
+ * Q8 kernels together. Auto (default) is hybrid for large FP32 jobs and static otherwise, and static for Q8, whose
+ * kernels prefetch along long contiguous runs and lose 6-25% to any claiming (measured on Xeon Max 9480, docs/plans). */
+typedef enum { SCHED_STATIC, SCHED_DYNAMIC, SCHED_HYBRID, SCHED_AUTO } GemvSched;
+static GemvSched gemv_sched_f32 = SCHED_AUTO, gemv_sched_q8 = SCHED_STATIC;
+/* auto, FP32: hybrid for a job that streams at least this many weight bytes (the 8B shards: 117-235 MiB; measured +14% on
+ * two sockets), static below it (1B: at most 64 MiB, where the claims cost 4-6%; Wo shards: 33 MiB). */
+enum { AUTO_HYBRID_BYTES = 96 << 20 };
+
+static GemvSched effective_f32(size_t bytes) {
+  return gemv_sched_f32 == SCHED_AUTO ? (bytes >= AUTO_HYBRID_BYTES ? SCHED_HYBRID : SCHED_STATIC) : gemv_sched_f32;
+}
+
 void kernels_init(void) {
+  const char *sched = getenv("LLAMA_GEMV_SCHED");
+  gemv_sched_f32 = SCHED_AUTO;
+  gemv_sched_q8 = SCHED_STATIC;
+  if (sched && *sched && strcmp(sched, "auto")) {
+    GemvSched which = !strcmp(sched, "static") ? SCHED_STATIC
+                      : !strcmp(sched, "dynamic") ? SCHED_DYNAMIC
+                      : !strcmp(sched, "hybrid") ? SCHED_HYBRID
+                                                 : (GemvSched)-1;
+    if ((int)which < 0)
+      fail("LLAMA_GEMV_SCHED must be static, dynamic, hybrid or auto");
+    gemv_sched_f32 = gemv_sched_q8 = which;
+  }
+  if (gemv_sched_q8 == SCHED_AUTO)
+    gemv_sched_q8 = SCHED_STATIC;
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
     kernels_select(supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR);
@@ -92,6 +124,13 @@ const char *kernels_name(void) {
 }
 
 enum { BLOCK = 4 }; // rows per GEMV kernel call
+
+/* Rows per claim: about four claims per member, a multiple of BLOCK, between 8 and 32 (a claim is a 128-512 KiB stream
+ * of a large matrix, long enough that the shared counter is touched rarely). */
+static int claim_rows(int total_rows, int workers) {
+  int rows = total_rows / (workers * 4) / BLOCK * BLOCK;
+  return rows < 8 ? 8 : rows > 32 ? 32 : rows;
+}
 
 int kernels_avx512_active(void) {
   return isa == KERNELS_AVX512;
@@ -588,6 +627,7 @@ typedef struct {
   int n, kind, count;
   F32Segment segment[3];
   size_t ld; /* weight row stride in floats; 0 = n */
+  atomic_int next; /* dynamic scheduling: the next unclaimed row (zero before the team starts) */
 } F32Job;
 
 static void f32_range(const F32Job *job, const F32Segment *seg, int r0, int r1) {
@@ -621,15 +661,63 @@ static void f32_rows(const void *p, int r0, int r1) {
   }
 }
 
-/* Teams split every segment on its own, so one member's range never straddles Q, K and V. */
-static void f32_team(const void *p, int worker, int workers) {
-  const F32Job *job = p;
+/* Static split: every segment on its own, so one member's range never straddles Q, K and V. */
+static void f32_team_static(const F32Job *job, int worker, int workers) {
   for (int s = 0; s < job->count; s++) {
     const F32Segment *seg = &job->segment[s];
     int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
     if (r1 > r0)
       f32_range(job, seg, r0, r1);
   }
+}
+
+/* Dynamic and hybrid splits over the concatenated rows of all segments; `next` is shared by the members of one job.
+ * `range(job, r0, r1)` runs rows [r0, r1) of that concatenation. */
+typedef void (*RangeFn)(const void *job, int r0, int r1);
+
+static void claim_rows_run(RangeFn range, const void *job, int rows, atomic_int *next, int worker, int workers,
+                           GemvSched sched) {
+  int first = 0, chunk = claim_rows(rows, workers);
+  if (sched == SCHED_HYBRID) {
+    int pool = rows * 3 / 4 / BLOCK * BLOCK; /* the contiguous shares */
+    int r0 = (int)((long long)pool * worker / workers) / BLOCK * BLOCK;
+    int r1 = worker + 1 == workers ? pool : (int)((long long)pool * (worker + 1) / workers) / BLOCK * BLOCK;
+    if (r1 > r0)
+      range(job, r0, r1);
+    first = pool;
+    chunk = (rows - pool) / (workers * 2) / BLOCK * BLOCK;
+    chunk = chunk < BLOCK ? BLOCK : chunk > 16 ? 16 : chunk;
+  }
+  for (;;) {
+    int r0 = first + atomic_fetch_add_explicit(next, chunk, memory_order_relaxed);
+    if (r0 >= rows)
+      return;
+    range(job, r0, r0 + chunk < rows ? r0 + chunk : rows);
+  }
+}
+
+static int job_rows_f32(const F32Job *job) {
+  int rows = 0;
+  for (int s = 0; s < job->count; s++)
+    rows += job->segment[s].d;
+  return rows;
+}
+
+static size_t job_bytes_f32(const F32Job *job) {
+  return (size_t)job_rows_f32(job) * (job->ld ? job->ld : (size_t)job->n) * sizeof(float) * (job->kind == SWIGLU ? 2 : 1);
+}
+
+static void f32_team_claim(const F32Job *job, atomic_int *next, int worker, int workers, GemvSched sched) {
+  claim_rows_run(f32_rows, job, job_rows_f32(job), next, worker, workers, sched);
+}
+
+static void f32_team(const void *p, int worker, int workers) {
+  F32Job *job = (F32Job *)p; /* the caller's job object is writable: only `next` changes */
+  GemvSched sched = effective_f32(job_bytes_f32(job));
+  if (sched != SCHED_STATIC && workers > 1)
+    f32_team_claim(job, &job->next, worker, workers, sched);
+  else
+    f32_team_static(job, worker, workers);
 }
 
 static void f32_run(F32Job *job) {
@@ -645,20 +733,20 @@ static void f32_run(F32Job *job) {
 
 void k_matmul(float *out, const float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
-  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0};
+  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0, 0};
   f32_run(&job);
 }
 void k_matmul_add(float *out, const float *x, const float *w, int n, int d) {
-  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0};
+  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0, 0};
   f32_run(&job);
 }
 void k_matmul_qkv(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv, int n,
                   int dq, int dkv) {
-  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0};
+  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0};
   f32_run(&job);
 }
 void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w3, int n, int d) {
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0};
   f32_run(&job);
 }
 
@@ -715,6 +803,7 @@ typedef struct {
   int n, gs, kind, count;
   Q8Segment segment[3];
   size_t ld; /* weight row stride in values (a multiple of gs); 0 = n */
+  atomic_int next;
 } Q8Job;
 
 static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
@@ -748,14 +837,28 @@ static void q8_rows(const void *p, int r0, int r1) {
   }
 }
 
-static void q8_team(const void *p, int worker, int workers) {
-  const Q8Job *job = p;
+static void q8_team_static(const Q8Job *job, int worker, int workers) {
   for (int s = 0; s < job->count; s++) {
     const Q8Segment *seg = &job->segment[s];
     int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
     if (r1 > r0)
       q8_range(job, seg, r0, r1);
   }
+}
+
+static void q8_team_claim(const Q8Job *job, atomic_int *next, int worker, int workers, GemvSched sched) {
+  int rows = 0;
+  for (int s = 0; s < job->count; s++)
+    rows += job->segment[s].d;
+  claim_rows_run(q8_rows, job, rows, next, worker, workers, sched);
+}
+
+static void q8_team(const void *p, int worker, int workers) {
+  Q8Job *job = (Q8Job *)p;
+  if (gemv_sched_q8 != SCHED_STATIC && workers > 1)
+    q8_team_claim(job, &job->next, worker, workers, gemv_sched_q8);
+  else
+    q8_team_static(job, worker, workers);
 }
 
 static void q8_run(Q8Job *job) {
@@ -770,20 +873,20 @@ static void q8_run(Q8Job *job) {
 }
 
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0};
+  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, 0};
   q8_run(&job);
 }
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0};
+  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, 0};
   q8_run(&job);
 }
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs) {
-  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0};
+  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, 0};
   q8_run(&job);
 }
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0};
   q8_run(&job);
 }
 
@@ -799,27 +902,53 @@ void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, i
   check_epilogue(kind, "k_matmul_ld");
   if (ld < (size_t)n)
     fail("k_matmul_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld};
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0};
   f32_run(&job);
+}
+/* The body of k_matmul_ld for one member of a team, to be called from inside a TeamFn on every member (the same row
+ * split as the team-level call, so the results are bitwise equal). It lets the caller fuse the projection with a
+ * following step into one team job. */
+void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind, int worker,
+                        int workers, atomic_int *claim) {
+  check_epilogue(kind, "k_matmul_ld_worker");
+  if (ld < (size_t)n)
+    fail("k_matmul_ld_worker: row stride %zu is shorter than the %d inputs", ld, n);
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0};
+  GemvSched sched = effective_f32(job_bytes_f32(&job));
+  if (sched != SCHED_STATIC && claim && workers > 1)
+    f32_team_claim(&job, claim, worker, workers, sched);
+  else
+    f32_team_static(&job, worker, workers);
 }
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d) {
   if (ld < (size_t)n)
     fail("k_matmul_swiglu_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld, 0};
   f32_run(&job);
 }
 void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind) {
   check_epilogue(kind, "k_matmul_q8_ld");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld};
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0};
   q8_run(&job);
+}
+void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
+                           int worker, int workers, atomic_int *claim) {
+  check_epilogue(kind, "k_matmul_q8_ld_worker");
+  if (ld < (size_t)n || ld % (size_t)gs)
+    fail("k_matmul_q8_ld_worker: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0};
+  if (gemv_sched_q8 != SCHED_STATIC && claim && workers > 1)
+    q8_team_claim(&job, claim, worker, workers, gemv_sched_q8);
+  else
+    q8_team_static(&job, worker, workers);
 }
 void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
                            int d, int gs) {
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_swiglu_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, 0};
   q8_run(&job);
 }
 
