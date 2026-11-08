@@ -187,6 +187,10 @@ reference.
 | `LLAMA_SOCKETS` | `1` (default) \| `2` | B5 |
 | `LLAMA_TP_FUSED` | `1` (default) \| `0`: the Wo/W2 projection and its reduction in one team job, or two | B7 |
 | `LLAMA_GEMV_SCHED` | `auto` (default) \| `static` \| `dynamic` \| `hybrid`: how a team splits the rows of a GEMV | B7 |
+| `LLAMA_TP_REDUCE` | `flags` (default) \| `barrier`: the fused reduction waits per output row (no team barrier) or with the two-barrier protocol of B4 | B7 |
+| `LLAMA_TEAM_JOIN` | `flags` (default) \| `counter`: how `team_run` learns that all members finished (one flag per member, or one shared counter) | B7 |
+| `LLAMA_TEAM_FANOUT` | `8` (default) \| `0` (flat) \| N up to 64: group size of the two-level team dispatch | B7 |
+| `LLAMA_TP_TRACE` | `FILE`: write a CSV with the timestamps of every member for every Wo/W2 reduction (fused form only) | B7 |
 | `LLAMA_PREFILL_BATCH` | `1` (default, per-token) \| M | C1 |
 | `LLAMA_PREFILL_LOGITS` | `last` (default) \| `all` (diagnostic) | C1 |
 | `LLAMA_KERNELS` | adds `amx` | C4 |
