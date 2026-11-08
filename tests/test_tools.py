@@ -99,6 +99,7 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertEqual(self.dry_run('cresco8-tp.sbatch', 'B7', GATES_ONLY='1'), [])
         placement = self.dry_run('cresco8-prefill.sbatch', 'D1', GATES_ONLY='1')
         self.assertTrue(placement and len(placement) < 20 and all('xplace' in line for line in placement), placement)
+        self.dry_run('cresco8-prefill.sbatch', 'D3')  # the W8A8 AMX diagnostic prints its comparisons and exits 0
         c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
         decode = [line for line in c7 if 'xdec' in line]
         self.assertTrue(decode and all('warm=2048' in line for line in decode))
@@ -344,6 +345,14 @@ class CompareEnginesTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual([row['position'] for row in data['comparisons']], [3])
             self.assertTrue(data['summary']['bitwise'])
+
+    def test_last_only_with_both_sides_batched(self):
+        """D1 compares two batched runs (one socket against two) on long prompts: only the final row of each is read."""
+        for engine in ('fp32', 'int8'):
+            result, data = self.compare(engine, '--batch-a', '3', '--batch-b', '5', '--last-only', '--env-a',
+                                        'LLAMA_PREFILL_GEMM=on', '--env-b', 'LLAMA_PREFILL_GEMM=on', '--bitwise')
+            self.assertEqual(result.returncode, 0, (engine, result.stderr))
+            self.assertEqual([row['position'] for row in data['comparisons']], [3])
 
     def test_scalar_gemm_prefill_is_bitwise_equal_to_per_token(self):
         # The scalar GEMM sums each output like the GEMV (one K block, ascending k); the Q8 engine has no GEMM yet.
