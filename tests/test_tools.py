@@ -214,7 +214,7 @@ class CampaignSummaryTests(unittest.TestCase):
         if not shutil.which('bash'):
             self.skipTest('bash is required')
         for script, phases, missing in (('cresco8-prefill.sbatch', 'D1 B7', 'B7'), ('cresco8-tp.sbatch', 'B7 D1', 'D1'),
-                                        ('cresco8-prefill.sbatch', 'C7 D3', 'D3')):
+                                        ('cresco8-prefill.sbatch', 'C7 D4', 'D4')):
             with tempfile.TemporaryDirectory() as temp:
                 env = {**os.environ, 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                        'PYTHON': sys.executable, 'PHASE': phases}  # not a dry run: the check must come before check_stage
