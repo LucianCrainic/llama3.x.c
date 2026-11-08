@@ -302,12 +302,16 @@ tokens_of() {
 CMP_FLAGS=(--bitwise)
 CMP_TOKENS=
 # W8A8 requantizes its activations: any change in FP32 operation order (another ISA, AMX, a split over two sockets) moves
-# the logits by a noise floor that is the same whatever the cause (measured on 1B, W8A8, 53 positions: scalar against
-# AVX-512 rms 0.063 / max 0.34, AMX-INT8 against scalar 0.062 / 0.36, two sockets against one 0.063 / 0.41; 8B up to
-# rms 0.086 / max 1.41), while W8A32 agrees to 3e-5 in the same runs. A per-position 1e-3 budget therefore cannot hold;
-# these provisional bounds sit a factor above the observed values. The _LAST form is for a single compared row.
-W8A8_GATE=(--max-abs 2.0 --rms-max 0.15 --argmax-min 0.9)
-W8A8_GATE_LAST=(--max-abs 2.0 --rms-max 0.15 --argmax-min 0)
+# the logits by a noise floor that is the same whatever the cause, and that grows with the model and the context. Measured
+# on 1B, 53 positions: scalar against AVX-512 rms 0.063 / max 0.34, AMX-INT8 against scalar 0.062 / 0.36, two sockets against
+# one 0.063 / 0.41. On 8B (D1/D3, job 5704685): ONE socket, AMX against AVX-512, rms 0.086 / max 1.41 on 86 tokens and 0.115 /
+# 7.58 on the last row of 2048; two sockets against one at the same AMX kernel 0.136 / 4.12 and 0.112 / 8.86; microbatch 64
+# against 16 bitwise identical; W8A32 agrees to 7e-5 in the same runs. A per-position 1e-3 budget therefore cannot hold and
+# the first provisional bounds (max 2.0, rms 0.15, calibrated on 1B) failed on 8B. The bounds below sit a factor of 1.5-2
+# above the largest observed values (rms 0.136, max 8.86): rms and argmax carry the judgment, the max only catches a
+# catastrophic error. The _LAST form is for a single compared row.
+W8A8_GATE=(--max-abs 16 --rms-max 0.2 --argmax-min 0.9)
+W8A8_GATE_LAST=(--max-abs 16 --rms-max 0.2 --argmax-min 0)
 # a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine comparison on the
 # tokens of the model (default gate: bitwise equality at every position).
 a_bitwise() {
