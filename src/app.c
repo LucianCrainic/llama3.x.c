@@ -34,6 +34,8 @@ static void usage(void) {
         "  --benchmark       non-interactive; fixed default prompt and seed 1\n"
         "  --generation-length INT  cap generated tokens; 0 skips inference\n"
         "                    benchmark default: 128; -n/context still cap passes\n"
+        "  --warm-context INT forward INT untimed tokens (the prompt, repeated) before the prompt, so decode\n"
+        "                    is timed from a retained context of that length (generate mode only)\n"
         "  --no-text         suppress generated text and prompt echo\n"
         "  --log-level LEVEL error|warn|info|debug|trace\n"
         "  --json PATH       write schema-v1 performance report to a file\n"
@@ -112,6 +114,8 @@ static void parse(int argc, char **argv) {
       steps_set = 1;
     } else if (!strcmp(flag, "--context-length"))
       options.context = (int)integer(value, flag, INT_MAX);
+    else if (!strcmp(flag, "--warm-context"))
+      options.warm_context = (int)integer(value, flag, INT_MAX);
     else if (!strcmp(flag, "--generation-length"))
       options.generation_length = (int)integer(value, flag, INT_MAX);
     else if (!strcmp(flag, "-i") || !strcmp(flag, "--prompt"))
@@ -143,6 +147,8 @@ static void parse(int argc, char **argv) {
     fail("unsupported mode '%s'", options.mode);
   if (options.prompt && options.prompt_file)
     fail("use either --prompt or --prompt-file");
+  if (options.warm_context && !strcmp(options.mode, "chat"))
+    fail("--warm-context applies to generate mode only");
   if (!strcmp(options.mode, "chat") && (options.benchmark || options.generation_length >= 0))
     fail("chat cannot be combined with benchmark or generation-length");
   if (options.benchmark) {
@@ -297,6 +303,39 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   return -1;
 }
 
+/* --warm-context: fill positions [0, warm) with the prompt tokens repeated (BOS only at position 0), in microbatches,
+ * without logits. The time is kept apart in metrics.warm_s, and the profile and per-microbatch counters do not see it, so
+ * that the timed prefill and decode start from a context of that length (B7 §4.1). */
+static int warm_up(const int *tokens, int n) {
+  int warm = options.warm_context;
+  if (warm <= 0)
+    return 0;
+  if (n < 1)
+    fail("--warm-context needs a non-empty prompt");
+  if (warm >= options.steps)
+    fail("--warm-context %d leaves no room: the context holds %d positions (-n / --context-length)", warm,
+         options.steps);
+  int max = engine_max_batch(&model);
+  int *chunk = memory_alloc((size_t)max, sizeof(int), MEM_PROMPT);
+  int saved_profile = profile_enabled;
+  profile_enabled = 0;
+  double start = monotonic_seconds();
+  for (int pos = 0; pos < warm;) {
+    int count = warm - pos < max ? warm - pos : max;
+    for (int j = 0; j < count; j++) {
+      int at = pos + j;
+      /* tokens[0] is BOS: later passes over the prompt skip it when the prompt has other tokens. */
+      chunk[j] = at < n ? tokens[at] : (n > 1 ? tokens[1 + (at - n) % (n - 1)] : tokens[0]);
+    }
+    engine_forward_batch(&model, chunk, count, pos, LOGITS_NONE);
+    pos += count;
+  }
+  metrics.warm_s = monotonic_seconds() - start;
+  profile_enabled = saved_profile;
+  memory_free(chunk);
+  return warm;
+}
+
 static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
   metrics.turns++;
   double start = monotonic_seconds();
@@ -305,7 +344,8 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
                     ? chat_prompt(t, options.system_prompt ? options.system_prompt : "", prompt ? prompt : "", 1, &n)
                     : tokenize(t, prompt ? prompt : "", 1, &n);
   metrics.tokenization_s += monotonic_seconds() - start;
-  int pos = 0;
+  int pos = warm_up(tokens, n);
+  start += metrics.warm_s; /* the warm-up is neither prefill nor time to first token */
   double excluded = metrics.verify_excluded_s;
   run_sequence(t, s, tokens, n, &pos, options.generation_length, !options.chat_template, start);
   kv_position = pos;

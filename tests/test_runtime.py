@@ -131,6 +131,31 @@ class RuntimeTests(unittest.TestCase):
                                                      'LLAMA_KERNELS': 'scalar'})
                         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_warm_context_is_untimed_and_uncounted(self):
+        # B7: --warm-context N fills N positions first; the timed prefill and decode start from that context.
+        for engine in ('run', 'runq'):
+            _, cold = self.execute(engine, '--context-length', '8', '--generation-length', '2')
+            self.assertEqual(cold['parameters']['warm_context'], 0)
+            self.assertIsNone(cold['timing_seconds']['warm_context'])
+            for batch in ('1', '3'):
+                _, warm = self.execute(engine, '--context-length', '8', '--generation-length', '2',
+                                       '--warm-context', '4', env={'LLAMA_PREFILL_BATCH': batch, 'LLAMA_PROFILE': '1'})
+                self.assertEqual(warm['parameters']['warm_context'], 4)
+                self.assertGreaterEqual(warm['timing_seconds']['warm_context'], 0)
+                for key in ('input_prompt', 'processed_prompt', 'forward_passes', 'decode_steps'):
+                    self.assertEqual(warm['tokens'][key], cold['tokens'][key], (engine, batch, key))
+                self.assertEqual(warm['prefill']['tokens'], cold['prefill']['tokens'])
+                # The warm positions are in the cache when the prompt is processed.
+                self.assertEqual(warm['kv']['after_prompt']['active_bytes'] // cold['kv']['after_prompt']['active_bytes'],
+                                 (4 + cold['tokens']['processed_prompt']) // cold['tokens']['processed_prompt'])
+                # The warm-up is outside the profile: its forward time stays that of the timed prefill.
+                self.assertEqual(warm['profile_seconds']['prefill']['forward_passes'], cold['tokens']['processed_prompt'])
+        # No room, chat mode and a missing prompt are rejected up front.
+        _, data = self.execute('run', '--context-length', '8', '--warm-context', '8', success=False)
+        self.assertIn('warm-context', data['error'])
+        _, data = self.execute('run', '-m', 'chat', '--warm-context', '2', success=False, stdin='')
+        self.assertIn('warm-context', data['error'])
+
     def test_prefill_invalid_inputs_and_configuration(self):
         for engine, binary, filename in (('run', 'test-prefill-fp32', 'fp32.bin'),
                                           ('runq', 'test-prefill-int8', 'int8.bin')):

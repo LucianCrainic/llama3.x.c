@@ -390,6 +390,7 @@ void write_report(void) {
     fputs("null", f);
   fputs(",\n    \"prefill_logits\": ", f);
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
+  fprintf(f, ",\n    \"warm_context\": %d", options.warm_context);
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "
           "\"generated_output\": %zu,\n    \"forward_passes\": %zu,\n    \"decode_steps\": %zu,\n    \"sampled\": "
@@ -410,6 +411,7 @@ void write_report(void) {
   timing(f, "average_decode_step", metrics.decode_steps ? metrics.decode_s / metrics.decode_steps : 0,
          metrics.decode_steps > 0, 1);
   /* weight_pack is the BF16 packing of C5; the placement timings come from the owned loader (A4). */
+  timing(f, "warm_context", metrics.warm_s, options.warm_context > 0, 1);
   timing(f, "weight_pack", metrics.weight_pack_s, metrics.weight_packed, 1);
   timing(f, "placement_populate", metrics.placement_populate_s, metrics.placement_owned, 1);
   timing(f, "placement_verify", metrics.placement_verify_s, metrics.placement_owned, 0);

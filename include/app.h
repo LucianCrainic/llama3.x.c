@@ -4,6 +4,7 @@
 typedef struct {
   const char *checkpoint, *tokenizer, *prompt, *prompt_file, *mode, *system_prompt, *json;
   int chat_template, context, steps, generation_length, benchmark, no_text;
+  int warm_context; /* --warm-context N: forward N untimed tokens before the prompt (B7), 0 = off */
   unsigned long long seed;
   float temperature, topp;
 } Options;
