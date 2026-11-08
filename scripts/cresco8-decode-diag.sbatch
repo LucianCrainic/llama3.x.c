@@ -14,6 +14,9 @@
 #   2s-old  LLAMA_SOCKETS=2 with the tree OLD_ROOT (the build before the leader-pinning fix)   -- optional
 #   2s-sep  LLAMA_SOCKETS=2, LLAMA_TP_FUSED=0 (projection and reduction as two team jobs)
 #   2s      LLAMA_SOCKETS=2, fused (the default)
+#   2s-trace  like 2s, with LLAMA_TP_TRACE: a CSV with the timestamps of every worker for every Wo/W2 reduction
+# REDUCE=1 first runs tests/reduce_bench.c (Wo, W1/W3 and W2 of synthetic layers on one or two sockets with the engine's
+# kernels and exchange; the reduction replaced by local barriers or by nothing, to separate kernel from sync from skew).
 # The info log of every two-socket launch carries the per-socket phase times and the split of the reduction.
 # While every two-socket launch runs, the affinity mask and the running CPU of each of its threads are sampled from
 # /proc, so a leader pinned to the wrong CPU shows up directly. Required: ROOT, OUT (new directory), PYTHON, MODELS
@@ -38,7 +41,7 @@ TWO_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOG
 ONE_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PROFILE=1)
 
 if ! dry_run; then
-  build_tree 1 release build/release/probe-fp32 build/release/stream-bench
+  build_tree 1 release build/release/probe-fp32 build/release/stream-bench build/release/reduce-bench
   if [[ -n $OLD_ROOT && ! -x $OLD_ROOT/build/release/run ]]; then
     make -C "$OLD_ROOT" CC=gcc OPENMP=1 MODE=release all > "$dir/build-old.log"
   fi
@@ -50,6 +53,26 @@ if ! dry_run && [[ ${STREAM:-1} == 1 ]]; then
       LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/stream-bench" --sockets "$sockets" --threads "$threads" --mib 4096 \
         --reps 7 > "$dir/stream-s$sockets-t$threads.jsonl" 2> "$dir/stream-s$sockets-t$threads.err" ||
         echo "stream-bench $sockets/$threads failed" >> "$dir/failures.txt"
+    done
+  done
+fi
+
+if ! dry_run && [[ ${REDUCE:-0} == 1 ]]; then
+  for model in 8b 1b; do
+    for precision in fp32 q8; do
+      args=(--model "$model" --precision "$precision" --threads "${REDUCE_THREADS:-56}" --layers 8 --passes "${REDUCE_PASSES:-100}")
+      for rep in 1 2; do
+        for stamps in 0 1; do
+          for red in none bars fused xonly; do
+            LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 2 "${args[@]}" --red "$red" --stamps "$stamps" \
+              >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" || echo "reduce-bench $model $precision $red $stamps failed" >> "$dir/failures.txt"
+          done
+        done
+        for red in none bars; do
+          LLAMA_TOPOLOGY=$EXPLICIT "$ROOT/build/release/reduce-bench" --sockets 1 "${args[@]}" --red "$red" --stamps 1 \
+            >> "$dir/reduce-bench.jsonl" 2>> "$dir/reduce-bench.err" || echo "reduce-bench s1 $model $precision $red failed" >> "$dir/failures.txt"
+        done
+      done
     done
   done
 fi
@@ -114,6 +137,8 @@ for entry in ${DECODE_MODELS-$MODELS}; do
               "LLAMA_GEMV_SCHED=${config#1s-}" ;;
           2s-old) diag_run 2s-old "$OLD_ROOT" "$name-$precision-2s-old" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" ;;
           2s-sep) diag_run 2s-sep "$ROOT" "$name-$precision-2s-sep" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" LLAMA_TP_FUSED=0 ;;
+          2s-trace) diag_run 2s-trace "$ROOT" "$name-$precision-2s-trace" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
+            "LLAMA_TP_TRACE=$dir/$name-$precision-2s-trace-$rep.trace.csv" ;;
           2s) diag_run 2s "$ROOT" "$name-$precision-2s" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" "${TWO_ENV[@]}" ;;
           2s-static | 2s-dynamic | 2s-hybrid)
             diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$two" "$tokenizer" "$rep" "$SAMPLE" "" "" \
@@ -130,4 +155,5 @@ done
 if ! dry_run; then
   "$PYTHON" "$ROOT/tools/summarize_decode_diag.py" "$dir" > "$dir/summary.md" || true
   "$PYTHON" "$ROOT/tools/summarize_profile.py" "$dir" > "$dir/profile.md" || true
+  "$PYTHON" "$ROOT/tools/summarize_reduce_diag.py" "$dir" > "$dir/reduce.md" || true
 fi

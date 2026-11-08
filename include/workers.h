@@ -77,6 +77,14 @@ float *exchange_partial(Exchange *exchange, int socket);
 /* Called by every worker of `socket` inside a TeamFn, after the local projection wrote `elements` values to the
  * pointer exchange_partial returned. A no-op after an abort. */
 void exchange_reduce_add(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements);
+/* Seconds (monotonic_seconds) at which one worker passed each step of exchange_reduce_add: left the first barrier, saw
+ * the peer's partial, finished adding, left the closing barrier. For tracing (LLAMA_TP_TRACE); see tp.c. */
+typedef struct {
+  double after_barrier1, after_peer, after_add, after_barrier2;
+} ReduceStamps;
+/* exchange_reduce_add that also records the worker's step times in *stamps (NULL: none). */
+void exchange_reduce_add_stamped(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements,
+                                 ReduceStamps *stamps);
 /* Process-wide and irreversible in production (it is workers_abort): every wait loop of the exchange and of the
  * team barriers returns, and the results of the generation in flight are garbage. */
 void exchange_abort(Exchange *exchange);

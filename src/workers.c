@@ -390,6 +390,11 @@ float *exchange_partial(Exchange *e, int socket) {
 }
 
 void exchange_reduce_add(Exchange *e, int socket, int worker, int workers, float *residual, int elements) {
+  exchange_reduce_add_stamped(e, socket, worker, workers, residual, elements, NULL);
+}
+
+void exchange_reduce_add_stamped(Exchange *e, int socket, int worker, int workers, float *residual, int elements,
+                                 ReduceStamps *stamps) {
   int peer = exchange_check_socket(e, socket);
   if (workers != team_size(e->team[socket]) || worker < 0 || worker >= workers || elements < 0 ||
       elements > e->elements_max)
@@ -401,20 +406,28 @@ void exchange_reduce_add(Exchange *e, int socket, int worker, int workers, float
   int timed = worker == 0 && atomic_load_explicit(&e->timing, memory_order_relaxed);
   double t0 = timed ? monotonic_seconds() : 0.0;
   team_barrier(e->team[socket]); /* 1. every worker finished writing the local partial */
-  double tb = timed ? monotonic_seconds() : 0.0;
+  double tb = timed || stamps ? monotonic_seconds() : 0.0;
+  if (stamps)
+    stamps->after_barrier1 = tb;
   if (worker == 0)
     atomic_store_explicit(&e->ready[socket].value, g, memory_order_release); /* 2 */
   if (!wait_at_least(&e->ready[peer], g))                                    /* 3 */
     return;
-  double t1 = timed ? monotonic_seconds() : 0.0;
+  double t1 = timed || stamps ? monotonic_seconds() : 0.0;
+  if (stamps)
+    stamps->after_peer = t1;
   const float *p0 = e->buffer[0][g & 1], *p1 = e->buffer[1][g & 1];
   int i0 = (int)((long long)elements * worker / workers), i1 = (int)((long long)elements * (worker + 1) / workers);
   for (int i = i0; i < i1; i++)
     residual[i] += p0[i] + p1[i];
-  double t2 = timed ? monotonic_seconds() : 0.0;
+  double t2 = timed || stamps ? monotonic_seconds() : 0.0;
+  if (stamps)
+    stamps->after_add = t2;
   team_barrier(e->team[socket]); /* 4. every worker of this socket finished reading both partials */
   if (worker == 0)
     atomic_store_explicit(&e->consumed[socket].value, g, memory_order_release);
+  if (stamps)
+    stamps->after_barrier2 = monotonic_seconds();
   if (timed) {
     double *phase = e->phase_seconds[socket];
     phase[0] += tb - t0;

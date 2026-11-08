@@ -16,6 +16,30 @@ enum { SOCKETS = 2, SPIN_LIMIT = 2048 };
 /* Per-socket profile slots: the engine's phases, then the projections that end in a reduction, timed on their own. */
 enum { TP_WO_MM = PHASE_COUNT, TP_W2_MM, TP_SLOTS };
 
+/* LLAMA_TP_TRACE=FILE: one record per Wo/W2 projection+reduction and socket, written to FILE as CSV when the engine is
+ * freed (microseconds relative to the leader's dispatch of the team job). Needs the fused form. Every worker stamps the
+ * end of its share of the projection and the steps of exchange_reduce_add (workers.h); the leader folds them into a
+ * record after the join. The stamps cost a few clock reads per worker, so a traced run is slightly slower. */
+typedef struct {
+  _Alignas(64) double start, proj_end;
+  ReduceStamps r;
+  double pad[2];
+} WorkerStamp;
+
+typedef struct {
+  int kind, stage;                   /* 0 = Wo, 1 = W2; Stage */
+  double disp;                       /* leader's clock (seconds) when it dispatched the team job */
+  double start_mean, start_max;      /* workers entering the job */
+  double end_first, end_mean, end_last; /* workers finishing their share of the projection */
+  double b1_leader, b1_last;         /* leaving the first barrier */
+  double peer_leader, peer_last;     /* seeing the other socket's partial */
+  double add_mean, add_last;         /* finishing the add */
+  double b2_leader, b2_last;         /* leaving the closing barrier */
+  double ret;                        /* team_run returned */
+  int last_worker;                   /* the worker whose projection ended last */
+} TraceRec;
+enum { TRACE_MAX_RECORDS = 40000, TRACE_MAX_WORKERS = 256 };
+
 typedef enum { CMD_SETUP, CMD_LOAD, CMD_FORWARD, CMD_STOP } Command;
 
 typedef struct {
@@ -32,11 +56,19 @@ typedef struct {
   float *xs;
   int8_t *aq; /* quantized slice that feeds Wo / W2 */
   float *as;
+  /* LLAMA_TP_TRACE */
+  WorkerStamp *stamps;
+  TraceRec *records;
+  size_t record_count;
+  unsigned last_count[2][TRACE_MAX_WORKERS];
+  double late_sum[2][TRACE_MAX_WORKERS];
+  size_t reductions[2];
 } TpSocket;
 
 struct Tp {
   Config c;
   int quantized, gs, check, fp32_activations;
+  const char *trace_path;
   int fused; /* LLAMA_TP_FUSED (default 1): the partial projection and the reduction run in one team job */
   ShardSet set;
   NumaRegion global;
@@ -164,6 +196,7 @@ typedef struct {
   const K8Weight *wq;               /* Q8; NULL for FP32 */
   double *leader_seconds;           /* fused: the leader's own share of the projection */
   atomic_int claim;                 /* fused: row counter shared by the members (zero before the team starts) */
+  WorkerStamp *stamps;              /* fused, traced: one per member */
 } ProjectJob;
 
 static void project_share(const ProjectJob *job, int worker, int workers) {
@@ -179,11 +212,59 @@ static void project_share(const ProjectJob *job, int worker, int workers) {
  * is the join of the projection. One team dispatch and join instead of two. */
 static void project_reduce_fn(const void *p, int worker, int workers) {
   const ProjectJob *job = p;
+  WorkerStamp *stamp = job->stamps ? &job->stamps[worker] : NULL;
   double start = worker == 0 && job->leader_seconds ? monotonic_seconds() : 0.0;
+  if (stamp)
+    stamp->start = start ? start : monotonic_seconds();
   project_share(job, worker, workers);
+  if (stamp)
+    stamp->proj_end = monotonic_seconds();
   if (start)
-    *job->leader_seconds = monotonic_seconds() - start;
-  exchange_reduce_add(job->tp->exchange, job->socket, worker, workers, job->residual, job->d);
+    *job->leader_seconds = (stamp ? stamp->proj_end : monotonic_seconds()) - start;
+  exchange_reduce_add_stamped(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
+                              stamp ? &stamp->r : NULL);
+}
+
+/* Folds the members' stamps of the reduction that just ended into one record of the socket. */
+static void trace_record(Tp *tp, TpSocket *sk, const ProjectJob *job, int kind, double disp, double ret) {
+  if (sk->record_count >= TRACE_MAX_RECORDS)
+    return;
+  int n = team_size(sk->team);
+  TraceRec *r = &sk->records[sk->record_count++];
+  *r = (TraceRec){.kind = kind, .stage = (int)profile_stage, .disp = disp, .ret = ret, .end_first = 1e30};
+  const WorkerStamp *w = job->stamps;
+  for (int i = 0; i < n; i++) {
+    r->start_mean += w[i].start;
+    r->end_mean += w[i].proj_end;
+    r->add_mean += w[i].r.after_add;
+    if (w[i].start > r->start_max)
+      r->start_max = w[i].start;
+    if (w[i].proj_end < r->end_first)
+      r->end_first = w[i].proj_end;
+    if (w[i].proj_end > r->end_last) {
+      r->end_last = w[i].proj_end;
+      r->last_worker = i;
+    }
+    if (w[i].r.after_barrier1 > r->b1_last)
+      r->b1_last = w[i].r.after_barrier1;
+    if (w[i].r.after_peer > r->peer_last)
+      r->peer_last = w[i].r.after_peer;
+    if (w[i].r.after_add > r->add_last)
+      r->add_last = w[i].r.after_add;
+    if (w[i].r.after_barrier2 > r->b2_last)
+      r->b2_last = w[i].r.after_barrier2;
+  }
+  r->start_mean /= n;
+  r->end_mean /= n;
+  r->add_mean /= n;
+  r->b1_leader = w[0].r.after_barrier1;
+  r->peer_leader = w[0].r.after_peer;
+  r->b2_leader = w[0].r.after_barrier2;
+  sk->reductions[kind]++;
+  sk->last_count[kind][r->last_worker < TRACE_MAX_WORKERS ? r->last_worker : 0]++;
+  for (int i = 0; i < n && i < TRACE_MAX_WORKERS; i++)
+    sk->late_sum[kind][i] += w[i].proj_end - r->end_mean;
+  (void)tp;
 }
 
 static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
@@ -195,7 +276,11 @@ static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
   if (tp->fused) {
     double leader = 0.0;
     job->leader_seconds = profile_enabled ? &leader : NULL;
+    job->stamps = sk->stamps;
+    double disp = sk->stamps ? monotonic_seconds() : 0.0;
     team_run(sk->team, project_reduce_fn, job);
+    if (sk->stamps)
+      trace_record(tp, sk, job, slot - TP_WO_MM, disp, monotonic_seconds());
     *prof += leader;
     return;
   }
@@ -485,6 +570,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   if (fused && *fused && strcmp(fused, "0") && strcmp(fused, "1"))
     fail("LLAMA_TP_FUSED must be 0 or 1");
   tp->fused = !(fused && !strcmp(fused, "0"));
+  const char *trace = getenv("LLAMA_TP_TRACE");
+  tp->trace_path = trace && *trace ? trace : NULL;
+  if (tp->trace_path && !tp->fused)
+    fail("LLAMA_TP_TRACE needs the fused reduction (LLAMA_TP_FUSED=1)");
   shards_plan(&tp->set, m, p, SOCKETS, gs);
   const char *mode = placement_mode();
   tp_check_topology(mode);
@@ -510,6 +599,16 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     region_mark_populated(&sk->kv_k);
     region_mark_populated(&sk->kv_v);
     region_mark_populated(&sk->work);
+    if (tp->trace_path) {
+      int n = team_size(sk->team);
+      if (n > TRACE_MAX_WORKERS)
+        fail("LLAMA_TP_TRACE supports at most %d workers per socket", TRACE_MAX_WORKERS);
+      if (posix_memalign((void **)&sk->stamps, 64, (size_t)n * sizeof(WorkerStamp)))
+        fail("cannot allocate the trace stamps");
+      sk->records = calloc(TRACE_MAX_RECORDS, sizeof(TraceRec));
+      if (!sk->records)
+        fail("cannot allocate the trace records");
+    }
   }
   if (tp->set.global_bytes)
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
@@ -561,6 +660,53 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
  * slowest member's lateness shows up as `straggler`). The exchange components are the leader's: straggler (waiting for
  * the socket's last partial write), peer (waiting for the other socket), add, close (final barrier) and buffer (waiting
  * for a free partial buffer). */
+static void write_trace(const Tp *tp) {
+  FILE *f = fopen(tp->trace_path, "w");
+  if (!f) {
+    LOG(LOG_WARN, "cannot write the reduction trace %s", tp->trace_path);
+    return;
+  }
+  fprintf(f, "socket,stage,kind,index,disp_s,start_mean,start_max,end_first,end_mean,end_last,b1_leader,b1_last,"
+             "peer_leader,peer_last,add_mean,add_last,b2_leader,b2_last,ret,last_worker\n");
+  for (int s = 0; s < SOCKETS; s++)
+    for (size_t i = 0; i < tp->s[s].record_count; i++) {
+      const TraceRec *r = &tp->s[s].records[i];
+#define US(field) ((r->field - r->disp) * 1e6)
+      fprintf(f, "%d,%d,%d,%zu,%.9f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n", s,
+              r->stage, r->kind, i, r->disp, US(start_mean), US(start_max), US(end_first), US(end_mean), US(end_last),
+              US(b1_leader), US(b1_last), US(peer_leader), US(peer_last), US(add_mean), US(add_last), US(b2_leader),
+              US(b2_last), US(ret), r->last_worker);
+#undef US
+    }
+  fclose(f);
+  LOG(LOG_INFO, "reduction trace written to %s", tp->trace_path);
+  /* The members that finish their share last most often, and how late the usual suspects are. */
+  for (int s = 0; s < SOCKETS; s++)
+    for (int kind = 0; kind < 2; kind++) {
+      const TpSocket *sk = &tp->s[s];
+      if (!sk->reductions[kind])
+        continue;
+      int n = team_size(sk->team), top[3] = {-1, -1, -1};
+      for (int w = 0; w < n && w < TRACE_MAX_WORKERS; w++)
+        for (int t = 0; t < 3; t++)
+          if (top[t] < 0 || sk->last_count[kind][w] > sk->last_count[kind][top[t]]) {
+            for (int u = 2; u > t; u--)
+              top[u] = top[u - 1];
+            top[t] = w;
+            break;
+          }
+      char line[512];
+      size_t used = (size_t)snprintf(line, sizeof(line), "trace socket %d %s (%zu reductions): last to finish the projection:", s,
+                                     kind ? "w2" : "wo", sk->reductions[kind]);
+      for (int t = 0; t < 3; t++)
+        if (top[t] >= 0)
+          used += (size_t)snprintf(line + used, sizeof(line) - used, " worker %d %.1f%% (mean %+.2f us)", top[t],
+                                   100.0 * sk->last_count[kind][top[t]] / (double)sk->reductions[kind],
+                                   sk->late_sum[kind][top[t]] / (double)sk->reductions[kind] * 1e6);
+      LOG(LOG_INFO, "%s", line);
+    }
+}
+
 static void log_profile(const Tp *tp) {
   static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
                                               "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
@@ -630,10 +776,14 @@ void tp_free(Tp *tp) {
   }
   if (profile_enabled)
     log_profile(tp);
+  if (tp->trace_path)
+    write_trace(tp);
   exchange_destroy(tp->exchange);
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];
     memory_free(sk->debug);
+    free(sk->stamps);
+    free(sk->records);
     region_release(&sk->weights);
     region_release(&sk->kv_k);
     region_release(&sk->kv_v);
