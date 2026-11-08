@@ -216,12 +216,13 @@ and covered by tests.
 Placement (one two-socket run per batched rung, `tp_placement`): the weights of each socket are one region on its HBM node (2 and 3), fully verified, 0
 pages elsewhere or missing (8B: 14 GiB per socket); the packed shards of the AMX rungs (8B BF16: 6.5 GiB per socket) are fully verified on the same
 nodes; the KV caches of both sockets are verified with 0 pages on another node (the missing pages are positions not yet written); the untied embedding
-is on DDR node 0, fully verified. **Not verified:** the work region and the exchange buffers (about 10 MB per socket) are reserved on the socket's
-node but never fully populated, so the page query reports them unverified, as in the one-socket engine; D1's criterion lists the exchange buffers, and
-this is the one place it is not met. BF16 packing took 0.11 s for 13 GiB (the `weight_pack` timing).
+is on DDR node 0, fully verified. **Not verified in that job:** the work region and the exchange buffers (about 10 MB per socket) were reserved on the socket's
+node but never fully populated, so the page query reported them unverified. Changed afterwards (8 November 2026, not yet run on the cluster): the work
+region is written whole by its socket at setup, the exchange region is zeroed whole before the exchange is created, both are verified like the other
+regions, and `tp_placement` asserts them (`scratch`) in the D1 placement runs. BF16 packing took 0.11 s for 13 GiB (the `weight_pack` timing).
 
 Open: the Hugging Face gate with two sockets (`HF_GATE=0` here); the M sweep, the profiled runs and the decode after prefill (the rest of `phase_D1`);
-the work and exchange regions' verification.
+the verification of the work and exchange regions on the hardware.
 
 ## 7. Exit criteria
 

@@ -704,6 +704,9 @@ static void setup_socket(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
   int hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS;
+  /* The socket that uses the work region writes all of it once, so every page exists on its own node and the page query
+   * can verify the region like the others (a fresh mapping is zero already; this only makes the pages exist). */
+  memset(sk->work.data, 0, sk->work.data_bytes);
   char *cursor = sk->work.data;
   size_t used = 0;
 #define CARVE(pointer, count, type)                                                                                    \
@@ -1085,6 +1088,12 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   if (tp->set.global_bytes)
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
                    region_thp_default());
+  /* The exchange buffers and flags start at zero; writing the whole region also makes its pages exist on their node. */
+  for (int s = 0; s < SOCKETS; s++)
+    if (tp->s[s].exchange.data) {
+      memset(tp->s[s].exchange.data, 0, tp->s[s].exchange.data_bytes);
+      region_mark_populated(&tp->s[s].exchange);
+    }
   tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
   if (tp->rows > 1)
     LOG(LOG_INFO, "two-socket batch capacity %d rows: work region %.1f MiB and exchange %.1f MiB per socket", tp->rows,
@@ -1159,6 +1168,8 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     verify_bound(&tp->s[s].weights, mode);
     verify_bound(&tp->s[s].packed, mode);
     verify_bound(&tp->s[s].repack, mode);
+    verify_bound(&tp->s[s].work, mode);
+    verify_bound(&tp->s[s].exchange, mode);
   }
   verify_bound(&tp->global, mode);
   metrics.placement_verify_s = monotonic_seconds() - start;

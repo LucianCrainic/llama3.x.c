@@ -500,6 +500,12 @@ for socket, node in ((0, 2), (1, 3)):
           len(found) == 1 and found[0]['node'] == node and found[0]['verified'] == 'full' and
           (found[0]['pages_queried'] or 0) > 0 and found[0]['pages_mismatched'] == 0 and found[0]['pages_missing'] == 0,
           str(found))
+if 'scratch' in sys.argv[2:]:
+    for socket, node in ((0, 2), (1, 3)):
+        found = [r for r in regions if r['role'] == 'work' and r['socket'] == socket]
+        check(f'socket {socket} work and exchange regions: on node {node}, fully verified',
+              len(found) >= 2 and all(r['node'] == node and r['verified'] == 'full' and r['pages_mismatched'] == 0 and
+                                      r['pages_missing'] == 0 for r in found), str(found))
 if 'kv' in sys.argv[2:]:
     kv = report.get('kv') or {}
     check('KV caches of both sockets verified, none on another node, none missing', bool(kv.get('verified')) and
