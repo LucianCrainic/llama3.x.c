@@ -162,7 +162,8 @@ cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=ch
   between paths that share no AMX code: scalar against AVX-512 per-token on 1B gives rms 0.063, max 0.34, argmax 96.2%,
   and scalar against AMX 0.062 / 0.36 / 94.3%, while W8A32 agrees to 3e-5 on all of them. W8A8 requantizes its
   activations, so any change of FP32 order moves the logits by this noise floor. The comparison now uses `W8A8_GATE`
-  (max 2.0, rms 0.15, argmax >= 0.9, from these values), and a strict W8A32 comparison of the AMX selection was added; both
+  (first max 2.0, rms 0.15, argmax >= 0.9, from these values; revised on 8 November 2026 to max 16, rms 0.2, argmax >= 0.9 after
+  the 8B measurements of D1/D3, where a plain kernel switch on one socket already gives rms 0.115 and max 7.58), and a strict W8A32 comparison of the AMX selection was added; both
   are in `phase_C6` and have not been run yet.
 - **Not run.** The Hugging Face recording of the Q8 variants (`HF_GATE=0`).
 

@@ -246,7 +246,7 @@ Each phase records the error it observes, next to the gate.
 | Real model, FP32 TP or GEMM vs one-socket per-token | max\|Δlogit\| ≤ 1e-3, argmax 100% | `tools/validate.py` default budget |
 | Real model vs HF (unchanged gate) | `--max-abs 1e-3 --rtol 1e-3` FP32 | `tools/validate.py:30-32` |
 | BF16 mode | recorded separately; provisional gate fixed in C5 | never judged against the FP32 budget |
-| Q8 paths | recorded (non-gating vs HF, as today); gated against the one-socket Q8 path | `scripts/cresco8-kernels.sbatch:86-112` |
+| Q8 paths | recorded (non-gating vs HF, as today); gated against the one-socket Q8 path (W8A32 strict 1e-3; W8A8 statistical: rms <= 0.2, argmax >= 0.9, max <= 16, see `W8A8_GATE`) | `scripts/cresco8-kernels.sbatch:86-112` |
 
 ### 6.5 Cluster conventions
 
