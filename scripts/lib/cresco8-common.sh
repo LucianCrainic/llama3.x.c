@@ -143,7 +143,10 @@ run_label() {
 # run_engine LABEL ENGINE CHECKPOINT TOKENIZER PROMPT_FILE REPEATS PERF [env...]
 # One benchmark label, REPEATS independent launches, with the workload of the kernel campaigns.
 # The caller sets the CPU and memory binding through CPU_BIND and MEM_BIND (numactl arguments), or leaves them unset
-# for engine-owned placement, where the job must not impose a memory policy.
+# for engine-owned placement, where the job must not impose a memory policy. CONTEXT and GENERATION size the run;
+# WARM=N adds --warm-context N (an untimed prefill of N tokens, so the timed decode starts from a retained context of
+# that length: CONTEXT must exceed N plus the prompt and the generation); LOG_LEVEL (default warn) is info for runs
+# whose per-socket profile lines (LLAMA_PROFILE=1) are wanted.
 run_engine() {
   local label=$1 engine=$2 checkpoint=$3 tokenizer=$4 prompt=$5 repeats=$6 perf=$7
   shift 7
@@ -156,8 +159,8 @@ run_engine() {
   local r first=1 last=$repeats
   [[ -z ${REP:-} ]] || first=$REP last=$REP
   if dry_run; then
-    printf 'RUN %s reps=%s-%s cpu=%s mem=%s ctx=%s gen=%s env=%s\n' "$label" "$first" "$last" "${CPU_BIND:-}" \
-      "${MEM_BIND:-}" "${CONTEXT:-2048}" "${GENERATION:-128}" "$*" | tee -a "$OUT/dry-run.txt"
+    printf 'RUN %s reps=%s-%s cpu=%s mem=%s ctx=%s gen=%s warm=%s env=%s\n' "$label" "$first" "$last" "${CPU_BIND:-}" \
+      "${MEM_BIND:-}" "${CONTEXT:-2048}" "${GENERATION:-128}" "${WARM:-0}" "$*" | tee -a "$OUT/dry-run.txt"
     return 0
   fi
   for ((r = first; r <= last; r++)); do
@@ -165,7 +168,7 @@ run_engine() {
     env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
       --chat-template --prompt-file "$prompt" -t 0 --seed 42 --generation-length "${GENERATION:-128}" --no-text \
-      --log-level warn --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
+      ${WARM:+--warm-context "$WARM"} --log-level "${LOG_LEVEL:-warn}" --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
     local pid=$!
     if [[ $perf == 1 && $r == "$first" ]]; then perf_attach "$pid" "$prefix"; fi
     wait "$pid"
@@ -434,4 +437,83 @@ check_stage() {
     status=$?
   if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
   perf_available
+}
+
+# ---- two-socket helpers shared by the B and D phases ------------------------------------------------------------------
+# tp_validate NAME ARTIFACTS HF PRECISION LABEL [env...]: the Hugging Face gate without the one-socket numactl binding
+# of validate_gate. FP32 failure is fatal; INT8 is recorded against today's unchanged budget.
+tp_validate() {
+  local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
+  shift 5
+  if dry_run; then
+    printf 'VALIDATE %s %s %s env=%s\n' "$name" "$precision" "$label" "$*" | tee -a "$OUT/dry-run.txt"
+    return 0
+  fi
+  local extra=()
+  [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
+  (cd "$ROOT" && env "$@" "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
+    --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
+    --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
+    > "$OUT/correctness-$name-$label.stdout" 2> "$OUT/correctness-$name-$label.stderr" || status=$?
+  printf '%s %s exit=%s env=%s\n' "$name" "$label" "$status" "$*" >> "$OUT/correctness-status.txt"
+  return "$status"
+}
+
+# tp_placement REPORT [packed]: both sockets' weights regions fully verified on HBM 2 and HBM 3, an untied embedding on
+# DDR 0; with `packed`, also one packed (BF16 or int8 shard copies) region per socket on its node, fully verified.
+tp_placement() {
+  python3 - "$@" << 'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+regions = report.get('regions') or []
+bad = 0
+def check(name, ok, detail=''):
+    global bad
+    bad += not ok
+    print(('PASS' if ok else 'FAIL'), name, detail)
+check('run completed', report.get('status') == 'completed', str(report.get('status')))
+check('two sockets', (report.get('runtime') or {}).get('sockets') == 2)
+for socket, node in ((0, 2), (1, 3)):
+    found = [r for r in regions if r['role'] == 'weights' and r['socket'] == socket]
+    check(f'socket {socket} weights: one region on node {node}, fully verified, nothing elsewhere or missing',
+          len(found) == 1 and found[0]['node'] == node and found[0]['verified'] == 'full' and
+          (found[0]['pages_queried'] or 0) > 0 and found[0]['pages_mismatched'] == 0 and found[0]['pages_missing'] == 0,
+          str(found))
+if 'kv' in sys.argv[2:]:
+    kv = report.get('kv') or {}
+    check('KV caches of both sockets verified, none on another node, none missing', bool(kv.get('verified')) and
+          kv.get('pages_wrong_node') == 0 and (kv.get('pages_queried') or 0) > 0, str({k: kv.get(k) for k in
+          ('verified', 'full', 'pages_queried', 'pages_wrong_node', 'pages_missing')}))
+if 'packed' in sys.argv[2:]:
+    for socket, node in ((0, 2), (1, 3)):
+        found = [r for r in regions if r['role'] == 'packed' and r['socket'] == socket]
+        check(f'socket {socket} packed shards: on node {node}, fully verified',
+              len(found) >= 1 and all(r['node'] == node and r['verified'] == 'full' and r['pages_mismatched'] == 0 and
+                                      r['pages_missing'] == 0 for r in found), str(found))
+for r in regions:
+    if r['role'] == 'embedding':
+        check('global embedding on DDR node 0', r['node'] == 0 and r['verified'] == 'full' and r['pages_mismatched'] == 0, str(r))
+sys.exit(1 if bad else 0)
+PY
+}
+
+B_FLAGS=()
+# B_FLAGS replaces b_compare's strict budget (W8A8 sets the statistical gate), B_EXPECT its expectation (any = recorded
+# only, for the BF16 rung until C5 has fixed its gate), and CMP_TOKENS the token file.
+# b_compare DIR NAME PRECISION STAGED LABEL ENVA... -- ENVB...: logits of one configuration against another at every
+# position of the 86-token prompt (the gate of compare_engines.py: max |delta logit| <= 1e-3).
+b_compare() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=()
+  shift 5
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
+    shift
+  done
+  # One socket against two, C against C: no job-wide binding, so both teams can pin themselves. B_FLAGS replaces the strict
+  # budget (W8A8 uses the statistical gate of the library).
+  local flags=(--max-abs 1e-3)
+  [[ ${#B_FLAGS[@]} -eq 0 ]] || flags=("${B_FLAGS[@]}")
+  expect "compare-$name-$precision-$label" "${B_EXPECT:-ok}" "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
+    "$ROOT/build/release/probe-$precision" --checkpoint "$staged" --tokens-file "${CMP_TOKENS:-$dir/$name-tokens.txt}" "${args[@]}" \
+    "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }
