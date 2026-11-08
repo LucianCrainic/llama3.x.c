@@ -794,6 +794,11 @@ static void f32_team(const void *p, int worker, int workers) {
     f32_team_static(job, worker, workers);
 }
 
+/* Rows [4 * first, 4 * last) of the concatenated segments: the packed4 layout splits only between whole four-row groups. */
+static void f32_group_rows(const void *p, int first, int last) {
+  f32_rows(p, first * BLOCK, last * BLOCK);
+}
+
 static void f32_run(F32Job *job) {
   if (current_team) {
     team_run(current_team, f32_team, job);
@@ -802,7 +807,10 @@ static void f32_run(F32Job *job) {
   int rows = 0;
   for (int s = 0; s < job->count; s++)
     rows += job->segment[s].d;
-  parallel_rows(rows, f32_rows, job);
+  if (job->packed)
+    parallel_rows(rows / BLOCK, f32_group_rows, job); /* every segment has a multiple of four rows */
+  else
+    parallel_rows(rows, f32_rows, job);
 }
 
 void k_matmul(float *out, const float *x, const float *w, int n, int d) {
