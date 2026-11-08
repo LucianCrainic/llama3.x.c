@@ -62,7 +62,7 @@ class CampaignSummaryTests(unittest.TestCase):
         for bad in ('correctness-1b-fp32', '1b-fp32-omp-file-s1-t56', 'x-fp16-omp-file-s1-t1-1'):
             self.assertIsNone(sc.parse_label(bad))
 
-    def dry_run(self, script, phases, models=('m1b', 'm8b')):
+    def dry_run(self, script, phases, models=('m1b', 'm8b'), **extra):
         """Runs one campaign script with DRY_RUN=1 and returns its RUN lines; every run label must parse."""
         if not shutil.which('bash'):
             self.skipTest('bash is required')
@@ -70,7 +70,7 @@ class CampaignSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': phases,
-                   'MODELS': ' '.join(f'{m}:/a/{m}:/hf/{m}' for m in models)}
+                   'MODELS': ' '.join(f'{m}:/a/{m}:/hf/{m}' for m in models), **extra}
             result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr[-2000:])
         runs = [line for line in result.stdout.splitlines() if line.startswith('RUN ')]
@@ -95,6 +95,10 @@ class CampaignSummaryTests(unittest.TestCase):
         d2 = self.dry_run('cresco8-prefill.sbatch', 'D2')
         self.assertEqual(len(d2), 288)
         self.assertEqual({line.split('warm=')[1].split()[0] for line in d2}, {'0', '512', '8192'})
+        # GATES_ONLY=1 keeps the gates (and D1's placement runs) and drops the benchmark.
+        self.assertEqual(self.dry_run('cresco8-tp.sbatch', 'B7', GATES_ONLY='1'), [])
+        placement = self.dry_run('cresco8-prefill.sbatch', 'D1', GATES_ONLY='1')
+        self.assertTrue(placement and len(placement) < 20 and all('xplace' in line for line in placement), placement)
         c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
         decode = [line for line in c7 if 'xdec' in line]
         self.assertTrue(decode and all('warm=2048' in line for line in decode))

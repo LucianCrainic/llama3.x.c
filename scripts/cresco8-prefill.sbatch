@@ -669,6 +669,7 @@ d_rungs() {
 # at {64, 256} for the same node state, REPEATS interleaved repeats, then one profiled run per two-socket point (per-socket
 # GEMM, attention, exchange and wait times in the .stderr files). (5) Decode after a two-socket prefill, 128 tokens
 # after the 2048-token prompt, to compare with B7. About 2 hours for 1B and 8B; a failed gate stops the benchmark.
+# GATES_ONLY=1 runs only the gates and the placement checks (about 30 minutes).
 d1_gates() {
   local dir=$1 name=$2 artifacts=$3 hf=$4 precision staged rung m=64 n tokens
   local a b
@@ -752,6 +753,11 @@ phase_D1() {
     for precision in $PRECISIONS; do
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
       d1_placement "$dir" "$name" "$precision" "$staged" "$tokenizer"
+      if [[ ${GATES_ONLY:-0} == 1 ]]; then # the gates and the placement checks, without the sweep
+        echo 'GATES_ONLY=1: the gates and placement checks ran, the sweep did not' > "$dir/gates-only.txt"
+        unstage_model_on 0 "$name" "$precision"
+        continue
+      fi
       # (4) the M sweep, interleaved: every point once per repeat.
       for ((rep = 1; rep <= reps; rep++)); do
         for rung in $(d_rungs "$precision"); do

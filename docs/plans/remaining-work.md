@@ -48,6 +48,16 @@ names are fixed, then L8-L10. L8's decision should be made before L6 so the B7 m
 Every submission needs the user's go-ahead for that job (plans README §6.5). Nodes are exclusive, so these run one at a
 time; the order puts the cheap gates ahead of the long campaigns.
 
+### 2.0 Pre-flight (done)
+
+| Job | Result |
+| --- | --- |
+| 5704660 (`PHASE=none`, tree 51e8424) | FAILED in `test-kernels`: the OpenMP build split the packed4 GEMV mid-group; fixed in 0679af8 |
+| 5704671 (`PHASE=none`, tree 73043e5) | PASSED in 36 minutes: `make test` green on the hardware, including the AVX-512 and real-AMX kernel and GEMM tests, `test-sizing`, `test-workers` (the 256 x 4096 exchange stress) and the 24 two-socket tests |
+
+`GATES_ONLY=1` (B7, D1) runs only the gates and D1's placement checks, so the hardware-only paths (the AVX-512 packed4 bitwise gate of B7, AMX on two
+sockets, the KV and packed-shard placement) can be checked before a campaign.
+
 ### 2.1 Check jobs (≤ 90 min each)
 
 | ID | Job | Purpose | Closes |
