@@ -25,6 +25,7 @@ job_begin
 # On hbm14: S0 = cores 0-55, DDR 0, HBM 2; S1 = cores 56-111, DDR 1, HBM 3 (explicit map C/H/D = package/HBM/DDR).
 EXPLICIT='explicit:0/2/0,1/3/1'
 # Two sockets run with no job-wide CPU or memory binding: each team pins itself and each region binds itself.
+B_FLAGS=() # b_compare's budget when it is not the strict 1e-3 (W8A8 sets the statistical gate)
 TP_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm)
 
 # tp_validate NAME ARTIFACTS HF PRECISION LABEL [env...]: the Hugging Face gate without the one-socket numactl binding
@@ -165,10 +166,13 @@ b_compare() {
     if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
     shift
   done
-  # One socket against two, C against C: no job-wide binding, so both teams can pin themselves.
+  # One socket against two, C against C: no job-wide binding, so both teams can pin themselves. B_FLAGS replaces the strict
+  # budget (W8A8 uses the statistical gate of the library).
+  local flags=(--max-abs 1e-3)
+  [[ ${#B_FLAGS[@]} -eq 0 ]] || flags=("${B_FLAGS[@]}")
   expect "compare-$name-$precision-$label" ok "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
     "$ROOT/build/release/probe-$precision" --checkpoint "$staged" --tokens-file "$dir/$name-tokens.txt" "${args[@]}" \
-    --max-abs 1e-3 --output "$dir/compare-$name-$precision-$label.json"
+    "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }
 
 # b_smoke NAME PRECISION ENGINE STAGED TOKENIZER TAG ENV...: one profiled two-socket run (recorded, not a gate) and its
@@ -233,8 +237,10 @@ phase_B6() {
     for precision in $PRECISIONS; do
       [[ $precision == int8 ]] || continue
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      B_FLAGS=("${W8A8_GATE[@]}")
       b_compare "$dir" "$name" "$precision" "$staged" w8a8-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 -- "${TP_ENV[@]}" \
         LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1
+      B_FLAGS=()
       b_compare "$dir" "$name" "$precision" "$staged" w8a32-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 \
         LLAMA_Q8_ACTIVATIONS=fp32 -- "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_Q8_ACTIVATIONS=fp32
       if [[ ${HF_GATE:-1} != 0 ]]; then

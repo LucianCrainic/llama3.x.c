@@ -298,6 +298,13 @@ tokens_of() {
 # DIR/NAME-tokens.txt. Phases set them and restore the defaults afterwards.
 CMP_FLAGS=(--bitwise)
 CMP_TOKENS=
+# W8A8 requantizes its activations: any change in FP32 operation order (another ISA, AMX, a split over two sockets) moves
+# the logits by a noise floor that is the same whatever the cause (measured on 1B, W8A8, 53 positions: scalar against
+# AVX-512 rms 0.063 / max 0.34, AMX-INT8 against scalar 0.062 / 0.36, two sockets against one 0.063 / 0.41; 8B up to
+# rms 0.086 / max 1.41), while W8A32 agrees to 3e-5 in the same runs. A per-position 1e-3 budget therefore cannot hold;
+# these provisional bounds sit a factor above the observed values. The _LAST form is for a single compared row.
+W8A8_GATE=(--max-abs 2.0 --rms-max 0.15 --argmax-min 0.9)
+W8A8_GATE_LAST=(--max-abs 2.0 --rms-max 0.15 --argmax-min 0)
 # a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine comparison on the
 # tokens of the model (default gate: bitwise equality at every position).
 a_bitwise() {

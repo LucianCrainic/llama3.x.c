@@ -5,6 +5,12 @@ maximum absolute difference, the RMS difference, the maximum relative difference
 Relative differences use max(|reference logit|, 1) as the denominator, so near-zero logits do not dominate.
 Config A is the reference. The exit status is non-zero when any position is over budget or its argmax differs.
 
+W8A8 requantizes its activations, so any change in FP32 operation order (another ISA, a split over two sockets) can flip
+a rounding decision and move the logits by a position-independent noise floor (rms ~0.06, measured scalar against
+AVX-512 on 1B and 8B) that no per-position 1e-3 budget survives. --rms-max and/or --argmax-min switch to a statistical
+gate for such comparisons: passed when every logit is finite, max |delta| <= --max-abs, rms <= --rms-max and the argmax
+agreement over all positions >= --argmax-min (positions are then not judged one by one).
+
     compare_engines.py --probe build/release/probe-fp32 --checkpoint fp32-v3.bin --tokens 1,5,9 \\
         --env-b LLAMA_BACKEND=teams --env-b LLAMA_THREADS=4 --output compare.json
 """
@@ -96,6 +102,9 @@ def main(argv=None):
     parser.add_argument('--max-abs', type=float, default=1e-3, help='budget for max |delta logit| (default 1e-3)')
     parser.add_argument('--last-only', action='store_true',
                         help='compare only the final position (config B runs the batched path with LLAMA_PREFILL_LOGITS=last)')
+    parser.add_argument('--rms-max', type=float, help='statistical gate: budget for the rms of the logit differences')
+    parser.add_argument('--argmax-min', type=float,
+                        help='statistical gate: minimum fraction of positions whose argmax agrees (default 1.0)')
     parser.add_argument('--bitwise', action='store_true', help='require bit-identical logits instead of the --max-abs budget')
     parser.add_argument('--output', help='write the JSON result here as well as to stdout')
     args = parser.parse_args(argv)
@@ -115,19 +124,28 @@ def main(argv=None):
     if len(blob_a) != len(blob_b):
         raise SystemExit('the two configurations produced logits of different sizes')
     rows = []
+    statistical = args.rms_max is not None or args.argmax_min is not None
+    if statistical and args.bitwise:
+        raise SystemExit('--bitwise cannot be combined with --rms-max or --argmax-min')
     for index, row in enumerate(positions(blob_a, blob_b, compared)):
         position = len(tokens) - 1 if args.last_only else index
         row.update(position=position, token=tokens[position])
-        row['passed'] = row['finite'] and row['argmax_match'] and (
+        row['passed'] = row['finite'] and (statistical or row['argmax_match']) and (
             row['bitwise'] if args.bitwise else row['max_abs'] <= args.max_abs)
         rows.append(row)
     summary = dict(max_abs=max(r['max_abs'] for r in rows), rms=math.sqrt(sum(r['rms'] ** 2 for r in rows) / len(rows)),
                    max_rel=max(r['max_rel'] for r in rows),
                    argmax_agreement=sum(r['argmax_match'] for r in rows) / len(rows),
                    bitwise=all(r['bitwise'] for r in rows))
-    result = dict(passed=all(r['passed'] for r in rows), probe=str(args.probe), checkpoint=str(args.checkpoint),
+    argmax_min = 1.0 if args.argmax_min is None else args.argmax_min
+    passed = all(r['passed'] for r in rows)
+    if statistical:
+        passed = passed and summary['argmax_agreement'] >= argmax_min and (
+            args.rms_max is None or summary['rms'] <= args.rms_max)
+    result = dict(passed=passed, probe=str(args.probe), checkpoint=str(args.checkpoint),
                   env_a=env_a, env_b=env_b, batch_a=args.batch_a, batch_b=args.batch_b, tokens=len(tokens),
-                  budget=dict(max_abs=0.0 if args.bitwise else args.max_abs, argmax_agreement=1.0, bitwise=args.bitwise),
+                  budget=dict(max_abs=0.0 if args.bitwise else args.max_abs, argmax_agreement=argmax_min,
+                              bitwise=args.bitwise, rms_max=args.rms_max, statistical=statistical),
                   summary=summary, comparisons=rows)
     out = json.dumps(result, indent=2) + '\n'
     if args.output:

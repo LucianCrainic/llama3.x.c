@@ -426,7 +426,7 @@ phase_C6() {
     CMP_TOKENS="$dir/$name-tokens.txt"
     a_bitwise "$dir" "$name" int8 "$staged" avx512-q8-m64-vs-per-token-prompt86 "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
       LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on
-    CMP_FLAGS=(--max-abs 1e-3 --batch-a 64 --batch-b 64)
+    CMP_FLAGS=("${W8A8_GATE[@]}" --batch-a 64 --batch-b 64)
     a_bitwise "$dir" "$name" int8 "$staged" amx-int8-m64-vs-avx512-q8-prompt86 "${benv[@]}" LLAMA_KERNELS=avx512 \
       LLAMA_PREFILL_GEMM=on -- "${benv[@]}" LLAMA_KERNELS=amx
     CMP_FLAGS=(--max-abs 1e-3 --batch-b 64 --last-only)
@@ -435,8 +435,15 @@ phase_C6() {
       "${benv[@]}" LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on
     # AMX-INT8 against the AVX-512 batched path at the last position of the long prompt: both sides batched, last-only needs
     # A to be per-token, so the AMX side is compared with the per-token path instead (same budget).
+    CMP_FLAGS=("${W8A8_GATE_LAST[@]}" --batch-b 64 --last-only)
     a_bitwise "$dir" "$name" int8 "$staged" amx-int8-m64-vs-per-token-prompt2048-last "${benv[@]}" LLAMA_KERNELS=avx512 -- \
       "${benv[@]}" LLAMA_KERNELS=amx
+    # The arithmetic itself: with FP32 activations there is no requantization, so the AMX selection (which keeps W8A32 on
+    # AVX-512) agrees with the per-token path to the strict budget.
+    CMP_FLAGS=(--max-abs 1e-3 --batch-b 64)
+    CMP_TOKENS="$dir/$name-tokens.txt"
+    a_bitwise "$dir" "$name" int8 "$staged" amx-w8a32-m64-vs-per-token-prompt86 "${benv[@]}" LLAMA_KERNELS=avx512 \
+      LLAMA_Q8_ACTIVATIONS=fp32 -- "${benv[@]}" LLAMA_KERNELS=amx LLAMA_Q8_ACTIVATIONS=fp32
     CMP_FLAGS=(--bitwise) CMP_TOKENS=
     # Hugging Face, recorded as for the other Q8 comparisons: per-token Q8 and AMX-INT8 batched; read the two max_abs
     # values against each other (AMX-INT8 <= per-token + 1e-3).

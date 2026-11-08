@@ -153,6 +153,22 @@ class CompareEnginesTests(unittest.TestCase):
         result, _ = self.compare('int8', '--env-b', 'LLAMA_Q8_ACTIVATIONS=fp32', '--output', str(output))
         self.assertEqual(json.loads(output.read_text())['tokens'], 4)
 
+    def test_statistical_gate_for_requantizing_comparisons(self):
+        """W8A8 moves by a noise floor under any FP32 reordering, so --rms-max / --argmax-min judge the whole comparison."""
+        perturb = ('--env-b', 'LLAMA_Q8_ACTIVATIONS=fp32')
+        result, data = self.compare('int8', *perturb, '--max-abs', '100', '--rms-max', '100', '--argmax-min', '0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(data['passed'])
+        self.assertEqual(data['budget']['rms_max'], 100.0)
+        self.assertTrue(data['budget']['statistical'])
+        for failing in (('--max-abs', '1e-12', '--rms-max', '100'), ('--max-abs', '100', '--rms-max', '1e-12'),
+                        ('--max-abs', '100', '--argmax-min', '1.5')):
+            result, data = self.compare('int8', *perturb, *failing)
+            self.assertEqual(result.returncode, 1, failing)
+            self.assertFalse(data['passed'], failing)
+        result, _ = self.compare('int8', *perturb, '--bitwise', '--rms-max', '1')
+        self.assertNotEqual(result.returncode, 0)
+
     def test_batched_prefill_is_bitwise_equal_to_per_token(self):
         for engine in ('fp32', 'int8'):
             for batch in ('3', '32'):
