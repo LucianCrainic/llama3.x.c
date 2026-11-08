@@ -852,6 +852,62 @@ phase_D2() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
 }
 
+# ---- D3: where does the W8A8 deviation of two-socket AMX-INT8 come from? (diagnostic, not a plan phase) ---------------------
+# D1's gate compares two-socket AMX-INT8 with one-socket AMX-INT8 on the 86-token prompt; on 8B it showed one position at
+# max |dlogit| 4.12 (budget 2.0) and rms 0.136, against 0.58 and 0.063 for AVX-512 VNNI. This records, without gating, the
+# deviation of every pair that isolates one factor: the kernel (one socket AMX against one socket AVX-512), the split (two
+# sockets against one at the same kernel), and the microbatch size (M = 64 against 16 on two sockets). All use W8A8 and the
+# statistical summary; read d3-summary.txt.
+d3_case() { # LABEL SOCKETS_A KERNEL_A M_A SOCKETS_B KERNEL_B M_B
+  local label=$1 a b kernel
+  local env_for=() 
+  for side in a b; do
+    local sockets kernel m
+    if [[ $side == a ]]; then sockets=$2 kernel=$3; else sockets=$5 kernel=$6; fi
+    local words=("${D_ENV[@]}" "LLAMA_SOCKETS=$sockets" "LLAMA_KERNELS=$kernel")
+    [[ $kernel != avx512 ]] || words+=(LLAMA_PREFILL_GEMM=on)
+    [[ $sockets != 2 ]] || words+=(LLAMA_TP_CHECK=1)
+    if [[ $side == a ]]; then a=("${words[@]}"); else b=("${words[@]}"); fi
+  done
+  B_EXPECT=any B_FLAGS=(--max-abs 1e30 --batch-a "$4" --batch-b "$7")
+  b_compare "$D3_DIR" "$D3_NAME" int8 "$D3_STAGED" "d3-$label" "${a[@]}" -- "${b[@]}"
+}
+
+phase_D3() {
+  local dir="$OUT/D3" entry name artifacts hf n
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no D3 run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  c_prompts "$dir" 2048
+  D3_DIR=$dir
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    D3_NAME=$name
+    D3_STAGED=$(stage_model_on 0 "$name" int8 "$artifacts")
+    for n in short 2048; do
+      CMP_TOKENS="$dir/$name-tokens$([[ $n == short ]] || echo "-$n").txt"
+      suffix=$([[ $n == short ]] || echo -prompt2048)
+      d3_case "1s-amx-vs-1s-avx512$suffix" 1 amx 64 1 avx512 64
+      d3_case "2s-amx-vs-1s-avx512$suffix" 2 amx 64 1 avx512 64
+      d3_case "2s-amx-vs-2s-avx512$suffix" 2 amx 64 2 avx512 64
+      d3_case "2s-amx-vs-1s-amx$suffix" 2 amx 64 1 amx 64
+      d3_case "2s-amx-m64-vs-m16$suffix" 2 amx 64 2 amx 16
+    done
+    B_FLAGS=() B_EXPECT=ok CMP_TOKENS=
+    unstage_model_on 0 "$name" int8
+  done
+  dry_run || python3 - "$dir" > "$OUT/d3-summary.txt" << 'PY'
+import glob, json, os, sys
+print(f'{"comparison":58} {"max_abs":>8} {"rms":>7} {"argmax":>7} {"bitwise":>8}')
+for path in sorted(glob.glob(os.path.join(sys.argv[1], 'compare-*-d3-*.json'))):
+    d = json.load(open(path))
+    s = d['summary']
+    print(f'{os.path.basename(path)[8:-5]:58} {s["max_abs"]:8.3f} {s["rms"]:7.4f} {s["argmax_agreement"]:7.3f} {str(s["bitwise"]):>8}')
+PY
+}
+
 require_phases
 if ! dry_run; then
   check_stage

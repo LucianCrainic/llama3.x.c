@@ -118,9 +118,7 @@ def main(argv=None):
     compared = len(tokens)
     if args.last_only:
         row_bytes = len(blob_a) // (len(tokens) if not args.batch_a else 1)
-        blob_a, compared = blob_a[-row_bytes:], 1
-        if args.batch_a:
-            raise SystemExit('--last-only needs config A to be the per-token path')
+        blob_a, compared = blob_a[-row_bytes:], 1  # a batched side already returns just the final row
     if len(blob_a) != len(blob_b):
         raise SystemExit('the two configurations produced logits of different sizes')
     rows = []
