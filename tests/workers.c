@@ -220,8 +220,21 @@ typedef struct {
   unsigned delay_permille, delay_us; /* chance per protocol step and longest sleep */
   int fail_at, fail_worker;          /* generation at which to call fail(); fail_worker -1 = the coordinator */
   int flags;                         /* the flag form: rows produced in interleaved chunks, no team barrier */
+  /* D1: a schedule of reductions on one exchange. Generation g (from 1) reduces schedule[(g - 1) % schedule_len]
+   * elements, in the flag form when forms[...] is set: decode-sized flag reductions between batch-sized barrier ones. */
+  const int *schedule;
+  const char *forms;
+  int schedule_len;
   float *residual;
 } Side;
+
+static int gen_elements(const Side *side, unsigned g) {
+  return side->schedule ? side->schedule[(g - 1) % (unsigned)side->schedule_len] : side->elements;
+}
+
+static int gen_flags(const Side *side, unsigned g) {
+  return side->schedule ? side->forms[(g - 1) % (unsigned)side->schedule_len] : side->flags;
+}
 
 typedef struct {
   Side *side;
@@ -241,31 +254,31 @@ static void generation_fn(const void *p, int worker, int workers) {
   const GenJob *job = p;
   Side *side = job->side;
   unsigned state = side->seed + 0x9E3779B9U * (unsigned)(worker + 1) + job->generation * 7919U;
-  int i0 = (int)((long long)side->elements * worker / workers),
-      i1 = (int)((long long)side->elements * (worker + 1) / workers);
+  const int elements = gen_elements(side, job->generation), flags = gen_flags(side, job->generation);
+  int i0 = (int)((long long)elements * worker / workers), i1 = (int)((long long)elements * (worker + 1) / workers);
   inject(&state, side);
   if ((int)job->generation == side->fail_at && worker == side->fail_worker)
     fail("injected failure in exchange worker %d of socket %d", worker, side->socket);
-  if (side->flags) {
+  if (flags) {
     /* Rows in chunks of 5, dealt to the members differently on each socket and generation, as claiming would. */
-    const int chunk = 5, chunks = (side->elements + chunk - 1) / chunk;
+    const int chunk = 5, chunks = (elements + chunk - 1) / chunk;
     for (int c = 0; c < chunks; c++) {
       if ((c + (int)job->generation + side->socket) % workers != worker)
         continue;
-      int r0 = c * chunk, r1 = r0 + chunk < side->elements ? r0 + chunk : side->elements;
+      int r0 = c * chunk, r1 = r0 + chunk < elements ? r0 + chunk : elements;
       for (int i = r0; i < r1; i++)
         job->partial[i] = partial_value(side->seed, job->generation, side->socket, i);
       inject(&state, side);
       exchange_rows_done(side->exchange, side->socket, r0, r1);
     }
-    exchange_reduce_add_flags(side->exchange, side->socket, worker, workers, side->residual, side->elements, NULL);
+    exchange_reduce_add_flags(side->exchange, side->socket, worker, workers, side->residual, elements, NULL);
     inject(&state, side);
     return;
   }
   for (int i = i0; i < i1; i++)
     job->partial[i] = partial_value(side->seed, job->generation, side->socket, i);
   inject(&state, side); /* a late ready */
-  exchange_reduce_add(side->exchange, side->socket, worker, workers, side->residual, side->elements);
+  exchange_reduce_add(side->exchange, side->socket, worker, workers, side->residual, elements);
   inject(&state, side); /* a late next projection */
 }
 
@@ -281,7 +294,7 @@ static void run_side(Side *side) {
       return; /* aborted */
     GenJob job = {side, (unsigned)g, partial};
     team_run(team, generation_fn, &job);
-    if (side->flags)
+    if (gen_flags(side, (unsigned)g))
       exchange_reduce_finish(side->exchange, side->socket);
   }
 }
@@ -295,6 +308,9 @@ typedef struct {
   int threads[2], elements, generations;
   unsigned delay_permille[2], delay_us[2];
   int use_regions, fail_at, fail_worker, flags;
+  const int *schedule; /* see Side */
+  const char *forms;
+  int schedule_len;
 } ExchangeCase;
 
 static void exchange_case(const ExchangeCase *c) {
@@ -325,6 +341,9 @@ static void exchange_case(const ExchangeCase *c) {
                      .fail_at = c->fail_at,
                      .fail_worker = c->fail_worker,
                      .flags = c->flags,
+                     .schedule = c->schedule,
+                     .forms = c->forms,
+                     .schedule_len = c->schedule_len,
                      .residual = memory_alloc((size_t)c->elements, sizeof(float), MEM_ACTIVATION)};
     side[s].fail_at = c->fail_at && ((s == 1) == (c->fail_worker >= 0)) ? c->fail_at : 0; /* one socket fails */
     memcpy(side[s].residual, initial, (size_t)c->elements * sizeof(float));
@@ -337,7 +356,7 @@ static void exchange_case(const ExchangeCase *c) {
   if (!c->fail_at)
     pthread_join(thread, NULL);
   for (int g = 1; g <= c->generations; g++)
-    for (int i = 0; i < c->elements; i++)
+    for (int i = 0; i < gen_elements(&side[0], (unsigned)g); i++)
       reference[i] += partial_value(1234, (unsigned)g, 0, i) + partial_value(1234, (unsigned)g, 1, i);
   for (int s = 0; s < 2; s++) {
     for (int i = 0; i < c->elements; i++)
@@ -534,6 +553,31 @@ static void unit_leaders(void) {
 }
 #endif
 
+/* D1: the exchange is created for M_max x dim elements and carries both kinds of reduction in turn: batch-sized ones in
+ * the two-barrier form (the GEMM has no row callback) and decode-sized ones in the flag form, with partial sums of
+ * different lengths in the same buffers, under random delays on either socket. M_max = 256 rows of dim 4096 is a million
+ * elements per reduction. */
+static void unit_exchange_batched(int scale) {
+  enum { DIM = 4096 };
+  const int schedule[] = {DIM * 256, DIM, DIM * 3, DIM, DIM * 64, 1, DIM * 256, DIM * 17, DIM, DIM * 256};
+  const char forms[] = {0, 1, 0, 1, 0, 1, 0, 0, 1, 0};
+  const int teams[][2] = {{3, 3}, {2, 5}, {1, 7}};
+  for (size_t t = 0; t < sizeof(teams) / sizeof(*teams); t++)
+    for (int regions = 0; regions < 2; regions++) {
+      ExchangeCase c = {.threads = {teams[t][0], teams[t][1]},
+                        .elements = DIM * 256,
+                        .generations = 3 * (int)(sizeof(schedule) / sizeof(*schedule)) * scale / 100,
+                        .fail_worker = -1,
+                        .use_regions = regions,
+                        .schedule = schedule,
+                        .forms = forms,
+                        .schedule_len = (int)(sizeof(schedule) / sizeof(*schedule)),
+                        .delay_permille = {200, 50},
+                        .delay_us = {300, 600}};
+      exchange_case(&c);
+    }
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && !strcmp(argv[1], "bench-exchange")) {
     bench_exchange(argc > 2 ? atoi(argv[2]) : 20000, argc > 3 ? atoi(argv[3]) : 4);
@@ -559,6 +603,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 1 || (argc == 2 && atoi(argv[1]) > 0)) {
     unit_exchange(100);
+    unit_exchange_batched(100);
     unit_exchange_abort();
     unit_lifecycle();
     unit_rows();

@@ -383,7 +383,9 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
   Transformer *t = model->implementation;
   Config *p = &t->config;
   RunState *s = &t->state;
-  if (t->tp) { /* per-token on two sockets; D1 adds the batched path */
+  if (t->tp && model->prefill_gemm && (count > 1 || model->prefill_bf16))
+    return tp_forward_batch(t->tp, tokens, count, pos0, want);
+  if (t->tp) { /* a single row, or the GEMM switched off: per token on two sockets */
     float *logits = NULL;
     if (want == LOGITS_ALL && !s->batch_logits)
       s->batch_logits = memory_alloc(checked_mul(model->max_batch, p->vocab_size), sizeof(float), MEM_ACTIVATION);
@@ -460,11 +462,12 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->prefill_bf16 = prefill_precision(0);
   prefill_configure(model);
   if (tp_sockets_requested() == 2) {
-    if (model->prefill_bf16)
-      fail("LLAMA_PRECISION=bf16 is not supported with LLAMA_SOCKETS=2: the two-socket FP32 forward has no batched path yet");
-    model->prefill_gemm = 0;
-    model->prefill_kernel = kernels_name();
-    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0, 0);
+    /* D1: with the GEMM on, microbatches run through the batched two-socket forward, else per token as before. In BF16
+     * mode every microbatch does, even a single row, so a prompt's precision does not depend on how it was split. */
+    bf16_mode = t->bf16 = model->prefill_bf16;
+    model->prefill_kernel = t->bf16 ? (kernels_amx_active() ? "amx-bf16" : "bf16-reference") : kernels_name();
+    t->tp = tp_create(&t->config, &t->manifest, t->fd, 0, 0, 0, model->prefill_gemm ? model->max_batch : 1,
+                      t->bf16 ? TP_PACK_BF16 : TP_PACK_NONE);
     munmap(t->data, t->file_size); /* the shards were read with pread */
     t->data = MAP_FAILED;
     model->mapped_bytes = 0;
@@ -483,7 +486,7 @@ void engine_load_context(Model *model, const char *path, int context) {
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;
   if (t->tp) {
-    tp_kv_stats(t->tp, position, out);
+    tp_kv_stats(t->tp, position, verify, out);
     return;
   }
   size_t kv_dim = (size_t)t->config.head_dim * t->config.n_kv_heads;
