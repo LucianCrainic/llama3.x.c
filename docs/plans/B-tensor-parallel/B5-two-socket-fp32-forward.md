@@ -13,9 +13,7 @@ cover:
 
 Its logits must agree with the one-socket reference within the FP32 budget.
 
-Status: **implemented and tested locally on the virtual topology (macOS, scalar kernels, ASAN/UBSAN, TSAN); nothing
-run on the cluster**. Branch: `feature/tp-local-b` (commit `feat: add the two-socket FP32 forward behind
-LLAMA_SOCKETS=2`).
+Status: **implemented; agreement check passed, decode slower than one socket** (see Cluster results).
 
 **Open risk:** B5 sits on A4's owned-weight conventions (regions, strict placement, verification), whose cluster check is
 still pending, and on B4's latency and B1's HBM placement, which have never run on real sockets.
@@ -145,6 +143,21 @@ user's go-ahead to submit.
 | `validate.py --hf` with `LLAMA_SOCKETS=2` | Today's FP32 budget vs HF (1e-3) |
 | Placement | Socket 0 regions on node 2 and socket 1 regions on node 3, 100% verified |
 | Smoke benchmark: 8B FP32, 2 × 56, `short.txt`, 1 repeat, with `LLAMA_PROFILE=1` | Records decode tok/s and the per-phase breakdown. Not a gate. |
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Job 5694402 (commit `4677bd5`), `LLAMA_SOCKETS=2`, 56 workers per socket, weights on HBM nodes 2 and 3.
+
+- **Agreement** (`compare_engines.py`, one socket against two, 53 positions, budget 1e-3, argmax 100%): max |Δlogit|
+  1.0e-5 (1B) and 3.3e-5 (8B), argmax 100%. The smoke placement check passes on both models.
+- **Bug found by the check.** For a model with a tied embedding the global region is never reserved; its zeroed record read as
+  a bound region on node 0 and strict placement failed (fixed in `4677bd5`).
+- **Speed, smoke only** (one launch, 86-token prompt, 128 tokens): decode 64.3 tok/s (1B) and 11.3 tok/s (8B), against
+  about 87 and 14.6-14.9 on one socket. **Two-socket decode is currently slower than one socket.** The decode profile
+  is dominated by the projections that end in the reduction (8B: W2 40%, Wo 25%, W1/W3 24%), yet the 64 measured
+  reductions per token account for only 3-4 ms of the 88 ms token (B4). The remaining loss has not been explained;
+  profiling the Wo/W2 column-shard kernels and the reduction wait per socket (`phase_seconds`) is the first step of B7.
+- **Not run.** The Hugging Face gate with `LLAMA_SOCKETS=2` (`HF_GATE=0`).
 
 ## 7. Exit criteria
 

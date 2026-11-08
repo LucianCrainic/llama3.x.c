@@ -7,9 +7,7 @@ grouped attention for its own query heads on its own team, with local head index
 and per-team task queues. The KV history, the attention scores and the per-head outputs
 never cross sockets (study §7).
 
-Status: **kernel side implemented and tested locally (macOS, scalar); engine-side KV regions and state land with B5;
-cluster `check` pending**. Branch: `feature/tp-local-b` (commit `test: check socket-local attention against the full
-attention`).
+Status: **kernel side and engine side implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -91,6 +89,13 @@ user's go-ahead to submit.
 - Run the attention kernel tests with 2 × 56 pinned workers.
 - Measure attention task time per socket at contexts 512, 8192 and 32768 with
   synthetic Q/K/V, to check the chunk count against the team size.
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Job 5694397 (commit `44ce282`). The two-team attention split test (`LLAMA_TEST_TEAMS=1,56`) and the attention
+benchmark on 2 × 28 and 2 × 56 pinned workers pass. Attention call latency on 56 workers, median of the runs, AVX-512
+split-K: 41-43 µs at 512 positions (14 chunks), 135-140 µs at 8192 (33 chunks), 556-610 µs at 32768 (129 chunks). The first
+attempt crashed here (SIGSEGV in `team_barrier`): see the note in B1.
 
 ## 7. Exit criteria
 

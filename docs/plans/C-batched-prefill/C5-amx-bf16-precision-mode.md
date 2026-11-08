@@ -13,10 +13,7 @@ with AMX-BF16.
 FP32 execution is never changed silently. Without `LLAMA_PRECISION=bf16`, nothing in
 this phase is active.
 
-Status: **implemented locally; cluster check pending** (2026-11-07). Branch: `feature/prefill-c5-amx-bf16` (worked
-on in the `tp-local-c` worktree). The mode, packing, GEMM driver, scalar reference forward, report fields and guards
-are in and tested on macOS (portable reference and the software tile model). The AMX hardware run, the error
-characterization against FP32 and HF, and therefore the final error gate, are open: §6.
+Status: **implemented; cluster check passed, error record taken, gate and Hugging Face comparison still to fix** (see Cluster results).
 
 ## 2. Depends on / unblocks
 
@@ -145,6 +142,32 @@ everything about speed.
   AVX512-BF16 instruction `vcvtneps2bf16` is deliberately not used: it flushes denormal inputs, which would break the
   bitwise equality with the reference. Measure the conversion cost on the cluster (§8) before deciding whether a
   vectorized integer version is needed.
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Job 5694396 (commit `44ce282`), `LLAMA_PRECISION=bf16`, AMX-BF16 prefill at M = 64 against the FP32 per-token path.
+
+- **Error record** (all positions; the FP32 AVX-512 GEMM is shown for scale):
+
+  | Model, prompt | BF16 max \|Δlogit\| | BF16 rms | BF16 argmax agreement | FP32 GEMM max \|Δlogit\| |
+  | --- | ---: | ---: | ---: | ---: |
+  | 1B, 53 tokens | 0.057 | 0.0096 | 98.1% | 1.1e-5 |
+  | 1B, 128 / 256 / 512 | 0.23 / 0.23 / 0.23 | 0.020 / 0.0195 / 0.017 | 98.4% / 99.2% / 99.6% | 2.9e-5 / 3.1e-5 / 3.1e-5 |
+  | 8B, 53 tokens | 0.77 | 0.023 | 100% | 1.4e-4 |
+  | 8B, 128 / 256 / 512 | 0.48 / 0.50 / 1.48 | 0.016 / 0.020 / 0.024 | 100% | 4.7e-5 / 2.0e-4 / 4.8e-4 |
+
+  The provisional gate of this document (argmax agreement >= 99% on the four `validate.py` prompts and identical greedy
+  continuations on at least three) is not yet decided: the 1B short prompt is at 98.1%, and the comparison with Hugging Face
+  is missing (`HF_GATE=0`). Fix the gate from the Hugging Face numbers.
+- **Prefill speed** (2048-token prompt, 56 threads, median of 3; AVX-512 FP32 GEMM and per-token for scale):
+
+  | Model | per-token | FP32 GEMM, M = 64 | AMX-BF16 M = 32 | M = 64 | M = 128 | M = 256 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 1B, tok/s | 111.8 | 915 | 1991 | 2274 | 2490 | 2612 |
+  | 8B, tok/s | 16.5 | 173.5 | 404 | 472 | 540 | 570 |
+
+  8B TTFT falls from 126.5 s (per-token) and 12.1 s (FP32 GEMM) to 3.7 s (AMX-BF16, M = 256). Decode is unchanged
+  (1B 88.7 tok/s as FP32; 8B 14.2-14.4).
 
 ## 7. Exit criteria
 

@@ -12,8 +12,7 @@ Add the kernel variants that a shard needs:
 The residual is added exactly once, after the cross-socket sum (B4). Without this, a
 per-socket `ADD` epilogue would apply the residual twice (study §6.2).
 
-Status: **implemented and tested locally (macOS, scalar); AVX-512 type-checked only, cluster `check` pending**.
-Branch: `feature/tp-local-b` (commit `feat: add partial-output and strided shard kernels`).
+Status: **implemented; cluster check passed** (see Cluster results).
 
 Implementation notes:
 
@@ -110,6 +109,12 @@ and 7:
 `cresco8-tp.sbatch STAGE=check PHASE=B2`. **Estimated** at 15 minutes. It needs the
 user's go-ahead to submit. It runs `test-kernels` on AVX-512 with team sizes 1, 28 and
 56, and checks for `avx512 ok`.
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Jobs 5694397 and 5694402. `test-kernels` passes scalar, AVX-512 and AMX levels on teams of 1, 28 and 56 (7,920,258 checks,
+0 failures), including the `PARTIAL` epilogue, the column-slice and padded-`ld` cases; the AVX-512 half of these tests
+had never run before this check. `make test` is green on Linux (job 5694402), as are the AMX kernels (`kernels: amx ok`).
 
 ## 7. Exit criteria
 

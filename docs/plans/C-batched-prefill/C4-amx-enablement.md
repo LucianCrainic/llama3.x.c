@@ -12,9 +12,7 @@ Make AMX available as a runtime-selected ISA level without adding dependencies:
 
 Nothing in the forward pass uses AMX yet. That comes in C5 and C6.
 
-Status: **implemented locally; AMX hardware check pending** (2026-11-07). Branch: `feature/prefill-c4-amx-enable`
-(worked on in the `tp-local-c` worktree). Everything below is in; what has run is listed in §5, and what needs a
-real AMX node is the open cluster check in §6.
+Status: **implemented; cluster check passed on real AMX hardware** (see Cluster results).
 
 ## 2. Depends on / unblocks
 
@@ -159,6 +157,21 @@ FP32 rounding per addition; the hardware's order inside a pair is not specified,
   tiles. The C5 and C6 drivers own that padding in their aligned A panels.
 - **Workspace.** `aligned_buffer_alloc()` carves a 64-byte-aligned range out of an accounted `memory_alloc`; the C5
   packed weights use a bound region instead.
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Jobs 5694396 (commit `44ce282`) and 5694402 (commit `4677bd5`); results `m3-prefill-20261107-2` and `m3-tp-20261107-3`
+under `~/PFS/lpor`; the host reports `amx_tile amx_bf16 amx_int8` and Linux 5.14. The first two attempts (jobs 5694393/5694397, commits `af44c34` and `44ce282`) found three bugs that macOS cannot show and that are fixed: the emulation test targets did not compile where GCC defines the real AVX-512 types, `attention_team` and `batch_team` took their barrier team from a thread-local that workers never set (SIGSEGV with per-thread teams, AVX-512 only), and the placement check of an unreserved global region (tied embedding) failed.
+
+- **First execution of AMX.** The tile-data permission is granted (`build.amx_permission: granted`), tile configuration
+  and release work per worker, and `test-kernels` and the GEMM tests pass with the AMX level selected on 1 and 56 workers
+  (on 56 workers: kernels 3,985,770 checks, GEMM 28,029,884 checks, 0 failures).
+- **Tile microkernels.** The BF16 tile GEMM is within 6.5e-8 and 1.1e-7 of Σ|w·x| (budget 2e-6) on the two shapes tested; the INT8
+  kernel's int32 group dots equal the scalar dots exactly (1,186 checks per mode, 0 failures).
+- **Microbenchmark** (k = 512, 20000 repetitions, best time): BF16 1.4 Tops on one worker and 70.3 Tops on 56 (1.26 per
+  worker); INT8 3.6 Tops on one worker and 130.0 Tops on 56 (2.3 per worker).
+- **Emulation builds** compile and pass on the cluster (`test-gemm-emul`, `test-amx-emul`, `test-bf16-emul`, `test-q8-emul`),
+  after `src/gemm.c` stopped including the real intrinsics headers in the AVX-512 emulation build.
 
 ## 7. Exit criteria
 

@@ -11,8 +11,7 @@ residual **once**. Use the release/acquire protocol of study §9. It must be:
 - sized for a vector of `M × dim` FP32 values, so D1's batched prefill can reuse it
   unchanged.
 
-Status: **implemented and tested locally (macOS, scalar, TSAN); cluster `check` pending**. Branch:
-`feature/tp-local-b` (commit `feat: add the cross-socket Exchange`).
+Status: **implemented; cluster check passed, latency above the per-token budget** (see Cluster results).
 
 Implementation notes:
 
@@ -141,6 +140,24 @@ p99 over 10⁵ generations. The model to compare against:
 - `32 layers × 2 = 64` reduction phases per token for 8B decode (study §8.3);
 - the per-token budget is the gap between the one-socket token time and the target
   two-socket token time.
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Job 5694397 (commit `44ce282`), partial buffers on HBM nodes 2 and 3, workers pinned.
+
+- **Correctness.** The stress test (bitwise exactness against the serial reference, delay injection, canary generations)
+  passes on 2 × 14, 2 × 28 and 2 × 56 workers, and the abort test (`fail()` in one socket) exits without a hang.
+- **Latency of one reduction** (median / p99 over 10^5 generations):
+
+  | Workers per socket | E = 4096 (decode) | E = 65536 | E = 262144 | E = 1048576 |
+  | --- | ---: | ---: | ---: | ---: |
+  | 14 | 47.3 / 95.2 µs | | | |
+  | 28 | 51.3 / 103.4 µs | | | |
+  | 56 | 60.0 / 121.0 µs | 64.3 / 127.1 µs | 85.5 / 156.0 µs | 171.5 / 249.2 µs |
+
+- **Budget.** 64 reductions per 8B token cost 3.0 ms (14 workers), 3.3 ms (28) or 3.8 ms (56) at the median, above the
+  42.2 µs per-reduction budget of this phase (about 10% of the modeled 27 ms two-socket token). This is the exit-criterion
+  case that must be flagged before B5; see B5 for the measured decode, where the reduction is a small part of the loss.
 
 ## 7. Exit criteria
 

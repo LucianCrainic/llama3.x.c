@@ -12,8 +12,7 @@ socket's bound region, and populate it with that socket's team.
 Correctness is shown by reconstructing every original tensor exactly. B1 changes no
 computation.
 
-Status: **implemented and tested locally (macOS, virtual regions); cluster `check` pending** (A4, which it builds on, passed
-its cluster check on 2026-11-07). Branch: `feature/tp-local-b` (commit `feat: add shard descriptors, validation and row/column packing`).
+Status: **implemented; cluster check passed** (see Cluster results). It builds on A4, whose check passed on 2026-11-07.
 
 Implementation notes:
 
@@ -173,6 +172,18 @@ user's go-ahead to submit.
 | Shard 8B FP32 and INT8 with S = 2, teams pinned to sockets 0 and 1, HBM placement | Full reconstruction check (a test-only mode compares against the source file) |
 | Verification | Socket 0 shards 100% on node 2; socket 1 shards 100% on node 3 |
 | Startup breakdown | **Measured** row-copy and column-pack time per socket, and the scratch peak |
+
+### Cluster results (2026-11-08)
+
+cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=0`. Jobs 5694397 (commit `44ce282`) and 5694402 (commit `4677bd5`); results `m3-tp-20261107-2` and `-3` under
+`~/PFS/lpor`. The first two attempts (jobs 5694393/5694397, commits `af44c34` and `44ce282`) found three bugs that macOS cannot show and that are fixed: the emulation test targets did not compile where GCC defines the real AVX-512 types, `attention_team` and `batch_team` took their barrier team from a thread-local that workers never set (SIGSEGV with per-thread teams, AVX-512 only), and the placement check of an unreserved global region (tied embedding) failed.
+
+- **Reconstruction.** `shards-synthetic` and the real checkpoints rebuild every tensor from the two sockets' shards exactly
+  (`match = 1`): 1B and 8B, FP32 and Q8_0 (gs 64).
+- **Placement.** Each socket's region is fully verified on its HBM node (8B FP32: node 2 and node 3, 3,664,644 pages
+  each, 0 wrong, 0 missing); the untied 8B embedding sits in the coordinator socket's DDR (2.10 GB FP32, 0.56 GB Q8).
+- **Load cost** (8B, both sockets in parallel, one launch): FP32 0.72 s for 2 × 15.0 GB (rows 0.31 / 0.22 s, packed
+  columns 0.41 / 0.38 s, scratch peak 64 MiB); Q8 0.26 s for 2 × 3.99 GB; 1B FP32 (tied embedding, no global region) 0.12 s.
 
 ## 7. Exit criteria
 
