@@ -13,8 +13,9 @@ The partitions stay aligned to groups (study §5.4, §6.2).
 
 Status: **implemented; W8A32 agreement passed, W8A8 recorded against a statistical gate, decode slower than one socket** (see Cluster results).
 
-**Open risk:** as B5, B6 stands on B1/B4 placement and latency that have never run on real sockets, and on A4's pending
-cluster check. The AVX-512 Q8 kernels that B6 drives through the new `ld` argument (B2) have only been type-checked.
+**Open risk (updated 2026-11-08):** B1/B4 placement and exchange and the AVX-512 Q8 kernels behind the `ld` argument (B2)
+have now run on real sockets and pass. Open: the two-socket decode speed (as B5), and the W8A8 comparison, which can only
+be judged against a statistical gate (see Cluster results).
 
 Implementation notes:
 

@@ -15,8 +15,9 @@ Its logits must agree with the one-socket reference within the FP32 budget.
 
 Status: **implemented; agreement check passed, decode slower than one socket** (see Cluster results).
 
-**Open risk:** B5 sits on A4's owned-weight conventions (regions, strict placement, verification), whose cluster check is
-still pending, and on B4's latency and B1's HBM placement, which have never run on real sockets.
+**Open risk (updated 2026-11-08):** the conventions it sits on (A4 owned regions, B1 placement) and the exchange (B4) now
+pass their cluster checks, and the forward agrees with one socket. What is open is its speed: decode is slower than one
+socket (see Cluster results), and the reason is not yet known.
 
 Implementation notes:
 
