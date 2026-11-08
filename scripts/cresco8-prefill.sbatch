@@ -720,8 +720,8 @@ d1_placement() {
     dry_run && continue
     c_rung "$rung" 64
     label=$(run_label "$name" "$RUNG_PREC" teams hbm 2 56 m=64 "k=$rung" x=place)
-    opts=kv
-    [[ $rung != amx_bf16 && $rung != amx_int8 ]] || opts="kv packed"
+    opts="kv scratch"
+    [[ $rung != amx_bf16 && $rung != amx_int8 ]] || opts="kv scratch packed"
     # shellcheck disable=SC2086
     if tp_placement "$OUT/$label-1.json" $opts > "$dir/placement-$name-$rung.txt"; then
       record_result "placement-$name-$rung" PASS
