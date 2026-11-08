@@ -428,15 +428,32 @@ phase_F2_models() {
 }
 
 # check_stage: everything every skeleton does before a phase matrix: environment, Flat-mode check, build, tests.
+# SKIP_TEST=1 builds but does not run `make test` (recorded as skipped): for a follow-up job on a tree whose full test run
+# already passed on the same hardware.
 check_stage() {
   record_environment
   check_flat_mode
   build_tree 1 release build/release/probe-fp32 build/release/probe-int8
   local status=0
-  (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1 ||
-    status=$?
-  if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
+  if [[ ${SKIP_TEST:-0} == 1 ]]; then
+    echo 'SKIP_TEST=1: make test was not run in this job' | tee "$OUT/test-skipped.txt"
+  else
+    (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1 ||
+      status=$?
+    if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
+  fi
   perf_available
+}
+
+# require_phases: every id in PHASE needs a phase_<ID> function in the script that was submitted (or in the library). Called
+# before anything is built, so a phase sent to the wrong script (B7 lives in cresco8-tp.sbatch, D1 in cresco8-prefill.sbatch)
+# fails at once instead of after the build and the tests.
+require_phases() {
+  local phase missing=
+  for phase in $PHASE; do
+    [[ $phase == none ]] || declare -F "phase_$phase" > /dev/null || missing+=" $phase"
+  done
+  [[ -z $missing ]] || die "no run matrix for phase(s)$missing in $(basename "${BASH_SOURCE[1]:-this script}"): submit each phase to the script of its track"
 }
 
 # ---- two-socket helpers shared by the B and D phases ------------------------------------------------------------------
