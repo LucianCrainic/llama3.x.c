@@ -16,6 +16,8 @@ Prefill and decode are always measured and reported separately.
 Status: **planned**. Branch: `feature/integ-d2-final-campaign` (scripts and results
 docs only).
 
+Results document skeleton (empty until the run): [`docs/numa-tp-prefill-results.md`](../../numa-tp-prefill-results.md) and its [validation record](../../numa-tp-prefill-results-validation.md).
+
 ## 2. Depends on / unblocks
 
 - Depends on: D1, B7 and C7.
@@ -69,6 +71,18 @@ the user's go-ahead to submit.
    confirmed or revised.
 6. **Modeled vs measured.** The roofline (`docs/hbm-roofline.md` §3–4) and study §8.3
    models against the measured results, with the gap explained.
+
+### 4.3 Script (`phase_D2`, 2026-11-08)
+
+`PHASE=D2` in `scripts/cresco8-prefill.sbatch`, dry-run verified (144 launches per model): sockets 1 and 2 (engine-owned HBM
+placement from a copy staged on DDR node 0) x the three rungs of each precision (per-token, AVX-512, AMX) x prompts 86, 2048
+and 8192, 32 generated tokens, REPEATS interleaved repeats; and decode from `--warm-context` 512 and 8192 for FP32, W8A8 and
+W8A32 on both socket counts. M per rung comes from `D2_M1` and `D2_M2` ("rung=M ..."; 64 until C7 and D1 supply their
+choices). It is the only place that needs those two results before it can run.
+
+The summary gives the report's tables from the same code: prefill tok/s and TTFT by rung, M, prompt and sockets with the
+speedup over the one-socket per-token baseline and where two sockets win beyond variability, decode by retained context with
+the crossover per model, precision and context, and the runs where synchronization or attention dominates.
 
 ## 5. Local tests
 

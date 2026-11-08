@@ -14,7 +14,10 @@ the residual is applied once.
 The result must agree numerically with the **one-socket batched reference at the same
 rung**. Prefill and decode are measured separately.
 
-Status: **planned**. Branch: `feature/integ-d1-two-socket-prefill`.
+Status: **in progress** (8 November 2026). Branch: `feature/integ-d1-two-socket-prefill`. FP32 is implemented and
+tested locally (L2), and so are W8A8 on the VNNI or portable Q8 GEMM (L3) and the packed AMX-BF16 and AMX-INT8 rungs (L4 of
+[remaining-work](../remaining-work.md)), the latter on the software tile model only, and so are the stress and sizing tests (L5).
+Open: the cluster check.
 
 ## 2. Depends on / unblocks
 
@@ -103,6 +106,54 @@ carries over.
   - the owned slice of each row for Wo/W2, on the original group boundaries (B6).
 - W8A32 stays on AVX-512.
 
+### 4.5 Implementation notes (FP32, L2)
+
+- `tp_forward_batch` in `src/tp.c` (`CMD_FORWARD_BATCH`, `forward_fp32_batch`); `engine_forward_batch` calls it when the model
+  is split, `count > 1` and the batched GEMM is on (`LLAMA_PREFILL_GEMM`: `auto` selects it only where AVX-512 or AMX
+  runs, `on` forces the portable GEMM, `off` keeps the per-token loop). A single-row batch stays on `tp_forward`.
+- Every socket holds `M_max` rows of `x`, `xb`, `hb`, `q` and `rope` in its work region, an attention workspace sized for
+  `M_max` rows (`k_attention_init_rows`), and the exchange is created for `M_max × dim` elements, so `tp_create` takes the
+  batch capacity (`model->max_batch`; 1 for Q8 until L3). `M_max × dim` above `INT_MAX` is refused at load.
+- QKV is one three-segment `k_gemm_f32` into the socket's own heads and straight into its KV rows; Wo and W2 are
+  `GEMM_PARTIAL` products over the owned K slice into the exchange buffer, followed by the two-barrier reduction
+  (`exchange_reduce_add`) over `M × dim` elements. The per-row flag form of B7 has no row-completion callback in the GEMM
+  and is not used here; it mixes with the barrier form across generations without change. The classifier stays per row
+  (`k_matmul` on the socket's vocabulary range), for the last row only unless all-position logits are requested.
+- `LLAMA_TP_CHECK=1` compares a hash of the whole `M × dim` residual of both sockets after every layer and microbatch.
+- **W8A8 (L3).** The same `forward_batch` runs the Q8 GEMM (`k_gemm_q8`): the normalized rows are quantized once with
+  `k_quantize_rows` for QKV and for W1/W3; Wo and W2 quantize only the socket's slice (`ql` and `hidden_l` values per
+  row, which start on a group boundary), so their groups are the original groups; the partials go to the exchange as FP32.
+  Embedding rows are dequantized from the owner's vocabulary shard, the classifier is the per-row `k_matmul_q8`. The
+  quantized activation buffers are padded to whole 32-row blocks for the AMX kernel. Kernel reported: `amx-int8`
+  with `LLAMA_KERNELS=amx` and a group size that is a multiple of 64 (packed shards, below), `avx512-q8` when AVX-512
+  runs and the group size is a multiple of 64, else `portable-q8`.
+- **W8A32** stays per token on two sockets, the C6 rule (`prefill_gemm` is forced off, the batch capacity is 1).
+- **Packed shards (L4).** `LLAMA_PRECISION=bf16` (FP32 checkpoints) and AMX-INT8 (`LLAMA_KERNELS=amx`, W8A8, group size a
+  multiple of 64) give every socket a `ROLE_PACKED` region on its own node with the VNNI copies of its seven shards per layer
+  (`plan_packing`, `CMD_PACK`; `pack_bf16_job_from_shard` / `pack_s8_job_from_shard`). The main thread reserves, carves and
+  later marks, protects and verifies the regions (the region registry is not thread-safe); the coordinators only run the
+  jobs on their teams. The shards stay (decode reads them), the Q8 group scales are read from the shard in place.
+  BF16 converts the activations into a per-socket panel (`k_gemm_bf16`); in BF16 mode even a single-row batch goes through
+  the batched forward, as on one socket. All-position logits use a BF16 GEMM on a classifier range packed on first request
+  (`pack_classifier`), the default last-row classifier stays FP32, exactly as C5 does.
+- **Budget.** With `LLAMA_PLACEMENT=hbm`, `check_budget` counts per socket the shards, the packed copies, both KV caches, the
+  work region and the exchange buffers against `LLAMA_HBM_BUDGET_GIB` (default 56) and names the packed bytes when it
+  fails. It cannot run on the virtual topology (hbm placement is refused there), so it is checked on the cluster.
+- **Sizing (L5).** The three conditions of §4.2 are pure functions in `src/tp.c` / `include/tp.h`: `tp_work_bytes` (what
+  `tp_create` reserves; also behind its own check), `tp_exchange_bytes`, `tp_exchange_payload_bytes`,
+  `tp_peer_bytes_per_token` and `tp_choose_batch`, which takes the measured exchange latency and bandwidth and per-layer
+  times and returns, per candidate M, whether it fits, reaches the ridge and keeps the two exchanges under the share
+  limit (modeled as `2 x (latency + payload / bandwidth)` against `max(shard stream, M x per-row time)`), and the largest
+  feasible one. `tests/sizing.c` pins the §4.2 table (256 KiB / 1 MiB / 4 MiB payloads, 1 MiB per token independent of M)
+  and each condition on the 8B and 1B shapes. The inputs in the test are modeled orders of magnitude; the cluster's M
+  sweep supplies the real ones and selects M.
+- **Exchange stress (L5).** `unit_exchange_batched` in `tests/workers.c` runs one exchange created for `256 x 4096`
+  elements through a schedule of reductions of different lengths (256, 1, 3, 17, 64 rows of 4096, and single rows), the
+  batch-sized ones in the two-barrier form and the decode-sized ones in the flag form, with random delays on either socket
+  and with and without caller-owned regions, bitwise against a serial reference; it is clean under ThreadSanitizer.
+  The residual-copy check (`LLAMA_TP_CHECK=1`) runs in every two-socket test of `tests/test_tp.py`.
+- Not yet: overlap of the exchange with the next block's GEMM (§9).
+
 ## 5. Local tests
 
 These run on macOS with `virtual:2x3`, the `tp` fixture, and the scalar FP32 and BF16
@@ -119,6 +170,14 @@ references. AMX is skipped on macOS.
   every layer and microbatch.
 
 ## 6. Cluster run
+
+`phase_D1` (and `phase_D2`) in `scripts/cresco8-prefill.sbatch` are written and dry-run verified (8 November 2026): D1 prints
+120 launches per model plus 10 comparisons per model, about 2 hours; the comparison for each rung is one socket against two
+at M = 64 with `--batch-a/--batch-b`, FP32 strict, W8A8 and AMX-INT8 under the statistical gate, W8A32 strict, BF16
+recorded only until C5 has set its gate; placement is checked per rung with `tp_placement` (weights, packed shards for
+the AMX rungs and the KV caches, which `tp_kv_stats` now verifies on both sockets); the sweep runs two sockets at every M
+and one socket at M = 64 and 256 in the same job, then a profiled run per point and the decode after the two-socket
+prefill. The table below is the plan; the script follows it.
 
 `cresco8-prefill.sbatch STAGE=check PHASE=D1`. **Estimated** at 90 minutes. It needs
 the user's go-ahead to submit.

@@ -11,6 +11,8 @@ measurement shows two sockets beating one by 1.4-1.9× on short-context decode (
 lengths, thread counts, perf counters, the `LLAMA_TP_PARTITION=rows` comparator) has not been run. Branch:
 `feature/tp-b7-campaign` (scripts and results docs only).
 
+Results document skeleton (empty until the run): [`docs/tensor-parallel.md`](../../tensor-parallel.md) and its [validation record](../../tensor-parallel-validation.md).
+
 ## 2. Depends on / unblocks
 
 - Depends on: B6, A6 (baseline and THP default) and F3.
@@ -53,10 +55,52 @@ All runs use `LLAMA_BACKEND=teams`, HBM placement, the THP setting chosen by A6,
 Long-context decode is measured from a comparable retained context, never averaged
 with an empty-cache run (study §10.3). That requires a `--warm-context N` benchmark
 option (prefill N tokens untimed, then time decode). It is added here, in `app.c`
-`generate`.
+`generate` (**implemented**, 8 November 2026: `warm_up` in `src/app.c`, documented in `docs/prefill.md`, tested by
+`test_warm_context_is_untimed_and_uncounted`).
 
 **Estimated** duration is 4–6 hours, so it may need to be split into two jobs by
 model. It needs the user's go-ahead to submit.
+
+### 4.1b Decision L8 and the packed4 decode layout (2026-11-08)
+
+The `LLAMA_TP_PARTITION=rows` comparator is **not built** (only if B7 shows reductions plus waits above 20%). The repacked FP32
+layout of the findings (§6, "Not done") **is**: `LLAMA_FP32_LAYOUT=packed4` (default `rows`) gives each socket a second copy of
+its FP32 shards in which the four rows of a group form one sequential stream (for each block of 16 columns: 16 floats of row
+0, 1, 2, 3; the last block zero-padded), in a `ROLE_PACKED` region on the socket's node, built at load on the socket's team
+(`k_pack4_many`, `CMD_REPACK`). Decode streams it (`k_matmul_qkv_p4`, `k_matmul_swiglu_p4`, `k_matmul_p4_worker`, with
+row-flag callbacks, claiming and the fused reduction unchanged); the batched GEMM and the BF16 / int8 packing keep reading the
+row-layout shards, so the layout costs one more copy of the matrices per socket (8B FP32: about 16 GiB of 56, counted by the
+HBM budget check) and applies to FP32 two-socket runs only. Every row's arithmetic is that of the four-row AVX-512 kernel
+(`dots_p4_avx512`: two accumulators, 32 columns a step, the masked tail), so the result is **bitwise equal** to the row layout
+whenever the row layout also forms whole four-row groups (claiming schedules); the scalar fallbacks agree to the kernel
+budget. Matrices whose shard has a row count that is not a multiple of 4 keep the row layout. Software prefetch runs 4 KiB
+ahead along the stream (the `pf4096` point of `tests/stream_bench.c`). **Measured: nothing yet** — the benchmark figures of §6
+(612 against 529 GB/s) are the expectation. B7 runs the two-socket FP32 decode from both layouts (tag `p4`, with its own
+profiled run) and gates the bitwise equality on the AVX-512 kernels first (`b7-packed4-vs-rows-2s`).
+
+### 4.2 Script (`phase_B7`, 2026-11-08)
+
+`PHASE=B7` in `scripts/cresco8-tp.sbatch`, `DRY_RUN=1` verified (96 launches per model, tested by
+`test_campaign_scripts_dry_run_and_their_labels_parse`). It runs the gates first (one socket against two with the batched
+warm-up path, FP32 strict, W8A8 statistical, W8A32 strict; a failure stops the benchmark), then per model and precision with
+the checkpoint staged on DDR node 0 and engine-owned HBM placement (`B7_THP`, default off, to be set from A6):
+
+- decode of 128 tokens from `--warm-context` 512, 8192 and 32768 (batched warm-up, `B7_BATCH` = 64) for one socket x 56 and
+  two sockets x 56; the worker-count sweep (2 x 14, 28, 42) and the control (112 OpenMP threads without tensor parallelism on
+  a copy interleaved over HBM 2 and 3) at 512 only, which trims the grid of §4.1 to the time budget; W8A32 at 2 x 56 for 512
+  and 8192;
+- REPEATS interleaved repeats, one `LLAMA_PROFILE=1` run per configuration and context (log level info, so the per-socket
+  `tp decode socket` lines reach the `.stderr` files), perf counters on the first repeat;
+- no `LLAMA_TP_PARTITION=rows` comparator (decision L8: only if reductions plus waits exceed 20%).
+
+Submit with `--time=06:00:00` or one model per job.
+
+`tools/summarize_campaign.py` (with `tools/campaign_tables.py`) turns the campaign directory into `summary.md`: the main table
+gains a *Warm ctx* column, followed by decode tok/s by retained context for every configuration with the two-socket gain and
+whether it is beyond variability; the per-socket phase table of the profiled runs (qkv, attention, wo, ffn, classifier,
+reduce, wait, and the imbalance row |s0 - s1|); the modeled-against-measured table (sum of the slower socket per compute
+phase plus the larger socket's exchange cost, and the bandwidth ceiling from the checkpoint size over 2 x 600 GB/s); and the
+revisit triggers of §7 (reductions plus waits above 20%, peer wait above 10%) with the runs where attention dominates.
 
 ## 5. Local tests
 

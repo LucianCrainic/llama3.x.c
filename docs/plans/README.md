@@ -1,10 +1,14 @@
 # Execution plan: NUMA placement, two-socket tensor parallelism and batched prefill
 
-Plan date: 1 November 2026. Status as of 7 November 2026: Waves 1 and 2 (M1, M2) are complete and validated on the
-cluster, apart from the A6 campaign. In Wave 3, B1-B6 (two-socket tensor parallelism) and C4-C7 (AMX enablement, the BF16
-precision mode, batched Q8 with AMX-INT8, the campaign scripts) are implemented and tested locally, B on the virtual
-topology and C on macOS against instruction models, with none of that code yet run on the cluster; B7 and Waves 4-5 (D)
-have not started. See the milestone table in §4 and each phase document's status line.
+Plan date: 1 November 2026. Status as of 8 November 2026: Waves 1 and 2 (M1, M2) are complete and validated on the
+cluster, apart from the A6 campaign. In Wave 3 the two-socket tensor-parallel decode (B1-B6) and the AMX / BF16 / INT8
+prefill (C4-C6) ran on the cluster, and the decode investigation of B7 is done (two sockets 1.9x one socket). Everything the
+plan still needed in code is now written and tested locally, with none of the new code run on the cluster: two-socket batched
+prefill at every rung (D1: FP32, W8A8, AMX-BF16 and AMX-INT8 on per-socket packed shards), `--warm-context`, the packed4 decode
+layout, the sizing rule, the B7, C7, D1 and D2 campaign phases, the summary tables and empty results documents. What is open is
+the cluster work: the check jobs (C5/C6 and B5/B6 Hugging Face gates, the F3 comparison, the D1 check) and the A6, C7, B7 and D2
+campaigns, in the order of [remaining-work.md](remaining-work.md). See the milestone table in §4 and each phase document's
+status line.
 Baseline tree: `feature/simd-kernels` at `5bc2b8c`. The plan was executed on the integration branch
 `feature/numa-tp-prefill`, which was closed on 7 November 2026 when everything was merged into `develop`; work now
 continues from `develop`.
@@ -96,6 +100,8 @@ reductions) and builds on A's regions.
 A6 does not block C. C7 runs on anon HBM if A6 is done, otherwise on staged
 `/dev/shm` weights, and records which.
 
+What is still open, split into local code (finished) and cluster stages, with the order of the jobs: [remaining-work.md](remaining-work.md).
+
 ## 4. Dependency graph and waves
 
 ```mermaid
@@ -141,7 +147,7 @@ Milestone status:
 | M1 | **complete** (2026-11-07) | Teams match OpenMP on one socket: [F2](00-foundations/F2-worker-teams.md) cluster results (agreement 2.5e-5, decode +4% to +11%, Hugging Face gate under `teams` passes for 1B and 8B FP32). Bound regions verified on all four nodes: [A3](A-numa-placement/A3-placement-verification.md) results. `make test` is green on Linux. Not part of M1 and still open: the F3 acceptance comparison with the kernels script |
 | M2 | **complete** (2026-11-07) | Engine-owned HBM placement is bitwise identical to the staged baseline on 1B and 8B, FP32 and Q8_0, `omp` and `teams`, and verified on the requested node ([A4](A-numa-placement/A4-owned-weight-loader.md), [A5](A-numa-placement/A5-kv-and-workspace-placement.md) cluster results). Batched FP32 prefill matches per-token: bitwise on the reference path ([C1](C-batched-prefill/C1-batched-forward-api.md)), within 4.8e-4 max \|Δlogit\| and 100% argmax with the AVX-512 GEMM and batched attention ([C2](C-batched-prefill/C2-avx512-fp32-gemm.md), [C3](C-batched-prefill/C3-batched-causal-attention-and-kv.md)); 8B prefill at a 2048-token prompt is 10.5x faster at M = 64 with unchanged decode. Not part of M2's gate and still open: the A6 campaign |
 | M3 | **partly validated on the cluster** (2026-11-08) | Track B on hardware: shard reconstruction and placement ([B1](B-tensor-parallel/B1-shard-descriptors-and-packing.md)), kernels, attention split and the cross-socket exchange (bitwise, 47-60 µs per reduction, above the 42 µs budget: [B4](B-tensor-parallel/B4-cross-socket-reduction.md)), and the two-socket FP32 and W8A32 forward agreeing with one socket to 1e-5 ([B5](B-tensor-parallel/B5-two-socket-fp32-forward.md), [B6](B-tensor-parallel/B6-two-socket-q8.md)); **two-socket decode first measured slower than one socket (8B FP32 11.3 against 14.6-14.9 tok/s); the cause was both socket leaders pinned to one CPU, fixed, and decode is now 1.86× one socket on 8B FP32 (30.2 against 16.2 tok/s), 1.76× on 8B Q8 (86.6 against 49.1), with fused reductions and FP32 row scheduling ([B7](B-tensor-parallel/B7-two-socket-decode-campaign.md) findings)**. Track C on real AMX: the tile kernels and the BF16 and INT8 prefill work ([C4](C-batched-prefill/C4-amx-enablement.md), [C5](C-batched-prefill/C5-amx-bf16-precision-mode.md), [C6](C-batched-prefill/C6-amx-int8-q8.md)); 8B prefill at 2048 tokens reaches 570 tok/s (BF16) and 563 tok/s (INT8) against 174 for the FP32 GEMM and 16.5 per-token. W8A8 comparisons use a statistical gate because requantization moves the logits by a noise floor (rms 0.063) under any change of FP32 order. B6 was re-run with the corrected gates and passes. Open: the B7 decode campaign proper (contexts, thread counts, counters), the packed-row weight layout, the C7 campaign, the Hugging Face gates of B5, B6, C5 and C6, the C5 error gate, a re-run of C6 with the corrected gates |
-| M4 | planned | — |
+| M4 | **code complete, not run** (2026-11-08) | [D1](D-integration/D1-two-socket-batched-prefill.md): two-socket batched prefill for FP32, W8A8, AMX-BF16 and AMX-INT8, checked on the virtual topology and the software tile model (agreement with one socket to 1e-6, ThreadSanitizer clean). Open: `STAGE=check PHASE=D1` on the hardware (agreement per rung, placement, the M sweep) |
 | M5 | planned | — |
 
 ## 5. User decisions recorded for these plans
@@ -190,6 +196,7 @@ reference.
 | `LLAMA_TP_REDUCE` | `flags` (default) \| `barrier`: the fused reduction waits per output row (no team barrier) or with the two-barrier protocol of B4 | B7 |
 | `LLAMA_TEAM_JOIN` | `flags` (default) \| `counter`: how `team_run` learns that all members finished (one flag per member, or one shared counter) | B7 |
 | `LLAMA_TEAM_FANOUT` | `8` (default) \| `0` (flat) \| N up to 64: group size of the two-level team dispatch | B7 |
+| `LLAMA_FP32_LAYOUT` | `rows` (default) \| `packed4`: FP32 two-socket decode streams a second copy of the shards in which four rows form one sequential stream | B7 |
 | `LLAMA_TP_TRACE` | `FILE`: write a CSV with the timestamps of every member for every Wo/W2 reduction (fused form only) | B7 |
 | `LLAMA_PREFILL_BATCH` | `1` (default, per-token) \| M | C1 |
 | `LLAMA_PREFILL_LOGITS` | `last` (default) \| `all` (diagnostic) | C1 |

@@ -22,6 +22,15 @@ W8A32. Existing kernel selection and checkpoint formats are unchanged.
 | `LLAMA_PREFILL_BATCH` | `1` | Positive decimal integer up to `INT_MAX`; effective capacity is capped at the allocated context |
 | `LLAMA_PREFILL_LOGITS` | `last` | `last` computes only the final prompt's classifier; `all` computes and retains every row within each microbatch |
 
+`--warm-context N` (generate mode) forwards N untimed tokens before the prompt, so that the timed prefill and decode
+start from a retained context of N positions: the prompt tokens repeated, in microbatches of `LLAMA_PREFILL_BATCH`, with no
+logits. The warm-up is outside `prefill`, `time_to_first_token`, `total_inference` and the profile; the report records
+`parameters.warm_context` and `timing_seconds.warm_context`, and `kv.after_prompt` counts the warm positions. N must be
+smaller than the context (`-n`, `--context-length`).
+
+With `LLAMA_SOCKETS=2` the FP32 engine runs each microbatch through the two-socket batched forward when the GEMM is on
+(D1), and so does the Q8 engine for W8A8 (W8A32 stays per token, as on one socket). `LLAMA_PRECISION=bf16` and AMX-INT8 also run on two sockets: each socket packs its own shards (a `packed` region per socket in the report).
+
 Unset or empty values select the defaults. Invalid nonempty values fail at model
 initialization. The batch size also respects the remaining prompt and `-n` limit.
 A truncated prompt produces no sampled output. Prompt echo emits the same bytes,
