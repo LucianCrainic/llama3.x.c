@@ -177,7 +177,8 @@ at M = 64 with `--batch-a/--batch-b`, FP32 strict, W8A8 and AMX-INT8 under the s
 recorded only until C5 has set its gate; placement is checked per rung with `tp_placement` (weights, packed shards for
 the AMX rungs and the KV caches, which `tp_kv_stats` now verifies on both sockets); the sweep runs two sockets at every M
 and one socket at M = 64 and 256 in the same job, then a profiled run per point and the decode after the two-socket
-prefill. The table below is the plan; the script follows it.
+prefill. `GATES_ONLY=1` runs only the comparisons and the placement checks (about 30 minutes per model), without the sweep. The table
+below is the plan; the script follows it.
 
 `cresco8-prefill.sbatch STAGE=check PHASE=D1`. **Estimated** at 90 minutes. It needs
 the user's go-ahead to submit.

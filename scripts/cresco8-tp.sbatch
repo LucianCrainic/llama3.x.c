@@ -10,7 +10,7 @@
 # Submit with a verified --partition/--nodelist and separate -o/-e paths; every submission needs the
 # owner's go-ahead for that job. Required: ROOT (tree under test), OUT (new directory), PYTHON. Optional: MODELS
 # ("NAME:ARTIFACT_DIR:HF_SNAPSHOT ..."; the artifact directory holds fp32-v3.bin, int8-v3.bin, tokenizer-v2.bin);
-# without it the model gates are skipped and recorded.
+# without it the model gates are skipped and recorded. GATES_ONLY=1 makes B7 stop after its correctness gates.
 # PHASE is a space-separated list of phase ids ("B1 B4"); phase_<ID> functions below (or in the library) hold each
 # phase's matrix. PHASE=none runs only the common check. The exit status is non-zero if any expectation failed.
 # B1-B6 are `check` phases: B1 and B4 need no model; B5 and B6 compare LLAMA_SOCKETS=2 with one socket on MODELS. B7 is
@@ -301,6 +301,10 @@ phase_B7() {
   done
   if ! dry_run && grep -q '^FAIL compare-.*-b7-' "$OUT/phase-results.txt" 2> /dev/null; then
     echo 'a B7 correctness gate failed: no benchmark was run' | tee "$dir/gate-failed.txt"
+    return 0
+  fi
+  if [[ ${GATES_ONLY:-0} == 1 ]]; then
+    echo 'GATES_ONLY=1: the gates ran, the benchmark did not' | tee "$dir/gates-only.txt"
     return 0
   fi
   for entry in $MODELS; do

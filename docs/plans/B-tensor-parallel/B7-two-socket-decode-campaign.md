@@ -93,7 +93,8 @@ the checkpoint staged on DDR node 0 and engine-owned HBM placement (`B7_THP`, de
   `tp decode socket` lines reach the `.stderr` files), perf counters on the first repeat;
 - no `LLAMA_TP_PARTITION=rows` comparator (decision L8: only if reductions plus waits exceed 20%).
 
-Submit with `--time=06:00:00` or one model per job.
+Submit with `--time=06:00:00` or one model per job. `GATES_ONLY=1` stops after the correctness gates (the packed4-against-rows bitwise gate
+included), which is how the new hardware paths are checked before the campaign.
 
 `tools/summarize_campaign.py` (with `tools/campaign_tables.py`) turns the campaign directory into `summary.md`: the main table
 gains a *Warm ctx* column, followed by decode tok/s by retained context for every configuration with the two-socket gain and
