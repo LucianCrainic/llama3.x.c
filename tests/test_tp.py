@@ -131,6 +131,31 @@ class TensorParallelTests(unittest.TestCase):
                     separate = self.probe(precision, 'shared', None, 2, threads, LLAMA_TP_FUSED='0', **extra)
                     self.assertEqual(fused, separate)
 
+    def test_reduction_join_and_dispatch_variants_are_bitwise_equal(self):
+        """The flag reduction against the two-barrier one, the flag join against the counter, and the dispatch tree
+        against the flat one only change how the members synchronize: not a bit of the output."""
+        variants = ({'LLAMA_TP_REDUCE': 'barrier', 'LLAMA_TEAM_JOIN': 'counter', 'LLAMA_TEAM_FANOUT': '0'},
+                    {'LLAMA_TP_REDUCE': 'flags', 'LLAMA_TEAM_JOIN': 'counter', 'LLAMA_TEAM_FANOUT': '0'},
+                    {'LLAMA_TP_REDUCE': 'barrier', 'LLAMA_TEAM_JOIN': 'flags', 'LLAMA_TEAM_FANOUT': '2'},
+                    {'LLAMA_TP_REDUCE': 'flags', 'LLAMA_TEAM_JOIN': 'flags', 'LLAMA_TEAM_FANOUT': '2'})
+        for precision, activations in (('fp32', None), ('int8', 'int8'), ('int8', 'fp32')):
+            extra = {'LLAMA_Q8_ACTIVATIONS': activations} if activations else {}
+            for threads in (3, 7):
+                reference = self.probe(precision, 'shared', None, 2, threads, **extra)
+                for variant in variants:
+                    with self.subTest(precision=precision, activations=activations, threads=threads, **variant):
+                        self.assertEqual(reference, self.probe(precision, 'shared', None, 2, threads, **variant, **extra))
+
+    def test_synchronization_knobs_are_validated(self):
+        model = self.fixtures['shared']/'fp32.bin'
+        for name, message in (('LLAMA_TP_REDUCE', b'LLAMA_TP_REDUCE must be flags or barrier'),
+                              ('LLAMA_TEAM_JOIN', b'LLAMA_TEAM_JOIN must be flags or counter'),
+                              ('LLAMA_TEAM_FANOUT', b'LLAMA_TEAM_FANOUT must be 0 (flat) or a group size up to 64')):
+            result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
+                                    env=environment(2, 3, **{name: 'x'}))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+
     def test_fused_knob_is_validated(self):
         model = self.fixtures['shared']/'fp32.bin'
         result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,

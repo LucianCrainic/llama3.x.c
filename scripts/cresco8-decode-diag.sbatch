@@ -18,6 +18,8 @@
 #   2s-RJ     LLAMA_SOCKETS=2 with the reduction protocol R (b = LLAMA_TP_REDUCE=barrier, f = flags) and the team join J
 #             (c = LLAMA_TEAM_JOIN=counter, f = flags): 2s-bc is the build before the flag protocols, 2s-ff the new default;
 #             1s-c / 1s-f: one socket with join counter / flags; 2s-ff-trace: 2s-ff with LLAMA_TP_TRACE
+#   1s-base / 2s-base  the synchronization before the flag work (two-barrier reduction, counter join, flat dispatch);
+#                      1s / 2s are the defaults now (flag reduction, flag join, dispatch fan-out 8)
 #   1s-fanN / 2s-fanN / 2s-fanN-trace   the defaults (flags, flags) with LLAMA_TEAM_FANOUT=N (0 = flat dispatch)
 # REDUCE=1 first runs tests/reduce_bench.c (Wo, W1/W3 and W2 of synthetic layers on one or two sockets with the engine's
 # kernels and exchange; the reduction replaced by local barriers or by nothing, to separate kernel from sync from skew).
@@ -167,6 +169,10 @@ for entry in ${DECODE_MODELS-$MODELS}; do
               diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
                 "LLAMA_TEAM_FANOUT=$fan" "${extra[@]}"
             fi ;;
+          1s-base) diag_run 1s-base "$ROOT" "$name-$precision-1s-base" "$engine" "$one" "$tokenizer" "$rep" 0 0 2 "${ONE_ENV[@]}" \
+            LLAMA_TEAM_JOIN=counter LLAMA_TEAM_FANOUT=0 ;;
+          2s-base) diag_run 2s-base "$ROOT" "$name-$precision-2s-base" "$engine" "$two" "$tokenizer" "$rep" 0 "" "" "${TWO_ENV[@]}" \
+            LLAMA_TP_REDUCE=barrier LLAMA_TEAM_JOIN=counter LLAMA_TEAM_FANOUT=0 ;;
           1s-c | 1s-f)
             diag_run "$config" "$ROOT" "$name-$precision-$config" "$engine" "$one" "$tokenizer" "$rep" 0 0 2 "${ONE_ENV[@]}" \
               "LLAMA_TEAM_JOIN=$([[ $config == 1s-c ]] && echo counter || echo flags)" ;;
