@@ -62,6 +62,9 @@ time; the order puts the cheap gates ahead of the long campaigns.
 | 5704694 (full D1, tree 04e913b, 22 min) | PASSED; 8B two-socket AMX-BF16 1092 tok/s, 1.5-1.9x one socket; RMSNorm found to be 18% of the token |
 | 5713378 (`make test` + full D1, tree 75761d4, 56 min) | PASSED; row-parallel RMSNorm/RoPE: 8B AMX-BF16 1354 tok/s (+24%), AMX-INT8 1341 (+26%), 1.78-1.93x one socket |
 
+| 5713402 (A6, tree 75761d4) | Gates passed; aborted at the remote-HBM control (topology validation); override and non-fatal launches added |
+| 5713411 (A6, tree 52d35c1, 31 min) | PASSED except the long-context point (cut at 4096 passes; `-n 0` fix 16b7332). Owned HBM 15.69 vs staged 16.07 tok/s (8B FP32, -2.4%), Q8 equal; owned DDR 8.41; THP neutral; remote 3.59 |
+
 `GATES_ONLY=1` (B7, D1) runs only the gates and D1's placement checks, so the hardware-only paths (the AVX-512 packed4 bitwise gate of B7, AMX on two
 sockets, the KV and packed-shard placement) can be checked before a campaign.
 
