@@ -327,9 +327,7 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
   static const PackedLayer none;
   const PackedLayer *pl = t->bf16 ? &t->packed[l] : &none;
 
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_att_weight + l * dim, dim,
-                                     p->norm_eps));
+  PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->xb, s->x, w->rms_att_weight + l * dim, count, dim, p->norm_eps));
   GemmSegment qkv[3] = {
       {.c = s->q, .ldc = dim, .w = w->wq + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_STORE},
       {.c = kc + (size_t)pos0 * kv_dim, .ldc = kv_dim, .w = w->wk + l * dim * kv_dim, .ldw = (size_t)dim, .n = kv_dim,
@@ -338,17 +336,14 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
        .kind = GEMM_STORE}};
   PROFILE(PHASE_QKV,
           project(t, s->xb, dim, count, dim, qkv, 3, (const uint16_t *const[]){pl->wq, pl->wk, pl->wv}, NULL));
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
-                                     s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
+  PROFILE(PHASE_ROPE, k_rope_apply_rows(s->q, (size_t)dim, kc + (size_t)pos0 * kv_dim, (size_t)kv_dim, s->rope,
+                                        (size_t)2 * head_size, count, p->n_heads, p->n_kv_heads, head_size));
   PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
                                              head_size, p->seq_len, pos0, count));
   GemmSegment wo = {.c = s->x, .ldc = dim, .w = w->wo + l * dim * dim, .ldw = (size_t)dim, .n = dim, .kind = GEMM_ADD};
   PROFILE(PHASE_WO, project(t, s->xb, dim, count, dim, &wo, 1, &pl->wo, NULL));
 
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_RMSNORM, k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_ffn_weight + l * dim, dim,
-                                     p->norm_eps));
+  PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->xb, s->x, w->rms_ffn_weight + l * dim, count, dim, p->norm_eps));
   GemmSegment up = {.c = s->hb, .ldc = hidden_dim, .w = w->w1 + l * dim * hidden_dim, .w3 = w->w3 + l * dim * hidden_dim,
                     .ldw = (size_t)dim, .n = hidden_dim, .kind = GEMM_SWIGLU};
   PROFILE(PHASE_W1_W3, project(t, s->xb, dim, count, dim, &up, 1, &pl->w1, &pl->w3));
@@ -423,9 +418,7 @@ float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0
     /* All-position logits use the BF16 GEMM on a lazily packed classifier; the last-row classifier stays FP32. */
     if (!t->packed_wcls)
       pack_classifier(t);
-    for (int i = 0; i < count; i++)
-      PROFILE(PHASE_RMSNORM, k_rmsnorm(s->x + (size_t)i * p->dim, s->x + (size_t)i * p->dim,
-                                       t->weights.rms_final_weight, p->dim, p->norm_eps));
+    PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->x, s->x, t->weights.rms_final_weight, count, p->dim, p->norm_eps));
     GemmBf16Segment cls = {
         .c = s->batch_logits, .ldc = p->vocab_size, .w = t->packed_wcls, .n = p->vocab_size, .kind = GEMM_STORE};
     PROFILE(PHASE_CLASSIFIER, k_gemm_bf16(s->x, p->dim, count, p->dim, &cls, 1, &t->panel));

@@ -39,6 +39,12 @@ typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
 void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
 
 void k_rmsnorm(float *out, const float *x, const float *weight, int size, float epsilon);
+/* `rows` consecutive rows of `size` values (out and x have row stride `size`; out may equal x), one team job; each row is
+ * exactly k_rmsnorm, so the result is bitwise that of the serial loop. */
+void k_rmsnorm_rows(float *out, const float *x, const float *weight, int rows, int size, float epsilon);
+/* k_rope_apply for `rows` rows with the given strides (in floats) of q, k and the rope table, one team job; bitwise the serial loop. */
+void k_rope_apply_rows(float *q, size_t q_stride, float *k, size_t k_stride, const float *table, size_t table_stride,
+                       int rows, int n_heads, int n_kv_heads, int head_dim);
 
 /* One position's RoPE table: 2 * head_dim floats (cosines duplicated per pair,
  * then sines as -s, +s). Values equal apply_rope's per-pair cosf/sinf. */

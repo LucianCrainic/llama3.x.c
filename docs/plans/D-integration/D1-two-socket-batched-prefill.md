@@ -248,7 +248,8 @@ reduction) + w1/w3 0.161 + w2 0.153 + rope 0.034; the exchange itself (add 0.014
 2.3% / 4.7% / 6.6%; AVX-512 FP32 1.0% / 1.8% / 3.5%): under the 10% budget at every M, and the imbalance between the sockets is small. Two sockets give 1.5-1.9x one
 socket, not 2x, because of the per-row operations that run serially on each socket's coordinator thread: **RMSNorm is 18% of the AMX-BF16 time per token (9% of the
 AVX-512 FP32 time)** and RoPE 3-4%, none of which halves with the second socket, and attention is 21-25% of the AMX rungs' time (FP32 kernels, half the heads per
-socket). Parallelizing the row loops over the team is the first lever (follow-up). **Decode after a two-socket prefill** (128 tokens from 2048): FP32 30.6-30.7 tok/s
+socket). Parallelizing the row loops over the team is the first lever: done afterwards (`k_rmsnorm_rows`, `k_rope_apply_rows`: one team job per call, each row exactly the
+single-row kernel, bitwise the serial loop; used by the two-socket forward and by both one-socket batched forwards); its effect on the sweep is not measured yet. **Decode after a two-socket prefill** (128 tokens from 2048): FP32 30.6-30.7 tok/s
 (8B) and 162-163 (1B), W8A8 83 (8B) and 392-396 (1B): FP32 equals B7's 30.2-31.05 within range; W8A8 is 13% below B7's 95.5 at an 86-token context, consistent with
 the longer context and to be compared in B7 at equal contexts.
 
