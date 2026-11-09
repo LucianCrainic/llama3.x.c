@@ -1,5 +1,6 @@
 """Topology discovery against synthetic sysfs trees (tests/sysfs_fixtures.py) through tests/numa_probe.c."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -29,9 +30,9 @@ class TopologyTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def probe(self, sysfs, *args, success=True):
+    def probe(self, sysfs, *args, success=True, env=None):
         result = subprocess.run([str(BUILD/'numa_probe'), '--sysfs', str(sysfs), *map(str, args)],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)
@@ -84,6 +85,20 @@ class TopologyTests(unittest.TestCase):
                            ('bogus', 'invalid topology')]:
             with self.subTest(spec=spec):
                 self.assertIn(text, self.probe(self.no_numaperf, '--topology', spec, success=False))
+
+    def test_far_hbm_map_is_a_diagnostic_override(self):
+        """A6's remote control points socket 0 at the other socket's HBM: refused by default, accepted with the override, and
+        every other check of the explicit map still applies."""
+        spec = 'explicit:0/3/0,1/2/1'
+        self.assertIn('nearer', self.probe(self.no_numaperf, '--topology', spec, success=False))
+        self.assertIn('nearer', self.probe(self.no_numaperf, '--topology', spec, success=False,
+                                           env={'LLAMA_TOPOLOGY_ALLOW_FAR_HBM': '0'}))
+        t = self.probe(self.no_numaperf, '--topology', spec, env={'LLAMA_TOPOLOGY_ALLOW_FAR_HBM': '1'})
+        self.assertEqual([(s['ddr_node'], s['hbm_node']) for s in t['sockets']], [(0, 3), (1, 2)])
+        for bad, text in (('explicit:0/2/0,1/2/1', 'share a node'), ('explicit:0/1/0,1/3/1', 'not an online CPU-less'),
+                          ('explicit:0/2/1,1/3/0', 'not the CPU-bearing DDR node')):
+            self.assertIn(text, self.probe(self.no_numaperf, '--topology', bad, success=False,
+                                           env={'LLAMA_TOPOLOGY_ALLOW_FAR_HBM': '1'}))
 
     def test_memory_only_node_that_is_not_faster_is_not_hbm(self):
         t = self.probe(self.slow)
