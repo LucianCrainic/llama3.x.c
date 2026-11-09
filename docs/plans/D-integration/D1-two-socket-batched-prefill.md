@@ -224,6 +224,34 @@ regions, and `tp_placement` asserts them (`scratch`) in the D1 placement runs. B
 Open: the Hugging Face gate with two sockets (`HF_GATE=0` here); the M sweep, the profiled runs and the decode after prefill (the rest of `phase_D1`);
 the verification of the work and exchange regions on the hardware.
 
+### Cluster results: the M sweep, profiles and decode (9 November 2026)
+
+Job 5704694 (tree 04e913b, hbm14, `PHASE=D1 SKIP_TEST=1 HF_GATE=0`, exit 0): 22 minutes, 242 reports, 0 failures; the gates and the eight placement checks
+passed again, and the work and exchange regions are now fully verified on their sockets' nodes. Prompt of 2048 tokens, engine-owned HBM placement,
+56 workers per socket, medians of 3 repeats. **Prefill tok/s, two sockets (and the ratio to one socket at the same M):**
+
+| Model, rung | M = 16 | 32 | 64 | 128 | 256 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8B AVX-512 FP32 GEMM | 249 | 313 | 353 (1.76x) | 350 | 327 (1.86x) |
+| 8B AMX-BF16 | 512 | 704 | 880 (1.68x) | 1016 | **1092** (1.69x) |
+| 8B AVX-512 Q8 W8A8 | 310 | 344 | 376 (1.82x) | 391 | 400 (1.84x) |
+| 8B AMX-INT8 W8A8 | 575 | 761 | 897 (1.57x) | 1001 | **1068** (1.64x) |
+| 1B AMX-BF16 | 2416 | 3174 | 3849 (1.53x) | 4297 | 4636 (1.56x) |
+| 1B AMX-INT8 | 2607 | 3308 | 3651 (1.51x) | 4001 | 4341 (1.53x) |
+
+TTFT of the 2048-token prompt, 8B: AMX-INT8 2.0 s on two sockets (M = 256) against 3.3 s on one; AMX-BF16 2.0 s against 3.3 s; AVX-512 FP32 6.0 s against 10.5 s;
+the per-token one-socket baseline is about 126 s. **M selection:** the throughput still rises at M = 256 for the AMX rungs (+8% over M = 128) and flattens at
+M = 64-128 for the AVX-512 rungs (FP32 falls at 256); the exchange is not what limits M (below).
+
+**Where the time goes** (8B, socket 0, ms per token, M = 256): AMX-BF16 total 0.931 = rmsnorm 0.170 + qkv 0.115 + attention 0.233 + wo 0.060 (incl. its
+reduction) + w1/w3 0.161 + w2 0.153 + rope 0.034; the exchange itself (add 0.014 + waits 0.017) is **3.3%** at M = 256, 4.4% at M = 64, 5.8% at M = 16 (AMX-INT8
+2.3% / 4.7% / 6.6%; AVX-512 FP32 1.0% / 1.8% / 3.5%): under the 10% budget at every M, and the imbalance between the sockets is small. Two sockets give 1.5-1.9x one
+socket, not 2x, because of the per-row operations that run serially on each socket's coordinator thread: **RMSNorm is 18% of the AMX-BF16 time per token (9% of the
+AVX-512 FP32 time)** and RoPE 3-4%, none of which halves with the second socket, and attention is 21-25% of the AMX rungs' time (FP32 kernels, half the heads per
+socket). Parallelizing the row loops over the team is the first lever (follow-up). **Decode after a two-socket prefill** (128 tokens from 2048): FP32 30.6-30.7 tok/s
+(8B) and 162-163 (1B), W8A8 83 (8B) and 392-396 (1B): FP32 equals B7's 30.2-31.05 within range; W8A8 is 13% below B7's 95.5 at an 86-token context, consistent with
+the longer context and to be compared in B7 at equal contexts.
+
 ## 7. Exit criteria
 
 - Two-socket batched prefill agrees with the one-socket batched reference at each
