@@ -318,9 +318,7 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
   static const PackedLayer none;
   const PackedLayer *pl = t->packed ? &t->packed[l] : &none;
 
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_RMSNORM,
-            k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_att_weight + l * dim, dim, p->norm_eps));
+  PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->xb, s->x, w->rms_att_weight + l * dim, count, dim, p->norm_eps));
   PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
   GemmQ8Segment qkv[3] = {{.c = s->q, .ldc = dim, .w = weight(w->wq + l), .pw = pl->wq, .n = dim, .kind = GEMM_STORE},
                           {.c = kc + (size_t)pos0 * kv_dim,
@@ -336,18 +334,15 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
                            .n = kv_dim,
                            .kind = GEMM_STORE}};
   PROFILE(PHASE_QKV, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, qkv, 3));
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_ROPE, k_rope_apply(s->q + (size_t)i * dim, kc + (size_t)(pos0 + i) * kv_dim,
-                                     s->rope + (size_t)i * 2 * head_size, p->n_heads, p->n_kv_heads, head_size));
+  PROFILE(PHASE_ROPE, k_rope_apply_rows(s->q, (size_t)dim, kc + (size_t)pos0 * kv_dim, (size_t)kv_dim, s->rope,
+                                        (size_t)2 * head_size, count, p->n_heads, p->n_kv_heads, head_size));
   PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
                                              head_size, p->seq_len, pos0, count));
   PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
   GemmQ8Segment wo = {.c = s->x, .ldc = dim, .w = weight(w->wo + l), .pw = pl->wo, .n = dim, .kind = GEMM_ADD};
   PROFILE(PHASE_WO, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, &wo, 1));
 
-  for (int i = 0; i < count; i++)
-    PROFILE(PHASE_RMSNORM,
-            k_rmsnorm(s->xb + (size_t)i * dim, s->x + (size_t)i * dim, w->rms_ffn_weight + l * dim, dim, p->norm_eps));
+  PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->xb, s->x, w->rms_ffn_weight + l * dim, count, dim, p->norm_eps));
   PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
   GemmQ8Segment up = {.c = s->hb,
                       .ldc = hidden_dim,

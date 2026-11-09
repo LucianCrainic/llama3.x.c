@@ -605,6 +605,51 @@ static void test_packed4(void) {
   }
 }
 
+/* The row-parallel forms of batched prefill are the serial row loops, bit for bit, on every instruction set, with and
+ * without a worker team: one row, many rows, and an in-place RMSNorm. */
+static void test_row_parallel(void) {
+  const int sizes[] = {16, 64, 100, 4096};
+  const int row_counts[] = {1, 2, 3, 7, 16, 33};
+  for (size_t a = 0; a < sizeof(sizes) / sizeof(*sizes); a++)
+    for (size_t b = 0; b < sizeof(row_counts) / sizeof(*row_counts); b++) {
+      const int size = sizes[a], rows = row_counts[b];
+      float *x = zeroed((size_t)rows * size, sizeof(float)), *weight = zeroed(size, sizeof(float));
+      float *serial = zeroed((size_t)rows * size, sizeof(float)), *parallel = zeroed((size_t)rows * size, sizeof(float));
+      fill(x, (size_t)rows * size, 2.0f), fill(weight, size, 1.0f);
+      for (int i = 0; i < rows; i++)
+        k_rmsnorm(serial + (size_t)i * size, x + (size_t)i * size, weight, size, 1e-5f);
+      k_rmsnorm_rows(parallel, x, weight, rows, size, 1e-5f);
+      checks++;
+      if (memcmp(serial, parallel, (size_t)rows * size * sizeof(float)) && failures++ < 20)
+        fprintf(stderr, "k_rmsnorm_rows [%s] rows=%d size=%d: differs from the serial loop\n", current, rows, size);
+      memcpy(parallel, x, (size_t)rows * size * sizeof(float)); /* in place */
+      k_rmsnorm_rows(parallel, parallel, weight, rows, size, 1e-5f);
+      checks++;
+      if (memcmp(serial, parallel, (size_t)rows * size * sizeof(float)) && failures++ < 20)
+        fprintf(stderr, "k_rmsnorm_rows in place [%s] rows=%d size=%d: differs from the serial loop\n", current, rows, size);
+      free(x), free(weight), free(serial), free(parallel);
+    }
+  /* RoPE: heads of head_dim 8 and 16 (even), GQA, row strides larger than the data they cover. */
+  const int shapes[][3] = {{4, 2, 8}, {8, 2, 16}, {6, 3, 8}};
+  for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++)
+    for (size_t b = 0; b < sizeof(row_counts) / sizeof(*row_counts); b++) {
+      const int heads = shapes[sh][0], kv_heads = shapes[sh][1], hd = shapes[sh][2], rows = row_counts[b];
+      const size_t qs = (size_t)heads * hd + 3, ks = (size_t)kv_heads * hd + 5, ts = (size_t)2 * hd;
+      float *q = zeroed(rows * qs, sizeof(float)), *k = zeroed(rows * ks, sizeof(float)), *table = zeroed(rows * ts, sizeof(float));
+      float *q2 = zeroed(rows * qs, sizeof(float)), *k2 = zeroed(rows * ks, sizeof(float));
+      fill(q, rows * qs, 1.0f), fill(k, rows * ks, 1.0f), fill(table, rows * ts, 1.0f);
+      memcpy(q2, q, rows * qs * sizeof(float)), memcpy(k2, k, rows * ks * sizeof(float));
+      for (int i = 0; i < rows; i++)
+        k_rope_apply(q + i * qs, k + i * ks, table + i * ts, heads, kv_heads, hd);
+      k_rope_apply_rows(q2, qs, k2, ks, table, ts, rows, heads, kv_heads, hd);
+      checks++;
+      if ((memcmp(q, q2, rows * qs * sizeof(float)) || memcmp(k, k2, rows * ks * sizeof(float))) && failures++ < 20)
+        fprintf(stderr, "k_rope_apply_rows [%s] heads=%d/%d hd=%d rows=%d: differs from the serial loop\n", current, heads,
+                kv_heads, hd, rows);
+      free(q), free(k), free(table), free(q2), free(k2);
+    }
+}
+
 static void *two_team_main(void *p) {
   TwoTeams *job = p;
   kernels_set_thread_team(pool_team(job->socket));
@@ -861,6 +906,7 @@ int main(int argc, char **argv) {
     test_attention_batch();
     test_partial();
     test_packed4();
+    test_row_parallel();
     test_two_teams();
     test_attention_split();
     rng = seed; /* identical inputs for every instruction set */
@@ -911,6 +957,7 @@ int main(int argc, char **argv) {
       test_attention_batch();
       test_partial();
       test_packed4();
+      test_row_parallel();
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();

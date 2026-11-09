@@ -625,6 +625,60 @@ void k_rope_apply(float *q, float *k, const float *table, int n_heads, int n_kv_
   }
 }
 
+/* ---- Row-parallel forms for batched prefill ---------------------------------------------------------------------------
+ * A microbatch normalizes and rotates M independent rows. Run one after the other on the thread that leads the team, these
+ * loops do not shrink with the number of workers or sockets: RMSNorm alone was 18% of a two-socket AMX-BF16 prefill token on
+ * 8B (D1, job 5704694). Each row is exactly the single-row call, so the results are bitwise those of the serial loops. */
+typedef struct {
+  float *out;
+  const float *x, *weight;
+  int size;
+  float epsilon;
+} RmsRowsJob;
+
+static void rmsnorm_rows_chunks(const void *p, int segment, int first, int last) {
+  const RmsRowsJob *job = p;
+  (void)segment;
+  for (int i = first; i < last; i++)
+    k_rmsnorm(job->out + (size_t)i * job->size, job->x + (size_t)i * job->size, job->weight, job->size, job->epsilon);
+}
+
+void k_rmsnorm_rows(float *out, const float *x, const float *weight, int rows, int size, float epsilon) {
+  RmsRowsJob job = {out, x, weight, size, epsilon};
+  if (rows < 2) {
+    if (rows == 1)
+      k_rmsnorm(out, x, weight, size, epsilon);
+    return;
+  }
+  kernels_parallel_segments(1, &rows, rmsnorm_rows_chunks, &job);
+}
+
+typedef struct {
+  float *q, *k;
+  const float *table;
+  size_t q_stride, k_stride, table_stride;
+  int n_heads, n_kv_heads, head_dim;
+} RopeRowsJob;
+
+static void rope_rows_chunks(const void *p, int segment, int first, int last) {
+  const RopeRowsJob *job = p;
+  (void)segment;
+  for (int i = first; i < last; i++)
+    k_rope_apply(job->q + (size_t)i * job->q_stride, job->k + (size_t)i * job->k_stride,
+                 job->table + (size_t)i * job->table_stride, job->n_heads, job->n_kv_heads, job->head_dim);
+}
+
+void k_rope_apply_rows(float *q, size_t q_stride, float *k, size_t k_stride, const float *table, size_t table_stride,
+                       int rows, int n_heads, int n_kv_heads, int head_dim) {
+  RopeRowsJob job = {q, k, table, q_stride, k_stride, table_stride, n_heads, n_kv_heads, head_dim};
+  if (rows < 2) {
+    if (rows == 1)
+      k_rope_apply(q, k, table, n_heads, n_kv_heads, head_dim);
+    return;
+  }
+  kernels_parallel_segments(1, &rows, rope_rows_chunks, &job);
+}
+
 // ----------------------------------------------------------------------------
 // GEMV drivers
 

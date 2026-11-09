@@ -542,8 +542,7 @@ static void rope_tables(const Tp *tp, TpSocket *sk) {
 }
 
 static void rmsnorm_rows(const Tp *tp, float *out, const float *x, const float *weight, int rows) {
-  for (int i = 0; i < rows; i++)
-    k_rmsnorm(out + (size_t)i * tp->c.dim, x + (size_t)i * tp->c.dim, weight, tp->c.dim, tp->c.norm_eps);
+  k_rmsnorm_rows(out, x, weight, rows, tp->c.dim, tp->c.norm_eps);
 }
 
 /* The packed copy of matrix `index` (PACK_ROLES order) of layer l on this socket, or NULL. */
@@ -634,9 +633,8 @@ static void forward_batch(Tp *tp, int s) {
       void *const pq[3] = {packed_copy(sk, l, 0), packed_copy(sk, l, 1), packed_copy(sk, l, 2)};
       SPROFILE(PHASE_QKV, gemm_f32_or_bf16(tp, sk, sk->xb, dim, dim, qkv, 3, pq, NULL));
     }
-    for (int i = 0; i < m; i++)
-      SPROFILE(PHASE_ROPE, k_rope_apply(sk->q + (size_t)i * ql, kc + (size_t)(pos0 + i) * kvl,
-                                        sk->rope + (size_t)i * 2 * hd, hl, kl, hd));
+    SPROFILE(PHASE_ROPE, k_rope_apply_rows(sk->q, (size_t)ql, kc + (size_t)pos0 * kvl, (size_t)kvl, sk->rope,
+                                           (size_t)2 * hd, m, hl, kl, hd));
     SPROFILE(PHASE_ATTENTION, k_attention_batch(sk->xb, sk->q, kc, vc, sk->att, &sk->attention, hl, kl, hd,
                                                 p->seq_len, pos0, m));
     int ok;
@@ -677,8 +675,7 @@ static void forward_batch(Tp *tp, int s) {
   if (tp->bwant == LOGITS_ALL && tp->pack == TP_PACK_BF16) {
     /* As in the one-socket BF16 mode: all-position logits are a BF16 GEMM on the packed classifier range, the default
      * last-row classifier below stays FP32. */
-    for (int i = 0; i < m; i++)
-      SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->x + (size_t)i * dim, sk->x + (size_t)i * dim, final_norm, dim, p->norm_eps));
+    SPROFILE(PHASE_RMSNORM, k_rmsnorm_rows(sk->x, sk->x, final_norm, m, dim, p->norm_eps));
     GemmBf16Segment seg = {.c = tp->batch_logits + cls->row0, .ldc = p->vocab_size, .w = sk->cls_bf16, .n = cls->rows,
                            .kind = GEMM_STORE};
     SPROFILE(PHASE_CLASSIFIER, k_gemm_bf16(sk->x, dim, m, dim, &seg, 1, &sk->panel));
