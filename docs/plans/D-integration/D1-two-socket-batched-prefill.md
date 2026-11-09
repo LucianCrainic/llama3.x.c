@@ -249,9 +249,28 @@ reduction) + w1/w3 0.161 + w2 0.153 + rope 0.034; the exchange itself (add 0.014
 socket, not 2x, because of the per-row operations that run serially on each socket's coordinator thread: **RMSNorm is 18% of the AMX-BF16 time per token (9% of the
 AVX-512 FP32 time)** and RoPE 3-4%, none of which halves with the second socket, and attention is 21-25% of the AMX rungs' time (FP32 kernels, half the heads per
 socket). Parallelizing the row loops over the team is the first lever: done afterwards (`k_rmsnorm_rows`, `k_rope_apply_rows`: one team job per call, each row exactly the
-single-row kernel, bitwise the serial loop; used by the two-socket forward and by both one-socket batched forwards); its effect on the sweep is not measured yet. **Decode after a two-socket prefill** (128 tokens from 2048): FP32 30.6-30.7 tok/s
+single-row kernel, bitwise the serial loop; used by the two-socket forward and by both one-socket batched forwards); its effect is measured below. **Decode after a two-socket prefill** (128 tokens from 2048): FP32 30.6-30.7 tok/s
 (8B) and 162-163 (1B), W8A8 83 (8B) and 392-396 (1B): FP32 equals B7's 30.2-31.05 within range; W8A8 is 13% below B7's 95.5 at an 86-token context, consistent with
 the longer context and to be compared in B7 at equal contexts.
+
+### Cluster results: after the row-parallel RMSNorm and RoPE (9 November 2026)
+
+Job 5713378 (tree 75761d4, hbm14, `make test` and the full `PHASE=D1`, `HF_GATE=0`, 56 minutes, exit 0): `make test` passed on the hardware with the new
+kernels (the row-parallel bitwise test included), all 20 comparisons and 8 placement checks passed again, 242 reports. Same settings as job 5704694; **prefill
+tok/s at 2048 tokens, two sockets (change against the previous job):**
+
+| 8B | M = 16 | M = 64 | M = 256 | One socket at M = 256 | Two sockets / one socket |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AMX-BF16 | 568 (+11%) | 1113 (+26%) | **1354** (+24%) | 724 (+12%) | **1.87x** |
+| AMX-INT8 | 670 (+17%) | 1145 (+28%) | **1341** (+26%) | 753 (+16%) | **1.78x** |
+| AVX-512 FP32 GEMM | 265 (+6%) | 390 (+10%) | 351 (+7%) | 182 (+4%) | 1.93x |
+| AVX-512 Q8 W8A8 | 330 (+6%) | 404 (+8%) | 435 (+9%) | 226 (+4%) | 1.93x |
+
+1B: AMX-BF16 5956 tok/s at M = 256 (+28%), AMX-INT8 5488 (+26%), 1.71-1.74x one socket. TTFT of the 2048-token prompt on 8B, two sockets at M = 256: AMX-BF16
+1.97 -> **1.60 s**, AMX-INT8 2.01 -> **1.61 s**, FP32 GEMM 6.42 -> 5.99 s, Q8 5.27 -> 4.84 s. The profile confirms the cause: per socket and token, RMSNorm
+0.170 -> 0.005 ms on AMX-BF16 (0.285 -> 0.064 on AVX-512 FP32), RoPE 0.032 -> 0.001; attention is unchanged (0.22-0.25 ms). Decode after the prefill is unchanged
+(8B FP32 30.7 -> 30.7, W8A8 83.1 -> 82.0 tok/s, within the range). Two sockets now reach 1.8-1.9x one socket on 8B at M = 256. Remaining non-scaling work on the AMX
+rungs: attention (about 24% of the token, FP32 kernels), and the 0.064 ms RMSNorm of the AVX-512 FP32 rung, which is not explained.
 
 ## 7. Exit criteria
 

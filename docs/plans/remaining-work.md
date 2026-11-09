@@ -59,6 +59,9 @@ time; the order puts the cheap gates ahead of the long campaigns.
 | 5704683 / 5704685 (D1 gates + D3, trees 8310e50 / e763e08) | Two script problems and a W8A8 gate too tight for 8B found (see D1 results); gate revised |
 | 5704689 (D1 gates + placement, tree cd31a67) | PASSED, 20 of 20 comparisons and 8 of 8 placement checks |
 
+| 5704694 (full D1, tree 04e913b, 22 min) | PASSED; 8B two-socket AMX-BF16 1092 tok/s, 1.5-1.9x one socket; RMSNorm found to be 18% of the token |
+| 5713378 (`make test` + full D1, tree 75761d4, 56 min) | PASSED; row-parallel RMSNorm/RoPE: 8B AMX-BF16 1354 tok/s (+24%), AMX-INT8 1341 (+26%), 1.78-1.93x one socket |
+
 `GATES_ONLY=1` (B7, D1) runs only the gates and D1's placement checks, so the hardware-only paths (the AVX-512 packed4 bitwise gate of B7, AMX on two
 sockets, the KV and packed-shard placement) can be checked before a campaign.
 
