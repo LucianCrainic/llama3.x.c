@@ -112,6 +112,19 @@ class CampaignSummaryTests(unittest.TestCase):
             self.assertIn('--last-only', line)
             self.assertIn('--batch-a 64', line, line)
             self.assertIn('--batch-b 64', line, line)
+        # C7's AMX-INT8 comparisons use the W8A8 statistical gate (rms and argmax), not the strict 1e-3 of the other rungs.
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'C7', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
+            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
+                                 text=True, timeout=120).stdout
+        amx = [line for line in out.splitlines() if line.startswith('EXPECT compare-') and 'c7-amx-int8' in line]
+        self.assertEqual(len(amx), 4)
+        for line in amx:
+            self.assertIn('--rms-max 0.2', line)
+            self.assertNotIn('--max-abs 1e-3', line)
+        for line in [l for l in out.splitlines() if l.startswith('EXPECT compare-') and 'c7-avx512-q8' in l]:
+            self.assertIn('--max-abs 1e-3', line)
         self.dry_run('cresco8-prefill.sbatch', 'D3')  # the W8A8 AMX diagnostic prints its comparisons and exits 0
         c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
         decode = [line for line in c7 if 'xdec' in line]
