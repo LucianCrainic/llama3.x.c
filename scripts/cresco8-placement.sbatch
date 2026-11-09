@@ -369,7 +369,8 @@ phase_A6() {
           LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_THP=on
         # Remote control: socket 0's threads read HBM node 3 (an explicit map points socket 0 at it).
         a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" remote hbm 56 LLAMA_BACKEND=teams \
-          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1
+          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1 \
+          LLAMA_TOPOLOGY_ALLOW_FAR_HBM=1
         for threads in 14 28; do
           a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm hbm "$threads" LLAMA_BACKEND=teams \
             LLAMA_THREADS=$threads OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm

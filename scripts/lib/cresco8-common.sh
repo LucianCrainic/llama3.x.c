@@ -171,7 +171,11 @@ run_engine() {
       ${WARM:+--warm-context "$WARM"} --log-level "${LOG_LEVEL:-warn}" --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
     local pid=$!
     if [[ $perf == 1 && $r == "$first" ]]; then perf_attach "$pid" "$prefix"; fi
-    wait "$pid"
+    # A failed launch is recorded and the campaign goes on (its report says status error, the summary shows it as failed,
+    # and OVERALL makes the job exit non-zero): one bad configuration must not cost the hours of the rest.
+    local rc=0
+    wait "$pid" || rc=$?
+    [[ $rc -eq 0 ]] || record_result "run-$label-$r" FAIL "exit=$rc"
   done
 }
 

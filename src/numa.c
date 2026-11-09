@@ -388,8 +388,12 @@ static int classify_explicit(Machine *m, const char *list, char *err, size_t err
   }
   if (count == 2 && (m->pkg_hbm[0] == m->pkg_hbm[1] || m->pkg_ddr[0] == m->pkg_ddr[1]))
     FAIL("explicit topology: the two sockets share a node");
-  /* Each socket's DDR must be nearer to its own HBM than to the other socket's. */
-  for (int p = 0; p < count && count == 2; p++)
+  /* Each socket's DDR must be nearer to its own HBM than to the other socket's. LLAMA_TOPOLOGY_ALLOW_FAR_HBM=1 lifts this
+   * for a diagnostic map that deliberately points a socket at the other socket's HBM (A6's remote control); every other
+   * check above still applies, and the setting is never a deployment choice. */
+  const char *far = getenv("LLAMA_TOPOLOGY_ALLOW_FAR_HBM");
+  const int allow_far = far && !strcmp(far, "1");
+  for (int p = 0; p < count && count == 2 && !allow_far; p++)
     if (m->dist[m->pkg_ddr[p]][m->pkg_hbm[p]] >= m->dist[m->pkg_ddr[p]][m->pkg_hbm[1 - p]])
       FAIL("explicit topology: node %d is not nearer to HBM node %d than to node %d", m->pkg_ddr[p], m->pkg_hbm[p],
            m->pkg_hbm[1 - p]);
