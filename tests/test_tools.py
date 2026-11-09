@@ -237,6 +237,13 @@ class CampaignSummaryTests(unittest.TestCase):
             self.assertIn(f'no run matrix for phase(s) {missing}', result.stderr)
             self.assertNotIn('build', result.stdout.lower())
 
+    def test_campaign_runs_use_the_whole_context(self):
+        """The engine's default of 4096 forward passes capped A6's 8192-token point; run_engine must pass -n 0."""
+        library = (ROOT/'scripts'/'lib'/'cresco8-common.sh').read_text()
+        launch = library[library.index('"$ROOT/build/release/$engine" "$checkpoint"'):]
+        launch = launch[:launch.index('&\n')]
+        self.assertIn(' -n 0 ', launch)
+
     def test_small_unverified_work_region_does_not_hide_a_verified_placement(self):
         import summarize_campaign as sc
         large = {'verified': 'full', 'pages_mismatched': 0, 'bytes': 2**30}

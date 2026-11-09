@@ -167,7 +167,7 @@ run_engine() {
     local prefix="$OUT/$label-$r"
     env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
-      --chat-template --prompt-file "$prompt" -t 0 --seed 42 --generation-length "${GENERATION:-128}" --no-text \
+      --chat-template --prompt-file "$prompt" -t 0 --seed 42 -n 0 --generation-length "${GENERATION:-128}" --no-text \
       ${WARM:+--warm-context "$WARM"} --log-level "${LOG_LEVEL:-warn}" --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
     local pid=$!
     if [[ $perf == 1 && $r == "$first" ]]; then perf_attach "$pid" "$prefix"; fi
