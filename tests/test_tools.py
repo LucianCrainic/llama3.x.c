@@ -208,8 +208,9 @@ class CampaignSummaryTests(unittest.TestCase):
         for name in names:
             text = (ROOT/'docs'/f'{name}.md').read_text()
             validation = (ROOT/'docs'/f'{name}-validation.md').read_text()
-            self.assertIn('**Status: not run.**', text)
-            self.assertIn('**Status: not run.**', validation)
+            # A skeleton says so; once the campaign has run the status line says when (and the tables hold numbers).
+            for document in (text, validation):
+                self.assertTrue('**Status: not run.**' in document or '**Status: run' in document, name)
             self.assertIn(header, text, name)
             self.assertIn(f'({name}-validation.md)', text)
             for section in ('## Provenance', '## Gates', '## Deviations from the plan', '## Raw data'):
