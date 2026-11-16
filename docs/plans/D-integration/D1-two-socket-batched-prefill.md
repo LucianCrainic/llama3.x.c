@@ -14,10 +14,10 @@ the residual is applied once.
 The result must agree numerically with the **one-socket batched reference at the same
 rung**. Prefill and decode are measured separately.
 
-Status: **in progress** (8 November 2026). Branch: `feature/integ-d1-two-socket-prefill`. FP32 is implemented and
-tested locally (L2), and so are W8A8 on the VNNI or portable Q8 GEMM (L3) and the packed AMX-BF16 and AMX-INT8 rungs (L4 of
-[remaining-work](../remaining-work.md)), the latter on the software tile model only, and so are the stress and sizing tests (L5).
-Open: the cluster check.
+Status: **implemented and run on the cluster** (9 November 2026; merged into `develop`, branch deleted). Gates and placement
+(jobs 5704689: 20 of 20 comparisons, 8 of 8 placement checks), the M sweep, profiles and decode (job 5704694) and the re-run after
+the row-parallel RMSNorm/RoPE (job 5713378: 8B AMX-BF16 1354 tok/s, 1.78-1.93x one socket) passed; see the cluster results below.
+Open: the Hugging Face gate with two sockets (`HF_GATE=1`, K4).
 
 ## 2. Depends on / unblocks
 

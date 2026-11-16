@@ -43,6 +43,12 @@ Suggested order: **L1** and **L2** first (independent, different files), then **
 different code paths in `tp.c` and can share one session only if they do not overlap), then **L6/L7** once the knob
 names are fixed, then L8-L10. L8's decision should be made before L6 so the B7 matrix is written once.
 
+### Status of 16 November 2026
+
+Done: K4 except its Hugging Face gate (D1 jobs 5704689, 5704694, 5713378), K5 except the long-context point (A6, job 5713411),
+K6 (C7, job 5713857). Open: K1, K2, K3, the HF gate of K4, the A6 long-context point, K7 (B7), K8 (D2). Cluster jobs are
+submitted and analysed without a per-job go-ahead (owner's standing instruction of 16 November 2026).
+
 ## 2. Cluster stages (after §1)
 
 Every submission needs the user's go-ahead for that job (plans README §6.5). Nodes are exclusive, so these run one at a

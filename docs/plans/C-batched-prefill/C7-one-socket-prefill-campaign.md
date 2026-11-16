@@ -7,7 +7,8 @@ model, prompt length and microbatch size, with decode measured **separately** to
 no regression. Then choose defaults (`LLAMA_PREFILL_BATCH` and the prefill kernel per
 precision) from the evidence.
 
-Status: **script written, dry-run verified; nothing run** (2026-11-07). Branch: `feature/prefill-c7-campaign` (scripts
+Status: **run on 9 November 2026 (job 5713857, 3 h 27 min); 30 of 32 gates passed, the Hugging Face gate of AMX-BF16 is still open (K1)**;
+results in [`docs/batched-prefill.md`](../../batched-prefill.md). Branch: `feature/prefill-c7-campaign` (scripts
 and results docs only). `phase_C7` in `scripts/cresco8-prefill.sbatch` implements §4.1 and §4.2 (pass structure in the
 comment above `c7_best`); `DRY_RUN=1` prints 245 launches per model (with the dry run's placeholder best sizes) and 16 correctness gates. The results documents
 `docs/batched-prefill.md` and `docs/batched-prefill-validation.md` and the choice of defaults wait for the run; it needs
