@@ -17,7 +17,7 @@ State at the end of §1 (8 November 2026; all of it on branch `feature/integ-d1-
 | D1 two-socket batched prefill | implemented for FP32, W8A8, AMX-BF16 and AMX-INT8; tested on the virtual topology and the software tile model; TSAN clean | `STAGE=check PHASE=D1` on the hardware (K4) |
 | `--warm-context`, packed4 decode layout, sizing rule | implemented and tested locally | The AVX-512 packed4 kernel and the HBM budget check have only been compiled / unit-tested, not run on hardware (gated in B7 and D1) |
 | Campaign scripts and tables | `PHASE=B7`, `D1`, `D2` written, C7 switched to `--warm-context`, summarizer tables, results skeletons; dry runs exit 0 | The runs (K5-K8) |
-| A6, C7 | scripts written and dry-run | Cluster only |
+| A6, C7 | A6 run (job 5713411); C7 run (job 5713857, 2026-11-09): 30 of 32 gates passed, results in `docs/batched-prefill.md` | A6 long-context re-run; C7 Hugging Face gate (K1) |
 | `LLAMA_TP_PARTITION=rows` | decided against (L8) | Only if B7 shows reductions plus waits above 20% |
 
 ## 1. Local subtasks (no cluster)
@@ -85,7 +85,7 @@ above only keeps the **campaigns** (K5-K8) behind §1. K4 needs L2-L6.
 | ID | Job | Time | Depends on |
 | --- | --- | --- | --- |
 | K5 | A6 placement (`PHASE=A6`, 121 launches, `--time` extended) | ~4 h | K3 |
-| K6 | C7 one-socket prefill (`PHASE=C7`, `--time=06:00:00`) | ~5 h | K1, K5 (anon HBM; else staged, recorded) |
+| K6 | C7 one-socket prefill (`PHASE=C7`, `--time=06:00:00`) | **done 2026-11-09, job 5713857, 3 h 27 min** (staged weights, HF gate not run) | K1, K5 (anon HBM; else staged, recorded) |
 | K7 | B7 two-socket decode (`PHASE=B7`) | 4-6 h | K2, K5, L6, L8 |
 | K8 | D2 final campaign (`PHASE=D2`) | 5-6 h | K4, K6, K7 |
 
