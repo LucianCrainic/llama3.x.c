@@ -321,6 +321,13 @@ CMP_TOKENS=
 # catastrophic error. The _LAST form is for a single compared row.
 W8A8_GATE=(--max-abs 16 --rms-max 0.2 --argmax-min 0.9)
 W8A8_GATE_LAST=(--max-abs 16 --rms-max 0.2 --argmax-min 0)
+# The AMX-BF16 gate (C5, fixed from the Hugging Face and FP32 per-token records of K1, jobs 5830324 and 5694396): AMX-BF16 prefill
+# against the FP32 per-token path, all positions: max 0.057-1.48, rms 0.0096-0.024, argmax agreement 98.1-100% (the 1B flips are
+# near-ties, one position in 53 on the short prompt); against Hugging Face max 0.09 (1B) / 0.22 (8B), rms <= 0.015, greedy
+# continuations identical on every prompt and mode. The bounds sit 1.3-2x above the observed values: max 2.0, rms 0.05, argmax 0.97.
+# BF16 is never judged against the FP32 1e-3 budget. The _LAST form is for a single compared row.
+BF16_GATE=(--max-abs 2 --rms-max 0.05 --argmax-min 0.97)
+BF16_GATE_LAST=(--max-abs 2 --rms-max 0.05 --argmax-min 0)
 # a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine comparison on the
 # tokens of the model (default gate: bitwise equality at every position).
 a_bitwise() {
@@ -483,6 +490,8 @@ tp_validate() {
   fi
   local extra=()
   [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
+  # TP_VALIDATE_FLAGS (e.g. --batch 64): validate.py reads the logits through the batched prefill path instead of per token
+  extra+=(${TP_VALIDATE_FLAGS[@]+"${TP_VALIDATE_FLAGS[@]}"})
   (cd "$ROOT" && env "$@" "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
     --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
     --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \

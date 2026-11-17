@@ -526,8 +526,11 @@ c7_gates() {
         if [[ $precision == fp32 ]]; then
           a_bitwise "$OUT/C7" "$name" fp32 "$staged" "c7-avx512-fp32-m$m-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
             LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on
-          c_record "$OUT/C7" "$name" fp32 "$staged" "c7-bf16-amx-m$m-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
+          local strictf=("${CMP_FLAGS[@]}")
+          if [[ $n == short ]]; then CMP_FLAGS=("${BF16_GATE[@]}" --batch-b "$m"); else CMP_FLAGS=("${BF16_GATE_LAST[@]}" --batch-b "$m" --last-only); fi
+          a_bitwise "$OUT/C7" "$name" fp32 "$staged" "c7-bf16-amx-m$m-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
             LLAMA_KERNELS=amx LLAMA_PRECISION=bf16
+          CMP_FLAGS=("${strictf[@]}")
         else
           a_bitwise "$OUT/C7" "$name" int8 "$staged" "c7-avx512-q8-m$m-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
             LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on
@@ -707,8 +710,12 @@ d1_gates() {
     done
     B_FLAGS=() B_EXPECT=ok CMP_TOKENS=
     if [[ $precision == fp32 && ${HF_GATE:-1} != 0 ]]; then
-      tp_validate "$name" "$artifacts" "$hf" fp32 fp32-2s-b64 "${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64 \
-        LLAMA_PREFILL_GEMM=on && record_result "hf-$name-fp32-2s-b64" PASS || record_result "hf-$name-fp32-2s-b64" FAIL
+      # --batch 64: the logits come through the two-socket batched prefill (without it validate.py reads them per token and
+      # only the generation steps use the batched path; K4 of 17 November 2026 showed the logits identical to the per-token gate)
+      TP_VALIDATE_FLAGS=(--batch 64)
+      tp_validate "$name" "$artifacts" "$hf" fp32 fp32-2s-b64 "${D_ENV[@]}" LLAMA_SOCKETS=2 \
+        LLAMA_PREFILL_BATCH=64 LLAMA_PREFILL_GEMM=on && record_result "hf-$name-fp32-2s-b64" PASS || record_result "hf-$name-fp32-2s-b64" FAIL
+      TP_VALIDATE_FLAGS=()
     elif [[ $precision == fp32 ]]; then
       echo "HF_GATE=0: the Hugging Face gate with LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64 was not run for $name" |
         tee -a "$dir/no-hf-gate.txt"
