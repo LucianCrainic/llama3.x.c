@@ -17,7 +17,7 @@ rung**. Prefill and decode are measured separately.
 Status: **implemented and run on the cluster** (9 November 2026; merged into `develop`, branch deleted). Gates and placement
 (jobs 5704689: 20 of 20 comparisons, 8 of 8 placement checks), the M sweep, profiles and decode (job 5704694) and the re-run after
 the row-parallel RMSNorm/RoPE (job 5713378: 8B AMX-BF16 1354 tok/s, 1.78-1.93x one socket) passed; see the cluster results below.
-Open: the Hugging Face gate with two sockets (`HF_GATE=1`, K4).
+The Hugging Face gate with two sockets passed on 17 November 2026 (job 5837867).
 
 ## 2. Depends on / unblocks
 
@@ -271,6 +271,17 @@ tok/s at 2048 tokens, two sockets (change against the previous job):**
 0.170 -> 0.005 ms on AMX-BF16 (0.285 -> 0.064 on AVX-512 FP32), RoPE 0.032 -> 0.001; attention is unchanged (0.22-0.25 ms). Decode after the prefill is unchanged
 (8B FP32 30.7 -> 30.7, W8A8 83.1 -> 82.0 tok/s, within the range). Two sockets now reach 1.8-1.9x one socket on 8B at M = 256. Remaining non-scaling work on the AMX
 rungs: attention (about 24% of the token, FP32 kernels), and the 0.064 ms RMSNorm of the AVX-512 FP32 rung, which is not explained.
+
+### Cluster results: the Hugging Face gate with two sockets (17 November 2026)
+
+cresco8-hbm14 (Flat mode), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `PHASE=D1`, `GATES_ONLY=1`, `HF_GATE=1`, `SKIP_TEST=1`, `SKIP_PRELUDE_HF=1`.
+First run (job 5830326, commit 3c554cd, 8 min) passed but did **not** exercise the batched path: `tp_validate` did not pass `--batch`, so
+`validate.py` read the logits per token (they equal the B5 two-socket numbers to the last digit) and only the generation steps used the
+batched prefill. The harness was fixed (`TP_VALIDATE_FLAGS=(--batch 64)`, commit 2aad124) and the gate re-run: job 5837867 (commit
+2aad124, 16 min, exit 0, 30 of 30 expectations passed). `LLAMA_SOCKETS=2 LLAMA_PREFILL_BATCH=64 LLAMA_PREFILL_GEMM=on`, FP32, four
+prompts, logits through the two-socket batched prefill, budget 1e-3: 1B max |Δlogit| 2.5e-5 (rms 2.9e-6), 8B 7.7e-5 (rms 5.3e-6), argmax
+100%, greedy continuations (base and instruct) identical to Hugging Face. The Hugging Face gate with two sockets is closed for FP32 (the
+other rungs have no Hugging Face budget; they are gated against one socket, above).
 
 ## 7. Exit criteria
 

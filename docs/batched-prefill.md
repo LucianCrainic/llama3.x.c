@@ -1,8 +1,7 @@
 # Batched prefill on one socket
 
 **Status: run (2026-11-09, job 5713857, commit ca2f7f8, node cresco8-hbm14).** All 32 correctness gates ran: 30 passed, 2 recorded
-deviations (AMX-BF16 on the 1B model, section "Gates"). The Hugging Face comparison for AMX-BF16 was **not** run (`HF_GATE=0`), so the
-BF16 gate stays provisional. Provenance and gates: [the validation record](batched-prefill-validation.md). Plan:
+deviations (AMX-BF16 on the 1B model, section "Gates"). The Hugging Face comparison for AMX-BF16 was **not** part of this job; it was run afterwards (17 November 2026, job 5830324) and fixed the BF16 gate (C5), under which the two recorded deviations pass. Provenance and gates: [the validation record](batched-prefill-validation.md). Plan:
 [C7](plans/C-batched-prefill/C7-one-socket-prefill-campaign.md). Full generated table: [batched-prefill-summary-table.md](batched-prefill-summary-table.md).
 Weights were read from the staged files (placement `file`), not from anonymous HBM; A6 measured that gap at 2.4% for 8B FP32 decode.
 
@@ -188,7 +187,7 @@ decisions for the owner.
 - [x] Decode is within its one-socket range after every rung: 8B FP32 15.5, BF16 15.5, Q8 41.4-42.0 tok/s against 15.45 / 41.81
   per-token references at the same context (one 0.9% miss at 8B AVX-512 Q8, run-to-run spread).
 - [ ] Defaults are chosen and justified: recommended above (M per precision); the `auto`-AMX decision is the owner's.
-- [ ] The BF16 provisional gate of C5 is confirmed or revised from the Hugging Face numbers: not done; `HF_GATE=0` in this job.
+- [x] The BF16 provisional gate of C5 is confirmed or revised from the Hugging Face numbers: revised on 17 November 2026 (job 5830324: max <= 0.22, rms <= 0.015 against Hugging Face, greedy continuations identical), to max 2.0, rms 0.05, argmax 0.97 against FP32 per token; see C5. The 98.1% of the two 1B deviations passes it.
 
 ## Follow-ups for a later plan
 

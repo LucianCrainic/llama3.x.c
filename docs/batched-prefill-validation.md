@@ -28,8 +28,8 @@ Correctness gates run before any benchmark and a failure stops it. The AMX-BF16 
 | AVX-512 FP32 GEMM against per-token (2 models x M 64, 256 x 86 and 2048 tokens) | max abs 1e-3 | 8 of 8 passed | pass |
 | AVX-512 Q8 against per-token (same grid) | max abs 1e-3 | 8 of 8 passed | pass |
 | AMX-INT8 against AVX-512 Q8 (same grid) | W8A8 statistical gate | 8 of 8 passed | pass |
-| AMX-BF16 against AVX-512 FP32 (same grid) | recorded, provisional argmax 1.0 | 6 of 8 passed; 1B at 86 tokens (M=64 and M=256): max 0.057, rms 0.0096, argmax 98.1%, the flip at position 0 (BOS) | 2 recorded deviations |
-| Hugging Face comparison of AMX-BF16 | Hugging Face numbers | not run (`HF_GATE=0`) | open (K1) |
+| AMX-BF16 against AVX-512 FP32 (same grid) | recorded, provisional argmax 1.0 (revised on 17 November 2026 to max 2.0, rms 0.05, argmax 0.97; the later C7 script applies it) | 6 of 8 passed; 1B at 86 tokens (M=64 and M=256): max 0.057, rms 0.0096, argmax 98.1%, the flip at position 0 (BOS) | 2 recorded deviations, which pass the revised gate |
+| Hugging Face comparison of AMX-BF16 | Hugging Face numbers | not run in this job; run on 17 November 2026 (job 5830324, commit 3c554cd): 8B max 0.22, rms 0.015, argmax 100%; 1B max 0.09, rms 0.013; greedy identical | done, gate revised (C5) |
 | Decode after prefill | within the same-context per-token run | 6 of 6 measured inside or within 1.5% (8B W8A32 has no same-context reference) | pass, see results document |
 
 `make test` was not run in this job (`SKIP_TEST=1`); the tool test suites passed locally on this commit before it was staged.

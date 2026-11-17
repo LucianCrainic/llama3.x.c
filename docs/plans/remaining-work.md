@@ -45,8 +45,8 @@ names are fixed, then L8-L10. L8's decision should be made before L6 so the B7 m
 
 ### Status of 16 November 2026
 
-Done: K4 except its Hugging Face gate (D1 jobs 5704689, 5704694, 5713378), K5 except the long-context point (A6, job 5713411),
-K6 (C7, job 5713857). Open: K1, K2, K3, the HF gate of K4, the A6 long-context point, K7 (B7), K8 (D2). Cluster jobs are
+Done: K1 (job 5830324, 17 November: C5 BF16 gate fixed, C6 HF recorded), K2 (job 5830325: B5, B6 HF with two sockets), K4 including its HF gate (D1 jobs 5704689, 5704694, 5713378, 5837867), K5 except the long-context point (A6, job 5713411),
+K6 (C7, job 5713857). K3 (F3 acceptance comparison) was not run: it needs the kernels campaign script and a second staged tree. Open: K3, the A6 long-context point, K7 (B7), K8 (D2). Cluster jobs are
 submitted and analysed without a per-job go-ahead (owner's standing instruction of 16 November 2026).
 
 ## 2. Cluster stages (after §1)

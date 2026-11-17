@@ -13,7 +13,7 @@ cover:
 
 Its logits must agree with the one-socket reference within the FP32 budget.
 
-Status: **implemented and validated on the cluster; two-socket decode is 1.86× one socket** (see Cluster results).
+Status: **implemented and validated on the cluster, including the Hugging Face gate with two sockets (17 November 2026); two-socket decode is 1.86× one socket** (see Cluster results).
 
 **Open risk (updated 2026-11-08):** none left from B5 itself. The conventions it sits on (A4 owned regions, B1 placement) and
 the exchange (B4) pass their cluster checks, the forward agrees with one socket, and the decode slowdown seen in the first
@@ -160,7 +160,9 @@ cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=ch
 - **Re-check of the final tree** (job 5703488, `repo-decodefix7`): `make test` passes on the cluster with AVX-512, and
   one socket against two agrees on 1B and 8B FP32 (8B: max |Δlogit| 4.5e-5, rms 2.9e-6, argmax 100%) with the placement
   check passing.
-- **Not run.** The Hugging Face gate with `LLAMA_SOCKETS=2` (`HF_GATE=0`).
+- **Hugging Face gate with `LLAMA_SOCKETS=2` (17 November 2026, job 5830325, 16 min, cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=1`, `SKIP_TEST=1` (`make test` had passed on the hardware in job 5713378), commit `3c554cd` (`develop`)):** passes at today's FP32 budget (1e-3) on four
+  prompts, per token: 1B max |Δlogit| 2.7e-5 (rms 3.1e-6), 8B 9.5e-5 (rms 6.7e-6), argmax agreement 100%, greedy continuations
+  (base and instruct) identical to Hugging Face. These are the one-socket figures (the two-socket path adds nothing visible).
 
 ## 7. Exit criteria
 

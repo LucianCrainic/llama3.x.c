@@ -11,9 +11,9 @@ Extend the two-socket forward pass to `runq` with the existing Q8_0 semantics:
 
 The partitions stay aligned to groups (study §5.4, §6.2).
 
-Status: **implemented and validated on the cluster; W8A32 agrees strictly, W8A8 passes the statistical gate, two-socket decode is 1.4-1.8× one socket** (see Cluster results).
+Status: **implemented and validated on the cluster; W8A32 agrees strictly, W8A8 passes the statistical gate, the Hugging Face deviation with two sockets is recorded (17 November 2026), two-socket decode is 1.4-1.8× one socket** (see Cluster results).
 
-**Open risk (updated 2026-11-08):** the Hugging Face deviation with `LLAMA_SOCKETS=2` has not been run. The decode speed question
+**Open risk (closed 2026-11-17):** the Hugging Face deviation with `LLAMA_SOCKETS=2` was run (job 5830325, see Cluster results); it matches the one-socket record. The decode speed question
 was a thread-pinning bug (fixed; see B7).
 
 Implementation notes:
@@ -109,7 +109,12 @@ cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=ch
   8B 86.6 against 49.1 (1.76×).
 - **Re-run of the checks on the final tree** (job 5703488, `repo-decodefix7`): the W8A32 comparison (strict 1e-3) and the
   W8A8 comparison (statistical gate) pass for 1B and 8B, and the placement check passes.
-- **Not run.** The Hugging Face deviation with `LLAMA_SOCKETS=2` (`HF_GATE=0`).
+- **Hugging Face deviation with `LLAMA_SOCKETS=2` (17 November 2026, job 5830325, cresco8-hbm14 (Flat mode, 2 × Xeon Max 9480), gcc 11.4.1, `OPENMP=1`, `STAGE=check`, `HF_GATE=1`, `SKIP_TEST=1` (`make test` had passed on the hardware in job 5713378), commit `3c554cd` (`develop`)):** recorded against the unchanged
+  atol 1.0 / rtol 0.05 budget, four prompts, per token. W8A32: 1B max 0.28-0.76 (rms 0.046-0.097), 8B max 0.64 (rms 0.055-0.096),
+  within the budget, greedy continuations identical. W8A8: 1B max 0.42-1.24 (rms 0.070-0.156), 8B max 1.44 (rms 0.099-0.177), argmax
+  100% except one flip on the 13-token multilingual prompt (92.3%, the same flip as one socket); the 1B and 8B W8A8 records exceed
+  the 1.0 max budget on that prompt exactly as the one-socket W8A8 record does (C6: 1.17 and 1.41), so it is the Q8 noise floor, not
+  a two-socket effect. Greedy continuations identical to Hugging Face.
 
 ## 7. Exit criteria
 
