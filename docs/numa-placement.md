@@ -1,8 +1,8 @@
 # One-socket placement: engine-owned memory against the staged baseline
 
-**Status: run (9 November 2026), except the long-context point.** Job 5713411 on the Flat-mode node, tree 52d35c1, 31 minutes, exit 0, 107 reports,
-no failed run. The sections below carry the measured numbers; the 8192-token point is invalid (cut at 4096 tokens by the engine's default step
-cap, fixed in 16b7332, to be re-run). Provenance and gates go in
+**Status: run (9 November 2026); the long-context point is covered by the B7 campaign (17 November 2026).** Job 5713411 on the Flat-mode node, tree 52d35c1, 31 minutes, exit 0, 107 reports,
+no failed run. The sections below carry the measured numbers; the 8192-token point of this job is invalid (cut at 4096 tokens by the engine's default step
+cap, fixed in 16b7332); the same configuration was measured in B7, see below. Provenance and gates go in
 [the validation record](numa-placement-validation.md). Plan: [A6](plans/A-numa-placement/A6-one-socket-placement-campaign.md). Branch: `feature/numa-a6-campaign`.
 
 Question: what does engine-owned placement (`LLAMA_PLACEMENT=ddr|hbm`, optional `LLAMA_THP=on`) achieve on one socket,
@@ -54,8 +54,8 @@ pages queried):
 | 8B | FP32 | 6.71 | 11.30 | 15.69 |
 | 8B | W8A8 | 21.12 | 34.54 | 50.76 |
 
-**Long-context point (8B FP32, 8192-token prompt): invalid.** The run stopped at 4096 forward passes (`stop: step_limit`, 4096 of 8226 prompt tokens processed, no decode) because
-`run_engine` did not pass `-n`; its figure (16.5 tok/s per-token prefill over 4096 tokens) must not be quoted. Fixed in 16b7332 (`-n 0`); the point is to be re-run.
+**Long-context point (8B FP32, 8192-token prompt): invalid in this job, measured in B7.** The run stopped at 4096 forward passes (`stop: step_limit`, 4096 of 8226 prompt tokens processed, no decode) because
+`run_engine` did not pass `-n`; its figure (16.5 tok/s per-token prefill over 4096 tokens) must not be quoted. Fixed in 16b7332 (`-n 0`). The B7 campaign (jobs 5839003 and 5839004, commit 2aad124, [tensor-parallel.md](tensor-parallel.md)) ran the same configuration with the fix: 8B FP32, engine-owned HBM (`teams`, `LLAMA_PLACEMENT=hbm`), 56 threads, one socket, an 8192-token retained context and 128 timed tokens. Weights (30.0 GB) and KV (2.2 GB) are verified `full` on node 2 with 0 wrong pages. Decode is 13.29 [13.24-13.42] tok/s at that context (16.42 at 512 tokens, 9.66 at 32768); W8A8 28.54 [28.48-28.57]. No separate A6 run was made, since the configuration is identical.
 
 ## Memory traffic (perf, first repeat, whole process)
 
@@ -84,7 +84,7 @@ One socket reads 447 of 552 GB/s for FP32 decode (**measured**, 81%, `docs/kerne
 - [x] Every `anon-*` run reports 100% verified weight placement; `remote-hbm` shows the penalty (4.4x slower on 8B FP32, 4.0x on W8A8) and reports node 3.
 - [x] THP: neutral, 15.68 against 15.69 on 8B FP32, 50.74 against 50.76 on W8A8, 1B within the ranges. The node already backs the weights with huge pages whatever the knob says (28.0 GiB `thp_bytes` with `LLAMA_THP` off, THP being `[always]`), so the knob changes nothing here: `B7_THP` and `D_THP` stay `off`.
 - [x] The correctness gate (`anon-hbm` bitwise equal to `file-shm-hbm`, 1B and 8B, FP32 and INT8) passed before any timing (4 of 4).
-- [ ] The long-context point: invalid, to be re-run (see above).
+- [x] The long-context point: measured in B7 (8B FP32 anon-hbm t56, 8192-token context: 13.29 tok/s decode, placement verified), see above.
 
 ## Follow-ups for a later plan
 

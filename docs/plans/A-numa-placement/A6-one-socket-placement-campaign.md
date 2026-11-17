@@ -13,7 +13,7 @@ staged-file baseline. Placement is separated into four effects:
 The result establishes the engine's local-HBM kernel rate, which is the baseline every
 later two-socket claim is judged against (study §10.3).
 
-Status: **run on 9 November 2026 (job 5713411) except the long-context point**: owned HBM within 2.4% of staged on FP32 and equal on Q8, owned DDR as fast as staged, THP neutral, remote 4x slower; see [`docs/numa-placement.md`](../../numa-placement.md). Branch: `feature/numa-a6-campaign` (scripts and results doc only).
+Status: **run on 9 November 2026 (job 5713411); the long-context point was measured in the B7 campaign on 17 November 2026 (8B FP32, 8192-token context, 13.29 tok/s, placement verified)**: owned HBM within 2.4% of staged on FP32 and equal on Q8, owned DDR as fast as staged, THP neutral, remote 4x slower; see [`docs/numa-placement.md`](../../numa-placement.md). Branch: `feature/numa-a6-campaign` (scripts and results doc only).
 
 Implementation notes:
 

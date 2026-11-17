@@ -6,9 +6,10 @@ Measure whether the two-socket split improves single-request decode latency over
 **optimized one-socket baseline** (A6), and explain where the time goes. The split is
 judged only by the study §10.4 criteria.
 
-Status: **investigation done, campaign not run** (2026-11-08). The slowdown found by B5/B6 was explained and fixed, and a first
-measurement shows two sockets beating one by 1.4-1.9× on short-context decode (see Findings). The §4.1 matrix (context
-lengths, thread counts, perf counters, the `LLAMA_TP_PARTITION=rows` comparator) has not been run. Branch:
+Status: **run on 17 November 2026 (jobs 5839003 and 5839004, commit 2aad124)**: two sockets beat one socket in all 12 cells of the 1B and 8B
+decode matrix (FP32 and W8A8, contexts 512, 8192 and 32768): 8B FP32 1.87x / 1.92x / 1.99x, 8B W8A8 1.84x / 1.77x / 1.90x, 1B 1.26x to 1.85x;
+8 of 8 gates passed; no revisit trigger reached; 56 workers per socket is the best setting; packed4 (bitwise equal) is not adopted (+3.2% at one context).
+Results: [`docs/tensor-parallel.md`](../../tensor-parallel.md). The investigation of 8 November 2026 (leader-pinning bug, first measurements) is in Findings. Branch:
 `feature/tp-b7-campaign` (scripts and results docs only).
 
 Results document skeleton (empty until the run): [`docs/tensor-parallel.md`](../../tensor-parallel.md) and its [validation record](../../tensor-parallel-validation.md).
