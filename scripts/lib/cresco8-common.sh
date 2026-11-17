@@ -220,6 +220,11 @@ validate_models() {
     echo 'HF_GATE=0: Hugging Face validation was not run (no torch/transformers environment)' | tee "$OUT/no-hf-gate.txt"
     return 0
   fi
+  if [[ ${SKIP_PRELUDE_HF:-0} == 1 ]]; then
+    echo 'SKIP_PRELUDE_HF=1: the one-socket Hugging Face gate of every precision was not repeated (the phases run their own)' |
+      tee "$OUT/no-prelude-hf.txt"
+    return 0
+  fi
   if [[ -z $MODELS ]]; then
     echo 'MODELS is empty: Hugging Face validation and model benchmarks were not run' | tee "$OUT/no-models.txt"
     return 0
@@ -445,6 +450,8 @@ check_stage() {
   local status=0
   if [[ ${SKIP_TEST:-0} == 1 ]]; then
     echo 'SKIP_TEST=1: make test was not run in this job' | tee "$OUT/test-skipped.txt"
+    # the phases that run a unit test binary (C5, C6, ...) still need the binaries
+    (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
     (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1 ||
       status=$?
