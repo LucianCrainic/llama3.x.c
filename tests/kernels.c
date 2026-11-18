@@ -1069,6 +1069,10 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
   free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores);
 }
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
 static double matrix_seconds; /* total time of the matrix, printed at the end so its cost stays visible */
 
 static void test_attention_matrix(void) {
@@ -1079,10 +1083,17 @@ static void test_attention_matrix(void) {
   const int ends[] = {31, 32, 33, 255, 256, 257}, warm[] = {1, 33, 256};
   const int decode_positions[] = {0, 1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 288, 511, 512, 513};
   int reduced = strstr(current, "teams") != NULL; /* the team loop repeats the matrix per team size: fewer shapes */
+#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+  int sparse = reduced; /* ThreadSanitizer makes the team barriers slow: one shape per team size is enough there */
+#else
+  int sparse = 0;
+#endif
   for (size_t g = 0; g < sizeof(groups) / sizeof(*groups); g++)
     for (size_t h = 0; h < sizeof(head_sizes) / sizeof(*head_sizes); h++) {
       AttnShape shape = {.kv_heads = 2, .group = groups[g], .hd = head_sizes[h]};
       if (reduced && (groups[g] == 4 || head_sizes[h] == 128))
+        continue;
+      if (sparse && (groups[g] != 2 || head_sizes[h] != 40))
         continue;
       for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++) {
         /* prompts that end (last row included) at 31/32/33 and 255/256/257 positions, and warm contexts */
@@ -1098,8 +1109,10 @@ static void test_attention_matrix(void) {
   /* M = 256: a microbatch that spans several chunk plans. Prompts ending at 256/257 positions and warm contexts (the
    * reference is O(m * context), so each shape gets two of them), then the same wave split from the workspace budget
    * the engine reads (LLAMA_ATTN_WORKSPACE_MIB) instead of a hand cut. */
-  attention_batch_case((AttnShape){2, 1, 64}, 256, 0, 0);
-  attention_batch_case((AttnShape){2, 4, 64}, 256, 1, 0);
+  if (!sparse) {
+    attention_batch_case((AttnShape){2, 1, 64}, 256, 0, 0);
+    attention_batch_case((AttnShape){2, 4, 64}, 256, 1, 0);
+  }
   if (!reduced) {
     attention_batch_case((AttnShape){2, 8, 40}, 256, 0, 0);
     attention_batch_case((AttnShape){2, 8, 40}, 256, 33, 0);
