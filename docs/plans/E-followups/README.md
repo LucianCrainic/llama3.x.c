@@ -100,7 +100,7 @@ by **what each one unblocks**.
 
 | ID | Phase | Depends on | Branch | Cluster run | Value gate (short) | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | code merged; job 5860637 |
+| E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | done, cross-check failed (0.77): see [attention-profile.md](../../attention-profile.md); job 5860637 |
 | E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | code merged, 13/13 mutations caught locally; job 5860637 |
 | E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | planned |
 | E3 | [AMX-BF16 flash attention](#e3-amx-bf16-flash-attention-conditional) | E2 decision | `feature/attn-e3-amx` | check + bench | ≥ 1.3x over E2 kernel; BF16 gate and ΔNLL | conditional |
