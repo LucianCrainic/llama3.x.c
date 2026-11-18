@@ -8,7 +8,8 @@
  * attention time. Decode calls k_attention at the last position of a context, cycling through enough copies of K/V
  * (--cold-mib, default 1024) that each call reads memory the previous one did not leave in the cache.
  * Threads, pinning and the instruction set come from the engine's own environment: LLAMA_BACKEND=teams LLAMA_THREADS=56
- * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN_ROW_BLOCK, LLAMA_ATTN_WORKSPACE_MIB.
+ * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
+ * LLAMA_ATTN_WORKSPACE_MIB.
  * One extra pass per cell runs with the kernels' task hook on (k_attention_set_task_hook) to measure how the workers are
  * used: the timed repetitions run without it. --portable runs the batched driver with the scalar chunk kernel
  * (k_attention_batch_portable), the only way to see tasks on a host without AVX-512. */
@@ -224,9 +225,11 @@ typedef struct {
 
 static void common_fields(const Setup *s, const char *mode, int workers) {
   printf("{\"mode\": \"%s\", \"isa\": \"%s\", \"backend\": \"%s\", \"workers\": %d, \"node\": %d, \"shape\": \"%s\", "
-         "\"heads\": %d, \"kv_heads\": %d, \"head_dim\": %d, \"kv_heads_model\": %d, \"row_block\": %d, \"portable\": %s, ",
+         "\"heads\": %d, \"kv_heads\": %d, \"head_dim\": %d, \"kv_heads_model\": %d, \"row_block\": %d, \"portable\": %s, "
+         "\"attn\": \"%s\", \"attn_decode\": \"%s\", ",
          mode, kernels_name(), kernels_backend_name(), workers, s->node, s->shape.name, s->heads, s->kv_heads, s->hd,
-         s->shape.kv_model, k_attention_row_block(), s->portable ? "true" : "false");
+         s->shape.kv_model, k_attention_row_block(), s->portable ? "true" : "false", kernels_attention_name(),
+         kernels_attention_decode_name());
 }
 
 static void prefill_cell(const Setup *s, int prompt, int m, int reps, int seq_extra) {

@@ -58,15 +58,15 @@ class TensorParallelTests(unittest.TestCase):
         out.frombytes(self.probe(*args, **kwargs))
         return out
 
-    def assert_agree(self, one, two, vocab):
+    def assert_agree(self, one, two, vocab, abs_tol=ABS, rel_tol=REL):
         self.assertEqual(len(one), len(two))
         for i, (a, b) in enumerate(zip(one, two)):
-            self.assertLessEqual(abs(a - b), ABS + REL * abs(a), f'logit {i}: {a} vs {b}')
+            self.assertLessEqual(abs(a - b), abs_tol + rel_tol * abs(a), f'logit {i}: {a} vs {b}')
         for row in range(len(one) // vocab):
             r1, r2 = one[row*vocab:(row+1)*vocab], two[row*vocab:(row+1)*vocab]
             top = max(r1)
             # argmax agreement, allowing a tie within the tolerance
-            self.assertGreaterEqual(r2[r1.index(top)], max(r2) - (ABS + REL * abs(top)))
+            self.assertGreaterEqual(r2[r1.index(top)], max(r2) - (abs_tol + rel_tol * abs(top)))
 
     def test_fp32_logits_agree_with_one_socket(self):
         for name, vocab in [('shared', TP_CONFIG[5]), ('unshared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])]:
@@ -299,6 +299,35 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIsNone(self.report('run', 'fp32.bin', LLAMA_PREFILL_BATCH='4', LLAMA_PREFILL_GEMM='off')['kernels_prefill'])
         # An oversized batch is capped at the context, and the exchange it needs is checked before anything is allocated.
         self.assertEqual(self.report('run', 'fp32.bin', LLAMA_PREFILL_BATCH='100000', LLAMA_PREFILL_GEMM='on')['prefill_batch'], 64)
+
+    def test_tiled_attention_batched_prefill_agrees_with_per_token(self):
+        """E2: LLAMA_ATTN=tiled on the AVX-512 kernels (the scalar model of the intrinsics, so the tile code itself runs),
+        M = 64 and a smaller block, on one socket and on two (virtual 2x3, LLAMA_TP_CHECK=1), against the per-token path.
+        The small fixture is held to the fixture tolerance against the scalar reference. The wide fixture has attention
+        scores in the hundreds, where a softmax is conditioned about 1e-5 per unit of rounding: there the batched split
+        attention itself is 2e-5 from per-token, so tiled (Q scaled before the dot, a longer dot chain) is held to 2e-4
+        against the per-token path of the same kernels. W8A8 is held to the fixture tolerance against split."""
+        self.need('probe-fp32-avx512-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(64)]
+        emul = dict(binary='probe-fp32-avx512-emul', LLAMA_KERNELS='avx512')
+        for name, vocab, reference, tolerance in (
+                ('shared', TP_CONFIG[5], self.logits('fp32', 'shared', None, 1, tokens=tokens), (ABS, REL)),
+                ('wide', TP_WIDE_CONFIG[5], self.logits('fp32', 'wide', None, 1, tokens=tokens, **emul), (2e-4, 2e-4))):
+            for batch in (64, 24):
+                for sockets in (1, 2):
+                    with self.subTest(fixture=name, batch=batch, sockets=sockets):
+                        args = dict(tokens=tokens, LLAMA_PREFILL_BATCH=str(batch), LLAMA_PREFILL_LOGITS='all',
+                                    LLAMA_PREFILL_GEMM='on', LLAMA_ATTN='tiled', **emul)
+                        self.assert_agree(reference, self.logits('fp32', name, 'batch', sockets, **args), vocab,
+                                          *tolerance)
+        self.need('probe-int8-avx512-emul')
+        for sockets in (1, 2):
+            args = dict(tokens=tokens, binary='probe-int8-avx512-emul', LLAMA_PREFILL_BATCH='64',
+                        LLAMA_PREFILL_LOGITS='all', LLAMA_PREFILL_GEMM='on', LLAMA_KERNELS='avx512')
+            with self.subTest(precision='int8', sockets=sockets):
+                self.assert_agree(self.logits('int8', 'wide', 'batch', sockets, **args, LLAMA_ATTN='split'),
+                                  self.logits('int8', 'wide', 'batch', sockets, **args, LLAMA_ATTN='tiled'),
+                                  TP_WIDE_CONFIG[5])
 
     def test_packed4_decode_layout_agrees_with_the_row_layout(self):
         """B7: LLAMA_FP32_LAYOUT=packed4 streams a second, four-rows-per-stream copy of the FP32 shards in decode (the shards

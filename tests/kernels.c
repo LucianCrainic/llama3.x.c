@@ -4,6 +4,7 @@
 #include "numa.h"
 #include "workers.h"
 #include <assert.h>
+#include <float.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -943,6 +944,7 @@ typedef struct {
   const char *name;
   AttnBatchFn batch;
   AttnDecodeFn decode;
+  int vs_split; /* also compared with the split kernel (variant 0) at 1e-5, the E2 gate */
 } AttnVariant;
 
 /* The driver with the portable chunk kernel runs the batched code (waves, row blocks, merge) on any host; it needs
@@ -955,9 +957,19 @@ static void attn_portable_batch(float *out, const float *q, const float *kc, con
     k_attention(out, q, kc, vc, att, work, heads, kv_heads, hd, seq, pos0);
 }
 
+/* E2: LLAMA_ATTN=tiled for one call. On a build without AVX-512 (or the scalar level) it hands the call to split with a
+ * one-time note, so the same expectations hold there. */
+static void attn_tiled_batch(float *out, const float *q, const float *kc, const float *vc, float *att,
+                             AttentionWork *work, int heads, int kv_heads, int hd, int seq, int pos0, int m) {
+  assert(kernels_attention_select("tiled", NULL));
+  k_attention_batch(out, q, kc, vc, att, work, heads, kv_heads, hd, seq, pos0, m);
+  assert(kernels_attention_select("split", NULL));
+}
+
 static const AttnVariant attn_variants[] = {
-    {"split", k_attention_batch, k_attention},
-    {"split-portable", attn_portable_batch, k_attention},
+    {"split", k_attention_batch, k_attention, 0},
+    {"split-portable", attn_portable_batch, k_attention, 0},
+    {"tiled", attn_tiled_batch, k_attention, 1},
 };
 enum { ATTN_VARIANTS = sizeof(attn_variants) / sizeof(*attn_variants), ATTN_GUARD_ROWS = 4 };
 
@@ -1007,6 +1019,11 @@ typedef struct {
   int kv_heads, group, hd;
 } AttnShape;
 
+/* When set, the workspace is sized for this many workers instead of the team's, so a single-threaded test still runs the
+ * multi-chunk plans of a 56-worker socket (chunk edges inside a row block, rows with no position in a chunk). */
+static int attn_force_workers;
+static double worst_vs_reference, worst_vs_split; /* largest error of the variants flagged vs_split, printed at the end */
+
 /* One batched case: m rows at pos0..pos0+m-1 on `shape`, through every variant. budget_mib > 0 sets
  * LLAMA_ATTN_WORKSPACE_MIB for the workspace sizing instead of cutting the capacity by hand. */
 static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mib) {
@@ -1017,7 +1034,7 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
   float *vc = zeroed(rows * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
   float *got = zeroed(m * dim, sizeof(float)), *first = zeroed(m * dim, sizeof(float));
   float *again = zeroed(m * dim, sizeof(float)), *kp = zeroed(rows * kv_dim, sizeof(float));
-  float *vp = zeroed(rows * kv_dim, sizeof(float));
+  float *vp = zeroed(rows * kv_dim, sizeof(float)), *split_first = zeroed(m * dim, sizeof(float));
   double *ref = zeroed(m * dim, sizeof(double)), *scores = zeroed(seq, sizeof(double));
   fill(q, m * dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
   poison(kc + (size_t)seq * kv_dim, ATTN_GUARD_ROWS * kv_dim);
@@ -1034,6 +1051,15 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
   k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
   if (budget_mib > 0)
     unsetenv("LLAMA_ATTN_WORKSPACE_MIB");
+  if (attn_force_workers) {
+    k_attention_free(&work);
+    int by_threads = (attn_force_workers + kv_heads - 1) / kv_heads, by_length = (seq + 255) / 256;
+    work.workers = attn_force_workers;
+    work.max_chunks = by_threads > by_length ? by_threads : by_length;
+    work.capacity = (size_t)m * heads * work.max_chunks * (hd + 2);
+    work.partial = zeroed(work.capacity, sizeof(float));
+    work.external = 1;
+  }
   size_t full_capacity = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
   if (budget_mib > 0)
     expect(full_capacity / one_row >= 1 && full_capacity / one_row < (size_t)m,
@@ -1052,11 +1078,22 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
                hd, m, pos0, pass);
       poison(got, m * dim), poison(att, (size_t)heads * seq), poison(work.partial, full_capacity);
       variant->batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
-      for (size_t i = 0; i < m * dim; i++)
+      for (size_t i = 0; i < m * dim; i++) {
         check(label, got[i], ref[i], 2e-5);
-      if (pass == 0)
+        if (variant->vs_split && strcmp(kernels_name(), "scalar") && fabs(got[i] - ref[i]) > worst_vs_reference)
+          worst_vs_reference = fabs(got[i] - ref[i]);
+      }
+      if (pass == 0) {
         memcpy(first, got, m * dim * sizeof(float));
-      else
+        if (v == 0)
+          memcpy(split_first, got, m * dim * sizeof(float));
+        if (variant->vs_split)
+          for (size_t i = 0; i < m * dim; i++) {
+            check(label, got[i], split_first[i], 1e-5); /* "vs split", the second E2 gate */
+            if (strcmp(kernels_name(), "scalar") && fabs(got[i] - split_first[i]) > worst_vs_split)
+              worst_vs_split = fabs(got[i] - split_first[i]);
+          }
+      } else
         expect(!memcmp(got, first, m * dim * sizeof(float)), "%s [%s]: waves changed the result bit for bit\n", label,
                current);
     }
@@ -1077,8 +1114,10 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
     }
   }
   k_attention_free(&work);
+  if (attn_force_workers)
+    free(work.partial);
   free(q), free(kc), free(vc), free(att), free(got), free(first), free(again), free(kp), free(vp), free(ref),
-      free(scores);
+      free(scores), free(split_first);
 }
 
 /* Single-row attention at `positions`, on a context whose rows after the position are NaN, through every variant. */
@@ -1117,6 +1156,131 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
   }
   k_attention_free(&work);
   free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores);
+}
+
+/* E2: a partial with no position in it (value sum 0, maximum -FLT_MAX, sum 0) must not move the merge, whatever the
+ * value-sum floats hold, at any chunk index. The merge of the real chunks alone is the expectation, bit for bit. */
+static void test_attention_empty_partial(void) {
+  enum { HD = 24, SLOT = HD + 2, CHUNKS = 5 };
+  float real[CHUNKS][SLOT], mixed[CHUNKS * 2 + 1][SLOT], want[HD], got[HD];
+  fill(&real[0][0], CHUNKS * SLOT, 3);
+  for (int c = 0; c < CHUNKS; c++)
+    real[c][HD + 1] = 1.0f + 4.0f * fabsf(real[c][HD + 1]); /* a real chunk has sum >= 1 */
+  k_attention_merge_partials(&real[0][0], SLOT, CHUNKS, HD, want);
+  for (int style = 0; style < 3; style++) {
+    int n = 0;
+    for (int c = 0; c <= CHUNKS; c++) { /* an empty slot before every real one and one at the end */
+      for (int i = 0; i < HD; i++)
+        mixed[n][i] = style == 0 ? 0.0f : style == 1 ? NAN : 1e30f;
+      mixed[n][HD] = -FLT_MAX, mixed[n][HD + 1] = 0.0f;
+      n++;
+      if (c < CHUNKS)
+        memcpy(mixed[n++], real[c], sizeof(real[c]));
+    }
+    memset(got, 0xAB, sizeof(got));
+    k_attention_merge_partials(&mixed[0][0], SLOT, n, HD, got);
+    checks++;
+    if (memcmp(got, want, sizeof(want)) && failures++ < 20)
+      fprintf(stderr, "empty partial merge [%s] style=%d: moved the result\n", current, style);
+  }
+  /* the double reference of the same merge, to make sure the expectation itself is the softmax */
+  double max = -1e30, sum = 0;
+  for (int c = 0; c < CHUNKS; c++)
+    max = fmax(max, real[c][HD]);
+  for (int c = 0; c < CHUNKS; c++)
+    sum += exp(real[c][HD] - max) * real[c][HD + 1];
+  for (int i = 0; i < HD; i++) {
+    double acc = 0;
+    for (int c = 0; c < CHUNKS; c++)
+      acc += exp(real[c][HD] - max) * real[c][i];
+    check("empty partial merge reference", want[i], acc / sum, 1e-5);
+  }
+}
+
+/* E2: the multi-chunk plans of a many-worker socket on any host: every position of a short context is a chunk edge for
+ * some row block, so rows with fewer valid chunks than their block (empty partials) occur at every shape. */
+static void test_attention_forced_plans(void) {
+  const int workers[] = {3, 6, 56};
+  for (size_t w = 0; w < sizeof(workers) / sizeof(*workers); w++) {
+    attn_force_workers = workers[w];
+    for (int pos0 = 0; pos0 <= 70; pos0 += (pos0 < 40 ? 1 : 3)) {
+      attention_batch_case((AttnShape){2, 4, 64}, 7, pos0, 0);
+      attention_batch_case((AttnShape){2, 1, 40}, 9, pos0, 0);
+    }
+    attention_batch_case((AttnShape){2, 2, 64}, 33, 100, 0);
+    attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
+  }
+  attn_force_workers = 0;
+}
+
+/* E2 knobs: every block size matches the reference through the whole matrix harness, and the claim order of the tasks
+ * (longest first or in plan order) changes nothing bit for bit, also with several waves and with the hook set. */
+static atomic_long hook_tasks, hook_positions;
+static void count_task(void *ctx, const AttentionTaskInfo *info) {
+  (void)ctx;
+  atomic_fetch_add(&hook_tasks, 1);
+  atomic_fetch_add(&hook_positions, info->positions);
+}
+
+static void test_attention_tiled_knobs(void) {
+  const int queries[] = {1, 3, 4, 8, 16};
+  for (size_t i = 0; i < sizeof(queries) / sizeof(*queries); i++) {
+    k_attention_set_tiled(queries[i], 1);
+    attn_force_workers = 6;
+    attention_batch_case((AttnShape){2, 4, 64}, 13, 61, 0);
+    attention_batch_case((AttnShape){2, 2, 40}, 9, 33, 0);
+    attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
+    attn_force_workers = 0;
+  }
+  const AttnShape shapes[] = {{2, 4, 64}, {2, 2, 128}, {2, 1, 40}};
+  for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
+    int heads = shapes[sh].kv_heads * shapes[sh].group, kv_heads = shapes[sh].kv_heads, hd = shapes[sh].hd;
+    int m = 21, pos0 = 200, seq = pos0 + m, workers = 6;
+    size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+    float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+    float *vc = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+    float *want = zeroed(m * dim, sizeof(float)), *got = zeroed(m * dim, sizeof(float));
+    fill(q, m * dim, 2), fill(kc, seq * kv_dim, 2), fill(vc, seq * kv_dim, 1);
+    AttentionWork work;
+    k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
+    k_attention_free(&work);
+    work.workers = workers, work.max_chunks = (workers + kv_heads - 1) / kv_heads > (seq + 255) / 256
+                                                  ? (workers + kv_heads - 1) / kv_heads
+                                                  : (seq + 255) / 256;
+    size_t one_row = (size_t)heads * work.max_chunks * (hd + 2);
+    work.partial = zeroed(m * one_row, sizeof(float)), work.external = 1;
+    for (int pass = 0; pass < 2; pass++) {
+      work.capacity = pass ? 3 * one_row : m * one_row; /* pass 1: waves of three rows */
+      assert(kernels_attention_select("tiled", NULL));
+      k_attention_set_tiled(16, 1);
+      k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      k_attention_set_tiled(16, 0);
+      memset(got, 0xAB, m * dim * sizeof(float));
+      atomic_store(&hook_tasks, 0), atomic_store(&hook_positions, 0);
+      k_attention_set_task_hook(count_task, NULL); /* the benchmark's path through the tasks */
+      k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      k_attention_set_task_hook(NULL, NULL);
+      k_attention_set_tiled(16, 1);
+      /* every row sees pos0 + i + 1 positions and each of them is scored by one task per KV head */
+      long visible = 0;
+      for (int i = 0; i < m; i++)
+        visible += (long)(pos0 + i + 1) * kv_heads;
+      int ran_tiled = strcmp(kernels_name(), "scalar") != 0; /* the scalar level hands tiled to split, which has no hook */
+      checks += 2;
+      if (ran_tiled && atomic_load(&hook_tasks) <= 0 && failures++ < 20)
+        fprintf(stderr, "tiled hook [%s]: no task reported\n", current);
+      if (ran_tiled && atomic_load(&hook_positions) != visible && failures++ < 20)
+        fprintf(stderr, "tiled hook [%s]: %ld positions reported, %ld expected\n", current,
+                (long)atomic_load(&hook_positions), visible);
+      assert(kernels_attention_select("split", NULL));
+      checks++;
+      if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
+        fprintf(stderr, "tiled order [%s] hd=%d g=%d pass=%d: natural order changed the result\n", current, hd,
+                shapes[sh].group, pass);
+    }
+    free(work.partial), free(q), free(kc), free(vc), free(att), free(want), free(got);
+  }
+  k_attention_set_tiled(16, 1);
 }
 
 #ifndef __has_feature
@@ -1207,6 +1371,9 @@ int main(int argc, char **argv) {
     test_attention_batch();
     test_attention_batch_row_block();
     test_attention_matrix();
+    test_attention_forced_plans();
+    test_attention_empty_partial();
+    test_attention_tiled_knobs();
     test_partial();
     test_packed4();
     test_row_parallel();
@@ -1273,6 +1440,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 3; i++)
     free(rope[i]), free(quantized[i]), free(scales[i]);
   printf("kernels: attention matrix %.1f s\n", matrix_seconds);
+  printf("kernels: tiled attention, largest error %.3g against the double reference, %.3g against split\n",
+         worst_vs_reference, worst_vs_split);
   printf("kernels: %d checks, %d failures\n", checks, failures);
   return failures != 0;
 }

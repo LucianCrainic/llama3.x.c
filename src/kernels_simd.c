@@ -39,6 +39,10 @@ static int initialized;
  * bitwise independent of it. */
 enum { BATCH_MAX_ROW_BLOCK = 16 };
 static int attention_row_block = 4;
+/* E2 tiled attention: query vectors per task (rows of a block x heads of the group, 1..16, LLAMA_ATTN_TILED_QUERIES) and
+ * whether the tasks of a wave are claimed longest first (LLAMA_ATTN_TILED_ORDER=longest|natural). Neither changes how a
+ * row is computed once its block is fixed; the block size sets the chunk plan, the order only the schedule. */
+static int attention_tiled_queries = 16, attention_tiled_longest_first = 1;
 /* With a team set, kernels run on it instead of opening OpenMP regions. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
@@ -124,6 +128,20 @@ void kernels_init(void) {
     if (*end || value < 1 || value > BATCH_MAX_ROW_BLOCK)
       fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
     attention_row_block = (int)value;
+  }
+  const char *queries = getenv("LLAMA_ATTN_TILED_QUERIES"), *order = getenv("LLAMA_ATTN_TILED_ORDER");
+  attention_tiled_queries = 16, attention_tiled_longest_first = 1;
+  if (queries && *queries) {
+    char *end;
+    long value = strtol(queries, &end, 10);
+    if (*end || value < 1 || value > 16)
+      fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
+    attention_tiled_queries = (int)value;
+  }
+  if (order && *order) {
+    if (strcmp(order, "longest") && strcmp(order, "natural"))
+      fail("LLAMA_ATTN_TILED_ORDER must be longest or natural");
+    attention_tiled_longest_first = !strcmp(order, "longest");
   }
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
@@ -222,9 +240,24 @@ static void parallel_rows(int rows, RowFn fn, const void *job) {
 }
 
 // ----------------------------------------------------------------------------
+// Split-K partials
+
+/* The partial of a chunk that holds no position of the row (tiled, E2): zero value sum, the lowest maximum, zero sum of
+ * exponentials. A real chunk always has sum >= 1 (its maximum contributes exp(0)), so the test cannot match one. */
+static int partial_empty(const float *chunk, int head_dim) {
+  return chunk[head_dim + 1] == 0.0f && chunk[head_dim] == -FLT_MAX;
+}
+
+// ----------------------------------------------------------------------------
 // AVX-512 helpers
 
 #if HAVE_AVX512
+static void partial_write_empty(float *o, int head_dim) {
+  memset(o, 0, (size_t)head_dim * sizeof(float));
+  o[head_dim] = -FLT_MAX;
+  o[head_dim + 1] = 0.0f;
+}
+
 AVX512 static inline __mmask16 tail_mask(int count) {
   return count >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << count) - 1u);
 }
@@ -600,6 +633,234 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
       _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : 0xFFFF, ov[v]);
     o[head_dim] = max_val;
     o[head_dim + 1] = _mm512_reduce_add_ps(vsum);
+  }
+}
+
+/* ---- E2: tiled batched attention -------------------------------------------------------------------------------------
+ * One task = one KV group, one chunk [t0, t1) of positions and a block of `nrows` consecutive rows (row r sees the
+ * positions below vis0 + r). The chunk is the same for every row of the block; a row sees only its own prefix of it, and
+ * a row with no position in the chunk writes an empty partial. The block's query vectors are its rows x the group's
+ * heads (at most 16); K is read once per tile of 32 positions for all of them. */
+enum { TILED_POS = 32, TILED_MAX_Q = 16, TILED_MAX_CHUNK = 256, TILED_QG = 8 };
+
+AVX512 static inline __mmask16 lane_mask(int count) {
+  return count <= 0 ? (__mmask16)0 : count >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << count) - 1u);
+}
+
+/* In-place transpose of a 16 x 16 tile held in 16 registers: 64 shuffles (unpack ps, unpack pd, two f32x4 shuffles). */
+AVX512 static inline void transpose16(__m512 *r) {
+  __m512 t[16], u[16];
+  for (int i = 0; i < 8; i++) {
+    t[2 * i] = _mm512_unpacklo_ps(r[2 * i], r[2 * i + 1]);
+    t[2 * i + 1] = _mm512_unpackhi_ps(r[2 * i], r[2 * i + 1]);
+  }
+  for (int g = 0; g < 4; g++) {
+    __m512d a = _mm512_castps_pd(t[4 * g]), b = _mm512_castps_pd(t[4 * g + 1]), c = _mm512_castps_pd(t[4 * g + 2]),
+            d = _mm512_castps_pd(t[4 * g + 3]);
+    u[4 * g] = _mm512_castpd_ps(_mm512_unpacklo_pd(a, c));
+    u[4 * g + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(a, c));
+    u[4 * g + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(b, d));
+    u[4 * g + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(b, d));
+  }
+  for (int k = 0; k < 4; k++) {
+    __m512 a0 = _mm512_shuffle_f32x4(u[k], u[4 + k], 0x88), a1 = _mm512_shuffle_f32x4(u[k], u[4 + k], 0xDD);
+    __m512 b0 = _mm512_shuffle_f32x4(u[8 + k], u[12 + k], 0x88), b1 = _mm512_shuffle_f32x4(u[8 + k], u[12 + k], 0xDD);
+    r[k] = _mm512_shuffle_f32x4(a0, b0, 0x88);
+    r[4 + k] = _mm512_shuffle_f32x4(a1, b1, 0x88);
+    r[8 + k] = _mm512_shuffle_f32x4(a0, b0, 0xDD);
+    r[12 + k] = _mm512_shuffle_f32x4(a1, b1, 0xDD);
+  }
+}
+
+/* Keys of positions t..t+cnt-1 (cnt <= 32) of one KV head as kt[d][position], so a score tile is a broadcast-FMA over d
+ * with no horizontal reduction. Positions at and after cnt are zero; rows past them are never read. */
+AVX512 static void tiled_transpose_keys(const float *kc, int kv_dim, int head_dim, int t, int cnt, float *kt) {
+  int halves = cnt > 16 ? 2 : 1;
+  for (int d0 = 0; d0 < head_dim; d0 += 16) {
+    __mmask16 dm = lane_mask(head_dim - d0);
+    int dn = head_dim - d0 < 16 ? head_dim - d0 : 16;
+    for (int h = 0; h < halves; h++) {
+      __m512 r[16];
+      for (int p = 0; p < 16; p++)
+        r[p] = h * 16 + p < cnt ? _mm512_maskz_loadu_ps(dm, kc + (size_t)(t + h * 16 + p) * kv_dim + d0)
+                                : _mm512_setzero_ps();
+      transpose16(r);
+      for (int i = 0; i < dn; i++)
+        _mm512_storeu_ps(kt + (size_t)(d0 + i) * TILED_POS + h * 16, r[i]);
+    }
+  }
+}
+
+/* Scores of TILED_QG query vectors (qd[d * 16 + j] is element d of vector j, already scaled: the 16 vectors of the task
+ * are interleaved per d so the broadcast operands of one d sit in one cache line) against the transposed tile: 8 x 2
+ * accumulators, per d two loads of kt and eight broadcast operands for 16 FMAs. `nv` is 1 or 2 position vectors. */
+AVX512 static inline void tiled_scores8(const float *kt, const float *qd, int head_dim, int nv, float *out,
+                                        size_t ostride, int cnt) {
+  __m512 a[TILED_QG][2];
+  for (int j = 0; j < TILED_QG; j++)
+    a[j][0] = a[j][1] = _mm512_setzero_ps();
+  if (nv == 2) {
+    for (int d = 0; d < head_dim; d++, kt += TILED_POS, qd += TILED_MAX_Q) {
+      __m512 k0 = _mm512_loadu_ps(kt), k1 = _mm512_loadu_ps(kt + 16);
+      for (int j = 0; j < TILED_QG; j++) {
+        __m512 b = _mm512_set1_ps(qd[j]);
+        a[j][0] = _mm512_fmadd_ps(b, k0, a[j][0]);
+        a[j][1] = _mm512_fmadd_ps(b, k1, a[j][1]);
+      }
+    }
+  } else {
+    for (int d = 0; d < head_dim; d++, kt += TILED_POS, qd += TILED_MAX_Q) {
+      __m512 k0 = _mm512_loadu_ps(kt);
+      for (int j = 0; j < TILED_QG; j++)
+        a[j][0] = _mm512_fmadd_ps(_mm512_set1_ps(qd[j]), k0, a[j][0]);
+    }
+  }
+  for (int j = 0; j < TILED_QG; j++) {
+    _mm512_mask_storeu_ps(out + j * ostride, lane_mask(cnt), a[j][0]);
+    if (nv == 2)
+      _mm512_mask_storeu_ps(out + j * ostride + 16, lane_mask(cnt - 16), a[j][1]);
+  }
+}
+
+/* P x V for TILED_QG query vectors and one slice of `dv` (1 or 2) vectors of the head: the accumulators come from the
+ * task's output scratch (rescaled by alpha when the running maximum moved), one V row load feeds 8 x dv FMAs whose
+ * broadcast operand is a probability in L1, and they go back to the scratch. 16 accumulators, two V registers. */
+AVX512 static inline __attribute__((always_inline)) void tiled_pv(const float *p8, const float *v, int kv_dim, int npos,
+                                                                   float *o8, size_t ostride, const float *alpha8,
+                                                                   __mmask16 m0, __mmask16 m1, int dv) {
+  __m512 a[TILED_QG][2];
+  for (int j = 0; j < TILED_QG; j++) {
+    a[j][0] = _mm512_loadu_ps(o8 + j * ostride);
+    a[j][1] = dv == 2 ? _mm512_loadu_ps(o8 + j * ostride + 16) : _mm512_setzero_ps();
+    if (alpha8) {
+      __m512 alpha = _mm512_set1_ps(alpha8[j]);
+      a[j][0] = _mm512_mul_ps(a[j][0], alpha);
+      if (dv == 2)
+        a[j][1] = _mm512_mul_ps(a[j][1], alpha);
+    }
+  }
+  for (int pos = 0; pos < npos; pos++) {
+    const float *vr = v + (size_t)pos * kv_dim;
+    __m512 v0 = _mm512_maskz_loadu_ps(m0, vr), v1 = dv == 2 ? _mm512_maskz_loadu_ps(m1, vr + 16) : _mm512_setzero_ps();
+    for (int j = 0; j < TILED_QG; j++) {
+      __m512 b = _mm512_set1_ps(p8[j * TILED_POS + pos]);
+      a[j][0] = _mm512_fmadd_ps(b, v0, a[j][0]);
+      if (dv == 2)
+        a[j][1] = _mm512_fmadd_ps(b, v1, a[j][1]);
+    }
+  }
+  for (int j = 0; j < TILED_QG; j++) {
+    _mm512_storeu_ps(o8 + j * ostride, a[j][0]);
+    if (dv == 2)
+      _mm512_storeu_ps(o8 + j * ostride + 16, a[j][1]);
+  }
+}
+
+/* The task. Per tile of 32 positions: transpose K once; then per group of 8 query vectors scores (registers to an 8 x 32
+ * L1 tile), online softmax (running maximum m and sum l per query vector; when the maximum moves, the accumulator and l
+ * are rescaled by exp(m_old - m_new)), probabilities to an L1 tile, and PV into the output scratch. Nothing but K, V
+ * and Q is read from beyond L1, and no score is ever written to memory the task does not own. Positions a row may not
+ * see get probability exactly zero (the lanes are masked, not given a large negative score). */
+AVX512 static void attention_tiled_avx512(const float *q, size_t q_row_stride, int nrows, int kv_mul, int head_dim,
+                                          int vis0, int t0, int t1, const float *kc, const float *vc, int kv_dim,
+                                          float *partial, size_t row_stride, size_t head_stride) {
+  _Alignas(64) float qs[TILED_MAX_Q * 256], kt[256 * TILED_POS], os[TILED_MAX_Q * 256], ps[TILED_MAX_Q * TILED_POS],
+      sc[TILED_QG * TILED_POS];
+  float m[TILED_MAX_Q], l[TILED_MAX_Q], alpha[TILED_MAX_Q], lane[16];
+  int vectors = (head_dim + 15) / 16, hdp = vectors * 16, nq = nrows * kv_mul;
+  int nqp = (nq + TILED_QG - 1) / TILED_QG * TILED_QG;
+  __mmask16 last = lane_mask(head_dim - (vectors - 1) * 16);
+  /* Q for the block, scaled by 1/sqrt(head_dim) once (no division per score) and transposed to qs[d][query vector], with
+   * zero vectors up to 16 (a 16 x 16 transpose per 16 elements of the head). */
+  const __m512 scale = _mm512_set1_ps(1.0f / sqrtf((float)head_dim));
+  for (int d0 = 0; d0 < hdp; d0 += 16) {
+    __mmask16 dm = lane_mask(head_dim - d0);
+    __m512 r[16];
+    for (int qi = 0; qi < TILED_MAX_Q; qi++)
+      r[qi] = qi < nq ? _mm512_mul_ps(_mm512_maskz_loadu_ps(dm, q + (size_t)(qi / kv_mul) * q_row_stride +
+                                                                    (size_t)(qi % kv_mul) * head_dim + d0),
+                                      scale)
+                      : _mm512_setzero_ps();
+    transpose16(r);
+    for (int c = 0; c < 16; c++)
+      _mm512_storeu_ps(qs + (size_t)(d0 + c) * TILED_MAX_Q, r[c]);
+  }
+  for (int qi = 0; qi < nqp; qi++)
+    for (int v = 0; v < vectors; v++)
+      _mm512_storeu_ps(os + (size_t)qi * hdp + v * 16, _mm512_setzero_ps());
+  for (int qi = 0; qi < TILED_MAX_Q; qi++) {
+    m[qi] = -FLT_MAX, l[qi] = 0.0f, alpha[qi] = 1.0f;
+    for (int i = 0; i < TILED_POS; i += 16)
+      _mm512_storeu_ps(ps + qi * TILED_POS + i, _mm512_setzero_ps());
+  }
+  const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff)), finite = _mm512_set1_ps(FLT_MAX);
+  int tend = t1 < vis0 + nrows - 1 ? t1 : vis0 + nrows - 1; /* beyond the last row's prefix nothing is read */
+  for (int t = t0; t < tend; t += TILED_POS) {
+    int cnt = tend - t < TILED_POS ? tend - t : TILED_POS;
+    tiled_transpose_keys(kc, kv_dim, head_dim, t, cnt, kt);
+    for (int q0 = 0; q0 < nqp; q0 += TILED_QG) {
+      /* the last real query vector of the group sees the most positions of this tile */
+      int qlast = q0 + TILED_QG - 1 < nq ? q0 + TILED_QG - 1 : nq - 1, rlast = qlast / kv_mul;
+      int gn = (vis0 + rlast < t + cnt ? vis0 + rlast : t + cnt) - t;
+      if (gn <= 0)
+        continue; /* no query vector of the group sees any position of this tile: nothing to add */
+      tiled_scores8(kt, qs + q0, head_dim, gn > 16 ? 2 : 1, sc, TILED_POS, gn);
+      int rescale = 0;
+      for (int j = 0; j < TILED_QG; j++) {
+        int qi = q0 + j, n = qi < nq ? (vis0 + qi / kv_mul < t + cnt ? vis0 + qi / kv_mul : t + cnt) - t : 0;
+        float *p = ps + (size_t)qi * TILED_POS;
+        alpha[qi] = 1.0f;
+        if (n <= 0) { /* a row above the diagonal of this tile, or a padding row */
+          _mm512_storeu_ps(p, _mm512_setzero_ps());
+          _mm512_storeu_ps(p + 16, _mm512_setzero_ps());
+          continue;
+        }
+        __mmask16 k0 = lane_mask(n), k1 = lane_mask(n - 16);
+        __m512 s0 = _mm512_maskz_loadu_ps(k0, sc + j * TILED_POS), s1 = _mm512_maskz_loadu_ps(k1, sc + j * TILED_POS + 16);
+        if ((_mm512_mask_cmp_ps_mask(k0, _mm512_and_ps(s0, abs_mask), finite, _CMP_LE_OQ) != k0) ||
+            (_mm512_mask_cmp_ps_mask(k1, _mm512_and_ps(s1, abs_mask), finite, _CMP_LE_OQ) != k1))
+          fail("nonfinite value in softmax");
+        __m512 vmax = _mm512_set1_ps(-FLT_MAX);
+        vmax = _mm512_mask_max_ps(vmax, k0, vmax, s0);
+        vmax = _mm512_mask_max_ps(vmax, k1, vmax, s1);
+        float tile_max = _mm512_reduce_max_ps(vmax), old = m[qi];
+        if (tile_max > old) { /* the maximum moved: what is accumulated so far is scaled by exp(old - new) */
+          _mm512_storeu_ps(lane, exp512(_mm512_set1_ps(old - tile_max)));
+          alpha[qi] = lane[0];
+          l[qi] *= lane[0];
+          m[qi] = tile_max;
+          rescale = 1;
+        }
+        __m512 shift = _mm512_set1_ps(m[qi]);
+        __m512 e0 = _mm512_maskz_mov_ps(k0, exp512(_mm512_sub_ps(s0, shift)));
+        __m512 e1 = _mm512_maskz_mov_ps(k1, exp512(_mm512_sub_ps(s1, shift)));
+        _mm512_storeu_ps(p, e0);
+        _mm512_storeu_ps(p + 16, e1);
+        l[qi] += _mm512_reduce_add_ps(_mm512_add_ps(e0, e1));
+      }
+      for (int s = 0; s < vectors; s += 2) { /* slices of two vectors of the head */
+        __mmask16 m0 = s + 1 == vectors ? last : 0xFFFF, m1 = s + 2 == vectors ? last : 0xFFFF;
+        const float *pq = ps + (size_t)q0 * TILED_POS, *v = vc + (size_t)t * kv_dim + s * 16;
+        float *o8 = os + (size_t)q0 * hdp + s * 16;
+        if (s + 1 < vectors)
+          tiled_pv(pq, v, kv_dim, gn, o8, (size_t)hdp, rescale ? alpha + q0 : NULL, m0, m1, 2);
+        else
+          tiled_pv(pq, v, kv_dim, gn, o8, (size_t)hdp, rescale ? alpha + q0 : NULL, m0, m1, 1);
+      }
+    }
+  }
+  for (int qi = 0; qi < nq; qi++) {
+    int r = qi / kv_mul, h = qi % kv_mul, end = t1 < vis0 + r ? t1 : vis0 + r;
+    float *o = partial + (size_t)r * row_stride + (size_t)h * head_stride;
+    if (end <= t0) {
+      partial_write_empty(o, head_dim);
+      continue;
+    }
+    for (int v = 0; v < vectors; v++)
+      _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : 0xFFFF,
+                            _mm512_loadu_ps(os + (size_t)qi * hdp + v * 16));
+    o[head_dim] = m[qi];
+    o[head_dim + 1] = l[qi];
   }
 }
 #endif
@@ -1406,7 +1667,8 @@ static void attention_scalar(float *out, const float *q, const float *key_cache,
     attention_scalar_head(&job, h);
 }
 
-/* Merge chunk results: rescale each by exp(m_c - M) and normalize. `base` holds `chunks` slots of `slot` floats. */
+/* Merge chunk results: rescale each by exp(m_c - M) and normalize. `base` holds `chunks` slots of `slot` floats. Empty
+ * partials are skipped, so their value sum is never read. */
 static void merge_chunks(const float *base, size_t slot, int chunks, int head_dim, float *o) {
   float max_val = base[head_dim];
   for (int c = 1; c < chunks; c++)
@@ -1416,6 +1678,8 @@ static void merge_chunks(const float *base, size_t slot, int chunks, int head_di
   memset(o, 0, head_dim * sizeof(float));
   for (int c = 0; c < chunks; c++) {
     const float *chunk = base + c * slot;
+    if (partial_empty(chunk, head_dim))
+      continue; /* a row with no position in this chunk (tiled, E2); split never writes one, so it is unaffected */
     float weight = expf(chunk[head_dim] - max_val);
     sum += weight * chunk[head_dim + 1];
     for (int i = 0; i < head_dim; i++)
@@ -1423,6 +1687,10 @@ static void merge_chunks(const float *base, size_t slot, int chunks, int head_di
   }
   for (int i = 0; i < head_dim; i++)
     o[i] /= sum;
+}
+
+void k_attention_merge_partials(const float *base, size_t slot, int chunks, int head_dim, float *o) {
+  merge_chunks(base, slot, chunks, head_dim, o);
 }
 
 /* Opt-in per-task timing for the attention benchmark (E0). Unset (the default), a task costs one atomic load. */
@@ -1586,6 +1854,13 @@ static void attention_chunk_portable(const float *q, const float *kc, const floa
 }
 
 enum { BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
+
+void k_attention_set_tiled(int queries, int longest_first) {
+  if (queries < 1 || queries > 16)
+    fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
+  attention_tiled_queries = queries;
+  attention_tiled_longest_first = longest_first != 0;
+}
 
 void k_attention_set_row_block(int rows) {
   if (rows < 1 || rows > BATCH_MAX_ROW_BLOCK)
@@ -1768,6 +2043,223 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
 }
 
 // ----------------------------------------------------------------------------
+// Tiled batched attention (E2)
+
+#if HAVE_AVX512
+typedef struct {
+  int g, block, chunk, cost;
+} TiledTask;
+
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  float *partial;
+  int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
+  int pos0, m, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch of m rows */
+  int rblock, chunks_wave, tasks;
+  const TiledTask *order; /* the tasks of the wave, in the order they are claimed */
+  size_t slot, head_stride, row_stride;
+  atomic_int next_task;
+  Team *team;
+} TiledJob;
+
+/* The chunk plan of a block of rows: chunk length (a multiple of the position tile) and chunk count. It depends only on
+ * the block's nominal last row, never on the wave that happens to contain the block, so results do not depend on how a
+ * microbatch is cut into waves. */
+static void tiled_plan(const TiledJob *j, int block, int *length, int *chunks) {
+  int end = (block + 1) * j->rblock < j->m ? (block + 1) * j->rblock : j->m, positions = j->pos0 + end;
+  int wanted = attention_chunks(positions, j->n_kv_heads, j->limit, j->workers);
+  int len = ((positions + wanted - 1) / wanted + TILED_POS - 1) / TILED_POS * TILED_POS;
+  *length = len;
+  *chunks = (positions + len - 1) / len;
+}
+
+/* What a task covers: the first and last row of its block that belong to the wave, and its chunk [t0, t1). */
+static void tiled_extent(const TiledJob *j, const TiledTask *t, int *first, int *last, int *t0, int *t1) {
+  int length, chunks;
+  tiled_plan(j, t->block, &length, &chunks);
+  int block_end = (t->block + 1) * j->rblock < j->m ? (t->block + 1) * j->rblock : j->m;
+  *first = t->block * j->rblock > j->row0 ? t->block * j->rblock : j->row0;
+  *last = block_end < j->row0 + j->rows ? block_end : j->row0 + j->rows;
+  *t0 = t->chunk * length;
+  *t1 = (t->chunk + 1) * length < j->pos0 + block_end ? (t->chunk + 1) * length : j->pos0 + block_end;
+}
+
+static void tiled_task(const TiledJob *j, const TiledTask *t) {
+  int first, last, t0, t1;
+  tiled_extent(j, t, &first, &last, &t0, &t1);
+  int h0 = t->g * j->kv_mul, rr = first - j->row0;
+  attention_tiled_avx512(j->q + (size_t)first * j->dim + (size_t)h0 * j->head_dim, (size_t)j->dim, last - first,
+                         j->kv_mul, j->head_dim, j->pos0 + first + 1, t0, t1,
+                         j->key_cache + (size_t)t->g * j->head_dim, j->value_cache + (size_t)t->g * j->head_dim,
+                         j->kv_dim,
+                         j->partial + (size_t)rr * j->row_stride + (size_t)h0 * j->head_stride + t->chunk * j->slot,
+                         j->row_stride, j->head_stride);
+}
+
+static void tiled_run(const TiledJob *j, int index, int worker) {
+  const TiledTask *t = &j->order[index];
+  AttentionTaskHook hook = atomic_load_explicit(&attention_task_hook, memory_order_acquire);
+  if (!hook) {
+    tiled_task(j, t);
+    return;
+  }
+  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .wave = j->row0, .task = index};
+  int first, last, t0, t1;
+  tiled_extent(j, t, &first, &last, &t0, &t1);
+  for (int row = first; row < last; row++) {
+    int end = t1 < j->pos0 + row + 1 ? t1 : j->pos0 + row + 1;
+    if (end > t0)
+      info.rows++, info.positions += end - t0;
+  }
+  info.span = t1 > t0 ? t1 - t0 : 0;
+  info.begin = monotonic_seconds();
+  tiled_task(j, t);
+  info.end = monotonic_seconds();
+  hook(attention_task_ctx, &info);
+}
+
+static void tiled_merge(const TiledJob *j, int item) {
+  int rr = item / j->n_heads, h = item % j->n_heads, row = j->row0 + rr, length, chunks;
+  tiled_plan(j, row / j->rblock, &length, &chunks);
+  merge_chunks(j->partial + (size_t)rr * j->row_stride + (size_t)h * j->head_stride, j->slot, chunks, j->head_dim,
+               j->out + (size_t)row * j->dim + (size_t)h * j->head_dim);
+}
+
+static void tiled_team(const void *p, int worker, int workers) {
+  TiledJob *j = (TiledJob *)p;
+  for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
+    tiled_run(j, task, worker);
+  team_barrier(j->team); /* every chunk of every row and head is in `partial` before any is merged */
+  int items = j->rows * j->n_heads;
+  for (int item = (int)((long long)items * worker / workers); item < (int)((long long)items * (worker + 1) / workers);
+       item++)
+    tiled_merge(j, item);
+}
+
+/* The tasks of a wave in the order they are claimed: the most positions first (the late row blocks, whose chunks are the
+ * longest), then late blocks, early chunks, low groups. Slots are disjoint, so the order never changes a result. */
+static int tiled_compare(const void *a, const void *b) {
+  const TiledTask *x = a, *y = b;
+  if (x->cost != y->cost)
+    return x->cost > y->cost ? -1 : 1;
+  if (x->block != y->block)
+    return x->block > y->block ? -1 : 1;
+  if (x->chunk != y->chunk)
+    return x->chunk < y->chunk ? -1 : 1;
+  return x->g - y->g;
+}
+
+static TiledTask *tiled_tasks(TiledJob *j) {
+  int block0 = j->row0 / j->rblock, block1 = (j->row0 + j->rows - 1) / j->rblock, count = 0;
+  TiledTask *list = NULL;
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass) {
+      list = malloc((size_t)count * sizeof(*list));
+      if (!list)
+        fail("out of memory for the attention task list");
+      count = 0;
+    }
+    for (int block = block0; block <= block1; block++) {
+      int length, chunks;
+      tiled_plan(j, block, &length, &chunks);
+      int end = j->pos0 + ((block + 1) * j->rblock < j->m ? (block + 1) * j->rblock : j->m);
+      for (int g = 0; g < j->n_kv_heads; g++)
+        for (int c = 0; c < chunks; c++) {
+          if (pass) {
+            int span = (c + 1) * length < end ? length : end - c * length;
+            list[count] = (TiledTask){.g = g, .block = block, .chunk = c, .cost = span};
+          }
+          count++;
+        }
+    }
+  }
+  j->tasks = count;
+  if (attention_tiled_longest_first)
+    qsort(list, (size_t)count, sizeof(*list), tiled_compare);
+  return list;
+}
+
+static void attention_tiled_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m) {
+  int kv_mul = n_heads / n_kv_heads, queries = attention_tiled_queries / kv_mul;
+  TiledJob job = {.out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
+                  .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .kv_mul = kv_mul,
+                  .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim, .limit = work->max_chunks,
+                  .workers = work->workers, .pos0 = pos0, .m = m, .rblock = queries < 1 ? 1 : queries,
+                  .slot = (size_t)head_dim + 2};
+  for (int row0 = 0; row0 < m;) {
+    /* A wave holds as many rows of partials as the workspace allows. The slots per head follow the plan of the last
+     * block of the wave; chunk counts only grow with the position. */
+    int rows = m - row0;
+    for (;;) {
+      job.row0 = row0, job.rows = rows;
+      int last_end = ((row0 + rows - 1) / job.rblock + 1) * job.rblock;
+      job.chunks_wave = attention_chunks(pos0 + (last_end < m ? last_end : m), n_kv_heads, job.limit, job.workers);
+      if (rows == 1 || (size_t)rows * n_heads * job.chunks_wave * job.slot <= work->capacity)
+        break;
+      rows = (int)(work->capacity / ((size_t)n_heads * job.chunks_wave * job.slot));
+      rows = rows < 1 ? 1 : rows;
+    }
+    job.head_stride = (size_t)job.chunks_wave * job.slot;
+    job.row_stride = (size_t)n_heads * job.head_stride;
+    TiledTask *order = tiled_tasks(&job);
+    job.order = order;
+    atomic_init(&job.next_task, 0);
+    job.team = current_team;
+    if (current_team) {
+      team_run(current_team, tiled_team, &job);
+    } else {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+      {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (int task = 0; task < job.tasks; task++)
+          tiled_run(&job, task, -1);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (int item = 0; item < job.rows * n_heads; item++)
+          tiled_merge(&job, item);
+      }
+    }
+    free(order);
+    row0 += rows;
+  }
+}
+#endif
+
+/* One note per process when `tiled` hands a call to `split`: the precision is the same, only the speed differs. */
+static void attention_tiled_fallback(const char *reason) {
+  static atomic_flag noted = ATOMIC_FLAG_INIT;
+  if (!atomic_flag_test_and_set(&noted))
+    LOG(LOG_INFO, "LLAMA_ATTN=tiled: %s, running split attention instead", reason);
+}
+
+static void attention_batch_tiled(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                  int seq_len, int pos0, int m) {
+  if (m > 1) { /* a single row is the decode path, whatever the variant */
+#if HAVE_AVX512
+    if (isa != KERNELS_AVX512)
+      attention_tiled_fallback("the AVX-512 kernels are not active");
+    else if (head_dim > 256 || n_heads / n_kv_heads > TILED_MAX_Q)
+      attention_tiled_fallback("head_dim above 256 or more than 16 query heads per KV head is not supported");
+    else if (batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
+      attention_tiled_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m);
+      return;
+    }
+#else
+    attention_tiled_fallback("the AVX-512 kernels are not built");
+#endif
+  }
+  attention_batch_split(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m);
+}
+
+// ----------------------------------------------------------------------------
 // Attention variant dispatch (E1)
 
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
@@ -1793,8 +2285,8 @@ typedef struct {
 
 static const AttentionBatchEntry attention_batch_table[] = {
     {"split", attention_batch_split, NULL},
-    {"tiled", NULL, "E2/E3"},
-    {"amx", NULL, "E2/E3"},
+    {"tiled", attention_batch_tiled, NULL},
+    {"amx", NULL, "E3"},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
     {"split", attention_decode_split, NULL},
