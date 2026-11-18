@@ -427,6 +427,123 @@ class CompareEnginesTests(unittest.TestCase):
         self.assertIn('KEY=VALUE', result.stderr)
 
 
+class GenerationMathTests(unittest.TestCase):
+    """compare_generation.py helpers, on synthetic sequences and logits (no engine needed)."""
+    @classmethod
+    def setUpClass(cls):
+        import compare_generation as cg
+        cls.cg = cg
+
+    def test_first_divergence(self):
+        self.assertIsNone(self.cg.first_divergence([1, 2, 3], [1, 2, 3]))
+        self.assertIsNone(self.cg.first_divergence([], []))
+        self.assertEqual(self.cg.first_divergence([1, 2, 3], [1, 9, 3]), 1)
+        self.assertEqual(self.cg.first_divergence([1, 2], [1, 2, 3]), 2)   # a strict prefix ends where it diverges
+        self.assertEqual(self.cg.first_divergence([], [7]), 0)
+
+    def test_edit_distance(self):
+        self.assertEqual(self.cg.edit_distance([], []), 0)
+        self.assertEqual(self.cg.edit_distance([1, 2, 3], [1, 2, 3]), 0)
+        self.assertEqual(self.cg.edit_distance([1, 2, 3], [1, 3]), 1)          # deletion
+        self.assertEqual(self.cg.edit_distance([], [1, 2]), 2)                 # insertions only
+        self.assertEqual(self.cg.edit_distance([1, 2, 3], [1, 9, 3]), 1)       # substitution
+        self.assertEqual(self.cg.edit_distance(list('kitten'), list('sitting')), 3)
+        self.assertEqual(self.cg.edit_distance([1, 2, 3, 4], [4, 3, 2, 1]), 4)
+
+    def test_top_two_margin_on_synthetic_logits(self):
+        import struct
+        margin, top2 = self.cg.top_two_margin(struct.pack('<4f', 0.5, 2.5, 2.0, -1.0))
+        self.assertEqual((margin, top2), (0.5, [1, 2]))
+        margin, top2 = self.cg.top_two_margin(struct.pack('<3f', 1.0, 1.0, 0.0))
+        self.assertEqual((margin, top2), (0.0, [0, 1]))  # a tie: the lower id ranks first
+        with self.assertRaises(SystemExit):
+            self.cg.top_two_margin(struct.pack('<2f', float('nan'), 1.0))
+        with self.assertRaises(SystemExit):
+            self.cg.top_two_margin(struct.pack('<1f', 3.0))
+
+
+@unittest.skipUnless(BUILD and (BUILD/'probe-fp32').exists() and (BUILD/'run').exists(),
+                     'needs BUILD_DIR with run and probe-fp32 (make test)')
+class CompareGenerationTests(unittest.TestCase):
+    STUB = ('#!{python}\n'
+            'import json, os\n'
+            'with open(os.environ["LLAMA_TOKENS_OUT"], "w") as f:\n'
+            '    json.dump({{"prompt": [65, 66, 67], "generated": json.loads(os.environ["STUB_GENERATED"])}}, f)\n')
+
+    @classmethod
+    def setUpClass(cls):
+        from fixtures import create
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.fixture = create(Path(cls.temp.name)/'fx')
+        cls.prompt = Path(cls.temp.name)/'prompt.txt'
+        cls.prompt.write_text('A')
+        cls.stub = Path(cls.temp.name)/'stub-engine'
+        cls.stub.write_text(cls.STUB.format(python=sys.executable))
+        cls.stub.chmod(0o755)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def compare(self, *args, engine=None, steps='16'):
+        result = subprocess.run([sys.executable, str(TOOLS/'compare_generation.py'), '--engine', str(engine or BUILD/'run'),
+                                 '--checkpoint', str(self.fixture/'fp32.bin'), '--tokenizer', str(self.fixture/'tokenizer.bin'),
+                                 '--prompt-file', str(self.prompt), '--steps', steps, *args],
+                                capture_output=True, text=True, timeout=120)
+        return result, (json.loads(result.stdout) if result.stdout else None)
+
+    def test_identical_configurations_generate_identical_text(self):
+        result, data = self.compare('--env-a', 'LLAMA_BACKEND=omp', '--env-b', 'LLAMA_BACKEND=teams',
+                                    '--env-b', 'LLAMA_THREADS=3', '--probe', str(BUILD/'probe-fp32'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(data['identical'])
+        self.assertIsNone(data['first_divergence'])
+        self.assertEqual((data['edit_distance'], data['margin_a'], data['top2_a']), (0, None, None))
+        self.assertGreater(data['generated_a'], 0)
+        self.assertEqual(data['generated_a'], data['generated_b'])
+        self.assertTrue(data['prompt_identical'])
+        self.assertEqual(data['env_b'], {'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3'})
+        self.assertIn('identical', result.stderr)
+
+    def test_warm_context_is_part_of_the_recorded_prompt(self):
+        result, data = self.compare('--warm-context', '2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(data['prompt_tokens'], 2 + 2)   # BOS and 'A', forwarded once as warm-up and once as prompt
+        self.assertEqual(data['warm_context'], 2)
+
+    def test_divergence_reports_index_tokens_distance_and_margin(self):
+        """A stub engine writes the chosen ids, so the divergence is known exactly; the margin is the real probe's."""
+        from compare_engines import run_probe
+        from compare_generation import top_two_margin
+        result, data = self.compare('--env-a', 'STUB_GENERATED=[70,71,72,73]', '--env-b', 'STUB_GENERATED=[70,71,99,73]',
+                                    '--probe', str(BUILD/'probe-fp32'), engine=self.stub, steps='4')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(data['identical'])
+        self.assertEqual((data['first_divergence'], data['token_a'], data['token_b']), (2, 72, 99))
+        self.assertEqual((data['generated_a'], data['generated_b'], data['edit_distance']), (4, 4, 1))
+        blob = run_probe(BUILD/'probe-fp32', self.fixture/'fp32.bin', [65, 66, 67, 70, 71], {}, batch=1, last_only=True)
+        margin, top2 = top_two_margin(blob)
+        self.assertAlmostEqual(data['margin_a'], margin, places=6)
+        self.assertEqual(data['top2_a'], top2)
+        self.assertIn('diverge at token 2', result.stderr)
+
+    def test_prefix_divergence_and_identical_stubs(self):
+        result, data = self.compare('--env-a', 'STUB_GENERATED=[70,71,72,73]', '--env-b', 'STUB_GENERATED=[70,71]',
+                                    engine=self.stub, steps='4')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((data['first_divergence'], data['token_a'], data['token_b'], data['edit_distance']),
+                         (2, 72, None, 2))
+        self.assertIsNone(data['margin_a'])     # no --probe
+        result, data = self.compare('--env-a', 'STUB_GENERATED=[70,71]', '--env-b', 'STUB_GENERATED=[70,71]',
+                                    engine=self.stub, steps='4')
+        self.assertTrue(data['identical'])
+
+    def test_failed_engine_run_is_an_error(self):
+        result, data = self.compare('--warm-context', '99999', steps='4')  # warm-up must leave room in the context
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(data)
+
+
 @unittest.skipUnless(BUILD and (BUILD/'probe-fp32').exists(), 'needs BUILD_DIR with probe-fp32 (make test)')
 class MakePromptsTests(unittest.TestCase):
     def build(self, out, lengths):

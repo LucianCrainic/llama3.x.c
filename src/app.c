@@ -201,6 +201,52 @@ static int *tokenize(Tokenizer *t, const char *text, int bos, int *n) {
   return tokens;
 }
 
+/* LLAMA_TOKENS_OUT=FILE (generate mode only): prompt collects every id forwarded before the first sampled token (the
+ * --warm-context ids first, then the prompt), generated every sampled id, the final stop token included. The JSON is
+ * written once, after generation. Unset, none of this runs. */
+typedef struct {
+  int *ids;
+  int count, capacity;
+} TokenList;
+static const char *tokens_out;
+static TokenList token_prompt, token_generated;
+
+static void token_list_add(TokenList *list, const int *values, int n) {
+  if (n > INT_MAX - list->count)
+    fail("LLAMA_TOKENS_OUT: too many tokens");
+  if (list->count + n > list->capacity) {
+    int capacity = list->capacity ? list->capacity : 256;
+    while (capacity < list->count + n)
+      capacity = capacity > INT_MAX / 2 ? INT_MAX : capacity * 2;
+    int *grown = memory_alloc((size_t)capacity, sizeof(int), MEM_PROMPT);
+    if (list->count)
+      memcpy(grown, list->ids, (size_t)list->count * sizeof(int));
+    memory_free(list->ids);
+    list->ids = grown;
+    list->capacity = capacity;
+  }
+  memcpy(list->ids + list->count, values, (size_t)n * sizeof(int));
+  list->count += n;
+}
+static void token_list_write(FILE *file, const TokenList *list) {
+  for (int i = 0; i < list->count; i++)
+    fprintf(file, "%s%d", i ? ", " : "", list->ids[i]);
+}
+static void tokens_write(void) {
+  FILE *file = fopen(tokens_out, "wb");
+  if (!file)
+    fail("cannot open LLAMA_TOKENS_OUT '%s': %s", tokens_out, strerror(errno));
+  fputs("{\"prompt\": [", file);
+  token_list_write(file, &token_prompt);
+  fputs("], \"generated\": [", file);
+  token_list_write(file, &token_generated);
+  fputs("]}\n", file);
+  if (fclose(file))
+    fail("cannot write LLAMA_TOKENS_OUT '%s': %s", tokens_out, strerror(errno));
+  memory_free(token_prompt.ids);
+  memory_free(token_generated.ids);
+}
+
 /* Microbatched prefill: every supplied token, including the last prompt token,
  * is forwarded. Only the final prompt logits are sampled. A decode step
  * forwards the previously generated token. EOS/EOT are sampled but not emitted. */
@@ -236,6 +282,8 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       count = options.steps - *position;
     LogitsWanted want = model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
     profile_stage = STAGE_PREFILL;
+    if (tokens_out && !metrics.sampled_tokens)
+      token_list_add(&token_prompt, tokens + i, count);
     double start = monotonic_seconds();
     logits = engine_forward_batch(&model, tokens + i, count, *position, want);
     metrics.prefill_s += monotonic_seconds() - start;
@@ -270,6 +318,8 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   for (;;) {
     int next = sample(sampler, logits);
     metrics.sampled_tokens++;
+    if (tokens_out)
+      token_list_add(&token_generated, &next, 1);
     if (tokenizer_stop(t, next)) {
       metrics.stop_tokens++;
       metrics.stop_reason = "stop_token";
@@ -327,6 +377,8 @@ static int warm_up(const int *tokens, int n) {
       /* tokens[0] is BOS: later passes over the prompt skip it when the prompt has other tokens. */
       chunk[j] = at < n ? tokens[at] : (n > 1 ? tokens[1 + (at - n) % (n - 1)] : tokens[0]);
     }
+    if (tokens_out)
+      token_list_add(&token_prompt, chunk, count);
     engine_forward_batch(&model, chunk, count, pos, LOGITS_NONE);
     pos += count;
   }
@@ -420,6 +472,9 @@ int main(int argc, char **argv) {
   program_start = monotonic_seconds();
   atexit(finish);
   parse(argc, argv);
+  tokens_out = getenv("LLAMA_TOKENS_OUT");
+  if (tokens_out && (!*tokens_out || !strcmp(options.mode, "chat")))
+    fail(!*tokens_out ? "LLAMA_TOKENS_OUT must name a file" : "LLAMA_TOKENS_OUT applies to generate mode only");
   if (options.prompt_file) {
     FILE *file = fopen(options.prompt_file, "rb");
     if (!file)
@@ -454,6 +509,8 @@ int main(int argc, char **argv) {
     fail("cannot flush generated text: %s", strerror(errno));
   if (ferror(stdout))
     fail("cannot write generated text: %s", strerror(errno));
+  if (tokens_out)
+    tokens_write();
   LOG(LOG_INFO,
       "prompt=%zu processed=%zu output=%zu forwards=%zu decode_steps=%zu; prefill=%.6fs decode=%.6fs inference=%.6fs",
       metrics.input_tokens, metrics.processed_tokens, metrics.output_tokens, metrics.forward_passes,
