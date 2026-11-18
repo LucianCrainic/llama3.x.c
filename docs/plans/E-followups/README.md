@@ -101,8 +101,8 @@ by **what each one unblocks**.
 | ID | Phase | Depends on | Branch | Cluster run | Value gate (short) | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | done, cross-check failed (0.77): see [attention-profile.md](../../attention-profile.md); job 5860637 |
-| E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | code merged, 13/13 mutations caught locally; job 5860637 |
-| E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | planned |
+| E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | done: defaults bitwise, FP32 gate 8/8 identical, 2b = noise floor (margin 0.046 < 0.2); 13/13 mutations caught; job 5863571 |
+| E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | check passed (18/18, FP32 max abs Δ ≤ 1.4e-4), job 5863571; bench job 5864099 running |
 | E3 | [AMX-BF16 flash attention](#e3-amx-bf16-flash-attention-conditional) | E2 decision | `feature/attn-e3-amx` | check + bench | ≥ 1.3x over E2 kernel; BF16 gate and ΔNLL | conditional |
 | E4 | [Prefill campaign and decision](#e4-prefill-attention-campaign-and-decision) | E2 (and E3) | `feature/attn-e4-campaign` | 1 campaign | ≥ 1.5x TTFT at 8192, one socket; two sockets agree | planned |
 | E5 | [Decode attention](#e5-decode-attention) | E0, E1 (E2 micro-kernel) | `feature/attn-e5-decode` | check + B7 subset | ≥ 1.3x decode at 32768 on 1B; 512 not slower | planned |
@@ -329,6 +329,29 @@ and the item-2b reruns (1B W8A8, 8192 context, one and two sockets, three repeat
 - **Value**: the harness catches every mutation (that is its value; record which test caught which); item 2b has a written
   verdict (noise floor or bug) backed by the margin data.
 - **Decision**: proceed to E2 if 2b is "noise floor" or "bug fixed"; otherwise stop and report to the owner.
+
+### E1.6 Results (measured, job 5863571, commit 0b26adb, 2026-11-18)
+
+- **Hardware tests**: `make test` passed (every C check 0 failures; Python suites OK).
+- **Defaults unchanged**: 8B FP32 at 2048 tokens against the 8f3114f baseline build, bitwise identical (max |Δ| 0) for
+  M 64, per-token and two-socket M 64.
+- **FP32 determinism gate**: 8 of 8 comparisons identical over 128 tokens (1B and 8B; short and 2048-token prompts;
+  one against two sockets; per-token against M 64).
+- **Item 2b verdict: noise floor.** 1B, 8192-token retained context (prompt 8278 tokens), three repeats each:
+
+  | comparison | diverged | first divergence | reference top-2 margin |
+  | --- | ---: | ---: | ---: |
+  | W8A8, one socket against two | 3 of 3 | token 0 | 0.0455 (all three runs) |
+  | W8A32, one socket against two | 0 of 3 | - | - |
+  | W8A8, one socket against one (control) | 0 of 3 | - | - |
+
+  The two sockets pick the second candidate at the first generated token, where the reference run's top two logits
+  (tokens 128010 and 128006, both special tokens) differ by 0.0455, below the W8A8 noise floor of 0.2. With FP32
+  activations (W8A32) one and two sockets generate the same 128 tokens, so the divergence is confined to the W8A8 path
+  (where its rounding enters is not isolated, and at this margin need not be). The earlier "stop after 29 tokens" is
+  this near-tie at token 0 followed by a different continuation (30 tokens here). E2 is not blocked.
+- The earlier run of this check (job 5860637) could not report margins because `probe` was capped at 4096 positions
+  (fixed in 7901b44).
 
 ---
 
