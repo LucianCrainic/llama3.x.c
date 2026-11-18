@@ -1,6 +1,6 @@
 # Track E: faster attention, then the post-M5 follow-ups
 
-Plan date: 18 November 2026. Status: **planned, nothing started.** Baseline: `develop` at `1dc674c` (M5 closed, D2 results in
+Plan date: 18 November 2026. Status (18 November 2026): **E0 and E1 code merged into `develop` (397aa10) and passing `make test`; cluster job 5860637 (`STAGE=check PHASE="E0 E1"`) submitted.** Baseline: `develop` at `1dc674c` (M5 closed, D2 results in
 [`docs/numa-tp-prefill-results.md`](../../numa-tp-prefill-results.md)). Source brief:
 [`agent-brief.md`](agent-brief.md); this document turns it into phases with a correctness gate, a value gate and a
 go/no-go decision at the end of each one. Read §1-§5 once, then the phase you are working on.
@@ -100,8 +100,8 @@ by **what each one unblocks**.
 
 | ID | Phase | Depends on | Branch | Cluster run | Value gate (short) | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | planned |
-| E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | planned |
+| E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | code merged; job 5860637 |
+| E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | code merged, 13/13 mutations caught locally; job 5860637 |
 | E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | planned |
 | E3 | [AMX-BF16 flash attention](#e3-amx-bf16-flash-attention-conditional) | E2 decision | `feature/attn-e3-amx` | check + bench | ≥ 1.3x over E2 kernel; BF16 gate and ΔNLL | conditional |
 | E4 | [Prefill campaign and decision](#e4-prefill-attention-campaign-and-decision) | E2 (and E3) | `feature/attn-e4-campaign` | 1 campaign | ≥ 1.5x TTFT at 8192, one socket; two sockets agree | planned |
