@@ -358,6 +358,56 @@ static void test_attention_batch(void) {
       }
 }
 
+/* E0: LLAMA_ATTN_ROW_BLOCK only regroups rows into tasks; every row is computed as before, so the batched result is
+ * bitwise the same for any block size, with row counts the block does not divide, with several waves, and on both the
+ * engine path and the portable driver. */
+static void test_attention_batch_row_block(void) {
+  const int configs[][3] = {{8, 2, 64}, {6, 2, 40}, {4, 4, 128}};
+  const int ms[] = {2, 7, 13, 32}, starts[] = {0, 31, 250};
+  const int blocks[] = {1, 2, 3, 4, 7, 16};
+  const int saved = k_attention_row_block();
+  for (size_t c = 0; c < sizeof(configs) / sizeof(*configs); c++)
+    for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++)
+      for (size_t pi = 0; pi < sizeof(starts) / sizeof(*starts); pi++) {
+        int heads = configs[c][0], kv_heads = configs[c][1], hd = configs[c][2], m = ms[mi], pos0 = starts[pi];
+        int seq = pos0 + m;
+        size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+        float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+        float *vc = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+        float *want = zeroed(m * dim, sizeof(float)), *got = zeroed(m * dim, sizeof(float));
+        float *want_port = zeroed(m * dim, sizeof(float)), *port = zeroed(m * dim, sizeof(float));
+        fill(q, m * dim, 2), fill(kc, seq * kv_dim, 2), fill(vc, seq * kv_dim, 1);
+        AttentionWork work;
+        k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
+        size_t full_capacity = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
+        for (int pass = 0; pass < 2; pass++) {
+          /* pass 1: room for only two rows, so the batch runs in several waves whose blocks are cut short */
+          work.capacity = pass ? (2 * one_row < full_capacity ? 2 * one_row : full_capacity) : full_capacity;
+          k_attention_set_row_block(4);
+          k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+          k_attention_batch_portable(want_port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
+          for (size_t b = 0; b < sizeof(blocks) / sizeof(*blocks); b++) {
+            k_attention_set_row_block(blocks[b]);
+            memset(got, 0xAB, m * dim * sizeof(float));
+            memset(port, 0xAB, m * dim * sizeof(float));
+            k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+            k_attention_batch_portable(port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
+            checks += 2;
+            if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
+              fprintf(stderr, "attention_batch row block [%s] heads=%d kv=%d hd=%d m=%d pos0=%d pass=%d block=%d: differs\n",
+                      current, heads, kv_heads, hd, m, pos0, pass, blocks[b]);
+            if (memcmp(port, want_port, m * dim * sizeof(float)) && failures++ < 20)
+              fprintf(stderr, "attention_batch portable row block [%s] heads=%d m=%d pos0=%d pass=%d block=%d: differs\n",
+                      current, heads, m, pos0, pass, blocks[b]);
+          }
+        }
+        work.capacity = full_capacity;
+        k_attention_free(&work);
+        free(q), free(kc), free(vc), free(att), free(want), free(got), free(want_port), free(port);
+      }
+  k_attention_set_row_block(saved);
+}
+
 /* ---- Shard kernels (B2): partial outputs, column slices, row slices and padded rows -------------------------------
  */
 
@@ -904,6 +954,7 @@ int main(int argc, char **argv) {
     rope_used = test_rope(rope[i]);
     test_attention();
     test_attention_batch();
+    test_attention_batch_row_block();
     test_partial();
     test_packed4();
     test_row_parallel();
