@@ -945,6 +945,7 @@ typedef struct {
   AttnBatchFn batch;
   AttnDecodeFn decode;
   int vs_split; /* also compared with the split kernel (variant 0) at 1e-5, the E2 gate */
+  int decode_only; /* a single-row variant (E5): the batched cases run it for m = 1 only */
 } AttnVariant;
 
 /* The driver with the portable chunk kernel runs the batched code (waves, row blocks, merge) on any host; it needs
@@ -966,10 +967,26 @@ static void attn_tiled_batch(float *out, const float *q, const float *kc, const 
   assert(kernels_attention_select("split", NULL));
 }
 
+/* E5: LLAMA_ATTN_DECODE=group for one call; like tiled it hands the call to split with a one-time note where AVX-512
+ * is not active. A single row goes through the decode path, which is where the knob acts. */
+static void attn_group_decode(float *out, const float *q, const float *kc, const float *vc, float *att,
+                              AttentionWork *work, int heads, int kv_heads, int hd, int seq, int position) {
+  assert(kernels_attention_select(NULL, "group"));
+  k_attention(out, q, kc, vc, att, work, heads, kv_heads, hd, seq, position);
+  assert(kernels_attention_select(NULL, "split"));
+}
+
+static void attn_group_batch(float *out, const float *q, const float *kc, const float *vc, float *att,
+                             AttentionWork *work, int heads, int kv_heads, int hd, int seq, int pos0, int m) {
+  assert(m == 1);
+  attn_group_decode(out, q, kc, vc, att, work, heads, kv_heads, hd, seq, pos0);
+}
+
 static const AttnVariant attn_variants[] = {
-    {"split", k_attention_batch, k_attention, 0},
-    {"split-portable", attn_portable_batch, k_attention, 0},
-    {"tiled", attn_tiled_batch, k_attention, 1},
+    {"split", k_attention_batch, k_attention, 0, 0},
+    {"split-portable", attn_portable_batch, k_attention, 0, 0},
+    {"tiled", attn_tiled_batch, k_attention, 1, 0},
+    {"group", attn_group_batch, attn_group_decode, 1, 1},
 };
 enum { ATTN_VARIANTS = sizeof(attn_variants) / sizeof(*attn_variants), ATTN_GUARD_ROWS = 4 };
 
@@ -1022,6 +1039,7 @@ typedef struct {
 /* When set, the workspace is sized for this many workers instead of the team's, so a single-threaded test still runs the
  * multi-chunk plans of a 56-worker socket (chunk edges inside a row block, rows with no position in a chunk). */
 static int attn_force_workers;
+static double matrix_seconds_long;                /* time of the long decode contexts */
 static double worst_vs_reference, worst_vs_split; /* largest error of the variants flagged vs_split, printed at the end */
 
 /* One batched case: m rows at pos0..pos0+m-1 on `shape`, through every variant. budget_mib > 0 sets
@@ -1067,6 +1085,8 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
            budget_mib, full_capacity / one_row, m);
   for (int v = 0; v < ATTN_VARIANTS; v++) {
     const AttnVariant *variant = &attn_variants[v];
+    if (variant->decode_only && m != 1)
+      continue;
     /* pass 0: as sized; pass 1: a third of the rows per wave; pass 2: one row per wave (short batches only) */
     for (int pass = 0; pass < 3; pass++) {
       if (pass && (budget_mib > 0 || m < 3 || (pass == 2 && m > 32)))
@@ -1129,6 +1149,7 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
   float *vc = zeroed(seq * kv_dim, sizeof(float)), *kp = zeroed(seq * kv_dim, sizeof(float));
   float *vp = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
   float *got = zeroed(dim, sizeof(float)), *second = zeroed(dim, sizeof(float));
+  float *split_got = zeroed(dim, sizeof(float));
   double *ref = zeroed(dim, sizeof(double)), *scores = zeroed(seq, sizeof(double));
   fill(q, dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
   AttentionWork work;
@@ -1147,6 +1168,14 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
       attn_variants[v].decode(got, q, kp, vp, att, &work, heads, kv_heads, hd, seq, position);
       for (size_t i = 0; i < dim; i++)
         check(label, got[i], ref[i], 2e-5);
+      if (v == 0)
+        memcpy(split_got, got, dim * sizeof(float));
+      else if (attn_variants[v].vs_split)
+        for (size_t i = 0; i < dim; i++) {
+          check(label, got[i], split_got[i], 1e-5); /* "vs split" */
+          if (strcmp(kernels_name(), "scalar") && fabs(got[i] - split_got[i]) > worst_vs_split)
+            worst_vs_split = fabs(got[i] - split_got[i]);
+        }
       /* the rows after the position are NaN above; the result must not move when they hold real data */
       poison(second, dim), poison(att, (size_t)heads * seq), poison(work.partial, work.capacity);
       attn_variants[v].decode(second, q, kc, vc, att, &work, heads, kv_heads, hd, seq, position);
@@ -1155,7 +1184,8 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
     }
   }
   k_attention_free(&work);
-  free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores);
+  free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores),
+      free(split_got);
 }
 
 /* E2: a partial with no position in it (value sum 0, maximum -FLT_MAX, sum 0) must not move the merge, whatever the
@@ -1206,6 +1236,8 @@ static void test_attention_forced_plans(void) {
     for (int pos0 = 0; pos0 <= 70; pos0 += (pos0 < 40 ? 1 : 3)) {
       attention_batch_case((AttnShape){2, 4, 64}, 7, pos0, 0);
       attention_batch_case((AttnShape){2, 1, 40}, 9, pos0, 0);
+      attention_batch_case((AttnShape){2, 4, 64}, 1, pos0, 0); /* E5: a single row on a many-worker plan */
+      attention_batch_case((AttnShape){2, 2, 40}, 1, pos0, 0);
     }
     attention_batch_case((AttnShape){2, 2, 64}, 33, 100, 0);
     attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
@@ -1281,6 +1313,17 @@ static void test_attention_tiled_knobs(void) {
     free(work.partial), free(q), free(kc), free(vc), free(att), free(want), free(got);
   }
   k_attention_set_tiled(16, 1);
+}
+
+/* E5: long single-row contexts through every decode variant (the chunk plan is at its 256-position chunks there), up to
+ * the 32767 positions of the longest campaign context. */
+static void test_attention_decode_long(void) {
+  double started = monotonic_seconds();
+  const int positions[] = {1023, 4095, 8191, 32767};
+  attention_decode_case((AttnShape){2, 4, 128}, positions, sizeof(positions) / sizeof(*positions));
+  attention_decode_case((AttnShape){2, 8, 40}, positions, 3);
+  attention_decode_case((AttnShape){2, 1, 64}, positions + 1, 2);
+  matrix_seconds_long += monotonic_seconds() - started;
 }
 
 #ifndef __has_feature
@@ -1371,6 +1414,7 @@ int main(int argc, char **argv) {
     test_attention_batch();
     test_attention_batch_row_block();
     test_attention_matrix();
+    test_attention_decode_long();
     test_attention_forced_plans();
     test_attention_empty_partial();
     test_attention_tiled_knobs();
@@ -1439,7 +1483,7 @@ int main(int argc, char **argv) {
     assert(memory_current[i] == 0);
   for (int i = 0; i < 3; i++)
     free(rope[i]), free(quantized[i]), free(scales[i]);
-  printf("kernels: attention matrix %.1f s\n", matrix_seconds);
+  printf("kernels: attention matrix %.1f s, long decode contexts %.1f s\n", matrix_seconds, matrix_seconds_long);
   printf("kernels: tiled attention, largest error %.3g against the double reference, %.3g against split\n",
          worst_vs_reference, worst_vs_split);
   printf("kernels: %d checks, %d failures\n", checks, failures);
