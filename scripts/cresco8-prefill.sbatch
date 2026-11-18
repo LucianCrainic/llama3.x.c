@@ -928,7 +928,9 @@ PY
 E0_CORE_EVENTS='cycles,instructions,l1d.replacement,l2_rqsts.miss,mem_load_retired.l3_miss'
 E0_PERF=0
 
-# e0_bench NAME THREADS [ENV_WORDS...] -- BENCH_ARGS...: one attention-bench launch, output in E0/NAME.out.
+# E0_DIR (default $OUT/E0) is where the three helpers below write; phase_E2 points it at E2/. E0_ATTN, when set, adds
+# LLAMA_ATTN=$E0_ATTN to the counted launch of e0_counted (e0_bench takes its environment words from the caller).
+# e0_bench NAME THREADS [ENV_WORDS...] -- BENCH_ARGS...: one attention-bench launch, output in E0_DIR/NAME.out.
 e0_bench() {
   local name=$1 threads=$2 env_words=() args=() side=env
   shift 2
@@ -936,14 +938,15 @@ e0_bench() {
     if [[ $1 == -- ]]; then side=args; elif [[ $side == env ]]; then env_words+=("$1"); else args+=("$1"); fi
     shift
   done
-  expect "$name" ok "$OUT/E0" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false \
+  expect "$name" ok "${E0_DIR:-$OUT/E0}" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false \
     LLAMA_KERNELS=avx512 ${env_words[@]+"${env_words[@]}"} "$ROOT/build/release/attention-bench" --node 2 "${args[@]}"
 }
 
 # e0_collect FILE PATTERN: the jsonl of every E0/PATTERN.out, concatenated.
 e0_collect() {
   dry_run && return 0
-  if compgen -G "$OUT/E0/$2" > /dev/null; then cat "$OUT"/E0/$2 > "$OUT/E0/$1"; else : > "$OUT/E0/$1"; fi
+  local dir=${E0_DIR:-$OUT/E0}
+  if compgen -G "$dir/$2" > /dev/null; then cat "$dir"/$2 > "$dir/$1"; else : > "$dir/$1"; fi
 }
 
 # e0_counted NAME THREADS BENCH_ARGS...: one bench launch counted by perf, system-wide per socket, the way run_engine counts an
@@ -954,15 +957,17 @@ e0_counted() {
   shift 2
   [[ $PERF != 1 ]] || events+=",$EVENTS"
   if dry_run; then
-    printf 'COUNTERS %s threads=%s events=%s: %s\n' "$name" "$threads" "$events" "$*" | tee -a "$OUT/dry-run.txt"
+    printf 'COUNTERS %s threads=%s attn=%s events=%s: %s\n' "$name" "$threads" "${E0_ATTN:-default}" "$events" "$*" | tee -a "$OUT/dry-run.txt"
     return 0
   fi
   [[ $E0_PERF == 1 ]] || return 0
+  local dir=${E0_DIR:-$OUT/E0}
   numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false LLAMA_KERNELS=avx512 \
-    "$ROOT/build/release/attention-bench" --node 2 "$@" > "$OUT/E0/counters-$name.jsonl" 2> "$OUT/E0/counters-$name.err" &
+    ${E0_ATTN:+"LLAMA_ATTN=$E0_ATTN"} "$ROOT/build/release/attention-bench" --node 2 "$@" > "$dir/counters-$name.jsonl" \
+    2> "$dir/counters-$name.err" &
   pid=$!
   sudo -n /usr/bin/perf stat -a --per-socket -x , -e "$events" -- tail -s 0.1 --pid="$pid" -f /dev/null \
-    2> "$OUT/E0/counters-$name.perf.csv" || true
+    2> "$dir/counters-$name.perf.csv" || true
   wait "$pid" || record_result "counters-$name" FAIL 'attention-bench failed under perf'
 }
 
@@ -1155,6 +1160,222 @@ phase_E1() {
     echo "no MODELS entry matches E1_MODEL=${E1_MODEL:-8b}: the bitwise default check was skipped" | tee "$dir/no-bitwise-model.txt"
   fi
   dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
+}
+
+# ---- E2: FP32 register-tiled fused attention (LLAMA_ATTN=tiled) -----------------------------------------------------------
+# Both stages need the models. STAGE=check is one job of about 1.5-2.5 hours (the one-socket per-token references at 8192 tokens
+# dominate: submit with --time=03:00:00), STAGE=bench one of about 2 hours. The check job's `make test` is the common job start
+# (check_stage); with SKIP_TEST=1 it is not repeated and the phase records that. The bench job follows the check with SKIP_TEST=1
+# (and SKIP_PRELUDE_HF=1 if the Hugging Face prelude is not wanted again); GATES_ONLY is not used by this phase.
+# check (E2/compare-*.json, summary.md from tools/summarize_e2.py): every comparison is a compare_engines.py run, A first.
+#   FP32 gate (max |dlogit| <= 1e-3, argmax 100%), LLAMA_ATTN=tiled with M = 64 against the one-socket per-token reference, on every
+#     model at 86 tokens (all positions), 2048 and 8192 (last row); at 8192 once more with LLAMA_ATTN_TILED_QUERIES=4;
+#   AMX-BF16 (BF16_GATE): tiled against split, M = 64, 86 tokens (all positions) and 2048 (last row);
+#   two real sockets (8B only, E2_MODEL): tiled M = 64 with LLAMA_TP_CHECK=1 against one socket per token, 2048 tokens, FP32 gate;
+#   W8A8 (W8A8_GATE, probe-int8, int8 checkpoint): tiled against split, M = 64, 2048 tokens (last row);
+#   `split` stays bitwise: with BASELINE_ROOT, E1's three bitwise comparisons (e1_bitwise) on the 8B model.
+# bench (E2/): bench-split.jsonl and bench-tiled.jsonl (the E0 prefill matrix and its half-KV-head cells, 56 threads included
+#   at 8B/8192/M256), bench-tiled-sweep.jsonl (queries 4, 8, 16 x order longest, natural on 8B 8192/M256 and 2048/M64),
+#   counters-{split,tiled}-prefill-8b-8192-m256.*, engine TTFT of 8B and 1B (AVX-512 FP32 and AMX-BF16, one socket, 2048 and 8192
+#   tokens, split against tiled, REPEATS repeats plus one LLAMA_PROFILE=1 repeat; reports $OUT/*-xattn{split,tiled}-N.json and
+#   -xprof{split,tiled}-1.json, summarised in E2/ttft.csv), one decode cell with the default attention (8B FP32, 8192 retained
+#   context, x=dec), E2/bench-summary.md. M of the engine runs is D2_M1's (default 64 per rung): set
+#   D2_M1="avx512_fp32=64 amx_bf16=256" at submission.
+E2_FP32_GATE=(--max-abs 1e-3) # argmax agreement stays at the compare_engines default of 100%
+
+# e2_fp32_case DIR NAME STAGED N LABEL [ENV_WORDS...]: LLAMA_ATTN=tiled (and ENV_WORDS) at M = 64 against the one-socket per-token
+# reference (M = 1 batched interface, the e1 per-token convention) at N tokens: every position at 86, the last row above.
+e2_fp32_case() {
+  local dir=$1 name=$2 staged=$3 n=$4 label=$5 benv
+  shift 5
+  read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+  CMP_FLAGS=("${E2_FP32_GATE[@]}" --batch-a 1 --batch-b 64)
+  CMP_TOKENS=
+  if [[ $n != 86 ]]; then
+    CMP_FLAGS+=(--last-only)
+    CMP_TOKENS="$dir/$name-tokens-$n.txt"
+  fi
+  a_bitwise "$dir" "$name" fp32 "$staged" "e2-$label-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
+    LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on LLAMA_ATTN=tiled "$@"
+  CMP_FLAGS=(--bitwise) CMP_TOKENS=
+}
+
+# e2_pair_case DIR NAME PRECISION STAGED N LABEL RUNG GATE...: tiled against split at the rung (M = 64), both sides batched.
+e2_pair_case() {
+  local dir=$1 name=$2 precision=$3 staged=$4 n=$5 label=$6 rung=$7 benv
+  shift 7
+  read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+  c_rung "$rung" 64
+  CMP_FLAGS=("$@" --batch-a 64 --batch-b 64)
+  CMP_TOKENS=
+  if [[ $n != 86 ]]; then
+    CMP_FLAGS+=(--last-only)
+    CMP_TOKENS="$dir/$name-tokens-$n.txt"
+  fi
+  a_bitwise "$dir" "$name" "$precision" "$staged" "e2-$label-prompt$n" "${benv[@]}" "${RUNG_ENV[@]}" LLAMA_ATTN=split -- \
+    "${benv[@]}" "${RUNG_ENV[@]}" LLAMA_ATTN=tiled
+  CMP_FLAGS=(--bitwise) CMP_TOKENS=
+}
+
+e2_check() {
+  local dir=$1 entry name artifacts hf n staged two bitwise_done=0
+  if ! dry_run && ! grep -q '^PASS make-test' "$OUT/phase-results.txt" 2> /dev/null; then
+    echo 'make test did not pass in this job (SKIP_TEST=1, or it failed): the check relies on an earlier passing run' |
+      tee "$dir/make-test-not-verified.txt"
+  fi
+  if [[ -z ${BASELINE_ROOT:-} ]]; then
+    echo 'baseline not given: the bitwise split check against the baseline build was skipped' | tee "$dir/baseline-not-given.txt"
+  elif ! dry_run && [[ ! -x $BASELINE_ROOT/build/release/probe-fp32 ]]; then
+    record_result e2-baseline-probe FAIL 'BASELINE_ROOT has no build/release/probe-fp32'
+    BASELINE_ROOT=
+  fi
+  c_prompts "$dir" 2048,8192
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    staged=$(stage_model_on 0 "$name" fp32 "$artifacts")
+    # (1) real-model FP32, tiled M = 64 against one-socket per token; the block-size knob at 8192.
+    for n in 86 2048 8192; do
+      e2_fp32_case "$dir" "$name" "$staged" "$n" tiled-m64
+    done
+    e2_fp32_case "$dir" "$name" "$staged" 8192 tiled-q4-m64 LLAMA_ATTN_TILED_QUERIES=4
+    # (2) AMX-BF16, tiled against split.
+    e2_pair_case "$dir" "$name" fp32 "$staged" 86 bf16-tiled-vs-split amx_bf16 "${BF16_GATE[@]}"
+    e2_pair_case "$dir" "$name" fp32 "$staged" 2048 bf16-tiled-vs-split amx_bf16 "${BF16_GATE_LAST[@]}"
+    if e1_is "$name" "${E2_MODEL:-8b}"; then
+      # (3) two real sockets against one socket per token, 2048 tokens, exchange state checked.
+      two=("${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on LLAMA_ATTN=tiled)
+      CMP_TOKENS="$dir/$name-tokens-2048.txt"
+      B_FLAGS=("${E2_FP32_GATE[@]}" --batch-a 1 --batch-b 64 --last-only) B_EXPECT=ok
+      b_compare "$dir" "$name" fp32 "$staged" e2-s2-tiled-m64-prompt2048 "${D_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_KERNELS=avx512 -- \
+        "${two[@]}"
+      B_FLAGS=() CMP_TOKENS=
+      # (4) split stays bitwise against the baseline build (E1's helper).
+      if [[ -n ${BASELINE_ROOT:-} ]]; then
+        e1_bitwise "$dir" "$name" "$staged"
+        bitwise_done=1
+      fi
+    fi
+    unstage_model_on 0 "$name" fp32
+    # (5) W8A8, tiled against split.
+    staged=$(stage_model_on 0 "$name" int8 "$artifacts")
+    e2_pair_case "$dir" "$name" int8 "$staged" 2048 w8a8-tiled-vs-split avx512_q8 "${W8A8_GATE_LAST[@]}"
+    unstage_model_on 0 "$name" int8
+  done
+  if [[ $bitwise_done == 0 && -n ${BASELINE_ROOT:-} ]]; then
+    echo "no MODELS entry matches E2_MODEL=${E2_MODEL:-8b}: the bitwise split check was skipped" | tee "$dir/no-bitwise-model.txt"
+  fi
+  # the exit status of the summary is the failure count; the failures are already in phase-results.txt
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_e2.py" checks "$dir" > "$dir/summary.md" || true
+}
+
+e2_bench() {
+  local dir=$1 attn shape threads q order cell n m rung rep entry name artifacts hf staged tokenizer
+  E0_DIR=$dir
+  if ! dry_run && sudo -n /usr/bin/perf stat -a --per-socket -x , -e "$E0_CORE_EVENTS" -- true 2> /dev/null; then E0_PERF=1; fi
+  dry_run || printf 'perf_core=%s\n' "$E0_PERF" >> "$OUT/environment.txt"
+  # (1) the E0 prefill matrix and the half-KV-head cells, per attention kernel (decode is untouched, so not repeated).
+  for attn in split tiled; do
+    for shape in 8b 1b; do
+      for threads in 14 28 56; do
+        e0_bench "bench-$attn-prefill-$shape-t$threads" "$threads" "LLAMA_ATTN=$attn" -- --mode prefill --shape "$shape" \
+          --prompt 512,2048,8192 --m 16,64,256 --reps "$REPEATS"
+      done
+      e0_bench "bench-$attn-h6-$shape-kv4" 56 "LLAMA_ATTN=$attn" -- --mode prefill --shape "$shape" --prompt 2048,8192 \
+        --m 64,256 --reps "$REPEATS" --kv-heads-local 4
+    done
+    e0_collect "bench-$attn.jsonl" "bench-$attn-*.out"
+  done
+  # (2) the tiled knobs on the two cells that matter; every collected line carries its knobs.
+  for cell in 8192:256 2048:64; do
+    n=${cell%:*} m=${cell#*:}
+    for q in 4 8 16; do
+      for order in longest natural; do
+        e0_bench "sweep-q$q-$order-p$n-m$m" 56 LLAMA_ATTN=tiled "LLAMA_ATTN_TILED_QUERIES=$q" "LLAMA_ATTN_TILED_ORDER=$order" -- \
+          --mode prefill --shape 8b --prompt "$n" --m "$m" --reps "$REPEATS"
+      done
+    done
+  done
+  if ! dry_run; then
+    : > "$dir/bench-tiled-sweep.jsonl"
+    for cell in "$dir"/sweep-q*-*-p*-m*.out; do
+      [[ -e $cell ]] || continue
+      q=${cell##*/sweep-q} q=${q%%-*}
+      order=${cell#*/sweep-q$q-} order=${order%%-p*}
+      sed "s/^{/{\"tiled_queries\": $q, \"tiled_order\": \"$order\", /" "$cell" >> "$dir/bench-tiled-sweep.jsonl"
+    done
+  fi
+  # (3) counters on the 8b/8192/M256 prefill cell for both kernels.
+  for attn in split tiled; do
+    E0_ATTN=$attn e0_counted "$attn-prefill-8b-8192-m256" 56 --mode prefill --shape 8b --prompt 8192 --m 256 --reps "$REPEATS"
+  done
+  unset E0_DIR
+  # (4) engine TTFT, one socket, checkpoint on HBM node 2: the rungs of C7 at 2048 and 8192 tokens, split against tiled.
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E2 engine run was made' | tee "$dir/no-models.txt"
+  else
+    need_shm
+    c_prompts "$dir" 2048,8192
+    for entry in $MODELS; do
+      IFS=: read -r name artifacts hf <<< "$entry"
+      tokenizer="$artifacts/tokenizer-v2.bin"
+      staged=$(stage_model_on 2 "$name" fp32 "$artifacts")
+      for rung in avx512_fp32 amx_bf16; do
+        m=$(d2_m 1 "$rung")
+        for ((rep = 1; rep <= REPEATS; rep++)); do
+          for n in 2048 8192; do
+            for attn in split tiled; do
+              CONTEXT=$((n + 256)) GENERATION=32 c_launch "$name" "$rung" "$m" 56 "$rep" "$OUT/prompt-$n.txt" "$staged" \
+                "$tokenizer" "p=$n" "c=$((n + 256))" "x=attn$attn" -- "LLAMA_ATTN=$attn"
+            done
+          done
+        done
+        for n in 2048 8192; do
+          for attn in split tiled; do
+            CONTEXT=$((n + 256)) GENERATION=1 c_launch "$name" "$rung" "$m" 56 1 "$OUT/prompt-$n.txt" "$staged" "$tokenizer" \
+              "p=$n" "c=$((n + 256))" "x=prof$attn" -- LLAMA_PROFILE=1 "LLAMA_ATTN=$attn"
+          done
+        done
+      done
+      # (5) decode is untouched: one cell (8B FP32 from a retained context of 8192 tokens, the C7/D2 decode cell), default settings.
+      if e1_is "$name" "${E2_MODEL:-8b}"; then
+        for ((rep = 1; rep <= REPEATS; rep++)); do
+          CONTEXT=8448 GENERATION=128 WARM=8192 c_launch "$name" avx512_fp32 "$(d2_m 1 avx512_fp32)" 56 "$rep" "$OUT/short.txt" \
+            "$staged" "$tokenizer" p=8192 c=8448 x=dec
+        done
+      fi
+      unstage_model_on 2 "$name" fp32
+    done
+  fi
+  # (6) summaries.
+  if ! dry_run; then
+    "$PYTHON" "$ROOT/tools/summarize_e2.py" ttft "$OUT" > "$dir/ttft.csv"
+    {
+      "$PYTHON" "$ROOT/tools/summarize_attention_bench.py" --compare "$dir/bench-split.jsonl" "$dir/bench-tiled.jsonl" \
+        --sweep "$dir/bench-tiled-sweep.jsonl"
+      for attn in split tiled; do
+        printf '\n# attention=%s\n\n' "$attn"
+        "$PYTHON" "$ROOT/tools/summarize_attention_bench.py" "$dir" --prefill-file "$dir/bench-$attn.jsonl" --no-counters
+      done
+      printf '\n# Counters\n\n'
+      "$PYTHON" "$ROOT/tools/summarize_attention_bench.py" "$dir" --prefill-file /dev/null --counters-csv "$dir/counters.csv" |
+        sed -n '/^## Counters/,$p'
+      printf '\n# Engine TTFT (ttft.csv)\n\n```\n'
+      cat "$dir/ttft.csv"
+      printf '```\n'
+    } > "$dir/bench-summary.md"
+  fi
+}
+
+phase_E2() {
+  local dir="$OUT/E2"
+  if [[ $STAGE == bench ]]; then
+    e2_bench "$dir"
+  elif [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E2 check was made' | tee "$dir/no-models.txt"
+  else
+    need_shm
+    e2_check "$dir"
+  fi
 }
 
 require_phases

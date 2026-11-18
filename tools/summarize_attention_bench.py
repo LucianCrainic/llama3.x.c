@@ -3,6 +3,12 @@ heads (H6), decode (H5), hardware counters, and the cross-check of the bench aga
 
     summarize_attention_bench.py E0_DIR [--counters-csv PATH] [--layers 32] [--tolerance 0.20]
                                  [--peak-gflops 8800] [--peak-gbs 552]
+    summarize_attention_bench.py E2_DIR --prefill-file bench-split.jsonl [--no-counters]   (any prefill matrix file)
+    summarize_attention_bench.py --compare A.jsonl B.jsonl [--sweep SWEEP.jsonl]
+
+--compare prints, for every cell the two files share (E2: A = split, B = tiled), ms per layer and GFLOP/s of both and the
+speedup of B over A, with the E2 value gates (kernel >= 1.8x on 8b/8192/M256/56 threads, 2048 not slower). --sweep adds the
+table of the tiled knobs (rows carry tiled_queries and tiled_order, which phase_E2 writes into every line it collects).
 
 Reads bench-prefill.jsonl, rowblock.jsonl, bench-prefill-kv4.jsonl, bench-decode.jsonl, counters-*.{jsonl,perf.csv},
 engine-profile.json and the e0 row-block comparison, whichever exist. The cross-check line compares the bench's median
@@ -181,17 +187,93 @@ def correctness(directory):
     return out
 
 
+GATE_CELL = dict(shape='8b', prompt=8192, m=256, workers=56, kv_heads=8)
+GATE_SPEEDUP = 1.8
+
+
+def cell_key(row):
+    return (row['mode'], row['shape'], row['kv_heads'], row['workers'], row.get('prompt', row.get('context')), row.get('m', 0))
+
+
+def compare_tables(a_rows, b_rows):
+    """(table lines, verdict lines) of B against A over the cells both contain."""
+    a = {cell_key(r): r for r in a_rows}
+    b = {cell_key(r): r for r in b_rows}
+    names = (next(iter(a.values()))['attn'] if a else 'A', next(iter(b.values()))['attn'] if b else 'B')
+    out = [f'| mode | shape | threads | prompt/context | M | {names[0]} ms/layer | {names[1]} ms/layer | speedup | '
+           f'{names[0]} GFLOP/s | {names[1]} GFLOP/s |', '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+    speedups = {}
+    for key in sorted(a.keys() & b.keys(), key=lambda k: tuple(str(x) for x in k[:2]) + tuple(int(x) for x in k[2:])):
+        ra, rb = a[key], b[key]
+        speedup = ra['ms_layer_median'] / rb['ms_layer_median']
+        speedups[key] = speedup
+        out.append(f"| {key[0]} | {key[1]} kv{key[2]} | {key[3]} | {key[4]} | {key[5]} | {spread(ra)} | {spread(rb)} | "
+                   f"{speedup:.2f}x | {ra['gflops_median']:.0f} | {rb['gflops_median']:.0f} |")
+    verdict = []
+    gate = ('prefill', GATE_CELL['shape'], GATE_CELL['kv_heads'], GATE_CELL['workers'], GATE_CELL['prompt'], GATE_CELL['m'])
+    if gate in speedups:
+        ok = speedups[gate] >= GATE_SPEEDUP
+        verdict.append(f"Kernel gate (8b, prompt 8192, M 256, 56 threads): {speedups[gate]:.2f}x, "
+                       f"{'PASS' if ok else 'FAIL'} (>= {GATE_SPEEDUP}x).")
+    else:
+        verdict.append('Kernel gate cell (8b, prompt 8192, M 256, 56 threads) is missing from one of the files.')
+    slower = [k for k, v in speedups.items() if k[0] == 'prefill' and k[4] == 2048 and v < 1.0]
+    verdict.append('2048-token cells not slower: ' + ('PASS' if not slower else 'FAIL, slower: ' + ', '.join(
+        f'{k[1]} kv{k[2]} t{k[3]} M{k[5]} ({speedups[k]:.2f}x)' for k in slower)) + '.')
+    return out, verdict
+
+
+def sweep_table(rows):
+    out = ['| shape | prompt | M | threads | queries | order | ms/layer median (min-max) | GFLOP/s |',
+           '| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |']
+    for r in sorted(rows, key=lambda r: (r['shape'], r['prompt'], r['m'], r['tiled_queries'], r['tiled_order'])):
+        out.append(f"| {r['shape']} | {r['prompt']} | {r['m']} | {r['workers']} | {r['tiled_queries']} | {r['tiled_order']} | "
+                   f"{spread(r)} | {r['gflops_median']:.0f} |")
+    best = {}
+    for r in rows:
+        cell = (r['shape'], r['prompt'], r['m'])
+        if cell not in best or r['ms_layer_median'] < best[cell]['ms_layer_median']:
+            best[cell] = r
+    notes = [f"Best for {c[0]} prompt {c[1]} M {c[2]}: queries {r['tiled_queries']}, order {r['tiled_order']} "
+             f"({r['ms_layer_median']:.2f} ms/layer)." for c, r in sorted(best.items())]
+    return out, notes
+
+
+def compare_main(args):
+    a, b = load(args.compare[0]), load(args.compare[1])
+    out = ['# E2 attention bench: split against tiled', '']
+    if not a or not b:
+        out.append('One of the bench files is missing or empty: no comparison.')
+    else:
+        table, verdict = compare_tables(a, b)
+        out += table + [''] + verdict + ['']
+    sweep = load(args.sweep) if args.sweep else []
+    if sweep:
+        table, notes = sweep_table(sweep)
+        out += ['## Tiled knobs: queries per block and task order', ''] + table + [''] + notes + ['']
+    print('\n'.join(out))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('directory')
+    parser.add_argument('directory', nargs='?')
+    parser.add_argument('--compare', nargs=2, metavar=('A', 'B'), help='compare two bench jsonl files cell by cell (B over A)')
+    parser.add_argument('--prefill-file', help='read the prefill matrix from this jsonl instead of DIRECTORY/bench-prefill.jsonl')
+    parser.add_argument('--no-counters', action='store_true', help='leave the counters section out (a second summary of the same directory)')
+    parser.add_argument('--sweep', help='with --compare: the jsonl of the tiled knob sweep')
     parser.add_argument('--counters-csv', help='write the counters of every counters-*.perf.csv here (or "not available")')
     parser.add_argument('--layers', type=int, default=32)
     parser.add_argument('--tolerance', type=float, default=0.20)
     parser.add_argument('--peak-gflops', type=float, default=8800.0, help='FP32 FMA peak of the socket (docs/hbm-roofline.md)')
     parser.add_argument('--peak-gbs', type=float, default=552.0, help='HBM read ceiling of the socket in GB/s')
     args = parser.parse_args(argv)
+    if args.compare:
+        return compare_main(args)
+    if not args.directory:
+        parser.error('a directory, or --compare A B, is required')
     d = args.directory
-    prefill = load(os.path.join(d, 'bench-prefill.jsonl'))
+    prefill = load(args.prefill_file or os.path.join(d, 'bench-prefill.jsonl'))
     kv4 = load(os.path.join(d, 'bench-prefill-kv4.jsonl'))
     rowblock = load(os.path.join(d, 'rowblock.jsonl'))
     decode = load(os.path.join(d, 'bench-decode.jsonl'))
@@ -210,7 +292,8 @@ def main(argv=None):
         out += ['## Half the KV heads (H6): one socket\'s share of the model, 56 threads', ''] + half_table(prefill, kv4) + ['']
     if decode:
         out += ['## Decode, one layer, last position (H5)', ''] + decode_table(decode, args.peak_gbs, args.peak_gflops) + ['']
-    out += ['## Counters', ''] + counters(d, args.counters_csv) + ['']
+    if not args.no_counters:
+        out += ['## Counters', ''] + counters(d, args.counters_csv) + ['']
     check = correctness(d)
     if check:
         out += ['## Row-block correctness (engine, bitwise)', ''] + check + ['']
