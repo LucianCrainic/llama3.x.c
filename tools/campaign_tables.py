@@ -40,6 +40,14 @@ def dig(obj, *keys):
     return obj
 
 
+def attention_tag(report):
+    """The attention variants of a run (report build.attention for prefill, build.attention_decode for decode), written
+    only when they are not the default `split`, so default runs and old reports keep their columns unchanged."""
+    parts = [f'{label}={value}' for label, key in (('attn', 'attention'), ('decode-attn', 'attention_decode'))
+             for value in [dig(report, 'build', key)] if value not in (None, 'split')]
+    return ' '.join(parts)
+
+
 def number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
@@ -222,7 +230,7 @@ def prefill_speedup(groups):
     for label, (info, reports) in groups.items():
         if info['tag'] not in (None,) or not info['prompt'] or (dig(reports[0], 'parameters', 'warm_context') or 0):
             continue
-        kernel = info['kernel'] or '-'
+        kernel = ' '.join(part for part in (info['kernel'] or '-', attention_tag(reports[0])) if part)
         key = (info['model'], info['precision'], int(info['prompt']), kernel)
         cells.setdefault(key, {})[(info['sockets'], int(info['m'] or 1))] = (
             [dig(r, 'throughput_tokens_per_second', 'prefill') for r in reports],

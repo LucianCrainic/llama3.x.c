@@ -118,7 +118,8 @@ def summarize(root):
             lines.append(f'| {label} | {len(reports)} | failed |' + ' |' * 15)
             continue
         first = reports[0]
-        kernel = info['kernel'] or dig(first, 'build', 'kernels') or '-'
+        kernel = ' '.join(part for part in (info['kernel'] or dig(first, 'build', 'kernels') or '-',
+                                            campaign_tables.attention_tag(first)) if part)
         thp = dig(first, 'runtime', 'thp') or '-'
         thp_bytes = sum((r.get('thp_bytes') or 0) for r in first.get('regions') or [])
         if thp == 'on' and thp_bytes:

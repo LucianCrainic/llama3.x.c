@@ -421,6 +421,24 @@ class RuntimeTests(unittest.TestCase):
                                 env={**os.environ, 'LLAMA_KERNELS': 'bogus'})
         self.assertIn('LLAMA_KERNELS must be auto, scalar, avx512 or amx', result.stderr)
 
+    def test_attention_variant_knobs_are_reported_and_validated(self):
+        """E1: LLAMA_ATTN / LLAMA_ATTN_DECODE default to split, are recorded in the report, and refuse variants that are not
+        built yet or are unknown, with a non-zero exit."""
+        _, data = self.execute('run')
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'split'))
+        _, data = self.execute('run', env={'LLAMA_ATTN': 'split', 'LLAMA_ATTN_DECODE': 'split'})
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'split'))
+        for knob, value, message in (('LLAMA_ATTN', 'tiled', 'LLAMA_ATTN=tiled is not implemented yet (E2/E3)'),
+                                     ('LLAMA_ATTN', 'amx', 'LLAMA_ATTN=amx is not implemented yet (E2/E3)'),
+                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be split, tiled or amx'),
+                                     ('LLAMA_ATTN_DECODE', 'group', 'LLAMA_ATTN_DECODE=group is not implemented yet'),
+                                     ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):
+            result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                     '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                    env={**os.environ, knob: value})
+            self.assertNotEqual(result.returncode, 0, (knob, value))
+            self.assertIn(message, result.stderr)
+
     # ---- C5: the explicit BF16 precision mode
     def test_bf16_mode_is_explicit_and_validated(self):
         for engine, env, text in (

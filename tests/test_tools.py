@@ -41,8 +41,14 @@ class ToolSmokeTests(unittest.TestCase):
         self.assertEqual(calls,[('hello è',{'allowed_special':{'allowed'},'disallowed_special':set()})])
 
 
-def report(prefill, decode, ttft=0.5, status='completed', placement='file', regions=None, thp='off', kernels='avx512'):
-    return {'schema_version': 2, 'status': status, 'build': {'kernels': kernels},
+def report(prefill, decode, ttft=0.5, status='completed', placement='file', regions=None, thp='off', kernels='avx512',
+           attention=None, attention_decode=None):
+    build = {'kernels': kernels}
+    if attention is not None:
+        build['attention'] = attention
+    if attention_decode is not None:
+        build['attention_decode'] = attention_decode
+    return {'schema_version': 2, 'status': status, 'build': build,
             'runtime': {'placement': placement, 'thp': thp, 'precision_mode': 'fp32'}, 'regions': regions or [],
             'timing_seconds': {'time_to_first_token': ttft},
             'throughput_tokens_per_second': {'prefill': prefill, 'decode': decode},
@@ -290,6 +296,27 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertEqual(status(large, dict(work, bytes=2**30)), 'hbm (unverified)')  # a big unchecked region still counts
         self.assertEqual(status(work), 'hbm (unverified)')                             # nothing was verified at all
         self.assertEqual(status(large, dict(large, pages_mismatched=3)), 'hbm (MISMATCH)')
+
+    def test_attention_variants_appear_only_when_not_default(self):
+        """E1: LLAMA_ATTN / LLAMA_ATTN_DECODE are recorded in build.attention / build.attention_decode; the summary shows
+        them next to the kernel when they differ from `split`, and old or default reports keep their cells."""
+        import summarize_campaign as sc
+        import campaign_tables as ct
+        self.assertEqual(ct.attention_tag(report(1, 1)), '')
+        self.assertEqual(ct.attention_tag(report(1, 1, attention='split', attention_decode='split')), '')
+        self.assertEqual(ct.attention_tag(report(1, 1, attention='tiled', attention_decode='split')), 'attn=tiled')
+        self.assertEqual(ct.attention_tag(report(1, 1, attention='amx', attention_decode='group')),
+                         'attn=amx decode-attn=group')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root/'8b-fp32-teams-hbm-s1-t56-p512-kavx512-1.json').write_text(
+                json.dumps(report(1, 1, attention='split', attention_decode='split')))
+            (root/'8b-fp32-teams-hbm-s1-t56-p512-kavx512_tiled-1.json').write_text(
+                json.dumps(report(1, 1, attention='tiled', attention_decode='split')))
+            table = sc.summarize(root)
+        rows = {line.split('|')[1].strip(): line for line in table.splitlines()[2:] if line.startswith('| 8b')}
+        self.assertIn('| avx512 |', rows['8b-fp32-teams-hbm-s1-t56-p512-kavx512'])
+        self.assertIn('| avx512_tiled attn=tiled |', rows['8b-fp32-teams-hbm-s1-t56-p512-kavx512_tiled'])
 
     def test_summary_of_repeats_failures_and_old_reports(self):
         import summarize_campaign as sc
