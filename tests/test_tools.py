@@ -843,6 +843,83 @@ class SummarizeAttentionBenchTests(unittest.TestCase):
             self.assertEqual((Path(temp)/'counters.csv').read_text(), 'not available\n')
 
 
+class SummarizeAttentionCompareTests(unittest.TestCase):
+    """--compare of tools/summarize_attention_bench.py and the E2 summaries of tools/summarize_e2.py."""
+
+    @staticmethod
+    def row(attn, ms, prompt=8192, m=256, gflops=800.0, **extra):
+        return dict(SummarizeAttentionBenchTests.prefill(ms, m=m, **extra), prompt=prompt, attn=attn, gflops_median=gflops)
+
+    @staticmethod
+    def write(path, rows):
+        path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
+
+    def run_tool(self, tool, *args):
+        result = subprocess.run([sys.executable, str(TOOLS/tool), *map(str, args)], capture_output=True, text=True)
+        return result.returncode, result.stdout
+
+    def test_compare_speedups_and_gates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            self.write(d/'a.jsonl', [self.row('split', 700.0), self.row('split', 40.0, prompt=2048, m=64)])
+            self.write(d/'b.jsonl', [self.row('tiled', 300.0, gflops=1900.0), self.row('tiled', 30.0, prompt=2048, m=64)])
+            self.write(d/'sweep.jsonl', [self.row('tiled', 310.0, tiled_queries=4, tiled_order='natural'),
+                                         self.row('tiled', 290.0, tiled_queries=16, tiled_order='longest')])
+            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'b.jsonl', '--sweep', d/'sweep.jsonl')
+            self.assertEqual(code, 0, out)
+            self.assertIn('| split ms/layer | tiled ms/layer | speedup |', out)
+            self.assertIn('| 256 | 700.00 (686.00-721.00) | 300.00 (294.00-309.00) | 2.33x | 800 | 1900 |', out)
+            self.assertIn('| 64 | 40.00 (39.20-41.20) | 30.00 (29.40-30.90) | 1.33x |', out)
+            self.assertIn('Kernel gate (8b, prompt 8192, M 256, 56 threads): 2.33x, PASS', out)
+            self.assertIn('2048-token cells not slower: PASS', out)
+            self.assertIn('Best for 8b prompt 8192 M 256: queries 16, order longest (290.00 ms/layer).', out)
+            # a slower 2048 cell and a missed gate are reported as FAIL
+            self.write(d/'b.jsonl', [self.row('tiled', 500.0), self.row('tiled', 45.0, prompt=2048, m=64)])
+            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'b.jsonl')
+            self.assertIn('1.40x, FAIL', out)
+            self.assertIn('2048-token cells not slower: FAIL', out)
+            # the directory summary of any prefill matrix file, without the counters
+            code, out = self.run_tool('summarize_attention_bench.py', d, '--prefill-file', d/'b.jsonl', '--no-counters')
+            self.assertEqual(code, 0, out)
+            self.assertIn('| 8b kv8 | 56 | 8192 | 256 | 500.00 (490.00-515.00) |', out)
+            self.assertNotIn('## Counters', out)
+            # a missing file is not a crash
+            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'none.jsonl')
+            self.assertEqual(code, 0, out)
+            self.assertIn('no comparison', out)
+
+    def test_checks_table_and_ttft_csv(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            ok = dict(passed=True, budget=dict(max_abs=1e-3, argmax_agreement=1.0, bitwise=False, rms_max=None, statistical=False),
+                      summary=dict(max_abs=4e-5, argmax_agreement=1.0, rms=1e-5))
+            bad = dict(ok, passed=False, summary=dict(max_abs=0.2, argmax_agreement=0.9, rms=0.01),
+                       budget=dict(max_abs=2.0, argmax_agreement=0.97, bitwise=False, rms_max=0.05, statistical=True))
+            (d/'compare-m8b-fp32-e2-tiled-m64-prompt2048.json').write_text(json.dumps(ok))
+            (d/'compare-m8b-fp32-e2-bf16-prompt2048.json').write_text(json.dumps(bad))
+            (d/'compare-broken.json').write_text('{}')
+            code, out = self.run_tool('summarize_e2.py', 'checks', d)
+            self.assertEqual(code, 1, out)
+            self.assertIn('| m8b-fp32-e2-tiled-m64-prompt2048 | max 0.001, argmax 100% | 4e-05 | 100.0% | PASS |', out)
+            self.assertIn('| m8b-fp32-e2-bf16-prompt2048 | max 2, rms 0.05, argmax 97% (statistical) | 0.2 | 90.0% | FAIL |', out)
+            self.assertIn('2 comparisons, 1 failed.', out)
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            for tag, times in (('attnsplit', (10.0, 11.0, 12.0)), ('attntiled', (7.0, 8.0, 9.0)), ('proftiled', (8.5,))):
+                for rep, t in enumerate(times, 1):
+                    (d/f'm8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16-x{tag}-{rep}.json').write_text(json.dumps(
+                        dict(status='completed', timing_seconds=dict(time_to_first_token=t),
+                             throughput_tokens_per_second=dict(prefill=8192 / t))))
+            (d/'m8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16-xattnsplit-4.json').write_text(json.dumps(dict(status='error')))
+            code, out = self.run_tool('summarize_e2.py', 'ttft', d)
+            self.assertEqual(code, 0, out)
+            lines = out.splitlines()
+            self.assertEqual(lines[0].split(',')[0:3], ['configuration', 'attn', 'repeats'])
+            self.assertIn('m8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16,split,3,11.0000,10.0000,12.0000,744.7,', out)
+            self.assertIn(',tiled,3,8.0000,7.0000,9.0000,1024.0,1.375', out)
+            self.assertIn(',profiled-tiled,1,8.5000,8.5000,8.5000,963.8,', out)
+
+
 class CheckPlacementTests(unittest.TestCase):
     """tools/check_placement.py judges the evidence in a report; it must fail loudly on any wrong or missing page."""
 
