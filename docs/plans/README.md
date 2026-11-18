@@ -106,6 +106,7 @@ A6 does not block C. C7 runs on anon HBM if A6 is done, otherwise on staged
 What is still open, split into local code (finished) and cluster stages, with the order of the jobs: [remaining-work.md](remaining-work.md).
 
 Follow-up work after M5 (priority: a faster attention kernel), written as a brief for a specialist agent: [E-followups/agent-brief.md](E-followups/agent-brief.md).
+The phased plan built from it (phases E0-E6, each with a correctness gate, a value gate and a go/no-go decision): [E-followups/README.md](E-followups/README.md).
 
 ## 4. Dependency graph and waves
 
