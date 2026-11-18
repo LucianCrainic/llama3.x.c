@@ -159,6 +159,47 @@ class CampaignSummaryTests(unittest.TestCase):
             self.assertIn(word, compare[0])
         self.assertFalse([line for line in out if 'm1b' in line and 'compare' in line])
 
+    def e1_dry(self, **extra):
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E1', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', 'REPEATS': '3',
+                   **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
+                                    text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            skipped = (Path(temp)/'out'/'E1'/'baseline-not-given.txt').exists()
+        return [line for line in result.stdout.splitlines() if line.startswith('EXPECT ')], skipped
+
+    def test_e1_dry_run_matrix(self):
+        """E1: bitwise baseline comparisons on 8B only, item 2b on 1B only, FP32 determinism data on every model."""
+        lines, skipped = self.e1_dry(BASELINE_ROOT='/b')
+        self.assertFalse(skipped)
+        bitwise = [l for l in lines if l.startswith('EXPECT compare-')]
+        self.assertEqual(len(bitwise), 3)
+        for line in bitwise:
+            self.assertIn('m8b-fp32', line)
+            for word in ('--bitwise', '--last-only', 'probe-shim-fp32.sh', 'PROBE_DIR=/b/build/release',
+                         f'PROBE_DIR={ROOT}/build/release', 'LLAMA_ATTN=split'):
+                self.assertIn(word, line)
+        self.assertEqual(len([l for l in bitwise if 'LLAMA_TP_CHECK=1' in l and 'LLAMA_SOCKETS=2' in l]), 1)
+        gen = [l for l in lines if 'compare_generation.py' in l]
+        item2b = [l for l in gen if 'gen-item2b-' in l]
+        self.assertEqual(len(item2b), 3 * 3)  # three cases, REPEATS = 3
+        self.assertTrue(all('m1b' in l and '--warm-context 8192' in l and '--steps 128' in l and '--probe-batch 64' in l and
+                            'probe-int8' in l and '--context-length 8448' in l for l in item2b), item2b)
+        self.assertEqual(len([l for l in item2b if 'w8a32' in l]), 3)
+        self.assertTrue(all('LLAMA_Q8_ACTIVATIONS=fp32' in l for l in item2b if 'w8a32-s1-vs-s2' in l))
+        self.assertTrue(all('LLAMA_TP_CHECK=1' in l for l in item2b if 's1-vs-s2' in l))
+        self.assertFalse([l for l in item2b if 's1-vs-s1' in l and 'LLAMA_SOCKETS=2' in l])
+        fp32 = [l for l in gen if 'gen-fp32-' in l]
+        self.assertEqual(len(fp32), 2 * 2 * 2)  # models x prompts x comparisons
+        self.assertTrue(all('probe-fp32' in l and 'warm-context' not in l for l in fp32))
+        self.assertEqual(len(lines), 3 + 9 + 8)
+        # Without a baseline the bitwise part is skipped and recorded, and nothing else changes.
+        lines, skipped = self.e1_dry()
+        self.assertTrue(skipped)
+        self.assertEqual(len(lines), 9 + 8)
+
     @staticmethod
     def v2(prefill=None, decode=None, warm=0, sockets=1, ttft=1.0, steps=128, decode_seconds=None, model_file=32e9,
            attention=None):
@@ -686,6 +727,65 @@ class SummarizeGemmTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('| 8 | 2000 / 1800 | 100 | 23% | 500 | 4.0x |', result.stdout)
         self.assertIn('| 64 | 4400 / 3960 | 100 | 50% | - | - |', result.stdout)
+
+
+class SummarizeGenerationTests(unittest.TestCase):
+    @staticmethod
+    def gen(identical=True, where=None, margin=None, a=128, b=128, **extra):
+        return dict(identical=identical, first_divergence=where, edit_distance=0 if identical else 5, generated_a=a,
+                    generated_b=b, margin_a=margin, steps=128, **extra)
+
+    def summarize(self, files, *flags):
+        with tempfile.TemporaryDirectory() as temp:
+            for name, data in files.items():
+                (Path(temp)/name).write_text(json.dumps(data))
+            result = subprocess.run([sys.executable, str(TOOLS/'summarize_generation.py'), temp, *flags], capture_output=True,
+                                    text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_item_2b_verdicts(self):
+        same, diverged = self.gen(), self.gen(False, 29, margin=0.05, a=29, b=40)
+        base = {'gen-item2b-m1b-w8a32-s1-vs-s2-1.json': same, 'gen-item2b-m1b-w8a8-s1-vs-s1-1.json': same,
+                'gen-item2b-m1b-w8a8-s1-vs-s2-1.json': diverged}
+        out = self.summarize(base)
+        self.assertIn('| item2b-m1b-w8a8-s1-vs-s2 | 1 | no | 29 | 29/40 | 5 | 0.05 |', out)
+        self.assertIn('W8A8, one socket against two: diverged in 1 of 1 runs, first divergence at token [29]', out)
+        self.assertIn('Verdict (m1b): noise floor', out)
+        # a margin above the noise floor, or any W8A32 divergence, is a bug; a missing margin leaves the verdict undecided
+        big = {**base, 'gen-item2b-m1b-w8a8-s1-vs-s2-1.json': self.gen(False, 29, margin=1.5)}
+        self.assertIn('Verdict (m1b): BUG (blocks E2): W8A8 diverged at a margin above the noise floor 0.2', self.summarize(big))
+        w8a32 = {**base, 'gen-item2b-m1b-w8a32-s1-vs-s2-1.json': self.gen(False, 70, margin=0.01)}
+        self.assertIn('BUG (blocks E2): W8A32 diverged between socket counts', self.summarize(w8a32))
+        self.assertIn('undecided: a margin is missing', self.summarize({**base, 'gen-item2b-m1b-w8a8-s1-vs-s2-1.json':
+                                                                       self.gen(False, 29, margin=None)}))
+        none = {k: same for k in base}
+        self.assertIn('no divergence reproduced', self.summarize(none))
+        self.assertIn('control, one socket against one socket (run-to-run): diverged in 1 of 1 runs',
+                      self.summarize({**base, 'gen-item2b-m1b-w8a8-s1-vs-s1-1.json': diverged}))
+
+    def test_repeats_and_fp32_gate(self):
+        files = {f'gen-item2b-m1b-w8a8-s1-vs-s2-{r}.json': self.gen(False, 29 + r, margin=0.1) for r in (1, 2, 3)}
+        files['gen-fp32-m8b-2048-s1-vs-s2-1.json'] = self.gen()
+        files['gen-fp32-m8b-short-pertoken-vs-m64-1.json'] = self.gen(False, 12, margin=1e-4)
+        files['gen-fp32-m1b-short-s1-vs-s2-1.json'] = self.gen(False, 7, margin=0.4)
+        files['gen-broken-1.json'] = {'nonsense': 1}  # skipped, not a crash
+        out = self.summarize(files)
+        self.assertIn('diverged in 3 of 3 runs', out)
+        self.assertIn('| fp32-m8b-2048-s1-vs-s2 | 1 | PASS (identical) |', out)
+        self.assertIn('| fp32-m8b-short-pertoken-vs-m64 | 1 | PASS (diverges at 12, margin within the tolerance) |', out)
+        self.assertIn('| fp32-m1b-short-s1-vs-s2 | 1 | FAIL (diverges at 7) |', out)
+        self.assertIn('1 of the FP32 comparisons outside the gate', out)
+        self.assertNotIn('gen-broken', out)
+        # the tolerance follows the observed max |delta logit|
+        self.assertIn('| fp32-m1b-short-s1-vs-s2 | 1 | PASS (diverges at 7, margin within the tolerance) |',
+                      self.summarize(files, '--max-dlogit', '0.5'))
+
+    def test_bitwise_table_and_empty_directory(self):
+        compare = dict(passed=True, summary=dict(bitwise=True, max_abs=0.0))
+        out = self.summarize({'compare-m8b-fp32-e1-m64-prompt2048.json': compare})
+        self.assertIn('| m8b-fp32-e1-m64-prompt2048 | yes | 0 | PASS |', out)
+        self.assertIn('No generation comparison results', self.summarize({}))
 
 
 class SummarizeAttentionBenchTests(unittest.TestCase):

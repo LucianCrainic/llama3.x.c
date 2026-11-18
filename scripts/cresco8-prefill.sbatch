@@ -1036,6 +1036,127 @@ phase_E0() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_attention_bench.py" "$dir" --counters-csv "$dir/counters.csv" > "$dir/summary.md"
 }
 
+# ---- E1: attention dispatch check (default unchanged), item 2b and the FP32 determinism data -------------------------------
+# STAGE=check PHASE=E1; `make test` already ran in the common check stage. Three parts, about an hour for 1B and 8B:
+# (1) the bitwise gate: with BASELINE_ROOT (a copy of an earlier commit, e.g. the D2 build, whose build/release/probe-fp32 an
+#     earlier job built) the logits of that build and of this tree with LLAMA_ATTN=split must be bit-identical on the 8B model
+#     (E1_MODEL, default 8b) at the 2048-token prompt, last row: FP32 M = 64 batched, FP32 per token, two sockets M = 64. A shim
+#     written into E1/ runs $PROBE_DIR/probe-fp32, so one compare_engines invocation can compare two binaries. Without
+#     BASELINE_ROOT this part is skipped and recorded (not a failure).
+# (2) item 2b, recorded: the 1B model (E1_SMALL_MODEL, default 1b), W8A8 and W8A32 from a retained context of 8192 tokens,
+#     one socket against two (LLAMA_TP_CHECK=1), and one socket against one socket as the run-to-run control, REPEATS times,
+#     128 steps, greedy: E1/gen-<case>-<rep>.json. (3) FP32 determinism-gate data on every model: the 2048-token and the short
+#     prompt, one socket per token against two sockets and against batched M = 64, one repeat. tools/summarize_generation.py
+#     reads the gen-*.json files and writes E1/summary.md. None of the generation comparisons gates the job unless a run fails.
+e1_is() { # NAME PATTERN: does the lower-cased model name contain PATTERN
+  [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == *"$2"* ]]
+}
+
+# e1_shim DIR PRECISION: writes DIR/probe-shim-PRECISION.sh, which runs $PROBE_DIR/probe-PRECISION, and prints its path.
+e1_shim() {
+  local shim="$1/probe-shim-$2.sh"
+  if ! dry_run; then
+    printf '#!/usr/bin/env bash\nexec "$PROBE_DIR/probe-%s" "$@"\n' "$2" > "$shim"
+    chmod +x "$shim"
+  fi
+  printf '%s\n' "$shim"
+}
+
+# e1_bitwise DIR NAME STAGED: the three bitwise comparisons of the baseline probe against this build (needs c_prompts 2048).
+e1_bitwise() {
+  local dir=$1 name=$2 staged=$3 shim benv base="$BASELINE_ROOT/build/release" here="$ROOT/build/release" two
+  shim=$(e1_shim "$dir" fp32)
+  read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+  CMP_PROBE=$shim CMP_TOKENS="$dir/$name-tokens-2048.txt"
+  CMP_FLAGS=(--bitwise --batch-a 64 --batch-b 64 --last-only)
+  a_bitwise "$dir" "$name" fp32 "$staged" e1-m64-prompt2048 "${benv[@]}" LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on \
+    "PROBE_DIR=$base" -- "${benv[@]}" LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on LLAMA_ATTN=split "PROBE_DIR=$here"
+  # per token: the batched path at M = 1 returning the last row only (the per-token reference, without 2048 rows of logits)
+  CMP_FLAGS=(--bitwise --batch-a 1 --batch-b 1 --last-only)
+  a_bitwise "$dir" "$name" fp32 "$staged" e1-pertoken-prompt2048 "${benv[@]}" LLAMA_KERNELS=avx512 "PROBE_DIR=$base" -- \
+    "${benv[@]}" LLAMA_KERNELS=avx512 LLAMA_ATTN=split "PROBE_DIR=$here"
+  # two sockets, as D2 runs them (teams, 56 threads each), exchange state checked
+  two=("${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on)
+  B_FLAGS=(--bitwise --batch-a 64 --batch-b 64 --last-only) B_EXPECT=ok
+  b_compare "$dir" "$name" fp32 "$staged" e1-s2-m64-prompt2048 "${two[@]}" "PROBE_DIR=$base" -- "${two[@]}" LLAMA_ATTN=split \
+    "PROBE_DIR=$here"
+  B_FLAGS=() CMP_FLAGS=(--bitwise) CMP_TOKENS= CMP_PROBE=
+}
+
+# e1_side SOCKETS RUNG M: sets E1_SIDE to the environment words of one configuration (D2's placement words, the rung's kernels).
+e1_side() {
+  c_rung "$2" "$3"
+  E1_SIDE=("${D_ENV[@]}" "LLAMA_SOCKETS=$1")
+  [[ $1 != 2 ]] || E1_SIDE+=(LLAMA_TP_CHECK=1)
+  E1_SIDE+=("${RUNG_ENV[@]}")
+}
+
+# e1_case CASE REP SOCKETS_A RUNG_A M_A SOCKETS_B RUNG_B M_B: one recorded generation comparison with tools/compare_generation.py
+# (A is the reference, and its probe gives the top-2 margin at the divergence). The run is described by E1_ENGINE, E1_PROBE,
+# E1_STAGED, E1_TOKENIZER, E1_PROMPT, E1_CTX (context length), E1_WARM (retained context, 0 for none) and E1_PBATCH.
+e1_case() {
+  local case=$1 rep=$2 a b warm=() args=() word
+  e1_side "$3" "$4" "$5"
+  a=("${E1_SIDE[@]}")
+  e1_side "$6" "$7" "$8"
+  b=("${E1_SIDE[@]}")
+  [[ $E1_WARM == 0 ]] || warm=(--warm-context "$E1_WARM")
+  for word in "${a[@]}"; do args+=(--env-a "$word"); done
+  for word in "${b[@]}"; do args+=(--env-b "$word"); done
+  expect "gen-$case-$rep" ok "$OUT/E1" -- "$PYTHON" "$ROOT/tools/compare_generation.py" --engine "$ROOT/build/release/$E1_ENGINE" \
+    --checkpoint "$E1_STAGED" --tokenizer "$E1_TOKENIZER" --prompt-file "$E1_PROMPT" --steps 128 ${warm[@]+"${warm[@]}"} \
+    --engine-args "--context-length $E1_CTX --chat-template" "${args[@]}" \
+    --probe "$ROOT/build/release/$E1_PROBE" --probe-batch "$E1_PBATCH" --output "$OUT/E1/gen-$case-$rep.json"
+}
+
+phase_E1() {
+  local dir="$OUT/E1" entry name artifacts hf n rep bitwise_done=0
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E1 run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  c_prompts "$dir" 2048
+  if [[ -z ${BASELINE_ROOT:-} ]]; then
+    echo 'baseline not given: the bitwise default check against the baseline build was skipped' | tee "$dir/baseline-not-given.txt"
+  elif ! dry_run && [[ ! -x $BASELINE_ROOT/build/release/probe-fp32 ]]; then
+    record_result e1-baseline-probe FAIL 'BASELINE_ROOT has no build/release/probe-fp32'
+    BASELINE_ROOT=
+  fi
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    E1_TOKENIZER="$artifacts/tokenizer-v2.bin"
+    # FP32 on every model: the bitwise gate (8B only) and the determinism-gate data.
+    E1_STAGED=$(stage_model_on 0 "$name" fp32 "$artifacts")
+    if [[ -n ${BASELINE_ROOT:-} ]] && e1_is "$name" "${E1_MODEL:-8b}"; then
+      e1_bitwise "$dir" "$name" "$E1_STAGED"
+      bitwise_done=1
+    fi
+    E1_ENGINE=run E1_PROBE=probe-fp32 E1_WARM=0 E1_PBATCH=1
+    for n in short 2048; do
+      if [[ $n == short ]]; then E1_PROMPT="$OUT/short.txt" E1_CTX=512; else E1_PROMPT="$OUT/prompt-2048.txt" E1_CTX=2304; fi
+      e1_case "fp32-$name-$n-s1-vs-s2" 1 1 per_token 1 2 per_token 1
+      e1_case "fp32-$name-$n-pertoken-vs-m64" 1 1 per_token 1 1 avx512_fp32 64
+    done
+    unstage_model_on 0 "$name" fp32
+    # item 2b on the 1B model: W8A8 and W8A32 from a retained context of 8192 tokens.
+    if e1_is "$name" "${E1_SMALL_MODEL:-1b}"; then
+      E1_STAGED=$(stage_model_on 0 "$name" int8 "$artifacts")
+      E1_ENGINE=runq E1_PROBE=probe-int8 E1_WARM=8192 E1_CTX=8448 E1_PBATCH=64 E1_PROMPT="$OUT/short.txt"
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        e1_case "item2b-$name-w8a8-s1-vs-s2" "$rep" 1 avx512_q8 "$(d2_m 1 avx512_q8)" 2 avx512_q8 "$(d2_m 2 avx512_q8)"
+        e1_case "item2b-$name-w8a32-s1-vs-s2" "$rep" 1 avx512_q8_w8a32 1 2 avx512_q8_w8a32 1
+        e1_case "item2b-$name-w8a8-s1-vs-s1" "$rep" 1 avx512_q8 "$(d2_m 1 avx512_q8)" 1 avx512_q8 "$(d2_m 1 avx512_q8)"
+      done
+      unstage_model_on 0 "$name" int8
+    fi
+  done
+  if [[ $bitwise_done == 0 && -n ${BASELINE_ROOT:-} ]]; then
+    echo "no MODELS entry matches E1_MODEL=${E1_MODEL:-8b}: the bitwise default check was skipped" | tee "$dir/no-bitwise-model.txt"
+  fi
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
+}
+
 require_phases
 if ! dry_run; then
   check_stage
