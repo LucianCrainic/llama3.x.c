@@ -431,12 +431,14 @@ class RuntimeTests(unittest.TestCase):
         # E2: tiled is built; it runs the same on any host (split where AVX-512 is not active) and is recorded
         _, data = self.execute('run', env={'LLAMA_ATTN': 'tiled'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'split'))
+        # E5: group is built; it is recorded, and runs split where AVX-512 is not active
+        _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'group'))
         for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN=amx is not implemented yet (E3)'),
                                      ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be split, tiled or amx'),
                                      ('LLAMA_ATTN_TILED_QUERIES', '0', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
                                      ('LLAMA_ATTN_TILED_QUERIES', '17', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
                                      ('LLAMA_ATTN_TILED_ORDER', 'random', 'LLAMA_ATTN_TILED_ORDER must be longest or natural'),
-                                     ('LLAMA_ATTN_DECODE', 'group', 'LLAMA_ATTN_DECODE=group is not implemented yet'),
                                      ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):
             result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
                                      '-i', 'A', '-t', '0'], capture_output=True, text=True,

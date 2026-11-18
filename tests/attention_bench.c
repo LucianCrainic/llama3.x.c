@@ -8,7 +8,8 @@
  * attention time. Decode calls k_attention at the last position of a context, cycling through enough copies of K/V
  * (--cold-mib, default 1024) that each call reads memory the previous one did not leave in the cache.
  * Threads, pinning and the instruction set come from the engine's own environment: LLAMA_BACKEND=teams LLAMA_THREADS=56
- * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
+ * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_DECODE (split|group; decode mode),
+ * LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
  * LLAMA_ATTN_WORKSPACE_MIB.
  * One extra pass per cell runs with the kernels' task hook on (k_attention_set_task_hook) to measure how the workers are
  * used: the timed repetitions run without it. --portable runs the batched driver with the scalar chunk kernel
