@@ -1003,7 +1003,7 @@ phase_E0() {
   e0_collect bench-decode.jsonl 'decode-*.out'
   # (5) counters on the 8b/8192/M256 prefill cell and the 1b/32768 decode cell.
   e0_counted prefill-8b-8192-m256 56 --mode prefill --shape 8b --prompt 8192 --m 256 --reps "$REPEATS"
-  e0_counted decode-1b-32768 56 --mode decode --shape 1b --context 32768 --reps 2000
+  e0_counted decode-1b-32768 56 --mode decode --shape 1b --context 32768 --reps 1000
   # (6) engine runs: the bitwise gate of the knob, and one profiled run for the cross-check.
   if [[ -z $MODELS ]]; then
     echo 'MODELS is empty: no E0 engine run was made' | tee "$dir/no-models.txt"
