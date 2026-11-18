@@ -1386,6 +1386,232 @@ phase_E2() {
   fi
 }
 
+# ---- E4: prefill attention campaign (split against tiled, and amx when E3 is adopted) ---------------------------------------
+# One controlled campaign for the decision of the attention track: docs/plans/E-followups/README.md, E4. Both stages need the
+# models. Submit check first (SKIP_TEST=1 on the bench job once the check passed), one job per stage; the E3 variant `amx` is
+# opted in with E4_AMX=1 (LLAMA_ATTN=amx exists only after E3; before that it fails with an E3 message). Knobs:
+#   E4_ATTN        attention variants of the matrix (default "split tiled"); `amx` in the list counts for the BF16 rung only
+#   E4_AMX         1 adds LLAMA_ATTN=amx, on the AMX-BF16 rung only (default 0)
+#   E4_TILED_ENV   environment words that go with LLAMA_ATTN=tiled everywhere, e.g. "LLAMA_ATTN_TILED_QUERIES=8" (E2's knob choice)
+#   E4_RUNGS       RUNG:M cells (default "avx512_fp32:64 avx512_fp32:128 amx_bf16:256 amx_int8:256"); FP32 and BF16 read the fp32
+#                  checkpoint, AMX-INT8 the int8 one
+# check (E4/compare-*.json, gen-*.json; summary.md from tools/summarize_e4.py checks, generation-summary.md): for every variant
+#   FP32 (not amx): LLAMA_ATTN=A at M = 64 (86 tokens, all positions, and 2048, last row) and M = 128 (2048) against the one-socket
+#     per-token reference, max |dlogit| <= 1e-3, argmax 100%; two sockets (LLAMA_TP_CHECK=1) M = 64 against the same reference, 2048;
+#   AMX-BF16 M = 256: A against split (86 and 2048, BF16_GATE; not for split itself) and two sockets against one socket with A on
+#     both (2048, BF16_GATE_LAST);
+#   AMX-INT8 M = 256 (int8 checkpoint, W8A8_GATE_LAST): the same two comparisons, without amx;
+#   E1 determinism (tools/compare_generation.py, 128 steps greedy, short and 2048-token prompt): one against two sockets under A, and
+#     A against split on one socket; the FP32 rung cases are named fp32-e4-* (the E1 determinism gate reads them), BF16 ones bf16-e4-*.
+#   Not repeated here: the 8192-token per-token references (E2 gated them; one 8B reference takes tens of minutes) and the bitwise
+#   split check against a baseline build (E1 and E2 did that).
+# bench (E4/summary.md from tools/summarize_e4.py bench; campaign-summary.md from summarize_campaign.py): models x rungs x variants
+#   (amx on the BF16 rung only) x prompts {2048, 8192} x sockets {1, 2} (D2's launch: checkpoint staged on node 0, engine-owned HBM
+#   placement, socket 0 bound for one socket), REPEATS interleaved repeats (label x=attn<variant>; 32 generated tokens after the
+#   prefill, for decode) plus one LLAMA_PROFILE=1 repeat per cell (x=prof<variant>, one generated token, no perf counters).
+#   Cells per model with the default knobs: 8 rung-variant pairs x 2 prompts x 2 sockets = 32 cells (36 with amx), each
+#   REPEATS + 1 runs: 128 runs per model at REPEATS=3 (144 with amx), 256 (288) for 1B and 8B together.
+#   Duration (ESTIMATE, not measured): an 8B run costs about 70 s (checkpoint copy into HBM and placement verification about 30 s,
+#   prefill 5-50 s depending on rung, prompt and sockets, 32 decode tokens a few seconds), a 1B run about 20 s: 128 x 70 s
+#   + 128 x 20 s + staging = about 3.3 h (3.7 h with amx). Submit with --time=05:00:00. check: about 2 h (estimate; the
+#   one-socket per-token references at 2048 tokens on 8B dominate, plus the generation comparisons).
+E4_ATTN=${E4_ATTN:-split tiled}
+E4_RUNGS=${E4_RUNGS:-avx512_fp32:64 avx512_fp32:128 amx_bf16:256 amx_int8:256}
+
+# e4_ckpt RUNG: the checkpoint precision that rung reads.
+e4_ckpt() {
+  case $1 in
+    avx512_q8 | amx_int8) echo int8 ;;
+    *) echo fp32 ;;
+  esac
+}
+
+# e4_cells CKPT: the RUNG:M cells that read that checkpoint.
+e4_cells() {
+  local cell
+  for cell in $E4_RUNGS; do
+    [[ $(e4_ckpt "${cell%:*}") != "$1" ]] || echo "$cell"
+  done
+}
+
+# e4_attns RUNG: the attention variants measured on that rung; amx only on the BF16 rung, and only when E4_AMX=1 or listed.
+e4_attns() {
+  local attn out=()
+  for attn in $E4_ATTN; do
+    if [[ $attn != amx ]]; then
+      out+=("$attn")
+    elif [[ $1 == amx_bf16 ]]; then
+      out+=(amx)
+    fi
+  done
+  if [[ $1 == amx_bf16 && ${E4_AMX:-0} == 1 && " ${out[*]-} " != *" amx "* ]]; then out+=(amx); fi
+  echo ${out[@]+"${out[@]}"}
+}
+
+# e4_words ATTN: sets E4_EXTRA (the tiled knob words, for tiled only) and E4_ENV (LLAMA_ATTN=ATTN and E4_EXTRA).
+e4_words() {
+  E4_EXTRA=()
+  if [[ $1 == tiled && -n ${E4_TILED_ENV:-} ]]; then read -r -a E4_EXTRA <<< "$E4_TILED_ENV"; fi
+  E4_ENV=("LLAMA_ATTN=$1" ${E4_EXTRA[@]+"${E4_EXTRA[@]}"})
+}
+
+# e4_two_case DIR NAME PRECISION STAGED LABEL RUNG M ATTN GATE...: two real sockets (LLAMA_TP_CHECK=1, D2's placement words)
+# against one socket, 2048 tokens, last row. FP32 compares with the one-socket per-token reference, the other rungs with the
+# same rung and attention on one socket.
+e4_two_case() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 rung=$6 m=$7 attn=$8 a b batch_a=$7
+  shift 8
+  e4_words "$attn"
+  if [[ $rung == avx512_fp32 ]]; then
+    a=("${D_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_KERNELS=avx512)
+    batch_a=1
+  else
+    c_rung "$rung" "$m"
+    a=("${D_ENV[@]}" LLAMA_SOCKETS=1 "${RUNG_ENV[@]}" "${E4_ENV[@]}")
+  fi
+  c_rung "$rung" "$m"
+  b=("${D_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 "${RUNG_ENV[@]}" "${E4_ENV[@]}")
+  CMP_TOKENS="$dir/$name-tokens-2048.txt"
+  B_FLAGS=("$@" --batch-a "$batch_a" --batch-b "$m" --last-only) B_EXPECT=ok
+  b_compare "$dir" "$name" "$precision" "$staged" "$label" "${a[@]}" -- "${b[@]}"
+  B_FLAGS=() CMP_TOKENS=
+}
+
+# e4_gen_cases NAME ATTN: the E1 determinism comparisons of one attention variant on the FP32 (for amx: the BF16) rung. The caller
+# has set E1_TOKENIZER, E1_STAGED, E1_ENGINE, E1_PROBE, E1_WARM and E1_PBATCH.
+e4_gen_cases() {
+  local name=$1 attn=$2 rung=avx512_fp32 m=64 kind=fp32 n
+  if [[ $attn == amx ]]; then rung=amx_bf16 m=256 kind=bf16; fi
+  e4_words "$attn"
+  for n in short 2048; do
+    if [[ $n == short ]]; then E1_PROMPT="$OUT/short.txt" E1_CTX=512; else E1_PROMPT="$OUT/prompt-2048.txt" E1_CTX=2304; fi
+    E1_XENV_A="${E4_ENV[*]}" E1_XENV_B="${E4_ENV[*]}"
+    e1_case "$kind-e4-$name-$n-$attn-s1-vs-s2" 1 1 "$rung" "$m" 2 "$rung" "$m"
+    if [[ $attn != split ]]; then
+      E1_XENV_A=LLAMA_ATTN=split E1_XENV_B="${E4_ENV[*]}"
+      e1_case "$kind-e4-$name-$n-split-vs-$attn" 1 1 "$rung" "$m" 1 "$rung" "$m"
+    fi
+  done
+  E1_XENV_A= E1_XENV_B=
+}
+
+e4_check() {
+  local dir=$1 entry name artifacts hf staged attn n
+  if ! dry_run && ! grep -q '^PASS make-test' "$OUT/phase-results.txt" 2> /dev/null; then
+    echo 'make test did not pass in this job (SKIP_TEST=1, or it failed): the check relies on an earlier passing run' |
+      tee "$dir/make-test-not-verified.txt"
+  fi
+  c_prompts "$dir" 2048
+  E2_PFX=e4
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    staged=$(stage_model_on 0 "$name" fp32 "$artifacts")
+    E1_TOKENIZER="$artifacts/tokenizer-v2.bin" E1_STAGED=$staged E1_ENGINE=run E1_PROBE=probe-fp32 E1_WARM=0 E1_PBATCH=1
+    for attn in $(e4_attns amx_bf16); do
+      e4_words "$attn"
+      E2_ATTN=$attn
+      E2_EXTRA=(${E4_EXTRA[@]+"${E4_EXTRA[@]}"})
+      if [[ $attn != amx ]]; then
+        # (1) FP32 against the one-socket per-token reference, M = 64 (all positions at 86, the last row at 2048) and M = 128.
+        E2_M=64
+        for n in 86 2048; do
+          e2_fp32_case "$dir" "$name" "$staged" "$n" "$attn-m64" ${E4_EXTRA[@]+"${E4_EXTRA[@]}"}
+        done
+        E2_M=128
+        e2_fp32_case "$dir" "$name" "$staged" 2048 "$attn-m128" ${E4_EXTRA[@]+"${E4_EXTRA[@]}"}
+        # (3) two real sockets against that reference, exchange state checked.
+        e4_two_case "$dir" "$name" fp32 "$staged" "e4-s2-$attn-m64-prompt2048" avx512_fp32 64 "$attn" "${E2_FP32_GATE[@]}"
+      fi
+      # (2) AMX-BF16, A against split, then two sockets against one.
+      E2_M=256
+      if [[ $attn != split ]]; then
+        e2_pair_case "$dir" "$name" fp32 "$staged" 86 "bf16-$attn-vs-split" amx_bf16 "${BF16_GATE[@]}"
+        e2_pair_case "$dir" "$name" fp32 "$staged" 2048 "bf16-$attn-vs-split" amx_bf16 "${BF16_GATE_LAST[@]}"
+      fi
+      e4_two_case "$dir" "$name" fp32 "$staged" "e4-s2-bf16-$attn-m256-prompt2048" amx_bf16 256 "$attn" "${BF16_GATE_LAST[@]}"
+      # (4) the E1 determinism comparisons.
+      e4_gen_cases "$name" "$attn"
+      E2_M= E2_ATTN= E2_EXTRA=()
+    done
+    unstage_model_on 0 "$name" fp32
+    # (5) W8A8 on the int8 checkpoint: AMX-INT8, A against split, two sockets against one.
+    staged=$(stage_model_on 0 "$name" int8 "$artifacts")
+    for attn in $(e4_attns amx_int8); do
+      e4_words "$attn"
+      E2_ATTN=$attn E2_M=256
+      E2_EXTRA=(${E4_EXTRA[@]+"${E4_EXTRA[@]}"})
+      [[ $attn == split ]] || e2_pair_case "$dir" "$name" int8 "$staged" 2048 "w8a8-$attn-vs-split" amx_int8 "${W8A8_GATE_LAST[@]}"
+      e4_two_case "$dir" "$name" int8 "$staged" "e4-s2-w8a8-$attn-m256-prompt2048" amx_int8 256 "$attn" "${W8A8_GATE_LAST[@]}"
+      E2_M= E2_ATTN= E2_EXTRA=()
+    done
+    unstage_model_on 0 "$name" int8
+  done
+  E2_PFX=
+  # the exit status of the summary is the failure count; the failures are already in phase-results.txt
+  if ! dry_run; then
+    "$PYTHON" "$ROOT/tools/summarize_e4.py" checks "$dir" > "$dir/summary.md" || true
+    "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/generation-summary.md" || true
+  fi
+}
+
+e4_bench() {
+  local dir=$1 entry name artifacts hf ckpt staged tokenizer rep n sockets cell rung m attn
+  need_shm
+  c_prompts "$dir" 2048,8192
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for ckpt in fp32 int8; do
+      [[ -n $(e4_cells "$ckpt") ]] || continue
+      staged=$(stage_model_on 0 "$name" "$ckpt" "$artifacts")
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        for n in 2048 8192; do
+          for sockets in 1 2; do
+            for cell in $(e4_cells "$ckpt"); do
+              rung=${cell%:*} m=${cell#*:}
+              for attn in $(e4_attns "$rung"); do
+                e4_words "$attn"
+                CONTEXT=$((n + 256)) GENERATION=32 d_launch "$name" "$rung" "$m" "$sockets" "$rep" "$OUT/prompt-$n.txt" "$staged" \
+                  "$tokenizer" "p=$n" "x=attn$attn" -- "${E4_ENV[@]}"
+              done
+            done
+          done
+        done
+      done
+      # one profiled repeat per cell (attention share): one generated token, no perf counters.
+      for n in 2048 8192; do
+        for sockets in 1 2; do
+          for cell in $(e4_cells "$ckpt"); do
+            rung=${cell%:*} m=${cell#*:}
+            for attn in $(e4_attns "$rung"); do
+              e4_words "$attn"
+              PERF=0 CONTEXT=$((n + 256)) GENERATION=1 d_launch "$name" "$rung" "$m" "$sockets" 1 "$OUT/prompt-$n.txt" "$staged" \
+                "$tokenizer" "p=$n" "x=prof$attn" -- LLAMA_PROFILE=1 "${E4_ENV[@]}"
+            done
+          done
+        done
+      done
+      unstage_model_on 0 "$name" "$ckpt"
+    done
+  done
+  if ! dry_run; then
+    "$PYTHON" "$ROOT/tools/summarize_e4.py" bench "$OUT" > "$dir/summary.md"
+    "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/campaign-summary.md"
+  fi
+}
+
+phase_E4() {
+  local dir="$OUT/E4"
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E4 run was made' | tee "$dir/no-models.txt"
+  elif [[ $STAGE == bench ]]; then
+    e4_bench "$dir"
+  else
+    need_shm
+    e4_check "$dir"
+  fi
+}
+
 require_phases
 if ! dry_run; then
   check_stage
