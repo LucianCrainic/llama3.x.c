@@ -75,7 +75,8 @@ class RuntimeTests(unittest.TestCase):
         for key in v2:
             self.assertIn(key, data)
         self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
-            'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None})
+            'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None,
+            'attn_row_block': 4})
         self.assertIsNone(data['teams'])
         self.assertEqual(data['regions'], [])
         self.assertIsNone(data['phase_seconds'])

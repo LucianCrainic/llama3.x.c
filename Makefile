@@ -91,6 +91,8 @@ $(BUILD_DIR)/amx-bench: tests/amx_bench.c $(COMMON) $(HEADERS) $(BUILD_DIR)/conf
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/amx_bench.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/gemm-bench: tests/gemm_bench.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gemm_bench.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/attention-bench: tests/attention_bench.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/attention_bench.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-manifest: tests/manifest.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/manifest.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-sizing: tests/sizing.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
@@ -111,7 +113,7 @@ $(BUILD_DIR)/test-prefill-fp32: tests/prefill.c src/run.c $(COMMON) $(HEADERS) $
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-prefill-int8: tests/prefill.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-TEST_BINS := $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/amx-bench $(BUILD_DIR)/test-q8 $(BUILD_DIR)/test-q8-emul $(BUILD_DIR)/test-q8-engine $(BUILD_DIR)/test-q8-engine-emul $(BUILD_DIR)/runq-amx-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/test-shards $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-sizing $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8 $(BUILD_DIR)/probe-fp32-amx-emul $(BUILD_DIR)/probe-int8-amx-emul
+TEST_BINS := $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/amx-bench $(BUILD_DIR)/test-q8 $(BUILD_DIR)/test-q8-emul $(BUILD_DIR)/test-q8-engine $(BUILD_DIR)/test-q8-engine-emul $(BUILD_DIR)/runq-amx-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/attention-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/test-shards $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-sizing $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8 $(BUILD_DIR)/probe-fp32-amx-emul $(BUILD_DIR)/probe-int8-amx-emul
 test-bins: all $(TEST_BINS)
 test: test-bins
 	$(BUILD_DIR)/test-kernels
@@ -128,6 +130,9 @@ test: test-bins
 	$(BUILD_DIR)/test-regions
 	$(BUILD_DIR)/test-workers
 	$(BUILD_DIR)/test-sizing
+	$(BUILD_DIR)/attention-bench --mode prefill --shape 8/2/64 --prompt 96,200 --m 16,64 --reps 2 > /dev/null
+	$(BUILD_DIR)/attention-bench --mode prefill --shape 8/2/64 --prompt 200 --m 32 --reps 2 --portable > /dev/null
+	$(BUILD_DIR)/attention-bench --mode decode --shape 8/2/64 --context 300 --reps 4 --cold-mib 1 > /dev/null
 	python3 tests/test_runtime.py $(BUILD_DIR)
 	python3 tests/test_numa.py $(BUILD_DIR)
 	python3 tests/test_tp.py $(BUILD_DIR)

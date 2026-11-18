@@ -161,6 +161,24 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
  * count, for the report and for choosing contexts where a team has too little work. */
 int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int position);
 void k_attention_free(AttentionWork *work);
+/* Rows per batched-attention task (LLAMA_ATTN_ROW_BLOCK, 1..16, default 4; kernels_init reads it). Diagnostic only: the
+ * rows of a block are computed independently, so the results are bitwise the same for every value. */
+void k_attention_set_row_block(int rows);
+int k_attention_row_block(void);
+/* Opt-in timing of the attention tasks for tests/attention_bench.c: while a hook is set, every (kv group, chunk[, row
+ * block]) task reports who ran it, what it read and when (monotonic_seconds). The hook runs on the worker threads; set and
+ * clear it between kernel calls. With no hook (the default) the kernels are unchanged. */
+typedef struct {
+  int worker;        /* team member, or OpenMP thread number */
+  int wave;          /* first row of the wave inside the microbatch (0 for decode) */
+  int task;          /* index in the wave */
+  int rows;          /* rows of the block that take part */
+  int span;          /* K/V positions the block streams: min(t0)..max(t1) over its rows */
+  long positions;    /* positions scored, summed over the rows */
+  double begin, end; /* monotonic_seconds around the task */
+} AttentionTaskInfo;
+typedef void (*AttentionTaskHook)(void *ctx, const AttentionTaskInfo *info);
+void k_attention_set_task_hook(AttentionTaskHook hook, void *ctx);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);
 

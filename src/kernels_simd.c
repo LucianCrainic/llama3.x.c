@@ -8,6 +8,7 @@
 #include "tp.h"
 #include "workers.h"
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -27,6 +28,11 @@
 
 static KernelIsa isa = KERNELS_SCALAR;
 static int initialized;
+/* Rows of one (kv group, chunk) task of the batched attention (E0 diagnostic, LLAMA_ATTN_ROW_BLOCK, read once by
+ * kernels_init). Rows of a block are computed one after the other, each exactly as without the block, so the result is
+ * bitwise independent of it. */
+enum { BATCH_MAX_ROW_BLOCK = 16 };
+static int attention_row_block = 4;
 /* With a team set, kernels run on it instead of opening OpenMP regions. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
@@ -100,6 +106,15 @@ void kernels_init(void) {
   }
   if (gemv_sched_q8 == SCHED_AUTO)
     gemv_sched_q8 = SCHED_STATIC;
+  const char *rows = getenv("LLAMA_ATTN_ROW_BLOCK"); /* diagnostic: rows per batched-attention task, 1..16, default 4 */
+  attention_row_block = 4;
+  if (rows && *rows) {
+    char *end;
+    long value = strtol(rows, &end, 10);
+    if (*end || value < 1 || value > BATCH_MAX_ROW_BLOCK)
+      fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
+    attention_row_block = (int)value;
+  }
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
     kernels_select(supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR);
@@ -1398,6 +1413,24 @@ static void merge_chunks(const float *base, size_t slot, int chunks, int head_di
     o[i] /= sum;
 }
 
+/* Opt-in per-task timing for the attention benchmark (E0). Unset (the default), a task costs one atomic load. */
+static _Atomic(AttentionTaskHook) attention_task_hook;
+static void *attention_task_ctx;
+
+void k_attention_set_task_hook(AttentionTaskHook hook, void *ctx) {
+  attention_task_ctx = ctx;
+  atomic_store_explicit(&attention_task_hook, hook, memory_order_release);
+}
+
+/* worker < 0: the OpenMP thread number. */
+static int attention_worker_id(int worker) {
+#ifdef _OPENMP
+  return worker < 0 ? omp_get_thread_num() : worker;
+#else
+  return worker < 0 ? 0 : worker;
+#endif
+}
+
 #if HAVE_AVX512
 typedef struct {
   float *out;
@@ -1423,10 +1456,27 @@ static void attention_merge(const SplitKJob *j, int h) {
   merge_chunks(j->partial + h * j->head_stride, j->slot, j->chunks, j->head_dim, j->out + (size_t)h * j->head_dim);
 }
 
+/* The split-K task with the benchmark hook (see batch_run); a decode task is one row. */
+static void attention_run(const SplitKJob *j, int task, int worker) {
+  AttentionTaskHook hook = atomic_load_explicit(&attention_task_hook, memory_order_acquire);
+  if (!hook) {
+    attention_task(j, task);
+    return;
+  }
+  int c = task % j->chunks, t0 = (int)((long long)j->positions * c / j->chunks),
+      t1 = (int)((long long)j->positions * (c + 1) / j->chunks);
+  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .task = task, .rows = 1, .span = t1 - t0,
+                            .positions = t1 - t0};
+  info.begin = monotonic_seconds();
+  attention_task(j, task);
+  info.end = monotonic_seconds();
+  hook(attention_task_ctx, &info);
+}
+
 static void attention_team(const void *p, int worker, int workers) {
   SplitKJob *j = (SplitKJob *)p;
   for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
-    attention_task(j, task);
+    attention_run(j, task, worker);
   team_barrier(j->team); /* every chunk of every head is in `partial` before any head is merged */
   for (int h = (int)((long long)j->n_heads * worker / workers);
        h < (int)((long long)j->n_heads * (worker + 1) / workers); h++)
@@ -1470,7 +1520,7 @@ void k_attention(float *out, const float *q, const float *key_cache, const float
 #pragma omp for schedule(dynamic, 1)
 #endif
       for (int task = 0; task < job.tasks; task++)
-        attention_task(&job, task);
+        attention_run(&job, task, -1);
 #ifdef _OPENMP
 #pragma omp for
 #endif
@@ -1522,7 +1572,17 @@ static void attention_chunk_portable(const float *q, const float *kc, const floa
   }
 }
 
-enum { BATCH_ROW_BLOCK = 4, BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
+enum { BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
+
+void k_attention_set_row_block(int rows) {
+  if (rows < 1 || rows > BATCH_MAX_ROW_BLOCK)
+    fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
+  attention_row_block = rows;
+}
+
+int k_attention_row_block(void) {
+  return attention_row_block;
+}
 
 typedef struct {
   float *out;
@@ -1531,7 +1591,7 @@ typedef struct {
   ChunkFn chunk;
   int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
   int pos0, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch */
-  int chunks_wave, blocks, tasks;
+  int chunks_wave, blocks, tasks, row_block;
   size_t slot, head_stride, row_stride;
   atomic_int next_task; /* team-local queue over (kv group, chunk, row block) tasks */
   Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
@@ -1541,13 +1601,19 @@ static int batch_row_chunks(const BatchJob *j, int row) {
   return attention_chunks(j->pos0 + row + 1, j->n_kv_heads, j->limit, j->workers);
 }
 
+static void batch_split(const BatchJob *j, int task, int *g, int *c, int *first, int *last) {
+  int block = task % j->blocks, rest = task / j->blocks;
+  *c = rest % j->chunks_wave, *g = rest / j->chunks_wave;
+  *first = block * j->row_block, *last = *first + j->row_block < j->rows ? *first + j->row_block : j->rows;
+}
+
 /* One (kv group, chunk, block of rows) task. Rows of a block read the same K/V chunk back to back, so it stays in L2;
  * each row uses exactly the chunk plan k_attention would use at its position, and positions past the row are masked
  * simply by never being part of its chunks. */
 static void batch_task(const BatchJob *j, int task) {
-  int block = task % j->blocks, rest = task / j->blocks, c = rest % j->chunks_wave, g = rest / j->chunks_wave;
+  int g, c, first, last;
+  batch_split(j, task, &g, &c, &first, &last);
   float scores[BATCH_MAX_GROUP * BATCH_MAX_CHUNK];
-  int first = block * BATCH_ROW_BLOCK, last = first + BATCH_ROW_BLOCK < j->rows ? first + BATCH_ROW_BLOCK : j->rows;
   for (int rr = first; rr < last; rr++) {
     int row = j->row0 + rr, positions = j->pos0 + row + 1, chunks = batch_row_chunks(j, row);
     if (c >= chunks)
@@ -1561,6 +1627,36 @@ static void batch_task(const BatchJob *j, int task) {
   }
 }
 
+/* What a task reads, for the hook: rows that take part, positions scored, and the K/V span the block streams (the rows'
+ * chunks overlap, so the block pulls about min(t0)..max(t1) once). */
+static void batch_extent(const BatchJob *j, int task, AttentionTaskInfo *info) {
+  int g, c, first, last, lo = INT_MAX, hi = 0;
+  batch_split(j, task, &g, &c, &first, &last);
+  for (int rr = first; rr < last; rr++) {
+    int positions = j->pos0 + j->row0 + rr + 1, chunks = batch_row_chunks(j, j->row0 + rr);
+    if (c >= chunks)
+      continue;
+    int t0 = (int)((long long)positions * c / chunks), t1 = (int)((long long)positions * (c + 1) / chunks);
+    info->rows++, info->positions += t1 - t0;
+    lo = t0 < lo ? t0 : lo, hi = t1 > hi ? t1 : hi;
+  }
+  info->span = hi > lo ? hi - lo : 0;
+}
+
+static void batch_run(const BatchJob *j, int task, int worker) {
+  AttentionTaskHook hook = atomic_load_explicit(&attention_task_hook, memory_order_acquire);
+  if (!hook) {
+    batch_task(j, task);
+    return;
+  }
+  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .wave = j->row0, .task = task};
+  batch_extent(j, task, &info);
+  info.begin = monotonic_seconds();
+  batch_task(j, task);
+  info.end = monotonic_seconds();
+  hook(attention_task_ctx, &info);
+}
+
 static void batch_merge(const BatchJob *j, int item) {
   int rr = item / j->n_heads, h = item % j->n_heads, row = j->row0 + rr;
   merge_chunks(j->partial + (size_t)rr * j->row_stride + (size_t)h * j->head_stride, j->slot, batch_row_chunks(j, row),
@@ -1570,7 +1666,7 @@ static void batch_merge(const BatchJob *j, int item) {
 static void batch_team(const void *p, int worker, int workers) {
   BatchJob *j = (BatchJob *)p;
   for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
-    batch_task(j, task);
+    batch_run(j, task, worker);
   team_barrier(j->team); /* every chunk of every row and head is in `partial` before any is merged */
   int items = j->rows * j->n_heads;
   for (int item = (int)((long long)items * worker / workers); item < (int)((long long)items * (worker + 1) / workers);
@@ -1581,7 +1677,7 @@ static void batch_team(const void *p, int worker, int workers) {
 static void attention_batch_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
                                    ChunkFn chunk) {
-  BatchJob job = {.out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
+  BatchJob job = {.row_block = attention_row_block, .out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
                   .chunk = chunk, .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim,
                   .kv_mul = n_heads / n_kv_heads, .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim,
                   .limit = work->max_chunks, .workers = work->workers, .pos0 = pos0,
@@ -1600,7 +1696,7 @@ static void attention_batch_driver(float *out, const float *q, const float *key_
     }
     job.head_stride = (size_t)job.chunks_wave * job.slot;
     job.row_stride = (size_t)n_heads * job.head_stride;
-    job.blocks = (rows + BATCH_ROW_BLOCK - 1) / BATCH_ROW_BLOCK;
+    job.blocks = (rows + job.row_block - 1) / job.row_block;
     job.tasks = n_kv_heads * job.chunks_wave * job.blocks;
     atomic_init(&job.next_task, 0);
     job.team = current_team;
@@ -1615,7 +1711,7 @@ static void attention_batch_driver(float *out, const float *q, const float *key_
 #pragma omp for schedule(dynamic, 1)
 #endif
         for (int task = 0; task < job.tasks; task++)
-          batch_task(&job, task);
+          batch_run(&job, task, -1);
 #ifdef _OPENMP
 #pragma omp for
 #endif

@@ -130,6 +130,29 @@ class CampaignSummaryTests(unittest.TestCase):
         decode = [line for line in c7 if 'xdec' in line]
         self.assertTrue(decode and all('warm=2048' in line for line in decode))
 
+    def test_e0_dry_run_matrix(self):
+        """E0: the attention campaign prints its bench matrix, the knob's bitwise gate and one profiled 8B engine run."""
+        runs = self.dry_run('cresco8-prefill.sbatch', 'E0')  # only the 8B model of MODELS gets engine runs
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(all(w in runs[0] for w in ('-m256-p8192-', 'kamx_bf16', 'xprof', 'LLAMA_PROFILE=1', 'warm=0')), runs)
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E0', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b'}
+            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
+                                 text=True, timeout=120).stdout.splitlines()
+        bench = [line for line in out if line.startswith('EXPECT ') and 'attention-bench' in line]
+        self.assertEqual(len(bench), 6 + 5 + 2 + 4)  # prefill, row block, half KV heads, decode
+        self.assertTrue(all('--node 2' in line and '--cpunodebind=0' in line for line in bench))
+        self.assertEqual(sorted(line.split('LLAMA_ATTN_ROW_BLOCK=')[1].split()[0] for line in bench if 'ROW_BLOCK' in line),
+                         ['1', '16', '2', '4', '8'])
+        self.assertEqual(len([line for line in out if line.startswith('COUNTERS ')]), 2)
+        compare = [line for line in out if line.startswith('EXPECT compare-m8b-fp32-e0-rowblock')]
+        self.assertEqual(len(compare), 1)
+        for word in ('--bitwise', '--last-only', '--batch-a 64', '--batch-b 64', 'LLAMA_ATTN_ROW_BLOCK=4',
+                     'LLAMA_ATTN_ROW_BLOCK=16'):
+            self.assertIn(word, compare[0])
+        self.assertFalse([line for line in out if 'm1b' in line and 'compare' in line])
+
     @staticmethod
     def v2(prefill=None, decode=None, warm=0, sockets=1, ttft=1.0, steps=128, decode_seconds=None, model_file=32e9,
            attention=None):
@@ -519,6 +542,61 @@ class SummarizeGemmTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('| 8 | 2000 / 1800 | 100 | 23% | 500 | 4.0x |', result.stdout)
         self.assertIn('| 64 | 4400 / 3960 | 100 | 50% | - | - |', result.stdout)
+
+
+class SummarizeAttentionBenchTests(unittest.TestCase):
+    @staticmethod
+    def prefill(ms, row_block=4, m=256, kv=8, kv_model=8, **extra):
+        return dict(mode='prefill', isa='avx512', backend='teams', workers=56, node=2, shape='8b', heads=4 * kv, kv_heads=kv,
+                    head_dim=128, kv_heads_model=kv_model, row_block=row_block, prompt=8192, m=m, reps=3, ms_layer_median=ms,
+                    ms_layer_best=ms * .98, ms_layer_max=ms * 1.03, gflops_median=770.0, last_microbatch_ms_median=ms / 20,
+                    flops=5.5e11, tasks=1000, waves=40, streamed_over_unique=63.5, busy_mean=.8, busy_min=.7,
+                    tail_fraction=.12, task_phase_fraction=.97, **extra)
+
+    def run_tool(self, directory, *flags):
+        result = subprocess.run([sys.executable, str(TOOLS/'summarize_attention_bench.py'), str(directory), *flags],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_tables_cross_check_counters_and_missing_inputs(self):
+        write = lambda path, rows: path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            write(d/'bench-prefill.jsonl', [self.prefill(700.0), self.prefill(900.0, m=64)])
+            write(d/'rowblock.jsonl', [self.prefill(700.0 * 4 / r, row_block=r) for r in (1, 4, 16)])
+            write(d/'bench-prefill-kv4.jsonl', [self.prefill(330.0, kv=4, kv_model=8)])
+            write(d/'bench-decode.jsonl', [dict(mode='decode', shape='1b', kv_heads=8, context=32768, chunks=7, tasks=56,
+                                                ms_layer_median=.3, ms_layer_best=.29, ms_layer_max=.4, gbs_median=120.0,
+                                                gflops_median=60.0, busy_mean=.9, tail_fraction=.05, isa='avx512',
+                                                backend='teams', node=2)])
+            write(d/'counters-prefill-8b-8192-m256.jsonl', [self.prefill(700.0)])
+            (d/'counters-prefill-8b-8192-m256.perf.csv').write_text(
+                'S0,56,1.0e12,,cycles,1,100.0,,\nS0,56,2.0e12,,instructions,1,100.0,,\nS1,56,5,,cycles,1,100.0,,\n'
+                'S0,56,<not supported>,,l2_rqsts.miss,0,0.0,,\n')
+            (d/'engine-profile.json').write_text(json.dumps({'profile_seconds': {'prefill': {'forward': 30.0, 'attention': 23.0}}}))
+            out = self.run_tool(d, '--counters-csv', str(d/'counters.csv'))
+            # 22.4 s from the bench against 23.0 s from the engine: inside 20%
+            self.assertIn('= 22.40 s against the profiled engine attention 23.00 s', out)
+            self.assertIn('PASS (within +-20%)', out)
+            self.assertIn('| 4 | 700.00 (686.00-721.00) | 1.00x |', out)
+            self.assertIn('| 16 | 175.00 (171.50-180.25) | 4.00x |', out)
+            self.assertIn('H3: the best row block is 16 at 4.00x over 4 (at or above the 1.3x', out)
+            self.assertIn('| 8b | 8192 | 256 | 700.00 | 330.00 | 2.12 |', out)
+            self.assertIn('| 1b | 8 | 32768 | 7 | 56 | 0.30 (0.29-0.40) | 120 | 22% |', out)
+            self.assertIn('| 8b kv8 | 56 | 8192 | 256 | 700.00 (686.00-721.00) | 770 | 9% |', out)
+            self.assertIn('| prefill-8b-8192-m256 | 1e+12 | 2e+12 | 2.00 | 0.727 |', out)  # 2e12 / (5.5e11 * 5 passes)
+            csv_lines = (d/'counters.csv').read_text().splitlines()
+            self.assertEqual(csv_lines[0], 'cell,socket,event,value')
+            self.assertIn('prefill-8b-8192-m256,S0,instructions,2000000000000', csv_lines)
+            self.assertIn('prefill-8b-8192-m256,S0,l2_rqsts.miss,', csv_lines)
+            # an engine run 1.5x slower than the bench's prediction fails the gate
+            (d/'engine-profile.json').write_text(json.dumps({'profile_seconds': {'prefill': {'forward': 40.0, 'attention': 34.0}}}))
+            self.assertIn('FAIL (within +-20%)', self.run_tool(d))
+        with tempfile.TemporaryDirectory() as temp:  # nothing measured yet: no crash, counters recorded as unavailable
+            out = self.run_tool(temp, '--counters-csv', str(Path(temp)/'counters.csv'))
+            self.assertIn('Counters: not available', out)
+            self.assertEqual((Path(temp)/'counters.csv').read_text(), 'not available\n')
 
 
 class CheckPlacementTests(unittest.TestCase):
