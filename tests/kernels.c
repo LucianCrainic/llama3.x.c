@@ -1080,7 +1080,7 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
       variant->batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
       for (size_t i = 0; i < m * dim; i++) {
         check(label, got[i], ref[i], 2e-5);
-        if (variant->vs_split && fabs(got[i] - ref[i]) > worst_vs_reference)
+        if (variant->vs_split && strcmp(kernels_name(), "scalar") && fabs(got[i] - ref[i]) > worst_vs_reference)
           worst_vs_reference = fabs(got[i] - ref[i]);
       }
       if (pass == 0) {
@@ -1090,7 +1090,7 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
         if (variant->vs_split)
           for (size_t i = 0; i < m * dim; i++) {
             check(label, got[i], split_first[i], 1e-5); /* "vs split", the second E2 gate */
-            if (fabs(got[i] - split_first[i]) > worst_vs_split)
+            if (strcmp(kernels_name(), "scalar") && fabs(got[i] - split_first[i]) > worst_vs_split)
               worst_vs_split = fabs(got[i] - split_first[i]);
           }
       } else

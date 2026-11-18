@@ -673,27 +673,28 @@ AVX512 static void tiled_transpose_keys(const float *kc, int kv_dim, int head_di
   }
 }
 
-/* Scores of TILED_QG query vectors (rows of q8, stride qstride, already scaled) against the transposed tile: 8 x 2
+/* Scores of TILED_QG query vectors (qd[d * 16 + j] is element d of vector j, already scaled: the 16 vectors of the task
+ * are interleaved per d so the broadcast operands of one d sit in one cache line) against the transposed tile: 8 x 2
  * accumulators, per d two loads of kt and eight broadcast operands for 16 FMAs. `nv` is 1 or 2 position vectors. */
-AVX512 static inline void tiled_scores8(const float *kt, const float *q8, size_t qstride, int head_dim, int nv,
-                                        float *out, size_t ostride, int cnt) {
+AVX512 static inline void tiled_scores8(const float *kt, const float *qd, int head_dim, int nv, float *out,
+                                        size_t ostride, int cnt) {
   __m512 a[TILED_QG][2];
   for (int j = 0; j < TILED_QG; j++)
     a[j][0] = a[j][1] = _mm512_setzero_ps();
   if (nv == 2) {
-    for (int d = 0; d < head_dim; d++) {
-      __m512 k0 = _mm512_loadu_ps(kt + (size_t)d * TILED_POS), k1 = _mm512_loadu_ps(kt + (size_t)d * TILED_POS + 16);
+    for (int d = 0; d < head_dim; d++, kt += TILED_POS, qd += TILED_MAX_Q) {
+      __m512 k0 = _mm512_loadu_ps(kt), k1 = _mm512_loadu_ps(kt + 16);
       for (int j = 0; j < TILED_QG; j++) {
-        __m512 b = _mm512_set1_ps(q8[j * qstride + d]);
+        __m512 b = _mm512_set1_ps(qd[j]);
         a[j][0] = _mm512_fmadd_ps(b, k0, a[j][0]);
         a[j][1] = _mm512_fmadd_ps(b, k1, a[j][1]);
       }
     }
   } else {
-    for (int d = 0; d < head_dim; d++) {
-      __m512 k0 = _mm512_loadu_ps(kt + (size_t)d * TILED_POS);
+    for (int d = 0; d < head_dim; d++, kt += TILED_POS, qd += TILED_MAX_Q) {
+      __m512 k0 = _mm512_loadu_ps(kt);
       for (int j = 0; j < TILED_QG; j++)
-        a[j][0] = _mm512_fmadd_ps(_mm512_set1_ps(q8[j * qstride + d]), k0, a[j][0]);
+        a[j][0] = _mm512_fmadd_ps(_mm512_set1_ps(qd[j]), k0, a[j][0]);
     }
   }
   for (int j = 0; j < TILED_QG; j++) {
@@ -703,33 +704,133 @@ AVX512 static inline void tiled_scores8(const float *kt, const float *q8, size_t
   }
 }
 
+/* P x V for TILED_QG query vectors and one slice of `dv` (1 or 2) vectors of the head: the accumulators come from the
+ * task's output scratch (rescaled by alpha when the running maximum moved), one V row load feeds 8 x dv FMAs whose
+ * broadcast operand is a probability in L1, and they go back to the scratch. 16 accumulators, two V registers. */
+AVX512 static inline __attribute__((always_inline)) void tiled_pv(const float *p8, const float *v, int kv_dim, int npos,
+                                                                   float *o8, size_t ostride, const float *alpha8,
+                                                                   __mmask16 m0, __mmask16 m1, int dv) {
+  __m512 a[TILED_QG][2];
+  for (int j = 0; j < TILED_QG; j++) {
+    a[j][0] = _mm512_loadu_ps(o8 + j * ostride);
+    a[j][1] = dv == 2 ? _mm512_loadu_ps(o8 + j * ostride + 16) : _mm512_setzero_ps();
+    if (alpha8) {
+      __m512 alpha = _mm512_set1_ps(alpha8[j]);
+      a[j][0] = _mm512_mul_ps(a[j][0], alpha);
+      if (dv == 2)
+        a[j][1] = _mm512_mul_ps(a[j][1], alpha);
+    }
+  }
+  for (int pos = 0; pos < npos; pos++) {
+    const float *vr = v + (size_t)pos * kv_dim;
+    __m512 v0 = _mm512_maskz_loadu_ps(m0, vr), v1 = dv == 2 ? _mm512_maskz_loadu_ps(m1, vr + 16) : _mm512_setzero_ps();
+    for (int j = 0; j < TILED_QG; j++) {
+      __m512 b = _mm512_set1_ps(p8[j * TILED_POS + pos]);
+      a[j][0] = _mm512_fmadd_ps(b, v0, a[j][0]);
+      if (dv == 2)
+        a[j][1] = _mm512_fmadd_ps(b, v1, a[j][1]);
+    }
+  }
+  for (int j = 0; j < TILED_QG; j++) {
+    _mm512_storeu_ps(o8 + j * ostride, a[j][0]);
+    if (dv == 2)
+      _mm512_storeu_ps(o8 + j * ostride + 16, a[j][1]);
+  }
+}
+
+/* The task. Per tile of 32 positions: transpose K once; then per group of 8 query vectors scores (registers to an 8 x 32
+ * L1 tile), online softmax (running maximum m and sum l per query vector; when the maximum moves, the accumulator and l
+ * are rescaled by exp(m_old - m_new)), probabilities to an L1 tile, and PV into the output scratch. Nothing but K, V
+ * and Q is read from beyond L1, and no score is ever written to memory the task does not own. Positions a row may not
+ * see get probability exactly zero (the lanes are masked, not given a large negative score). */
 AVX512 static void attention_tiled_avx512(const float *q, size_t q_row_stride, int nrows, int kv_mul, int head_dim,
                                           int vis0, int t0, int t1, const float *kc, const float *vc, int kv_dim,
                                           float *partial, size_t row_stride, size_t head_stride) {
-  enum { MAX_VECTORS = 16, SCORE_STRIDE = TILED_MAX_CHUNK + TILED_POS };
-  _Alignas(64) float qs[TILED_MAX_Q * 256], kt[256 * TILED_POS], s[TILED_MAX_Q * SCORE_STRIDE];
-  int vectors = (head_dim + 15) / 16, hdp = vectors * 16, nq = nrows * kv_mul, nqp = (nq + TILED_QG - 1) / TILED_QG * TILED_QG;
+  _Alignas(64) float qs[TILED_MAX_Q * 256], kt[256 * TILED_POS], os[TILED_MAX_Q * 256], ps[TILED_MAX_Q * TILED_POS],
+      sc[TILED_QG * TILED_POS];
+  float m[TILED_MAX_Q], l[TILED_MAX_Q], alpha[TILED_MAX_Q], lane[16];
+  int vectors = (head_dim + 15) / 16, hdp = vectors * 16, nq = nrows * kv_mul;
+  int nqp = (nq + TILED_QG - 1) / TILED_QG * TILED_QG;
   __mmask16 last = lane_mask(head_dim - (vectors - 1) * 16);
-  /* Q for the block, scaled by 1/sqrt(head_dim) once (no division per score), zero rows pad to a multiple of 8. */
+  /* Q for the block, scaled by 1/sqrt(head_dim) once (no division per score) and transposed to qs[d][query vector], with
+   * zero vectors up to 16 (a 16 x 16 transpose per 16 elements of the head). */
   const __m512 scale = _mm512_set1_ps(1.0f / sqrtf((float)head_dim));
+  for (int d0 = 0; d0 < hdp; d0 += 16) {
+    __mmask16 dm = lane_mask(head_dim - d0);
+    __m512 r[16];
+    for (int qi = 0; qi < TILED_MAX_Q; qi++)
+      r[qi] = qi < nq ? _mm512_mul_ps(_mm512_maskz_loadu_ps(dm, q + (size_t)(qi / kv_mul) * q_row_stride +
+                                                                    (size_t)(qi % kv_mul) * head_dim + d0),
+                                      scale)
+                      : _mm512_setzero_ps();
+    transpose16(r);
+    for (int c = 0; c < 16; c++)
+      _mm512_storeu_ps(qs + (size_t)(d0 + c) * TILED_MAX_Q, r[c]);
+  }
   for (int qi = 0; qi < nqp; qi++)
-    for (int v = 0; v < vectors; v++) {
-      __m512 x = _mm512_setzero_ps();
-      if (qi < nq)
-        x = _mm512_mul_ps(_mm512_maskz_loadu_ps(v + 1 == vectors ? last : 0xFFFF,
-                                                q + (size_t)(qi / kv_mul) * q_row_stride + (size_t)(qi % kv_mul) * head_dim + v * 16),
-                          scale);
-      _mm512_storeu_ps(qs + (size_t)qi * hdp + v * 16, x);
-    }
+    for (int v = 0; v < vectors; v++)
+      _mm512_storeu_ps(os + (size_t)qi * hdp + v * 16, _mm512_setzero_ps());
+  for (int qi = 0; qi < TILED_MAX_Q; qi++) {
+    m[qi] = -FLT_MAX, l[qi] = 0.0f, alpha[qi] = 1.0f;
+    for (int i = 0; i < TILED_POS; i += 16)
+      _mm512_storeu_ps(ps + qi * TILED_POS + i, _mm512_setzero_ps());
+  }
+  const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff)), finite = _mm512_set1_ps(FLT_MAX);
   int tend = t1 < vis0 + nrows - 1 ? t1 : vis0 + nrows - 1; /* beyond the last row's prefix nothing is read */
   for (int t = t0; t < tend; t += TILED_POS) {
     int cnt = tend - t < TILED_POS ? tend - t : TILED_POS;
     tiled_transpose_keys(kc, kv_dim, head_dim, t, cnt, kt);
-    for (int q0 = 0; q0 < nqp; q0 += TILED_QG)
-      tiled_scores8(kt, qs + (size_t)q0 * hdp, (size_t)hdp, head_dim, cnt > 16 ? 2 : 1,
-                    s + (size_t)q0 * SCORE_STRIDE + (t - t0), SCORE_STRIDE, cnt);
+    for (int q0 = 0; q0 < nqp; q0 += TILED_QG) {
+      /* the last real query vector of the group sees the most positions of this tile */
+      int qlast = q0 + TILED_QG - 1 < nq ? q0 + TILED_QG - 1 : nq - 1, rlast = qlast / kv_mul;
+      int gn = (vis0 + rlast < t + cnt ? vis0 + rlast : t + cnt) - t;
+      if (gn <= 0)
+        continue; /* no query vector of the group sees any position of this tile: nothing to add */
+      tiled_scores8(kt, qs + q0, head_dim, gn > 16 ? 2 : 1, sc, TILED_POS, gn);
+      int rescale = 0;
+      for (int j = 0; j < TILED_QG; j++) {
+        int qi = q0 + j, n = qi < nq ? (vis0 + qi / kv_mul < t + cnt ? vis0 + qi / kv_mul : t + cnt) - t : 0;
+        float *p = ps + (size_t)qi * TILED_POS;
+        alpha[qi] = 1.0f;
+        if (n <= 0) { /* a row above the diagonal of this tile, or a padding row */
+          _mm512_storeu_ps(p, _mm512_setzero_ps());
+          _mm512_storeu_ps(p + 16, _mm512_setzero_ps());
+          continue;
+        }
+        __mmask16 k0 = lane_mask(n), k1 = lane_mask(n - 16);
+        __m512 s0 = _mm512_maskz_loadu_ps(k0, sc + j * TILED_POS), s1 = _mm512_maskz_loadu_ps(k1, sc + j * TILED_POS + 16);
+        if ((_mm512_mask_cmp_ps_mask(k0, _mm512_and_ps(s0, abs_mask), finite, _CMP_LE_OQ) != k0) ||
+            (_mm512_mask_cmp_ps_mask(k1, _mm512_and_ps(s1, abs_mask), finite, _CMP_LE_OQ) != k1))
+          fail("nonfinite value in softmax");
+        __m512 vmax = _mm512_set1_ps(-FLT_MAX);
+        vmax = _mm512_mask_max_ps(vmax, k0, vmax, s0);
+        vmax = _mm512_mask_max_ps(vmax, k1, vmax, s1);
+        float tile_max = _mm512_reduce_max_ps(vmax), old = m[qi];
+        if (tile_max > old) { /* the maximum moved: what is accumulated so far is scaled by exp(old - new) */
+          _mm512_storeu_ps(lane, exp512(_mm512_set1_ps(old - tile_max)));
+          alpha[qi] = lane[0];
+          l[qi] *= lane[0];
+          m[qi] = tile_max;
+          rescale = 1;
+        }
+        __m512 shift = _mm512_set1_ps(m[qi]);
+        __m512 e0 = _mm512_maskz_mov_ps(k0, exp512(_mm512_sub_ps(s0, shift)));
+        __m512 e1 = _mm512_maskz_mov_ps(k1, exp512(_mm512_sub_ps(s1, shift)));
+        _mm512_storeu_ps(p, e0);
+        _mm512_storeu_ps(p + 16, e1);
+        l[qi] += _mm512_reduce_add_ps(_mm512_add_ps(e0, e1));
+      }
+      for (int s = 0; s < vectors; s += 2) { /* slices of two vectors of the head */
+        __mmask16 m0 = s + 1 == vectors ? last : 0xFFFF, m1 = s + 2 == vectors ? last : 0xFFFF;
+        const float *pq = ps + (size_t)q0 * TILED_POS, *v = vc + (size_t)t * kv_dim + s * 16;
+        float *o8 = os + (size_t)q0 * hdp + s * 16;
+        if (s + 1 < vectors)
+          tiled_pv(pq, v, kv_dim, gn, o8, (size_t)hdp, rescale ? alpha + q0 : NULL, m0, m1, 2);
+        else
+          tiled_pv(pq, v, kv_dim, gn, o8, (size_t)hdp, rescale ? alpha + q0 : NULL, m0, m1, 1);
+      }
+    }
   }
-  const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff)), finite = _mm512_set1_ps(FLT_MAX);
   for (int qi = 0; qi < nq; qi++) {
     int r = qi / kv_mul, h = qi % kv_mul, end = t1 < vis0 + r ? t1 : vis0 + r;
     float *o = partial + (size_t)r * row_stride + (size_t)h * head_stride;
@@ -737,37 +838,11 @@ AVX512 static void attention_tiled_avx512(const float *q, size_t q_row_stride, i
       partial_write_empty(o, head_dim);
       continue;
     }
-    float *a = s + (size_t)qi * SCORE_STRIDE; /* a[t - t0] is the score of position t, for t0 <= t < end */
-    int n = end - t0;
-    __m512 vmax = _mm512_set1_ps(-FLT_MAX);
-    for (int i = 0; i < n; i += 16) {
-      __mmask16 m = lane_mask(n - i);
-      __m512 x = _mm512_maskz_loadu_ps(m, a + i);
-      if (_mm512_mask_cmp_ps_mask(m, _mm512_and_ps(x, abs_mask), finite, _CMP_LE_OQ) != m)
-        fail("nonfinite value in softmax");
-      vmax = _mm512_mask_max_ps(vmax, m, vmax, x);
-    }
-    float max_val = _mm512_reduce_max_ps(vmax);
-    __m512 vsum = _mm512_setzero_ps(), shift = _mm512_set1_ps(max_val);
-    for (int i = 0; i < n; i += 16) {
-      __mmask16 m = lane_mask(n - i);
-      __m512 e = exp512(_mm512_sub_ps(_mm512_maskz_loadu_ps(m, a + i), shift));
-      _mm512_mask_storeu_ps(a + i, m, e);
-      vsum = _mm512_mask_add_ps(vsum, m, vsum, e);
-    }
-    __m512 ov[MAX_VECTORS];
     for (int v = 0; v < vectors; v++)
-      ov[v] = _mm512_setzero_ps();
-    for (int i = 0; i < n; i++) {
-      const float *vr = vc + (size_t)(t0 + i) * kv_dim;
-      __m512 p = _mm512_set1_ps(a[i]);
-      for (int v = 0; v < vectors; v++)
-        ov[v] = _mm512_fmadd_ps(p, _mm512_maskz_loadu_ps(v + 1 == vectors ? last : 0xFFFF, vr + v * 16), ov[v]);
-    }
-    for (int v = 0; v < vectors; v++)
-      _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : 0xFFFF, ov[v]);
-    o[head_dim] = max_val;
-    o[head_dim + 1] = _mm512_reduce_add_ps(vsum);
+      _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : 0xFFFF,
+                            _mm512_loadu_ps(os + (size_t)qi * hdp + v * 16));
+    o[head_dim] = m[qi];
+    o[head_dim + 1] = l[qi];
   }
 }
 #endif

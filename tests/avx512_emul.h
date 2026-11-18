@@ -302,5 +302,10 @@ static inline __m512 _mm512_shuffle_f32x4(__m512 a, __m512 b, int imm) {
   }
   return r;
 }
+/* Lanes with the mask bit clear are zero. */
+static inline __m512 _mm512_maskz_mov_ps(__mmask16 k, __m512 a) {
+  EMUL_LANES(if (!(k >> i & 1)) a.v[i] = 0.0f)
+  return a;
+}
 #undef EMUL_LANES
 #endif
