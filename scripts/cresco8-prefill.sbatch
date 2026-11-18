@@ -920,6 +920,122 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], 'compare-*-d3-*.json'))):
 PY
 }
 
+# ---- E0: measure attention before changing it ---------------------------------------------------------------------------
+# tests/attention_bench.c on socket 0 with K/V in a region on its HBM node (2): the prefill matrix (H1, H2, H4), the row-block
+# sweep (H3), the half-KV-head shapes (H6), decode (H5), hardware counters, one profiled engine run that shows whether the
+# bench represents the engine, and the bitwise gate of the LLAMA_ATTN_ROW_BLOCK knob. Everything but the last two needs no
+# model. Results land in E0/ as jsonl; tools/summarize_attention_bench.py builds E0/summary.md and E0/counters.csv.
+E0_CORE_EVENTS='cycles,instructions,l1d.replacement,l2_rqsts.miss,mem_load_retired.l3_miss'
+E0_PERF=0
+
+# e0_bench NAME THREADS [ENV_WORDS...] -- BENCH_ARGS...: one attention-bench launch, output in E0/NAME.out.
+e0_bench() {
+  local name=$1 threads=$2 env_words=() args=() side=env
+  shift 2
+  while (($#)); do
+    if [[ $1 == -- ]]; then side=args; elif [[ $side == env ]]; then env_words+=("$1"); else args+=("$1"); fi
+    shift
+  done
+  expect "$name" ok "$OUT/E0" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false \
+    LLAMA_KERNELS=avx512 ${env_words[@]+"${env_words[@]}"} "$ROOT/build/release/attention-bench" --node 2 "${args[@]}"
+}
+
+# e0_collect FILE PATTERN: the jsonl of every E0/PATTERN.out, concatenated.
+e0_collect() {
+  dry_run && return 0
+  if compgen -G "$OUT/E0/$2" > /dev/null; then cat "$OUT"/E0/$2 > "$OUT/E0/$1"; else : > "$OUT/E0/$1"; fi
+}
+
+# e0_counted NAME THREADS BENCH_ARGS...: one bench launch counted by perf, system-wide per socket, the way run_engine counts an
+# engine run (the uncore events too when the common check found them). Counts include the start-up of the bench; the cells use
+# enough repetitions that the passes dominate. Never fails the phase.
+e0_counted() {
+  local name=$1 threads=$2 events=$E0_CORE_EVENTS pid
+  shift 2
+  [[ $PERF != 1 ]] || events+=",$EVENTS"
+  if dry_run; then
+    printf 'COUNTERS %s threads=%s events=%s: %s\n' "$name" "$threads" "$events" "$*" | tee -a "$OUT/dry-run.txt"
+    return 0
+  fi
+  [[ $E0_PERF == 1 ]] || return 0
+  numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false LLAMA_KERNELS=avx512 \
+    "$ROOT/build/release/attention-bench" --node 2 "$@" > "$OUT/E0/counters-$name.jsonl" 2> "$OUT/E0/counters-$name.err" &
+  pid=$!
+  sudo -n /usr/bin/perf stat -a --per-socket -x , -e "$events" -- tail -s 0.1 --pid="$pid" -f /dev/null \
+    2> "$OUT/E0/counters-$name.perf.csv" || true
+  wait "$pid" || record_result "counters-$name" FAIL 'attention-bench failed under perf'
+}
+
+phase_E0() {
+  local dir="$OUT/E0" shape threads rb kv entry name artifacts hf tokenizer staged benv profile
+  if ! dry_run && sudo -n /usr/bin/perf stat -a --per-socket -x , -e "$E0_CORE_EVENTS" -- true 2> /dev/null; then E0_PERF=1; fi
+  dry_run || printf 'perf_core=%s\n' "$E0_PERF" >> "$OUT/environment.txt"
+  # (1) the prefill matrix: the whole prompt of one layer, microbatches as run.c cuts them.
+  for shape in 8b 1b; do
+    for threads in 14 28 56; do
+      e0_bench "prefill-$shape-t$threads" "$threads" -- --mode prefill --shape "$shape" --prompt 512,2048,8192 --m 16,64,256 \
+        --reps "$REPEATS"
+    done
+  done
+  e0_collect bench-prefill.jsonl 'prefill-*.out'
+  # (2) H3: rows per task, same results bit for bit.
+  for rb in 1 2 4 8 16; do
+    e0_bench "rowblock-$rb" 56 "LLAMA_ATTN_ROW_BLOCK=$rb" -- --mode prefill --shape 8b --prompt 8192 --m 256 --reps "$REPEATS"
+  done
+  e0_collect rowblock.jsonl 'rowblock-*.out'
+  # (3) H6: one socket's half of the model (4 of 8 KV heads) at the sizes of the two-socket runs, 56 threads.
+  for shape in 8b 1b; do
+    e0_bench "h6-prefill-$shape-kv4" 56 -- --mode prefill --shape "$shape" --prompt 2048,8192 --m 64,256 --reps "$REPEATS" \
+      --kv-heads-local 4
+  done
+  e0_collect bench-prefill-kv4.jsonl 'h6-prefill-*.out'
+  # (4) H5 and H6: decode attention at the last position of a full context, all KV heads and half of them.
+  for shape in 8b 1b; do
+    for kv in 8 4; do
+      e0_bench "decode-$shape-kv$kv" 56 -- --mode decode --shape "$shape" --context 8192,32768 --reps 200 --kv-heads-local "$kv"
+    done
+  done
+  e0_collect bench-decode.jsonl 'decode-*.out'
+  # (5) counters on the 8b/8192/M256 prefill cell and the 1b/32768 decode cell.
+  e0_counted prefill-8b-8192-m256 56 --mode prefill --shape 8b --prompt 8192 --m 256 --reps "$REPEATS"
+  e0_counted decode-1b-32768 56 --mode decode --shape 1b --context 32768 --reps 2000
+  # (6) engine runs: the bitwise gate of the knob, and one profiled run for the cross-check.
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E0 engine run was made' | tee "$dir/no-models.txt"
+  else
+    need_shm
+    c_prompts "$dir" 2048,8192
+    for entry in $MODELS; do
+      IFS=: read -r name artifacts hf <<< "$entry"
+      # the 8B model only (E0_MODEL=1b for a rehearsal on another model)
+      [[ $(printf '%s' "$name" | tr '[:upper:]' '[:lower:]') == *"${E0_MODEL:-8b}"* ]] || continue
+      tokenizer="$artifacts/tokenizer-v2.bin"
+      staged=$(stage_model_on 0 "$name" fp32 "$artifacts")
+      read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+      # Both sides batched (M 64), last row of the 2048-token prompt, the knob at 4 against 16: bit-identical logits.
+      CMP_FLAGS=(--bitwise --batch-a 64 --batch-b 64 --last-only)
+      CMP_TOKENS="$dir/$name-tokens-2048.txt"
+      a_bitwise "$dir" "$name" fp32 "$staged" e0-rowblock-4-vs-16-m64-prompt2048 "${benv[@]}" LLAMA_KERNELS=avx512 \
+        LLAMA_PREFILL_GEMM=on LLAMA_ATTN_ROW_BLOCK=4 -- "${benv[@]}" LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on \
+        LLAMA_ATTN_ROW_BLOCK=16
+      CMP_FLAGS=(--bitwise) CMP_TOKENS=
+      unstage_model_on 0 "$name" fp32
+      # The profiled engine run of C7 (8B AMX-BF16, one socket, 56 threads, checkpoint on HBM node 2): the attention seconds
+      # of its report are what the bench's ms per layer times 32 must match.
+      staged=$(stage_model_on 2 "$name" fp32 "$artifacts")
+      CONTEXT=8448 GENERATION=1 c_launch "$name" amx_bf16 256 56 1 "$OUT/prompt-8192.txt" "$staged" "$tokenizer" p=8192 \
+        c=8448 x=prof -- LLAMA_PROFILE=1
+      unstage_model_on 2 "$name" fp32
+      if ! dry_run; then
+        for profile in "$OUT/$name"-bf16-*-xprof-1.json; do
+          [[ ! -e $profile ]] || cp "$profile" "$dir/engine-profile.json"
+        done
+      fi
+    done
+  fi
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_attention_bench.py" "$dir" --counters-csv "$dir/counters.csv" > "$dir/summary.md"
+}
+
 require_phases
 if ! dry_run; then
   check_stage

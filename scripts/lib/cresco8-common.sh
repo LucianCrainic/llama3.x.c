@@ -33,7 +33,7 @@ require_env() {
   [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || die "REPEATS must be a positive integer, got '$REPEATS'"
   local phase
   for phase in $PHASE; do
-    [[ $phase =~ ^(none|[A-DF][0-9]+)$ ]] || die "PHASE must be none or phase ids such as 'A1 A3 F2', got '$PHASE'"
+    [[ $phase =~ ^(none|[A-F][0-9]+)$ ]] || die "PHASE must be none or phase ids such as 'A1 A3 F2', got '$PHASE'"
   done
   [[ ! -e $OUT ]] || die "OUT '$OUT' already exists"
   for entry in $MODELS; do
