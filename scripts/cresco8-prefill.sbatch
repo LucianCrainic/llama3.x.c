@@ -644,8 +644,8 @@ D_THP=${D_THP:-off}
 D_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm "LLAMA_THP=$D_THP")
 
 # d_launch NAME RUNG M SOCKETS REP PROMPT STAGED TOKENIZER [LABEL_WORDS...] [-- ENV_WORDS...]: one launch of a rung on one
-# or two sockets, REP selecting the repetition so a caller can interleave. A label word x=prof makes the run profiled
-# (the caller adds LLAMA_PROFILE=1); its per-socket lines are then logged.
+# or two sockets, REP selecting the repetition so a caller can interleave. A label word x=prof (or a tag that starts with
+# prof, as E4's x=profsplit) makes the run profiled (the caller adds LLAMA_PROFILE=1); its per-socket lines are then logged.
 d_launch() {
   local name=$1 rung=$2 m=$3 sockets=$4 rep=$5 prompt=$6 staged=$7 tokenizer=$8 label_words=() env_words=() side=label label
   local cpu= perf=0 log=warn
@@ -657,7 +657,7 @@ d_launch() {
   c_rung "$rung" "$m"
   [[ $sockets == 2 ]] || cpu=0
   [[ $rep != 1 ]] || perf=$PERF
-  [[ " ${label_words[*]-} " != *" x=prof "* ]] || log=info
+  [[ " ${label_words[*]-} " != *" x=prof"* ]] || log=info
   label=$(run_label "$name" "$RUNG_PREC" teams hbm "$sockets" 56 "m=$m" "k=$rung" ${label_words[@]+"${label_words[@]}"})
   CPU_BIND=$cpu REP=$rep LOG_LEVEL=$log run_engine "$label" "$RUNG_ENGINE" "$staged" "$tokenizer" "$prompt" 1 "$perf" \
     "${D_ENV[@]}" "LLAMA_SOCKETS=$sockets" "${RUNG_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
@@ -1097,14 +1097,20 @@ e1_side() {
 }
 
 # e1_case CASE REP SOCKETS_A RUNG_A M_A SOCKETS_B RUNG_B M_B: one recorded generation comparison with tools/compare_generation.py
-# (A is the reference, and its probe gives the top-2 margin at the divergence). The run is described by E1_ENGINE, E1_PROBE,
+# (A is the reference, and its probe gives the top-2 margin at the divergence). E1_XENV_A / E1_XENV_B (words, default none) add
+# environment words to one side (E4: LLAMA_ATTN). The run is described by E1_ENGINE, E1_PROBE,
 # E1_STAGED, E1_TOKENIZER, E1_PROMPT, E1_CTX (context length), E1_WARM (retained context, 0 for none) and E1_PBATCH.
 e1_case() {
   local case=$1 rep=$2 a b warm=() args=() word
   e1_side "$3" "$4" "$5"
   a=("${E1_SIDE[@]}")
+  read -r -a args <<< "${E1_XENV_A:-}"
+  a+=(${args[@]+"${args[@]}"})
   e1_side "$6" "$7" "$8"
   b=("${E1_SIDE[@]}")
+  read -r -a args <<< "${E1_XENV_B:-}"
+  b+=(${args[@]+"${args[@]}"})
+  args=()
   [[ $E1_WARM == 0 ]] || warm=(--warm-context "$E1_WARM")
   for word in "${a[@]}"; do args+=(--env-a "$word"); done
   for word in "${b[@]}"; do args+=(--env-b "$word"); done
@@ -1183,20 +1189,22 @@ phase_E1() {
 #   D2_M1="avx512_fp32=64 amx_bf16=256" at submission.
 E2_FP32_GATE=(--max-abs 1e-3) # argmax agreement stays at the compare_engines default of 100%
 
+# E4 reuses both cases through E2_ATTN (the attention under test, default tiled), E2_M (microbatch, default 64), E2_PFX (label
+# prefix, default e2) and E2_EXTRA (environment words of the tested side of the pair, default none); the defaults are E2's.
 # e2_fp32_case DIR NAME STAGED N LABEL [ENV_WORDS...]: LLAMA_ATTN=tiled (and ENV_WORDS) at M = 64 against the one-socket per-token
 # reference (M = 1 batched interface, the e1 per-token convention) at N tokens: every position at 86, the last row above.
 e2_fp32_case() {
   local dir=$1 name=$2 staged=$3 n=$4 label=$5 benv
   shift 5
   read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
-  CMP_FLAGS=("${E2_FP32_GATE[@]}" --batch-a 1 --batch-b 64)
+  CMP_FLAGS=("${E2_FP32_GATE[@]}" --batch-a 1 --batch-b "${E2_M:-64}")
   CMP_TOKENS=
   if [[ $n != 86 ]]; then
     CMP_FLAGS+=(--last-only)
     CMP_TOKENS="$dir/$name-tokens-$n.txt"
   fi
-  a_bitwise "$dir" "$name" fp32 "$staged" "e2-$label-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
-    LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on LLAMA_ATTN=tiled "$@"
+  a_bitwise "$dir" "$name" fp32 "$staged" "${E2_PFX:-e2}-$label-prompt$n" "${benv[@]}" LLAMA_KERNELS=avx512 -- "${benv[@]}" \
+    LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on "LLAMA_ATTN=${E2_ATTN:-tiled}" "$@"
   CMP_FLAGS=(--bitwise) CMP_TOKENS=
 }
 
@@ -1205,15 +1213,15 @@ e2_pair_case() {
   local dir=$1 name=$2 precision=$3 staged=$4 n=$5 label=$6 rung=$7 benv
   shift 7
   read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
-  c_rung "$rung" 64
-  CMP_FLAGS=("$@" --batch-a 64 --batch-b 64)
+  c_rung "$rung" "${E2_M:-64}"
+  CMP_FLAGS=("$@" --batch-a "${E2_M:-64}" --batch-b "${E2_M:-64}")
   CMP_TOKENS=
   if [[ $n != 86 ]]; then
     CMP_FLAGS+=(--last-only)
     CMP_TOKENS="$dir/$name-tokens-$n.txt"
   fi
-  a_bitwise "$dir" "$name" "$precision" "$staged" "e2-$label-prompt$n" "${benv[@]}" "${RUNG_ENV[@]}" LLAMA_ATTN=split -- \
-    "${benv[@]}" "${RUNG_ENV[@]}" LLAMA_ATTN=tiled
+  a_bitwise "$dir" "$name" "$precision" "$staged" "${E2_PFX:-e2}-$label-prompt$n" "${benv[@]}" "${RUNG_ENV[@]}" LLAMA_ATTN=split -- \
+    "${benv[@]}" "${RUNG_ENV[@]}" "LLAMA_ATTN=${E2_ATTN:-tiled}" ${E2_EXTRA[@]+"${E2_EXTRA[@]}"}
   CMP_FLAGS=(--bitwise) CMP_TOKENS=
 }
 
