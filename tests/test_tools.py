@@ -434,6 +434,32 @@ class CompareEnginesTests(unittest.TestCase):
             self.assertEqual((data['summary']['max_abs'], data['summary']['rms'], data['summary']['argmax_agreement']),
                              (0.0, 0.0, 1.0))
 
+    def test_probe_forwards_past_the_default_context(self):
+        """A probe run of more than 4096 positions sizes the context to them (E1 item 2b probes about 8300 positions, E2
+        compares 8192-token prompts); the engines' default would stop at position 4096. All three probe modes, both
+        engines, on a fixture whose checkpoint allows 4200 positions."""
+        from fixtures import create
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = create(Path(temp)/'long', seq_len=4200)
+            tokens = [str(65 + i % 20) for i in range(4100)]
+            for engine in ('fp32', 'int8'):
+                probe, model = str(BUILD/f'probe-{engine}'), str(fixture/f'{engine}.bin')
+                for mode, command, env, values in (('batch', [probe, 'batch', model, *tokens], {'LLAMA_PREFILL_BATCH': '64'}, 1),
+                                                   ('per-token', [probe, model, *tokens], {}, 4100),
+                                                   ('generate', [probe, 'generate', model, '3', *tokens[:4098]], {}, None)):
+                    with self.subTest(engine=engine, mode=mode):
+                        result = subprocess.run(command, capture_output=True, env={**os.environ, **env}, timeout=600)
+                        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace')[-500:])
+                        if values is not None:
+                            self.assertEqual(len(result.stdout) % (values * 4), 0)
+                            self.assertGreater(len(result.stdout), 0)
+                        else:
+                            self.assertGreaterEqual(len(result.stdout.split()), 1)
+                result = subprocess.run([probe, 'batch', model, *tokens, *tokens[:200]], capture_output=True,
+                                        env={**os.environ, 'LLAMA_PREFILL_BATCH': '64'}, timeout=600)
+                self.assertNotEqual(result.returncode, 0)  # 4300 positions: beyond the checkpoint's 4200
+                self.assertIn(b'requested context exceeds checkpoint context', result.stderr)
+
     def test_teams_backend_agrees_within_the_budget(self):
         result, data = self.compare('fp32', '--env-b', 'LLAMA_BACKEND=teams', '--env-b', 'LLAMA_THREADS=3')
         self.assertEqual(result.returncode, 0, result.stderr)
