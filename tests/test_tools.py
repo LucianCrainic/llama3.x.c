@@ -16,6 +16,18 @@ TOOLS = ROOT/'tools'
 sys.path[:0] = [str(TOOLS), str(ROOT/'tests')]
 BUILD = Path(os.environ['BUILD_DIR']).resolve() if os.environ.get('BUILD_DIR') else None
 
+# Knobs the campaign scripts read from the environment. A test that runs a script starts from the caller's environment
+# without them, so a run inside a campaign job (which exports BASELINE_ROOT, STAGE, MODELS and so on) sees what it sets.
+CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOKENS', 'CONTEXT', 'CPU_BIND', 'D2_M1', 'D2_M2',
+                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'GATES_ONLY',
+                  'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
+                  'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
+                  'WARM'}
+
+
+def campaign_env():
+    return {k: v for k, v in os.environ.items() if k not in CAMPAIGN_KNOBS and not k.startswith('LLAMA_')}
+
 
 class ToolSmokeTests(unittest.TestCase):
     def test_all_sources_compile(self):
@@ -74,7 +86,7 @@ class CampaignSummaryTests(unittest.TestCase):
             self.skipTest('bash is required')
         from summarize_campaign import parse_label
         with tempfile.TemporaryDirectory() as temp:
-            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': phases,
                    'MODELS': ' '.join(f'{m}:/a/{m}:/hf/{m}' for m in models), **extra}
             result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True, timeout=120)
@@ -108,7 +120,7 @@ class CampaignSummaryTests(unittest.TestCase):
         # Every D1 comparison of the 2048-token prompt reads only the last row, so both sides must run the batched probe
         # (job 5704685: W8A32 lost its --batch flags and the per-token side wrote every position).
         with tempfile.TemporaryDirectory() as temp:
-            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': 'D1', 'GATES_ONLY': '1', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
             out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
                                  text=True, timeout=120).stdout
@@ -120,7 +132,7 @@ class CampaignSummaryTests(unittest.TestCase):
             self.assertIn('--batch-b 64', line, line)
         # C7's AMX-INT8 comparisons use the W8A8 statistical gate (rms and argmax), not the strict 1e-3 of the other rungs.
         with tempfile.TemporaryDirectory() as temp:
-            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': 'C7', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
             out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
                                  text=True, timeout=120).stdout
@@ -142,7 +154,7 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertTrue(all(w in runs[0] for w in ('-m256-p8192-', 'kamx_bf16', 'xprof', 'LLAMA_PROFILE=1', 'warm=0')), runs)
         with tempfile.TemporaryDirectory() as temp:
-            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': 'E0', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b'}
             out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
                                  text=True, timeout=120).stdout.splitlines()
@@ -161,7 +173,7 @@ class CampaignSummaryTests(unittest.TestCase):
 
     def e1_dry(self, **extra):
         with tempfile.TemporaryDirectory() as temp:
-            env = {**os.environ, 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                    'PYTHON': sys.executable, 'PHASE': 'E1', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', 'REPEATS': '3',
                    **extra}
             result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
@@ -313,7 +325,7 @@ class CampaignSummaryTests(unittest.TestCase):
         for script, phases, missing in (('cresco8-prefill.sbatch', 'D1 B7', 'B7'), ('cresco8-tp.sbatch', 'B7 D1', 'D1'),
                                         ('cresco8-prefill.sbatch', 'C7 D4', 'D4')):
             with tempfile.TemporaryDirectory() as temp:
-                env = {**os.environ, 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                env = {**campaign_env(), 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
                        'PYTHON': sys.executable, 'PHASE': phases}  # not a dry run: the check must come before check_stage
                 result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True,
                                         timeout=60)
