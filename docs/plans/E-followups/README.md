@@ -102,8 +102,8 @@ by **what each one unblocks**.
 | --- | --- | --- | --- | --- | --- | --- |
 | E0 | [Measure attention](#e0-measure-attention-before-changing-it) | - | `feature/attn-e0-bench` | 1 bench job | bench reproduces the engine's attention time within ±20%; bound identified | done, cross-check failed (0.77): see [attention-profile.md](../../attention-profile.md); job 5860637 |
 | E1 | [Harness, knob and determinism gate](#e1-validation-harness-knob-and-determinism-gate) | E0 | `feature/attn-e1-harness` | 1 check job | mutations caught; defaults bitwise unchanged; 2b explained | done: defaults bitwise, FP32 gate 8/8 identical, 2b = noise floor (margin 0.046 < 0.2); 13/13 mutations caught; job 5863571 |
-| E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | check passed (18/18, FP32 max abs Δ ≤ 1.4e-4), job 5863571; bench job 5864099 running |
-| E3 | [AMX-BF16 flash attention](#e3-amx-bf16-flash-attention-conditional) | E2 decision | `feature/attn-e3-amx` | check + bench | ≥ 1.3x over E2 kernel; BF16 gate and ΔNLL | conditional |
+| E2 | [FP32 tiled fused attention](#e2-fp32-register-tiled-fused-attention) | E1 | `feature/attn-e2-tiled` | check + bench | kernel ≥ 1.8x at 8B/8192, 2048 not slower | done: kernel 1.90x, 8B BF16 TTFT at 8192 1.66x, 2048 faster, check 18/18; see [attention-results.md](../../attention-results.md); jobs 5863571, 5864099; E3 decision pending owner |
+| E3 | [AMX-BF16 flash attention](#e3-amx-bf16-flash-attention-conditional) | E2 decision | `feature/attn-e3-amx` | check + bench | ≥ 1.3x over E2 kernel; BF16 gate and ΔNLL | postponed (owner, 2026-11-18): see E2.8 outcome; revisit after E4 if ~2x at 8192 is wanted |
 | E4 | [Prefill campaign and decision](#e4-prefill-attention-campaign-and-decision) | E2 (and E3) | `feature/attn-e4-campaign` | 1 campaign | ≥ 1.5x TTFT at 8192, one socket; two sockets agree | planned |
 | E5 | [Decode attention](#e5-decode-attention) | E0, E1 (E2 micro-kernel) | `feature/attn-e5-decode` | check + B7 subset | ≥ 1.3x decode at 32768 on 1B; 512 not slower | planned |
 | E6 | [Batched decode design](#e6-batched-decode-design-design-only) | E5 | `feature/decode-e6-design` | none | modeled ≥ 2x aggregate tok/s; owner go/no-go | planned |
@@ -444,6 +444,14 @@ repeats, one `-xprof` repeat each.
 | Kernel between 1.8x and 3.0x, counters show FMA ports busy (compute-bound) | **do E3**: only a faster unit helps further |
 | Kernel between 1.8x and 3.0x, counters show L1/L2 traffic or tail limits | tune E2 first (R, tiles, ordering); E3 would hit the same limit |
 | Kernel < 1.8x | find the cause with the bench before E3; do not start E3 on an unexplained miss |
+
+**Outcome (measured, jobs 5863571 and 5864099; [attention-results.md](../../attention-results.md) §1.4, §1.7).** The kernel reached 1.90x at
+22% of FP32 peak. No row matches exactly. The FMA ports are about 27% busy (derived from IPC 2.15 and 0.125 instructions per FLOP), so
+the run is not compute-bound. L1 replacements fell 7.3x, and the tail is under 1% at 8192, so it is not traffic- or tail-bound either.
+The limit is the non-FMA work around the FMAs: transposes, loads, and the softmax max, exp and rescale. The nearest row is "tune E2
+first", and the E4 TTFT gate is already met by `tiled` (1.66x at 8192 on 8B AMX-BF16). **Decision (owner, 2026-11-18): E3 postponed;
+tune E2 (default task order `natural`, faster in the E2 sweep) and go to E4.** E3 is reconsidered after E4 if the "about 2x at
+8192" target is wanted. E4's `E4_AMX=1` keeps a place for it.
 
 ---
 
