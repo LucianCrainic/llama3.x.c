@@ -310,6 +310,8 @@ tokens_of() {
 # DIR/NAME-tokens.txt. Phases set them and restore the defaults afterwards.
 CMP_FLAGS=(--bitwise)
 CMP_TOKENS=
+# CMP_PROBE replaces the probe binary of a_bitwise and b_compare (E1: a shim that selects the baseline or the current build).
+CMP_PROBE=
 # W8A8 requantizes its activations: any change in FP32 operation order (another ISA, AMX, a split over two sockets) moves
 # the logits by a noise floor that is the same whatever the cause, and that grows with the model and the context. Measured
 # on 1B, 53 positions: scalar against AVX-512 rms 0.063 / max 0.34, AMX-INT8 against scalar 0.062 / 0.36, two sockets against
@@ -338,7 +340,7 @@ a_bitwise() {
     shift
   done
   expect "compare-$name-$precision-$label" ok "$dir" -- numactl --cpunodebind=0 "$PYTHON" \
-    "$ROOT/tools/compare_engines.py" --probe "$ROOT/build/release/probe-$precision" --checkpoint "$staged" \
+    "$ROOT/tools/compare_engines.py" --probe "${CMP_PROBE:-$ROOT/build/release/probe-$precision}" --checkpoint "$staged" \
     --tokens-file "$tokens" "${args[@]}" "${CMP_FLAGS[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }
 
@@ -561,6 +563,6 @@ b_compare() {
   local flags=(--max-abs 1e-3)
   [[ ${#B_FLAGS[@]} -eq 0 ]] || flags=("${B_FLAGS[@]}")
   expect "compare-$name-$precision-$label" "${B_EXPECT:-ok}" "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
-    "$ROOT/build/release/probe-$precision" --checkpoint "$staged" --tokens-file "${CMP_TOKENS:-$dir/$name-tokens.txt}" "${args[@]}" \
+    "${CMP_PROBE:-$ROOT/build/release/probe-$precision}" --checkpoint "$staged" --tokens-file "${CMP_TOKENS:-$dir/$name-tokens.txt}" "${args[@]}" \
     "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }
