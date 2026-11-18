@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -872,6 +873,241 @@ static void bench_attention(int threads) {
   pool_stop();
 }
 
+/* ---- E1: attention test matrix shared by every variant ----------------------------------------------------------------
+ * Every attention kernel (today the split-K one, on its public entry points and on the portable driver hook; E2 adds
+ * tiled) is one entry of attn_variants and goes through the same cases against one double-precision reference of causal
+ * GQA attention that never touches the chunk plan. Per case and variant:
+ *   - batched output against the reference (2e-5 absolute, as test_attention), with the output, the scratch and the
+ *     split-K workspace poisoned with NaN, and K/V rows beyond the last position poisoned too, so an unwritten row, a
+ *     stale partial slot or a read past the context turns into a NaN and fails;
+ *   - the same call with the workspace cut to a third of the rows and to one row, so the batch runs in several waves;
+ *     the result must equal the single-wave one bit for bit (waves only partition rows);
+ *   - causality by perturbation: K/V rows after the position a row may see are replaced with large values, and the
+ *     row must not move, bit for bit.
+ * Decode (k_attention) is checked at positions on both sides of every chunk boundary. */
+typedef void (*AttnBatchFn)(float *out, const float *q, const float *kc, const float *vc, float *att,
+                            AttentionWork *work, int heads, int kv_heads, int hd, int seq, int pos0, int m);
+typedef void (*AttnDecodeFn)(float *out, const float *q, const float *kc, const float *vc, float *att,
+                             AttentionWork *work, int heads, int kv_heads, int hd, int seq, int position);
+typedef struct {
+  const char *name;
+  AttnBatchFn batch;
+  AttnDecodeFn decode;
+} AttnVariant;
+
+/* The driver with the portable chunk kernel runs the batched code (waves, row blocks, merge) on any host; it needs
+ * m > 1, and a single row is the decode path anyway. */
+static void attn_portable_batch(float *out, const float *q, const float *kc, const float *vc, float *att,
+                                AttentionWork *work, int heads, int kv_heads, int hd, int seq, int pos0, int m) {
+  if (m > 1)
+    k_attention_batch_portable(out, q, kc, vc, work, heads, kv_heads, hd, seq, pos0, m);
+  else
+    k_attention(out, q, kc, vc, att, work, heads, kv_heads, hd, seq, pos0);
+}
+
+static const AttnVariant attn_variants[] = {
+    {"split", k_attention_batch, k_attention},
+    {"split-portable", attn_portable_batch, k_attention},
+};
+enum { ATTN_VARIANTS = sizeof(attn_variants) / sizeof(*attn_variants), ATTN_GUARD_ROWS = 4 };
+
+static void poison(float *x, size_t n) {
+  for (size_t i = 0; i < n; i++)
+    x[i] = NAN;
+}
+
+static void expect(int ok, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void expect(int ok, const char *format, ...) {
+  checks++;
+  if (ok || failures++ >= 20)
+    return;
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+}
+
+/* Causal GQA attention of one query row at `position` (it sees positions 0..position) in double precision. */
+static void attention_reference(const float *q, const float *kc, const float *vc, int heads, int kv_heads, int hd,
+                                int position, double *out, double *scores) {
+  int kv_mul = heads / kv_heads, kv_dim = kv_heads * hd;
+  for (int h = 0; h < heads; h++) {
+    const float *kh = kc + (size_t)(h / kv_mul) * hd, *vh = vc + (size_t)(h / kv_mul) * hd;
+    double max = -INFINITY, sum = 0;
+    for (int t = 0; t <= position; t++) {
+      double dot = 0;
+      for (int i = 0; i < hd; i++)
+        dot += (double)q[h * hd + i] * kh[(size_t)t * kv_dim + i];
+      scores[t] = dot / sqrt(hd);
+      if (scores[t] > max)
+        max = scores[t];
+    }
+    for (int t = 0; t <= position; t++)
+      sum += scores[t] = exp(scores[t] - max);
+    for (int i = 0; i < hd; i++) {
+      double acc = 0;
+      for (int t = 0; t <= position; t++)
+        acc += scores[t] / sum * vh[(size_t)t * kv_dim + i];
+      out[h * hd + i] = acc;
+    }
+  }
+}
+
+typedef struct {
+  int kv_heads, group, hd;
+} AttnShape;
+
+/* One batched case: m rows at pos0..pos0+m-1 on `shape`, through every variant. budget_mib > 0 sets
+ * LLAMA_ATTN_WORKSPACE_MIB for the workspace sizing instead of cutting the capacity by hand. */
+static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mib) {
+  int heads = shape.kv_heads * shape.group, kv_heads = shape.kv_heads, hd = shape.hd;
+  int seq = pos0 + m, rows = seq + ATTN_GUARD_ROWS;
+  size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+  float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed(rows * kv_dim, sizeof(float));
+  float *vc = zeroed(rows * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+  float *got = zeroed(m * dim, sizeof(float)), *first = zeroed(m * dim, sizeof(float));
+  float *again = zeroed(m * dim, sizeof(float)), *kp = zeroed(rows * kv_dim, sizeof(float));
+  float *vp = zeroed(rows * kv_dim, sizeof(float));
+  double *ref = zeroed(m * dim, sizeof(double)), *scores = zeroed(seq, sizeof(double));
+  fill(q, m * dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
+  poison(kc + (size_t)seq * kv_dim, ATTN_GUARD_ROWS * kv_dim);
+  poison(vc + (size_t)seq * kv_dim, ATTN_GUARD_ROWS * kv_dim);
+  for (int i = 0; i < m; i++)
+    attention_reference(q + i * dim, kc, vc, heads, kv_heads, hd, pos0 + i, ref + i * dim, scores);
+  char label[160];
+  if (budget_mib > 0) {
+    char value[16];
+    snprintf(value, sizeof(value), "%d", budget_mib);
+    setenv("LLAMA_ATTN_WORKSPACE_MIB", value, 1);
+  }
+  AttentionWork work;
+  k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
+  if (budget_mib > 0)
+    unsetenv("LLAMA_ATTN_WORKSPACE_MIB");
+  size_t full_capacity = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
+  if (budget_mib > 0)
+    expect(full_capacity / one_row >= 1 && full_capacity / one_row < (size_t)m,
+           "attention matrix [%s] budget %d MiB: %zu rows of partials for m=%d, expected 2+ waves\n", current,
+           budget_mib, full_capacity / one_row, m);
+  for (int v = 0; v < ATTN_VARIANTS; v++) {
+    const AttnVariant *variant = &attn_variants[v];
+    /* pass 0: as sized; pass 1: a third of the rows per wave; pass 2: one row per wave (short batches only) */
+    for (int pass = 0; pass < 3; pass++) {
+      if (pass && (budget_mib > 0 || m < 3 || (pass == 2 && m > 32)))
+        continue;
+      size_t rows_per_wave = pass == 1 ? (size_t)(m / 3 > 0 ? m / 3 : 1) : 1;
+      work.capacity = pass ? (rows_per_wave * one_row < full_capacity ? rows_per_wave * one_row : full_capacity)
+                           : full_capacity;
+      snprintf(label, sizeof(label), "attention matrix %s g=%d hd=%d m=%d pos0=%d pass=%d", variant->name, shape.group,
+               hd, m, pos0, pass);
+      poison(got, m * dim), poison(att, (size_t)heads * seq), poison(work.partial, full_capacity);
+      variant->batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      for (size_t i = 0; i < m * dim; i++)
+        check(label, got[i], ref[i], 2e-5);
+      if (pass == 0)
+        memcpy(first, got, m * dim * sizeof(float));
+      else
+        expect(!memcmp(got, first, m * dim * sizeof(float)), "%s [%s]: waves changed the result bit for bit\n", label,
+               current);
+    }
+    work.capacity = full_capacity;
+    const int probes[] = {0, m / 2, m - 1};
+    for (int pr = 0; pr < 3; pr++) {
+      int i = probes[pr], later = pos0 + i + 1;
+      if (later >= seq || (pr && i == probes[pr - 1]))
+        continue;
+      memcpy(kp, kc, rows * kv_dim * sizeof(float)), memcpy(vp, vc, rows * kv_dim * sizeof(float));
+      for (size_t t = (size_t)later * kv_dim; t < (size_t)seq * kv_dim; t++)
+        kp[t] = 40 * uniform(), vp[t] = 40 * uniform();
+      poison(again, m * dim), poison(att, (size_t)heads * seq), poison(work.partial, full_capacity);
+      variant->batch(again, q, kp, vp, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      expect(!memcmp(again + i * dim, first + i * dim, dim * sizeof(float)),
+             "attention matrix %s causality [%s] g=%d hd=%d m=%d pos0=%d row=%d: later K/V changed the row\n",
+             variant->name, current, shape.group, hd, m, pos0, i);
+    }
+  }
+  k_attention_free(&work);
+  free(q), free(kc), free(vc), free(att), free(got), free(first), free(again), free(kp), free(vp), free(ref),
+      free(scores);
+}
+
+/* Single-row attention at `positions`, on a context whose rows after the position are NaN, through every variant. */
+static void attention_decode_case(AttnShape shape, const int *positions, int count) {
+  int heads = shape.kv_heads * shape.group, kv_heads = shape.kv_heads, hd = shape.hd, last = positions[count - 1];
+  int seq = last + 1 + ATTN_GUARD_ROWS;
+  size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+  float *q = zeroed(dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+  float *vc = zeroed(seq * kv_dim, sizeof(float)), *kp = zeroed(seq * kv_dim, sizeof(float));
+  float *vp = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+  float *got = zeroed(dim, sizeof(float)), *second = zeroed(dim, sizeof(float));
+  double *ref = zeroed(dim, sizeof(double)), *scores = zeroed(seq, sizeof(double));
+  fill(q, dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
+  AttentionWork work;
+  k_attention_init(&work, heads, kv_heads, hd, seq);
+  char label[160];
+  for (int p = 0; p < count; p++) {
+    int position = positions[p];
+    attention_reference(q, kc, vc, heads, kv_heads, hd, position, ref, scores);
+    memcpy(kp, kc, seq * kv_dim * sizeof(float)), memcpy(vp, vc, seq * kv_dim * sizeof(float));
+    poison(kp + (size_t)(position + 1) * kv_dim, (size_t)(seq - position - 1) * kv_dim);
+    poison(vp + (size_t)(position + 1) * kv_dim, (size_t)(seq - position - 1) * kv_dim);
+    for (int v = 0; v < ATTN_VARIANTS; v++) {
+      snprintf(label, sizeof(label), "attention matrix %s decode g=%d hd=%d pos=%d", attn_variants[v].name,
+               shape.group, hd, position);
+      poison(got, dim), poison(att, (size_t)heads * seq), poison(work.partial, work.capacity);
+      attn_variants[v].decode(got, q, kp, vp, att, &work, heads, kv_heads, hd, seq, position);
+      for (size_t i = 0; i < dim; i++)
+        check(label, got[i], ref[i], 2e-5);
+      /* the rows after the position are NaN above; the result must not move when they hold real data */
+      poison(second, dim), poison(att, (size_t)heads * seq), poison(work.partial, work.capacity);
+      attn_variants[v].decode(second, q, kc, vc, att, &work, heads, kv_heads, hd, seq, position);
+      expect(!memcmp(got, second, dim * sizeof(float)), "%s [%s]: later K/V rows changed the result\n", label,
+             current);
+    }
+  }
+  k_attention_free(&work);
+  free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores);
+}
+
+static void test_attention_matrix(void) {
+  /* Reduced head counts (two KV heads) keep the matrix fast on scalar and sanitizer builds; the group sizes, head
+   * sizes and position counts are the ones that matter for the chunk plan and the tail masks. */
+  const int groups[] = {1, 2, 4, 8}, head_sizes[] = {64, 128, 40}, ms[] = {1, 3, 7, 32};
+  const int ends[] = {31, 32, 33, 255, 256, 257}, warm[] = {1, 33, 256};
+  const int decode_positions[] = {0, 1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 288, 511, 512, 513};
+  int reduced = strstr(current, "teams") != NULL; /* the team loop repeats the matrix per team size: fewer shapes */
+  for (size_t g = 0; g < sizeof(groups) / sizeof(*groups); g++)
+    for (size_t h = 0; h < sizeof(head_sizes) / sizeof(*head_sizes); h++) {
+      AttnShape shape = {.kv_heads = 2, .group = groups[g], .hd = head_sizes[h]};
+      if (reduced && (groups[g] == 4 || head_sizes[h] == 128))
+        continue;
+      for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++) {
+        /* prompts that end (last row included) at 31/32/33 and 255/256/257 positions, and warm contexts */
+        for (size_t e = 0; e < sizeof(ends) / sizeof(*ends); e++)
+          if (ends[e] - ms[mi] >= 0 && !(reduced && ends[e] > 33 && ends[e] < 255))
+            attention_batch_case(shape, ms[mi], ends[e] - ms[mi], 0);
+        for (size_t w = 0; w < sizeof(warm) / sizeof(*warm); w++)
+          if (!reduced || warm[w] != 33)
+            attention_batch_case(shape, ms[mi], warm[w], 0);
+      }
+      attention_decode_case(shape, decode_positions, sizeof(decode_positions) / sizeof(*decode_positions));
+    }
+  /* M = 256: a microbatch that spans several chunk plans. Prompts ending at 256/257 positions and warm contexts. */
+  const AttnShape big[] = {{2, 1, 64}, {2, 4, 64}, {2, 8, 40}, {2, 2, 128}};
+  for (size_t b = 0; b < sizeof(big) / sizeof(*big); b++) {
+    if (reduced && b > 1)
+      continue;
+    attention_batch_case(big[b], 256, 0, 0);
+    attention_batch_case(big[b], 256, 1, 0);
+    attention_batch_case(big[b], 256, 33, 0);
+    if (!reduced)
+      attention_batch_case(big[b], 256, 256, 0);
+  }
+  /* The same wave split, now from the workspace budget the engine reads (LLAMA_ATTN_WORKSPACE_MIB), not a hand cut. */
+  if (!reduced)
+    attention_batch_case((AttnShape){2, 8, 128}, 256, 33, 1);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && !strcmp(argv[1], "bench-attention")) {
     kernels_init();
@@ -904,6 +1140,7 @@ int main(int argc, char **argv) {
     rope_used = test_rope(rope[i]);
     test_attention();
     test_attention_batch();
+    test_attention_matrix();
     test_partial();
     test_packed4();
     test_row_parallel();
@@ -955,6 +1192,7 @@ int main(int argc, char **argv) {
       test_norm();
       test_attention();
       test_attention_batch();
+      test_attention_matrix();
       test_partial();
       test_packed4();
       test_row_parallel();
