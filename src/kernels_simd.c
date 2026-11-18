@@ -863,6 +863,179 @@ AVX512 static void attention_tiled_avx512(const float *q, size_t q_row_stride, i
     o[head_dim + 1] = l[qi];
   }
 }
+
+// ----------------------------------------------------------------------------
+// Group decode attention (E5)
+
+/* Single-row attention for one KV group over one chunk [t0, t1) of positions: the group's `nq` query heads (at most 16)
+ * are handled together, so each K and V row is read from memory once per group. Scores of 16 positions are computed
+ * as 16 partial vectors (one per position, accumulated over the head with the pre-scaled Q) and reduced by one 16-way
+ * transpose-add: no horizontal reduction and no division per score. Softmax is online per tile of 32 positions (running
+ * maximum m and sum l per head, accumulator and l rescaled by exp(m_old - m_new)) and PV is fused into the same pass.
+ * The result is a split-K partial [acc(head_dim), max, sum] per head, merged by merge_chunks like the split kernel's.
+ */
+enum { GROUP_POS = 32, GROUP_MAX_Q = 16, GROUP_MAX_HD = 256 };
+
+/* Lane j of the result is the sum of the 16 lanes of a[j]: 30 shuffles and 15 adds for 16 sums (a full transpose takes
+ * 64 shuffles). Levels: float unpack within 128-bit blocks, double unpack, then the four 128-bit blocks. */
+AVX512 static inline __m512 group_reduce16(const __m512 *a) {
+  __m512 s[8], u[4];
+  for (int i = 0; i < 8; i++)
+    s[i] = _mm512_add_ps(_mm512_unpacklo_ps(a[2 * i], a[2 * i + 1]), _mm512_unpackhi_ps(a[2 * i], a[2 * i + 1]));
+  for (int i = 0; i < 4; i++) {
+    __m512d x = _mm512_castps_pd(s[2 * i]), y = _mm512_castps_pd(s[2 * i + 1]);
+    u[i] = _mm512_add_ps(_mm512_castpd_ps(_mm512_unpacklo_pd(x, y)), _mm512_castpd_ps(_mm512_unpackhi_pd(x, y)));
+  }
+  __m512 t0 = _mm512_add_ps(_mm512_shuffle_f32x4(u[0], u[1], 0x88), _mm512_shuffle_f32x4(u[0], u[1], 0xDD));
+  __m512 t1 = _mm512_add_ps(_mm512_shuffle_f32x4(u[2], u[3], 0x88), _mm512_shuffle_f32x4(u[2], u[3], 0xDD));
+  return _mm512_add_ps(_mm512_shuffle_f32x4(t0, t1, 0x88), _mm512_shuffle_f32x4(t0, t1, 0xDD));
+}
+
+/* Scores (already scaled through q) of 16 positions whose key rows are kp[0..15]; lane p is position p. */
+AVX512 static inline __attribute__((always_inline)) __m512 group_scores16(const float *q, const float *const *kp,
+                                                                          int vectors, __mmask16 last) {
+  __m512 a[16];
+  for (int p = 0; p < 16; p++)
+    a[p] = _mm512_setzero_ps();
+  for (int v = 0; v + 1 < vectors; v++) {
+    __m512 qv = _mm512_loadu_ps(q + v * 16);
+    for (int p = 0; p < 16; p++)
+      a[p] = _mm512_fmadd_ps(qv, _mm512_loadu_ps(kp[p] + v * 16), a[p]);
+  }
+  __m512 qv = _mm512_loadu_ps(q + (vectors - 1) * 16);
+  for (int p = 0; p < 16; p++)
+    a[p] = _mm512_fmadd_ps(qv, _mm512_maskz_loadu_ps(last, kp[p] + (vectors - 1) * 16), a[p]);
+  return group_reduce16(a);
+}
+
+/* P x V for NH query heads and a slice of up to DV vectors of the head (dv of them used): accumulators from the task's
+ * output scratch (rescaled by alpha), one V row load feeds NH x dv FMAs with a probability broadcast, and they go back.
+ */
+AVX512 static inline __attribute__((always_inline)) void group_pv(const float *p, const float *v, int kv_dim, int npos,
+                                                                  float *o, size_t ostride, const float *alpha,
+                                                                  __mmask16 mlast, int dv, const int NH, const int DV) {
+  __m512 a[8][8];
+  __mmask16 mk[8];
+  for (int x = 0; x < DV; x++)
+    mk[x] = x + 1 == dv ? mlast : (__mmask16)0xFFFF;
+  for (int j = 0; j < NH; j++) {
+    __m512 al = _mm512_set1_ps(alpha[j]);
+    for (int x = 0; x < DV; x++)
+      a[j][x] = x < dv ? _mm512_mul_ps(_mm512_loadu_ps(o + j * ostride + x * 16), al) : _mm512_setzero_ps();
+  }
+  for (int pos = 0; pos < npos; pos++) {
+    const float *vr = v + (size_t)pos * kv_dim;
+    __m512 vv[8];
+    for (int x = 0; x < DV; x++)
+      vv[x] = x < dv ? _mm512_maskz_loadu_ps(mk[x], vr + x * 16) : _mm512_setzero_ps();
+    for (int j = 0; j < NH; j++) {
+      __m512 b = _mm512_set1_ps(p[j * GROUP_POS + pos]);
+      for (int x = 0; x < DV; x++)
+        a[j][x] = _mm512_fmadd_ps(b, vv[x], a[j][x]);
+    }
+  }
+  for (int j = 0; j < NH; j++)
+    for (int x = 0; x < DV; x++)
+      if (x < dv)
+        _mm512_storeu_ps(o + j * ostride + x * 16, a[j][x]);
+}
+
+AVX512 static void attention_group_avx512(const float *q, int nq, int head_dim, int t0, int t1, const float *kc,
+                                          const float *vc, int kv_dim, float *partial, size_t head_stride) {
+  _Alignas(64) float qs[GROUP_MAX_Q * GROUP_MAX_HD], os[GROUP_MAX_Q * GROUP_MAX_HD], ps[GROUP_MAX_Q * GROUP_POS],
+      zero[GROUP_MAX_HD];
+  float m[GROUP_MAX_Q], l[GROUP_MAX_Q], alpha[GROUP_MAX_Q], lane[16];
+  int vectors = (head_dim + 15) / 16, hdp = vectors * 16;
+  __mmask16 last = lane_mask(head_dim - (vectors - 1) * 16);
+  const __m512 scale = _mm512_set1_ps(1.0f / sqrtf((float)head_dim));
+  /* Q scaled once by 1/sqrt(head_dim); the tail of the last vector is zero so it never meets a stray key element. */
+  for (int h = 0; h < nq; h++) {
+    for (int v = 0; v < vectors; v++) {
+      __mmask16 mk = v + 1 == vectors ? last : (__mmask16)0xFFFF;
+      _mm512_storeu_ps(qs + (size_t)h * hdp + v * 16,
+                       _mm512_mul_ps(_mm512_maskz_loadu_ps(mk, q + (size_t)h * head_dim + v * 16), scale));
+      _mm512_storeu_ps(os + (size_t)h * hdp + v * 16, _mm512_setzero_ps());
+    }
+    m[h] = -FLT_MAX, l[h] = 0.0f, alpha[h] = 1.0f;
+  }
+  for (int v = 0; v < hdp; v += 16)
+    _mm512_storeu_ps(zero + v, _mm512_setzero_ps());
+  for (int i = 0; i < GROUP_MAX_Q * GROUP_POS; i += 16)
+    _mm512_storeu_ps(ps + i, _mm512_setzero_ps());
+  const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff)), finite = _mm512_set1_ps(FLT_MAX);
+  for (int t = t0; t < t1; t += GROUP_POS) {
+    int cnt = t1 - t < GROUP_POS ? t1 - t : GROUP_POS;
+    for (int p = 0; p < cnt; p++) /* bring the tile's V rows in while the scores are computed */
+      for (int d = 0; d < head_dim; d += 16)
+        __builtin_prefetch(vc + (size_t)(t + p) * kv_dim + d, 0, 3);
+    const float *kp[2][16];
+    for (int p = 0; p < GROUP_POS; p++)
+      kp[p / 16][p % 16] = p < cnt ? kc + (size_t)(t + p) * kv_dim : zero;
+    __mmask16 k0 = lane_mask(cnt), k1 = lane_mask(cnt - 16);
+    for (int h = 0; h < nq; h++) {
+      const float *qh = qs + (size_t)h * hdp;
+      __m512 s0 = group_scores16(qh, kp[0], vectors, last);
+      __m512 s1 = cnt > 16 ? group_scores16(qh, kp[1], vectors, last) : _mm512_setzero_ps();
+      if ((_mm512_mask_cmp_ps_mask(k0, _mm512_and_ps(s0, abs_mask), finite, _CMP_LE_OQ) != k0) ||
+          (_mm512_mask_cmp_ps_mask(k1, _mm512_and_ps(s1, abs_mask), finite, _CMP_LE_OQ) != k1))
+        fail("nonfinite value in softmax");
+      __m512 vmax = _mm512_set1_ps(-FLT_MAX);
+      vmax = _mm512_mask_max_ps(vmax, k0, vmax, s0);
+      vmax = _mm512_mask_max_ps(vmax, k1, vmax, s1);
+      float tile_max = _mm512_reduce_max_ps(vmax), old = m[h];
+      alpha[h] = 1.0f;      /* 1 when the maximum did not move: one code path serves both cases */
+      if (tile_max > old) { /* the maximum moved: what is accumulated so far is scaled by exp(old - new) */
+        _mm512_storeu_ps(lane, exp512(_mm512_set1_ps(old - tile_max)));
+        alpha[h] = lane[0];
+        l[h] *= lane[0];
+        m[h] = tile_max;
+      }
+      __m512 shift = _mm512_set1_ps(m[h]);
+      __m512 e0 = _mm512_maskz_mov_ps(k0, exp512(_mm512_sub_ps(s0, shift)));
+      __m512 e1 = _mm512_maskz_mov_ps(k1, exp512(_mm512_sub_ps(s1, shift)));
+      _mm512_storeu_ps(ps + h * GROUP_POS, e0);
+      _mm512_storeu_ps(ps + h * GROUP_POS + 16, e1);
+      l[h] += _mm512_reduce_add_ps(_mm512_add_ps(e0, e1));
+    }
+    for (int h0 = 0; h0 < nq;) {
+      int left = nq - h0, nh = left >= 8 ? 8 : left >= 4 ? 4 : left >= 2 ? 2 : 1;
+      int dvmax = nh == 8 ? 2 : nh == 4 ? 4 : 8;
+      for (int s = 0; s < vectors; s += dvmax) {
+        int dv = vectors - s < dvmax ? vectors - s : dvmax;
+        __mmask16 ml = s + dv == vectors ? last : (__mmask16)0xFFFF;
+        const float *pp = ps + (size_t)h0 * GROUP_POS, *v = vc + (size_t)t * kv_dim + s * 16, *al = alpha + h0;
+        float *o = os + (size_t)h0 * hdp + s * 16;
+        switch (nh) {
+        case 8:
+          group_pv(pp, v, kv_dim, cnt, o, (size_t)hdp, al, ml, dv, 8, 2);
+          break;
+        case 4:
+          group_pv(pp, v, kv_dim, cnt, o, (size_t)hdp, al, ml, dv, 4, 4);
+          break;
+        case 2:
+          group_pv(pp, v, kv_dim, cnt, o, (size_t)hdp, al, ml, dv, 2, 8);
+          break;
+        default:
+          group_pv(pp, v, kv_dim, cnt, o, (size_t)hdp, al, ml, dv, 1, 8);
+          break;
+        }
+      }
+      h0 += nh;
+    }
+  }
+  for (int h = 0; h < nq; h++) {
+    float *o = partial + (size_t)h * head_stride;
+    if (t1 <= t0) {
+      partial_write_empty(o, head_dim);
+      continue;
+    }
+    for (int v = 0; v < vectors; v++)
+      _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : (__mmask16)0xFFFF,
+                            _mm512_loadu_ps(os + (size_t)h * hdp + v * 16));
+    o[head_dim] = m[h];
+    o[head_dim + 1] = l[h];
+  }
+}
 #endif
 
 // ----------------------------------------------------------------------------
@@ -1717,6 +1890,7 @@ typedef struct {
   const float *q, *key_cache, *value_cache;
   float *att, *partial;
   int n_heads, head_dim, seq_len, positions, kv_mul, kv_dim, chunks, tasks;
+  int group; /* 1: the group kernel (E5) runs the (KV group, chunk) tasks instead of the per-head chunk kernel */
   size_t slot, head_stride;
   atomic_int next_task; /* team-local queue over (kv group, chunk) tasks */
   Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
@@ -1726,6 +1900,12 @@ static void attention_task(const SplitKJob *j, int task) {
   int g = task / j->chunks, c = task % j->chunks;
   int t0 = (int)((long long)j->positions * c / j->chunks), t1 = (int)((long long)j->positions * (c + 1) / j->chunks);
   int h0 = g * j->kv_mul;
+  if (j->group) {
+    attention_group_avx512(j->q + (size_t)h0 * j->head_dim, j->kv_mul, j->head_dim, t0, t1,
+                           j->key_cache + (size_t)g * j->head_dim, j->value_cache + (size_t)g * j->head_dim, j->kv_dim,
+                           j->partial + h0 * j->head_stride + c * j->slot, j->head_stride);
+    return;
+  }
   attention_chunk_avx512(j->q + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_dim,
                          j->value_cache + (size_t)g * j->head_dim, j->kv_dim, j->head_dim, j->kv_mul, t0, t1,
                          j->att + (size_t)h0 * j->seq_len + t0, j->seq_len,
@@ -1764,9 +1944,11 @@ static void attention_team(const void *p, int worker, int workers) {
 }
 #endif
 
-static void attention_decode_split(float *out, const float *q, const float *key_cache, const float *value_cache,
-                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                   int seq_len, int position) {
+/* The split-K decode path; `group` selects the per-group kernel (E5) for the (KV group, chunk) tasks. The chunk plan,
+ * the partial slots and the merge are the same for both. */
+static void attention_decode_splitk(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                    float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                    int seq_len, int position, int group) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && head_dim <= 256) {
     int positions = position + 1, kv_mul = n_heads / n_kv_heads, kv_dim = n_kv_heads * head_dim;
@@ -1785,6 +1967,7 @@ static void attention_decode_split(float *out, const float *q, const float *key_
                      .kv_dim = kv_dim,
                      .chunks = chunks,
                      .tasks = n_kv_heads * chunks,
+                     .group = group,
                      .slot = (size_t)head_dim + 2,
                      .head_stride = (size_t)work->max_chunks * ((size_t)head_dim + 2)};
     atomic_init(&job.next_task, 0);
@@ -1811,8 +1994,37 @@ static void attention_decode_split(float *out, const float *q, const float *key_
     return;
   }
 #endif
-  (void)work;
+  (void)work, (void)group;
   attention_scalar(out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_dim, seq_len, position);
+}
+
+static void attention_decode_split(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                   int seq_len, int position) {
+  attention_decode_splitk(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position,
+                          0);
+}
+
+/* LLAMA_ATTN_DECODE=group (E5). One note per process when the call goes to `split`: same precision, different speed. */
+static void attention_decode_group(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                   int seq_len, int position) {
+  const char *why = NULL;
+#if HAVE_AVX512
+  if (isa != KERNELS_AVX512)
+    why = "the AVX-512 kernels are not active";
+  else if (head_dim > GROUP_MAX_HD || n_heads / n_kv_heads > GROUP_MAX_Q)
+    why = "head_dim above 256 or more than 16 query heads per KV head is not supported";
+#else
+  why = "the AVX-512 kernels are not built";
+#endif
+  if (why) {
+    static atomic_flag noted = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&noted))
+      LOG(LOG_INFO, "LLAMA_ATTN_DECODE=group: %s, running split attention instead", why);
+  }
+  attention_decode_splitk(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position,
+                          why == NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -2290,7 +2502,7 @@ static const AttentionBatchEntry attention_batch_table[] = {
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
     {"split", attention_decode_split, NULL},
-    {"group", NULL, "E5"},
+    {"group", attention_decode_group, NULL},
 };
 static const AttentionBatchEntry *attention_batch_active = &attention_batch_table[0];
 static const AttentionDecodeEntry *attention_decode_active = &attention_decode_table[0];
