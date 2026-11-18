@@ -101,6 +101,31 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(data['topology'])
         self.assertIn('cannot read', data['topology_error'])
 
+    def test_tokens_out_records_prompt_and_generated_ids(self):
+        """LLAMA_TOKENS_OUT: prompt = every id forwarded before the first sample (warm-up ids first), generated = every
+        sampled id including the stop token; stdout is unchanged and the knob is rejected outside generate mode."""
+        out = self.root/'tokens.json'
+        def tokens(*args, fixture=None):
+            out.unlink(missing_ok=True)
+            result, _ = self.execute('run', *args, fixture=fixture, env={'LLAMA_TOKENS_OUT': str(out)})
+            data = json.loads(out.read_text())
+            self.assertEqual(set(data), {'prompt', 'generated'})
+            self.assertTrue(all(isinstance(v, int) for key in data for v in data[key]))
+            return result, data
+        unset, _ = self.execute('run', '--generation-length', '5')
+        result, data = tokens('--generation-length', '5')
+        self.assertEqual(result.stdout, unset.stdout)
+        self.assertGreater(len(data['prompt']), 0)
+        self.assertTrue(len(data['generated']) == 5 or data['generated'][-1] in (128001, 128008, 128009),
+                        data['generated'])
+        _, warmed = tokens('--generation-length', '5', '--warm-context', '3')
+        self.assertEqual(len(warmed['prompt']), len(data['prompt']) + 3)
+        self.assertEqual(warmed['prompt'][3:], data['prompt'])
+        _, stopped = tokens('--generation-length', '5', fixture=self.first_stop)
+        self.assertEqual(stopped['generated'], [128001])
+        self.assertEqual(stopped['prompt'], data['prompt'])
+        self.execute('run', '-m', 'chat', success=False, env={'LLAMA_TOKENS_OUT': str(out)})
+
     def test_backend_environment_is_validated(self):
         for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),
                           ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '0'}, 'LLAMA_THREADS must be'),
