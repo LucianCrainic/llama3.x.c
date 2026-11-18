@@ -248,5 +248,59 @@ static inline __m128i _mm256_extracti128_si256(__m256i a, int index) {
   memcpy(&r, a.i8 + 16 * index, sizeof(r));
   return r;
 }
+/* Transposes and tile stores (the tiled attention): 64-bit lanes are modelled as raw bits, so a cast never touches a
+ * value. */
+typedef struct {
+  uint64_t v[8];
+} __m512d;
+static inline void _mm512_storeu_ps(float *p, __m512 a) {
+  memcpy(p, &a, sizeof(a));
+}
+static inline __m512d _mm512_castps_pd(__m512 a) {
+  __m512d r;
+  memcpy(&r, &a, sizeof(r));
+  return r;
+}
+static inline __m512 _mm512_castpd_ps(__m512d a) {
+  __m512 r;
+  memcpy(&r, &a, sizeof(r));
+  return r;
+}
+/* Within each 128-bit lane: unpacklo = a0 b0 a1 b1, unpackhi = a2 b2 a3 b3 (floats); a0 b0 / a1 b1 (doubles). */
+static inline __m512 _mm512_unpacklo_ps(__m512 a, __m512 b) {
+  __m512 r;
+  for (int l = 0; l < 4; l++)
+    r.v[4 * l] = a.v[4 * l], r.v[4 * l + 1] = b.v[4 * l], r.v[4 * l + 2] = a.v[4 * l + 1], r.v[4 * l + 3] = b.v[4 * l + 1];
+  return r;
+}
+static inline __m512 _mm512_unpackhi_ps(__m512 a, __m512 b) {
+  __m512 r;
+  for (int l = 0; l < 4; l++)
+    r.v[4 * l] = a.v[4 * l + 2], r.v[4 * l + 1] = b.v[4 * l + 2], r.v[4 * l + 2] = a.v[4 * l + 3], r.v[4 * l + 3] = b.v[4 * l + 3];
+  return r;
+}
+static inline __m512d _mm512_unpacklo_pd(__m512d a, __m512d b) {
+  __m512d r;
+  for (int l = 0; l < 4; l++)
+    r.v[2 * l] = a.v[2 * l], r.v[2 * l + 1] = b.v[2 * l];
+  return r;
+}
+static inline __m512d _mm512_unpackhi_pd(__m512d a, __m512d b) {
+  __m512d r;
+  for (int l = 0; l < 4; l++)
+    r.v[2 * l] = a.v[2 * l + 1], r.v[2 * l + 1] = b.v[2 * l + 1];
+  return r;
+}
+/* 128-bit lanes: the two low result lanes come from a (selected by imm bits 0-1 and 2-3), the two high ones from b (4-5, 6-7). */
+static inline __m512 _mm512_shuffle_f32x4(__m512 a, __m512 b, int imm) {
+  __m512 r;
+  for (int l = 0; l < 4; l++) {
+    const __m512 *source = l < 2 ? &a : &b;
+    int pick = (imm >> (2 * l)) & 3;
+    for (int i = 0; i < 4; i++)
+      r.v[4 * l + i] = source->v[4 * pick + i];
+  }
+  return r;
+}
 #undef EMUL_LANES
 #endif

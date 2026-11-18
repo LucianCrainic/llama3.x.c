@@ -1022,6 +1022,7 @@ typedef struct {
 /* When set, the workspace is sized for this many workers instead of the team's, so a single-threaded test still runs the
  * multi-chunk plans of a 56-worker socket (chunk edges inside a row block, rows with no position in a chunk). */
 static int attn_force_workers;
+static double worst_vs_reference, worst_vs_split; /* largest error of the variants flagged vs_split, printed at the end */
 
 /* One batched case: m rows at pos0..pos0+m-1 on `shape`, through every variant. budget_mib > 0 sets
  * LLAMA_ATTN_WORKSPACE_MIB for the workspace sizing instead of cutting the capacity by hand. */
@@ -1077,15 +1078,21 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
                hd, m, pos0, pass);
       poison(got, m * dim), poison(att, (size_t)heads * seq), poison(work.partial, full_capacity);
       variant->batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
-      for (size_t i = 0; i < m * dim; i++)
+      for (size_t i = 0; i < m * dim; i++) {
         check(label, got[i], ref[i], 2e-5);
+        if (variant->vs_split && fabs(got[i] - ref[i]) > worst_vs_reference)
+          worst_vs_reference = fabs(got[i] - ref[i]);
+      }
       if (pass == 0) {
         memcpy(first, got, m * dim * sizeof(float));
         if (v == 0)
           memcpy(split_first, got, m * dim * sizeof(float));
         if (variant->vs_split)
-          for (size_t i = 0; i < m * dim; i++)
+          for (size_t i = 0; i < m * dim; i++) {
             check(label, got[i], split_first[i], 1e-5); /* "vs split", the second E2 gate */
+            if (fabs(got[i] - split_first[i]) > worst_vs_split)
+              worst_vs_split = fabs(got[i] - split_first[i]);
+          }
       } else
         expect(!memcmp(got, first, m * dim * sizeof(float)), "%s [%s]: waves changed the result bit for bit\n", label,
                current);
@@ -1362,6 +1369,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 3; i++)
     free(rope[i]), free(quantized[i]), free(scales[i]);
   printf("kernels: attention matrix %.1f s\n", matrix_seconds);
+  printf("kernels: tiled attention, largest error %.3g against the double reference, %.3g against split\n",
+         worst_vs_reference, worst_vs_split);
   printf("kernels: %d checks, %d failures\n", checks, failures);
   return failures != 0;
 }
