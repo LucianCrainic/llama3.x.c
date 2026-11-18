@@ -24,6 +24,13 @@ static char *text_argument(const char *arg) {
   return text;
 }
 
+/* The engines default to a context of min(checkpoint, 4096) positions. A probe run that forwards more positions asks for
+ * exactly that many (a request beyond the checkpoint's context fails); up to 4096 the default stands, so shorter runs keep
+ * their KV and attention-workspace sizing, and with it their results bit for bit. */
+static void load(Model *model, const char *path, long positions) {
+  engine_load_context(model, path, positions > 4096 ? (int)(positions < 1L << 30 ? positions : 1L << 30) : 0);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3)
     return 2;
@@ -49,7 +56,7 @@ int main(int argc, char **argv) {
     if (argc < 4)
       return 2;
     Model model = {0};
-    engine_load(&model, argv[2]);
+    load(&model, argv[2], argc - 3);
     int n = argc - 3;
     int *tokens = memory_alloc(n, sizeof(int), MEM_PROMPT);
     for (int i = 0; i < n; i++)
@@ -72,7 +79,7 @@ int main(int argc, char **argv) {
     if (argc < 5)
       return 2;
     Model model = {0};
-    engine_load(&model, argv[2]);
+    load(&model, argv[2], (long)(argc - 4) + atoi(argv[3]));
     int steps = atoi(argv[3]), pos = 0;
     float *logits = NULL;
     /* With LLAMA_PREFILL_BATCH > 1 the prompt goes through the batched prefill (C5/C6); decode stays per token. */
@@ -112,7 +119,7 @@ int main(int argc, char **argv) {
       printf("%.9g\n", rope_frequency(&p, j));
   } else {
     Model model = {0};
-    engine_load(&model, argv[1]);
+    load(&model, argv[1], argc - 2);
     for (int i = 2; i < argc; i++) {
       float *logits = engine_forward(&model, atoi(argv[i]), i - 2);
       if (fwrite(logits, sizeof(float), model.config.vocab_size, stdout) != (size_t)model.config.vocab_size)
