@@ -2286,7 +2286,7 @@ typedef struct {
 static const AttentionBatchEntry attention_batch_table[] = {
     {"split", attention_batch_split, NULL},
     {"tiled", attention_batch_tiled, NULL},
-    {"amx", NULL, "E2/E3"},
+    {"amx", NULL, "E3"},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
     {"split", attention_decode_split, NULL},
