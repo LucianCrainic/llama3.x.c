@@ -42,6 +42,8 @@ void kernels_set_thread_team(Team *team) {
   thread_team = team;
 }
 
+static void attention_init_from_env(void);
+
 static int supported(KernelIsa which) {
   if (which == KERNELS_SCALAR)
     return 1;
@@ -114,7 +116,9 @@ void kernels_init(void) {
   } else {
     fail("LLAMA_KERNELS must be auto, scalar, avx512 or amx");
   }
-  LOG(LOG_DEBUG, "compute kernels: %s", kernels_name());
+  attention_init_from_env();
+  LOG(LOG_DEBUG, "compute kernels: %s, attention %s, decode attention %s", kernels_name(), kernels_attention_name(),
+      kernels_attention_decode_name());
 }
 
 const char *kernels_name(void) {
@@ -1434,8 +1438,9 @@ static void attention_team(const void *p, int worker, int workers) {
 }
 #endif
 
-void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
-                 AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position) {
+static void attention_decode_split(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                   int seq_len, int position) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && head_dim <= 256) {
     int positions = position + 1, kv_mul = n_heads / n_kv_heads, kv_dim = n_kv_heads * head_dim;
@@ -1632,8 +1637,9 @@ static int batch_supported(int n_heads, int n_kv_heads, int head_dim, int seq_le
   return head_dim <= 256 && n_heads / n_kv_heads <= BATCH_MAX_GROUP && m > 1 && pos0 >= 0;
 }
 
-void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
-                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m) {
+static void attention_batch_split(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                  int seq_len, int pos0, int m) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
     attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
@@ -1644,8 +1650,8 @@ void k_attention_batch(float *out, const float *q, const float *key_cache, const
   /* The scalar kernels have no cross-row sharing to exploit: one row at a time, exactly the per-row call. */
   size_t dim = (size_t)n_heads * head_dim;
   for (int i = 0; i < m; i++)
-    k_attention(out + i * dim, q + i * dim, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len,
-                pos0 + i);
+    attention_decode_split(out + i * dim, q + i * dim, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim,
+                           seq_len, pos0 + i);
 }
 
 void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
@@ -1655,6 +1661,109 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
     fail("portable batched attention needs head_dim <= 256, at most %d heads per KV head and m > 1", BATCH_MAX_GROUP);
   attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
                          attention_chunk_portable);
+}
+
+// ----------------------------------------------------------------------------
+// Attention variant dispatch (E1)
+
+/* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
+ * (batched, prefill) and LLAMA_ATTN_DECODE (single row). A later variant is one new table entry plus its function;
+ * run.c, runq.c and tp.c need no change. An entry without a function is a known name that is not built yet: it is
+ * refused with a message rather than silently running the default. The first entry is the default. */
+typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                 float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                 int seq_len, int pos0, int m);
+typedef void (*AttentionDecodeFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                  int seq_len, int position);
+typedef struct {
+  const char *name;
+  AttentionBatchFn run;
+  const char *phase; /* where the variant lands, for the refusal message */
+} AttentionBatchEntry;
+typedef struct {
+  const char *name;
+  AttentionDecodeFn run;
+  const char *phase;
+} AttentionDecodeEntry;
+
+static const AttentionBatchEntry attention_batch_table[] = {
+    {"split", attention_batch_split, NULL},
+    {"tiled", NULL, "E2/E3"},
+    {"amx", NULL, "E2/E3"},
+};
+static const AttentionDecodeEntry attention_decode_table[] = {
+    {"split", attention_decode_split, NULL},
+    {"group", NULL, "E5"},
+};
+static const AttentionBatchEntry *attention_batch_active = &attention_batch_table[0];
+static const AttentionDecodeEntry *attention_decode_active = &attention_decode_table[0];
+
+int kernels_attention_select(const char *batch, const char *decode) {
+  const AttentionBatchEntry *b = NULL;
+  const AttentionDecodeEntry *d = NULL;
+  for (size_t i = 0; batch && i < sizeof(attention_batch_table) / sizeof(*attention_batch_table); i++)
+    if (!strcmp(batch, attention_batch_table[i].name))
+      b = &attention_batch_table[i];
+  for (size_t i = 0; decode && i < sizeof(attention_decode_table) / sizeof(*attention_decode_table); i++)
+    if (!strcmp(decode, attention_decode_table[i].name))
+      d = &attention_decode_table[i];
+  if ((batch && !(b && b->run)) || (decode && !(d && d->run)))
+    return 0;
+  if (b)
+    attention_batch_active = b;
+  if (d)
+    attention_decode_active = d;
+  return 1;
+}
+
+const char *kernels_attention_name(void) {
+  return attention_batch_active->name;
+}
+
+const char *kernels_attention_decode_name(void) {
+  return attention_decode_active->name;
+}
+
+/* LLAMA_ATTN / LLAMA_ATTN_DECODE, read once by kernels_init. Unset, empty or "auto" keep the default. */
+static void attention_init_from_env(void) {
+  const char *batch = getenv("LLAMA_ATTN"), *decode = getenv("LLAMA_ATTN_DECODE");
+  attention_batch_active = &attention_batch_table[0];
+  attention_decode_active = &attention_decode_table[0];
+  if (batch && *batch && strcmp(batch, "auto")) {
+    const AttentionBatchEntry *found = NULL;
+    for (size_t i = 0; i < sizeof(attention_batch_table) / sizeof(*attention_batch_table); i++)
+      if (!strcmp(batch, attention_batch_table[i].name))
+        found = &attention_batch_table[i];
+    if (!found)
+      fail("LLAMA_ATTN must be split, tiled or amx");
+    if (!found->run)
+      fail("LLAMA_ATTN=%s is not implemented yet (%s)", found->name, found->phase);
+    attention_batch_active = found;
+  }
+  if (decode && *decode && strcmp(decode, "auto")) {
+    const AttentionDecodeEntry *found = NULL;
+    for (size_t i = 0; i < sizeof(attention_decode_table) / sizeof(*attention_decode_table); i++)
+      if (!strcmp(decode, attention_decode_table[i].name))
+        found = &attention_decode_table[i];
+    if (!found)
+      fail("LLAMA_ATTN_DECODE must be split or group");
+    if (!found->run)
+      fail("LLAMA_ATTN_DECODE=%s is not implemented yet (%s)", found->name, found->phase);
+    attention_decode_active = found;
+  }
+}
+
+void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                 AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position) {
+  attention_decode_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len,
+                               position);
+}
+
+void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m) {
+  attention_batch_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0,
+                              m);
 }
 
 // ----------------------------------------------------------------------------

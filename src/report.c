@@ -356,6 +356,10 @@ void write_report(void) {
     string(f, kernels_name());
   else
     fputs("null", f);
+  fputs(",\n    \"attention\": ", f);
+  string(f, kernels_name() ? kernels_attention_name() : NULL);
+  fputs(",\n    \"attention_decode\": ", f);
+  string(f, kernels_name() ? kernels_attention_decode_name() : NULL);
   fputs(",\n    \"amx_permission\": ", f);
   string(f, gemm_amx_permission());
   fputs(",\n    \"openmp_max_threads\": ", f);

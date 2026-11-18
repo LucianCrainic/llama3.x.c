@@ -35,6 +35,13 @@ const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after
  * two segments. Returns after every share has run. */
 int kernels_avx512_active(void);
 int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
+/* Attention variants (E1). kernels_init reads LLAMA_ATTN (batched, prefill: split|tiled|amx) and LLAMA_ATTN_DECODE
+ * (single row: split|group) once; split, the default, is the split-K kernel. A variant that is not built yet is refused
+ * with a message. The names are recorded in the run report. kernels_attention_select picks them directly (NULL leaves
+ * one unchanged) and returns 0 for an unknown or unimplemented name; tests use it to run every variant. */
+const char *kernels_attention_name(void);
+const char *kernels_attention_decode_name(void);
+int kernels_attention_select(const char *batch, const char *decode);
 typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
 void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
 
