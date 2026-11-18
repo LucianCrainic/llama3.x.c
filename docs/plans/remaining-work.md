@@ -46,7 +46,7 @@ names are fixed, then L8-L10. L8's decision should be made before L6 so the B7 m
 ### Status of 16 November 2026
 
 Done: K1 (job 5830324, 17 November: C5 BF16 gate fixed, C6 HF recorded), K2 (job 5830325: B5, B6 HF with two sockets), K4 including its HF gate (D1 jobs 5704689, 5704694, 5713378, 5837867), K5 except the long-context point (A6, job 5713411),
-K6 (C7, job 5713857), K7 (B7, jobs 5839003 and 5839004, 17 November: two sockets 1.26x to 1.99x one socket in 12 of 12 cells, 56 workers per socket best, packed4 not adopted; [results](../tensor-parallel.md)). K3 (F3 acceptance comparison) was not run: it needs the kernels campaign script and a second staged tree. The A6 long-context point is covered by B7's one-socket anon-HBM runs at 8192 tokens ([numa-placement.md](../numa-placement.md)). Open: K3, K8 (D2). Settings recommended for K8 from C7, D1 and B7: `D2_M1="avx512_fp32=128 amx_bf16=256 avx512_q8=256 amx_int8=256"`, `D2_M2="avx512_fp32=64 amx_bf16=256 avx512_q8=256 amx_int8=256"`, 56 workers per socket, `B7_THP`/`D_THP` off, `LLAMA_FP32_LAYOUT=rows`. Cluster jobs are
+K6 (C7, job 5713857), K7 (B7, jobs 5839003 and 5839004, 17 November: two sockets 1.26x to 1.99x one socket in 12 of 12 cells, 56 workers per socket best, packed4 not adopted; [results](../tensor-parallel.md)). K3 (F3 acceptance comparison) was not run: it needs the kernels campaign script and a second staged tree. The A6 long-context point is covered by B7's one-socket anon-HBM runs at 8192 tokens ([numa-placement.md](../numa-placement.md)). K8 (D2, jobs 5845031 and 5845032, 17 November; [results](../numa-tp-prefill-results.md)) closes M5. Open: K3 only (not needed by any other stage). Settings recommended for K8 from C7, D1 and B7: `D2_M1="avx512_fp32=128 amx_bf16=256 avx512_q8=256 amx_int8=256"`, `D2_M2="avx512_fp32=64 amx_bf16=256 avx512_q8=256 amx_int8=256"`, 56 workers per socket, `B7_THP`/`D_THP` off, `LLAMA_FP32_LAYOUT=rows`. Cluster jobs are
 submitted and analysed without a per-job go-ahead (owner's standing instruction of 16 November 2026).
 
 ## 2. Cluster stages (after §1)
@@ -93,12 +93,12 @@ above only keeps the **campaigns** (K5-K8) behind §1. K4 needs L2-L6.
 | K5 | A6 placement (`PHASE=A6`, 121 launches, `--time` extended) | ~4 h | K3 |
 | K6 | C7 one-socket prefill (`PHASE=C7`, `--time=06:00:00`) | **done 2026-11-09, job 5713857, 3 h 27 min** (staged weights, HF gate not run) | K1, K5 (anon HBM; else staged, recorded) |
 | K7 | B7 two-socket decode (`PHASE=B7`) | **done 2026-11-17, jobs 5839003 (1B, 33 min) and 5839004 (8B, 2 h 33 min)** | K2, K5, L6, L8 |
-| K8 | D2 final campaign (`PHASE=D2`) | 5-6 h | K4, K6, K7 |
+| K8 | D2 final campaign (`PHASE=D2`) | **done 2026-11-17, jobs 5845031 (1B, 27 min) and 5845032 (8B, 2 h 1 min)** | K4, K6, K7 |
 
 After each: results doc plus its `-validation` companion, the phase status line, the milestone table, and a commit
 citing date, node, compiler, job ID and commit (plans README §6.6).
 
 ## 3. Exit
 
-M4 closes with K4, M5 with K8 and the decisions of D2 §7. Items outside this list (BF16 checkpoints, KV tiering,
+M4 closed with K4, M5 with K8 (17 November 2026) and the decisions of D2 §7. Items outside this list (BF16 checkpoints, KV tiering,
 batched decode, exchange/compute overlap, AMX attention) stay in the results doc as candidates for a later plan.

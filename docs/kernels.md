@@ -325,10 +325,12 @@ recorded with the budget unchanged.
 
 ## Not in this change
 
-The following items from the roofline analysis are not kernel work:
+The following items from the roofline analysis are not kernel work. The first three were built and measured afterwards, as the
+NUMA / tensor-parallel / batched-prefill plan (results in [numa-tp-prefill-results.md](numa-tp-prefill-results.md), with
+[numa-placement.md](numa-placement.md), [tensor-parallel.md](tensor-parallel.md) and [batched-prefill.md](batched-prefill.md)):
 
-- explicit NUMA placement of weights (anonymous memory + `mbind`)
-- two-socket tensor parallelism
-- batched prefill, and with it AMX GEMM
-- skipping vocabulary logits for prompt positions
-- BF16 weight format
+- explicit NUMA placement of weights (anonymous memory + `mbind`): done, an option (verified in every run; A6 within 2.4% of staged on 8B FP32)
+- two-socket tensor parallelism: done, 1.54-1.91x one-socket decode in every cell measured (8B FP32 30.6 against 16.5 tok/s at a context of 512)
+- batched prefill, and with it AMX GEMM: done, 8B at 2048 tokens 17 tok/s per token to 722 (AMX-BF16) and 754 (AMX-INT8) on one socket, 1344 and 1332 on two
+- skipping vocabulary logits for prompt positions: done (`LLAMA_PREFILL_LOGITS=last`)
+- BF16 weight format: not done (BF16 is a load-time conversion, `LLAMA_PRECISION=bf16`; a BF16 checkpoint format is a candidate for a later plan)

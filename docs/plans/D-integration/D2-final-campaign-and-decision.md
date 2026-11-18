@@ -13,7 +13,7 @@ result:
 
 Prefill and decode are always measured and reported separately.
 
-Status: **planned**. Branch: `feature/integ-d2-final-campaign` (scripts and results
+Status: **run on 17 November 2026 (jobs 5845031 and 5845032, commit 8f3114f); every decision of section 7 recorded** in [`docs/numa-tp-prefill-results.md`](../../numa-tp-prefill-results.md). Branch: `feature/integ-d2-final-campaign` (scripts and results
 docs only).
 
 Results document skeleton (empty until the run): [`docs/numa-tp-prefill-results.md`](../../numa-tp-prefill-results.md) and its [validation record](../../numa-tp-prefill-results-validation.md).
