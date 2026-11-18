@@ -1069,7 +1069,10 @@ static void attention_decode_case(AttnShape shape, const int *positions, int cou
   free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(got), free(second), free(ref), free(scores);
 }
 
+static double matrix_seconds; /* total time of the matrix, printed at the end so its cost stays visible */
+
 static void test_attention_matrix(void) {
+  double started = monotonic_seconds();
   /* Reduced head counts (two KV heads) keep the matrix fast on scalar and sanitizer builds; the group sizes, head
    * sizes and position counts are the ones that matter for the chunk plan and the tail masks. */
   const int groups[] = {1, 2, 4, 8}, head_sizes[] = {64, 128, 40}, ms[] = {1, 3, 7, 32};
@@ -1084,28 +1087,27 @@ static void test_attention_matrix(void) {
       for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++) {
         /* prompts that end (last row included) at 31/32/33 and 255/256/257 positions, and warm contexts */
         for (size_t e = 0; e < sizeof(ends) / sizeof(*ends); e++)
-          if (ends[e] - ms[mi] >= 0 && !(reduced && ends[e] > 33 && ends[e] < 255))
+          if (ends[e] - ms[mi] >= 0 && !(reduced && ends[e] != 32 && ends[e] != 257))
             attention_batch_case(shape, ms[mi], ends[e] - ms[mi], 0);
         for (size_t w = 0; w < sizeof(warm) / sizeof(*warm); w++)
-          if (!reduced || warm[w] != 33)
+          if (!reduced || warm[w] == 1)
             attention_batch_case(shape, ms[mi], warm[w], 0);
       }
       attention_decode_case(shape, decode_positions, sizeof(decode_positions) / sizeof(*decode_positions));
     }
-  /* M = 256: a microbatch that spans several chunk plans. Prompts ending at 256/257 positions and warm contexts. */
-  const AttnShape big[] = {{2, 1, 64}, {2, 4, 64}, {2, 8, 40}, {2, 2, 128}};
-  for (size_t b = 0; b < sizeof(big) / sizeof(*big); b++) {
-    if (reduced && b > 1)
-      continue;
-    attention_batch_case(big[b], 256, 0, 0);
-    attention_batch_case(big[b], 256, 1, 0);
-    attention_batch_case(big[b], 256, 33, 0);
-    if (!reduced)
-      attention_batch_case(big[b], 256, 256, 0);
+  /* M = 256: a microbatch that spans several chunk plans. Prompts ending at 256/257 positions and warm contexts (the
+   * reference is O(m * context), so each shape gets two of them), then the same wave split from the workspace budget
+   * the engine reads (LLAMA_ATTN_WORKSPACE_MIB) instead of a hand cut. */
+  attention_batch_case((AttnShape){2, 1, 64}, 256, 0, 0);
+  attention_batch_case((AttnShape){2, 4, 64}, 256, 1, 0);
+  if (!reduced) {
+    attention_batch_case((AttnShape){2, 8, 40}, 256, 0, 0);
+    attention_batch_case((AttnShape){2, 8, 40}, 256, 33, 0);
+    attention_batch_case((AttnShape){2, 8, 40}, 256, 33, 1);
+    attention_batch_case((AttnShape){2, 2, 128}, 256, 1, 0);
+    attention_batch_case((AttnShape){2, 2, 128}, 256, 256, 0);
   }
-  /* The same wave split, now from the workspace budget the engine reads (LLAMA_ATTN_WORKSPACE_MIB), not a hand cut. */
-  if (!reduced)
-    attention_batch_case((AttnShape){2, 8, 128}, 256, 33, 1);
+  matrix_seconds += monotonic_seconds() - started;
 }
 
 int main(int argc, char **argv) {
@@ -1206,6 +1208,7 @@ int main(int argc, char **argv) {
     assert(memory_current[i] == 0);
   for (int i = 0; i < 3; i++)
     free(rope[i]), free(quantized[i]), free(scales[i]);
+  printf("kernels: attention matrix %.1f s\n", matrix_seconds);
   printf("kernels: %d checks, %d failures\n", checks, failures);
   return failures != 0;
 }

@@ -17,7 +17,13 @@
 #include <omp.h>
 #endif
 
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#if defined(KERNELS_EMULATE_AVX512)
+/* Test builds (make test-kernels-emul): the AVX-512 kernels of this file run on a scalar model of the intrinsics, so their
+ * code, masks and tails are exercised on any host. Only speed and the hardware's exact rounding stay with real AVX-512. */
+#define HAVE_AVX512 1
+#include "../tests/avx512_emul.h"
+#define AVX512
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define HAVE_AVX512 1
 #include <immintrin.h>
 #define AVX512 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,fma")))
@@ -49,7 +55,9 @@ static int supported(KernelIsa which) {
     return 1;
   if (which == KERNELS_AMX)
     return gemm_amx_unavailable() == NULL;
-#if HAVE_AVX512
+#if defined(KERNELS_EMULATE_AVX512)
+  return 1;
+#elif HAVE_AVX512
   __builtin_cpu_init();
   return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
          __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl") &&
