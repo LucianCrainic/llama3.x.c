@@ -160,6 +160,9 @@ void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int
  * att is the per-row scratch of the fallback path. */
 void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                        AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m);
+/* Test hook: the merge of `chunks` split-K partials [value sum (head_dim), maximum, sum] into one normalized row. A
+ * partial with maximum -FLT_MAX and sum 0 (a row with no position in that chunk, tiled attention) is skipped. */
+void k_attention_merge_partials(const float *base, size_t slot, int chunks, int head_dim, float *o);
 /* Test hook: the same driver with a portable chunk kernel, on any host. */
 void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
                                 AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,

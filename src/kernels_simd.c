@@ -222,9 +222,24 @@ static void parallel_rows(int rows, RowFn fn, const void *job) {
 }
 
 // ----------------------------------------------------------------------------
+// Split-K partials
+
+/* The partial of a chunk that holds no position of the row (tiled, E2): zero value sum, the lowest maximum, zero sum of
+ * exponentials. A real chunk always has sum >= 1 (its maximum contributes exp(0)), so the test cannot match one. */
+static int partial_empty(const float *chunk, int head_dim) {
+  return chunk[head_dim + 1] == 0.0f && chunk[head_dim] == -FLT_MAX;
+}
+
+// ----------------------------------------------------------------------------
 // AVX-512 helpers
 
 #if HAVE_AVX512
+static void partial_write_empty(float *o, int head_dim) {
+  memset(o, 0, (size_t)head_dim * sizeof(float));
+  o[head_dim] = -FLT_MAX;
+  o[head_dim + 1] = 0.0f;
+}
+
 AVX512 static inline __mmask16 tail_mask(int count) {
   return count >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << count) - 1u);
 }
@@ -600,6 +615,29 @@ AVX512 static void attention_chunk_avx512(const float *q, const float *kc, const
       _mm512_mask_storeu_ps(o + v * 16, v + 1 == vectors ? last : 0xFFFF, ov[v]);
     o[head_dim] = max_val;
     o[head_dim + 1] = _mm512_reduce_add_ps(vsum);
+  }
+}
+
+/* ---- E2: tiled batched attention -------------------------------------------------------------------------------------
+ * One task = one KV group, one chunk [t0, t1) of positions and a block of `nrows` consecutive rows (row r sees the
+ * positions below vis0 + r). The chunk is the same for every row of the block; a row sees only its own prefix of it, and
+ * a row with no position in the chunk writes an empty partial. */
+enum { TILED_POS = 32, TILED_MAX_Q = 16, TILED_MAX_CHUNK = 256 };
+
+AVX512 static void attention_tiled_avx512(const float *q, size_t q_row_stride, int nrows, int kv_mul, int head_dim,
+                                          int vis0, int t0, int t1, const float *kc, const float *vc, int kv_dim,
+                                          float *partial, size_t row_stride, size_t head_stride) {
+  float scores[TILED_MAX_Q * TILED_MAX_CHUNK];
+  for (int r = 0; r < nrows; r++) {
+    int end = t1 < vis0 + r ? t1 : vis0 + r;
+    float *o = partial + (size_t)r * row_stride;
+    if (end <= t0) {
+      for (int h = 0; h < kv_mul; h++)
+        partial_write_empty(o + (size_t)h * head_stride, head_dim);
+      continue;
+    }
+    attention_chunk_avx512(q + (size_t)r * q_row_stride, kc, vc, kv_dim, head_dim, kv_mul, t0, end, scores,
+                           (size_t)(end - t0), o, head_stride);
   }
 }
 #endif
@@ -1406,7 +1444,8 @@ static void attention_scalar(float *out, const float *q, const float *key_cache,
     attention_scalar_head(&job, h);
 }
 
-/* Merge chunk results: rescale each by exp(m_c - M) and normalize. `base` holds `chunks` slots of `slot` floats. */
+/* Merge chunk results: rescale each by exp(m_c - M) and normalize. `base` holds `chunks` slots of `slot` floats. Empty
+ * partials are skipped, so their value sum is never read. */
 static void merge_chunks(const float *base, size_t slot, int chunks, int head_dim, float *o) {
   float max_val = base[head_dim];
   for (int c = 1; c < chunks; c++)
@@ -1416,6 +1455,8 @@ static void merge_chunks(const float *base, size_t slot, int chunks, int head_di
   memset(o, 0, head_dim * sizeof(float));
   for (int c = 0; c < chunks; c++) {
     const float *chunk = base + c * slot;
+    if (partial_empty(chunk, head_dim))
+      continue; /* a row with no position in this chunk (tiled, E2); split never writes one, so it is unaffected */
     float weight = expf(chunk[head_dim] - max_val);
     sum += weight * chunk[head_dim + 1];
     for (int i = 0; i < head_dim; i++)
@@ -1423,6 +1464,10 @@ static void merge_chunks(const float *base, size_t slot, int chunks, int head_di
   }
   for (int i = 0; i < head_dim; i++)
     o[i] /= sum;
+}
+
+void k_attention_merge_partials(const float *base, size_t slot, int chunks, int head_dim, float *o) {
+  merge_chunks(base, slot, chunks, head_dim, o);
 }
 
 /* Opt-in per-task timing for the attention benchmark (E0). Unset (the default), a task costs one atomic load. */
@@ -1768,6 +1813,225 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
 }
 
 // ----------------------------------------------------------------------------
+// Tiled batched attention (E2)
+
+#if HAVE_AVX512
+/* Query vectors per task (rows of a block x heads of the group), at most TILED_MAX_Q; LLAMA_ATTN_TILED_QUERIES. */
+static int attention_tiled_queries = TILED_MAX_Q;
+
+typedef struct {
+  int g, block, chunk, cost;
+} TiledTask;
+
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  float *partial;
+  int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
+  int pos0, m, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch of m rows */
+  int rblock, chunks_wave, tasks;
+  const TiledTask *order; /* the tasks of the wave, in the order they are claimed */
+  size_t slot, head_stride, row_stride;
+  atomic_int next_task;
+  Team *team;
+} TiledJob;
+
+/* The chunk plan of a block of rows: chunk length (a multiple of the position tile) and chunk count. It depends only on
+ * the block's nominal last row, never on the wave that happens to contain the block, so results do not depend on how a
+ * microbatch is cut into waves. */
+static void tiled_plan(const TiledJob *j, int block, int *length, int *chunks) {
+  int end = (block + 1) * j->rblock < j->m ? (block + 1) * j->rblock : j->m, positions = j->pos0 + end;
+  int wanted = attention_chunks(positions, j->n_kv_heads, j->limit, j->workers);
+  int len = ((positions + wanted - 1) / wanted + TILED_POS - 1) / TILED_POS * TILED_POS;
+  *length = len;
+  *chunks = (positions + len - 1) / len;
+}
+
+/* What a task covers: the first and last row of its block that belong to the wave, and its chunk [t0, t1). */
+static void tiled_extent(const TiledJob *j, const TiledTask *t, int *first, int *last, int *t0, int *t1) {
+  int length, chunks;
+  tiled_plan(j, t->block, &length, &chunks);
+  int block_end = (t->block + 1) * j->rblock < j->m ? (t->block + 1) * j->rblock : j->m;
+  *first = t->block * j->rblock > j->row0 ? t->block * j->rblock : j->row0;
+  *last = block_end < j->row0 + j->rows ? block_end : j->row0 + j->rows;
+  *t0 = t->chunk * length;
+  *t1 = (t->chunk + 1) * length < j->pos0 + block_end ? (t->chunk + 1) * length : j->pos0 + block_end;
+}
+
+static void tiled_task(const TiledJob *j, const TiledTask *t) {
+  int first, last, t0, t1;
+  tiled_extent(j, t, &first, &last, &t0, &t1);
+  int h0 = t->g * j->kv_mul, rr = first - j->row0;
+  attention_tiled_avx512(j->q + (size_t)first * j->dim + (size_t)h0 * j->head_dim, (size_t)j->dim, last - first,
+                         j->kv_mul, j->head_dim, j->pos0 + first + 1, t0, t1,
+                         j->key_cache + (size_t)t->g * j->head_dim, j->value_cache + (size_t)t->g * j->head_dim,
+                         j->kv_dim,
+                         j->partial + (size_t)rr * j->row_stride + (size_t)h0 * j->head_stride + t->chunk * j->slot,
+                         j->row_stride, j->head_stride);
+}
+
+static void tiled_run(const TiledJob *j, int index, int worker) {
+  const TiledTask *t = &j->order[index];
+  AttentionTaskHook hook = atomic_load_explicit(&attention_task_hook, memory_order_acquire);
+  if (!hook) {
+    tiled_task(j, t);
+    return;
+  }
+  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .wave = j->row0, .task = index};
+  int first, last, t0, t1;
+  tiled_extent(j, t, &first, &last, &t0, &t1);
+  for (int row = first; row < last; row++) {
+    int end = t1 < j->pos0 + row + 1 ? t1 : j->pos0 + row + 1;
+    if (end > t0)
+      info.rows++, info.positions += end - t0;
+  }
+  info.span = t1 > t0 ? t1 - t0 : 0;
+  info.begin = monotonic_seconds();
+  tiled_task(j, t);
+  info.end = monotonic_seconds();
+  hook(attention_task_ctx, &info);
+}
+
+static void tiled_merge(const TiledJob *j, int item) {
+  int rr = item / j->n_heads, h = item % j->n_heads, row = j->row0 + rr, length, chunks;
+  tiled_plan(j, row / j->rblock, &length, &chunks);
+  merge_chunks(j->partial + (size_t)rr * j->row_stride + (size_t)h * j->head_stride, j->slot, chunks, j->head_dim,
+               j->out + (size_t)row * j->dim + (size_t)h * j->head_dim);
+}
+
+static void tiled_team(const void *p, int worker, int workers) {
+  TiledJob *j = (TiledJob *)p;
+  for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;)
+    tiled_run(j, task, worker);
+  team_barrier(j->team); /* every chunk of every row and head is in `partial` before any is merged */
+  int items = j->rows * j->n_heads;
+  for (int item = (int)((long long)items * worker / workers); item < (int)((long long)items * (worker + 1) / workers);
+       item++)
+    tiled_merge(j, item);
+}
+
+/* The tasks of a wave in the order they are claimed: the most positions first (the late row blocks, whose chunks are the
+ * longest), then late blocks, early chunks, low groups. Slots are disjoint, so the order never changes a result. */
+static int tiled_compare(const void *a, const void *b) {
+  const TiledTask *x = a, *y = b;
+  if (x->cost != y->cost)
+    return x->cost > y->cost ? -1 : 1;
+  if (x->block != y->block)
+    return x->block > y->block ? -1 : 1;
+  if (x->chunk != y->chunk)
+    return x->chunk < y->chunk ? -1 : 1;
+  return x->g - y->g;
+}
+
+static TiledTask *tiled_tasks(TiledJob *j) {
+  int block0 = j->row0 / j->rblock, block1 = (j->row0 + j->rows - 1) / j->rblock, count = 0;
+  TiledTask *list = NULL;
+  for (int pass = 0; pass < 2; pass++) {
+    if (pass) {
+      list = malloc((size_t)count * sizeof(*list));
+      if (!list)
+        fail("out of memory for the attention task list");
+      count = 0;
+    }
+    for (int block = block0; block <= block1; block++) {
+      int length, chunks;
+      tiled_plan(j, block, &length, &chunks);
+      int end = j->pos0 + ((block + 1) * j->rblock < j->m ? (block + 1) * j->rblock : j->m);
+      for (int g = 0; g < j->n_kv_heads; g++)
+        for (int c = 0; c < chunks; c++) {
+          if (pass) {
+            int span = (c + 1) * length < end ? length : end - c * length;
+            list[count] = (TiledTask){.g = g, .block = block, .chunk = c, .cost = span};
+          }
+          count++;
+        }
+    }
+  }
+  j->tasks = count;
+  qsort(list, (size_t)count, sizeof(*list), tiled_compare);
+  return list;
+}
+
+static void attention_tiled_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                   AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m) {
+  int kv_mul = n_heads / n_kv_heads, queries = attention_tiled_queries / kv_mul;
+  TiledJob job = {.out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
+                  .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .kv_mul = kv_mul,
+                  .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim, .limit = work->max_chunks,
+                  .workers = work->workers, .pos0 = pos0, .m = m, .rblock = queries < 1 ? 1 : queries,
+                  .slot = (size_t)head_dim + 2};
+  for (int row0 = 0; row0 < m;) {
+    /* A wave holds as many rows of partials as the workspace allows. The slots per head follow the plan of the last
+     * block of the wave; chunk counts only grow with the position. */
+    int rows = m - row0;
+    for (;;) {
+      job.row0 = row0, job.rows = rows;
+      int last_end = ((row0 + rows - 1) / job.rblock + 1) * job.rblock;
+      job.chunks_wave = attention_chunks(pos0 + (last_end < m ? last_end : m), n_kv_heads, job.limit, job.workers);
+      if (rows == 1 || (size_t)rows * n_heads * job.chunks_wave * job.slot <= work->capacity)
+        break;
+      rows = (int)(work->capacity / ((size_t)n_heads * job.chunks_wave * job.slot));
+      rows = rows < 1 ? 1 : rows;
+    }
+    job.head_stride = (size_t)job.chunks_wave * job.slot;
+    job.row_stride = (size_t)n_heads * job.head_stride;
+    TiledTask *order = tiled_tasks(&job);
+    job.order = order;
+    atomic_init(&job.next_task, 0);
+    job.team = current_team;
+    if (current_team) {
+      team_run(current_team, tiled_team, &job);
+    } else {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+      {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (int task = 0; task < job.tasks; task++)
+          tiled_run(&job, task, -1);
+#ifdef _OPENMP
+#pragma omp for
+#endif
+        for (int item = 0; item < job.rows * n_heads; item++)
+          tiled_merge(&job, item);
+      }
+    }
+    free(order);
+    row0 += rows;
+  }
+}
+#endif
+
+/* One note per process when `tiled` hands a call to `split`: the precision is the same, only the speed differs. */
+static void attention_tiled_fallback(const char *reason) {
+  static atomic_flag noted = ATOMIC_FLAG_INIT;
+  if (!atomic_flag_test_and_set(&noted))
+    LOG(LOG_INFO, "LLAMA_ATTN=tiled: %s, running split attention instead", reason);
+}
+
+static void attention_batch_tiled(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
+                                  int seq_len, int pos0, int m) {
+  if (m > 1) { /* a single row is the decode path, whatever the variant */
+#if HAVE_AVX512
+    if (isa != KERNELS_AVX512)
+      attention_tiled_fallback("the AVX-512 kernels are not active");
+    else if (head_dim > 256 || n_heads / n_kv_heads > TILED_MAX_Q)
+      attention_tiled_fallback("head_dim above 256 or more than 16 query heads per KV head is not supported");
+    else if (batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
+      attention_tiled_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m);
+      return;
+    }
+#else
+    attention_tiled_fallback("the AVX-512 kernels are not built");
+#endif
+  }
+  attention_batch_split(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m);
+}
+
+// ----------------------------------------------------------------------------
 // Attention variant dispatch (E1)
 
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
@@ -1793,7 +2057,7 @@ typedef struct {
 
 static const AttentionBatchEntry attention_batch_table[] = {
     {"split", attention_batch_split, NULL},
-    {"tiled", NULL, "E2/E3"},
+    {"tiled", attention_batch_tiled, NULL},
     {"amx", NULL, "E2/E3"},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
