@@ -19,7 +19,8 @@ BUILD = Path(os.environ['BUILD_DIR']).resolve() if os.environ.get('BUILD_DIR') e
 # Knobs the campaign scripts read from the environment. A test that runs a script starts from the caller's environment
 # without them, so a run inside a campaign job (which exports BASELINE_ROOT, STAGE, MODELS and so on) sees what it sets.
 CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOKENS', 'CONTEXT', 'CPU_BIND', 'D2_M1', 'D2_M2',
-                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'GATES_ONLY',
+                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'E4_AMX', 'E4_ATTN',
+                  'E4_RUNGS', 'E4_TILED_ENV', 'GATES_ONLY',
                   'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
                   'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
                   'WARM'}
@@ -1009,6 +1010,213 @@ class CheckPlacementTests(unittest.TestCase):
             code, out = self.run_tool(report, *self.ARGS)
             self.assertEqual(code, 1, (name, out))
             self.assertIn('FAIL', out, name)
+
+
+class SummarizeE4Tests(unittest.TestCase):
+    """tools/summarize_e4.py bench and checks on small synthetic report directories."""
+
+    @staticmethod
+    def report(ttft=None, decode=None, share=None, status='completed', verified='full'):
+        report = dict(status=status, runtime=dict(placement='hbm'),
+                      regions=[dict(role='weights', verified=verified, pages_mismatched=0, pages_missing=0, bytes=1 << 30)],
+                      timing_seconds=dict(time_to_first_token=ttft), throughput_tokens_per_second=dict(decode=decode))
+        if share is not None:
+            report['profile_seconds'] = dict(prefill=dict(forward=10.0, attention=10.0 * share))
+        return report
+
+    @classmethod
+    def write(cls, root, model, kernel, m, prompt, sockets, attn, ttfts, decodes=None, share=None, **extra):
+        base = f'{model}-fp32-teams-hbm-s{sockets}-t56-m{m}-p{prompt}-k{kernel}'
+        for rep, ttft in enumerate(ttfts, 1):
+            decode = (decodes or [5.0] * len(ttfts))[rep - 1]
+            (Path(root)/f'{base}-xattn{attn}-{rep}.json').write_text(json.dumps(cls.report(ttft, decode, **extra)))
+        if share is not None:
+            (Path(root)/f'{base}-xprof{attn}-1.json').write_text(json.dumps(cls.report(1.0, share=share)))
+
+    def bench(self, root):
+        result = subprocess.run([sys.executable, str(TOOLS/'summarize_e4.py'), 'bench', str(root)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def populate(self, root, tiled8192=(19.2, 20.4, 20.6), tiled2048=(4.4, 4.5, 4.6), decode_tiled=(5.0, 5.1, 5.2),
+                 verified='full'):
+        def w(*args, **kwargs):
+            self.write(root, *args, **kwargs)
+        w('m8b', 'amx_bf16', 256, 8192, 1, 'split', [30.6, 30.9, 31.2], [5.0, 5.1, 5.2], share=0.75)
+        w('m8b', 'amx_bf16', 256, 8192, 1, 'tiled', list(tiled8192), list(decode_tiled), share=0.40, verified=verified)
+        w('m8b', 'amx_bf16', 256, 8192, 2, 'split', [14.0, 14.2, 14.4], [6.0, 6.1, 6.2])
+        w('m8b', 'amx_bf16', 256, 8192, 2, 'tiled', [10.0, 10.1, 10.2], [6.0, 6.1, 6.2])
+        w('m8b', 'amx_bf16', 256, 2048, 1, 'split', [4.5, 4.6, 4.7], [5.0, 5.1, 5.2], share=0.30)
+        w('m8b', 'amx_bf16', 256, 2048, 1, 'tiled', list(tiled2048), [5.0, 5.1, 5.2], share=0.15)
+        w('m1b', 'avx512_fp32', 64, 8192, 1, 'split', [9.0, 9.1, 9.2])
+        w('m1b', 'avx512_fp32', 64, 8192, 1, 'tiled', [7.0, 7.1, 7.2])
+
+    def test_matrix_and_passing_gates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.populate(temp)
+            out = self.bench(temp)
+        row = [line for line in out.splitlines() if line.startswith('| m8b | amx_bf16 | 256 | 8192 | 1 | tiled')][0]
+        cells = [c.strip() for c in row.strip('|').split('|')]
+        self.assertEqual(cells[6], '3')
+        self.assertEqual(cells[7], '20.400 [19.200-20.600]')  # median and range of TTFT
+        self.assertEqual(cells[8], '1.51x')  # 30.9 / 20.4
+        self.assertEqual(cells[9], '40%')  # attention share of the profiled repeat
+        self.assertEqual(cells[10], '5.1 [5.0-5.2]')
+        split = [line for line in out.splitlines() if line.startswith('| m8b | amx_bf16 | 256 | 8192 | 1 | split')][0]
+        self.assertIn('| 75% |', split)
+        self.assertIn('Value gate (the amx_bf16 rung): **PASS**', out)
+        self.assertIn('| yes | PASS |', out)  # slowest tiled repeat 20.6 < fastest split repeat 30.6: beyond variability
+        self.assertIn('2048 gate: **PASS**', out)
+        self.assertIn('Decode gate: **PASS**', out)
+        self.assertIn('Placement gate: **PASS**', out)
+        self.assertIn('| m8b | amx_bf16 | 256 | 8192 | tiled | 20.400 [19.200-20.600] | 10.100 [10.000-10.200] | 2.02x |', out)
+        self.assertIn('- value: PASS', out)
+
+    def test_each_gate_fails_on_its_own_condition(self):
+        for name, kwargs, text in [
+                ('value', dict(tiled8192=(25.0, 25.5, 26.0)), 'Value gate (the amx_bf16 rung): **FAIL**'),
+                ('2048', dict(tiled2048=(4.8, 4.9, 5.0)), '2048 gate: **FAIL**'),
+                ('decode', dict(decode_tiled=(4.0, 4.1, 4.2)), 'Decode gate: **FAIL**'),
+                ('placement', dict(verified='sampled'), 'Placement gate: **FAIL**')]:
+            with self.subTest(gate=name), tempfile.TemporaryDirectory() as temp:
+                self.populate(temp, **kwargs)
+                out = self.bench(temp)
+                self.assertIn(text, out)
+                self.assertEqual(out.count('**FAIL**'), 1, out)  # the other gates are not affected
+
+    def test_overlapping_ranges_are_not_beyond_variability(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.populate(temp, tiled8192=(19.2, 20.4, 31.0))  # the slowest tiled repeat is above the fastest split one (30.6)
+            out = self.bench(temp)
+        self.assertIn('| no | PASS |', out)
+
+    def test_empty_directory_and_failed_runs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertIn('No E4 reports', self.bench(temp))
+            self.write(temp, 'm8b', 'amx_bf16', 256, 8192, 1, 'split', [30.0, 31.0])
+            self.write(temp, 'm8b', 'amx_bf16', 256, 8192, 1, 'tiled', [None], status='error')
+            out = self.bench(temp)
+        self.assertIn('(1 failed)', out)
+        self.assertIn('Placement gate: **FAIL**', out)
+        self.assertIn('- value: no data', out)
+
+    def test_checks_title_and_failure_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            summary = dict(max_abs=0.0005, argmax_agreement=1.0)
+            good = dict(passed=True, summary=summary, budget=dict(max_abs=1e-3, argmax_agreement=1.0))
+            (Path(temp)/'compare-m8b-fp32-e4-tiled-m64-prompt2048.json').write_text(json.dumps(good))
+
+            def run():
+                return subprocess.run([sys.executable, str(TOOLS/'summarize_e4.py'), 'checks', temp], capture_output=True, text=True)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('# E4 correctness', result.stdout)
+            self.assertIn('| m8b-fp32-e4-tiled-m64-prompt2048 | max 0.001, argmax 100% |', result.stdout)
+            (Path(temp)/'compare-m8b-fp32-e4-bad.json').write_text(json.dumps(dict(good, passed=False)))
+            self.assertEqual(run().returncode, 1)
+
+
+class PhaseE4DryRunTests(unittest.TestCase):
+    """phase_E4 prints its matrix and its gates without running anything (DRY_RUN=1)."""
+
+    def run_phase(self, stage, **extra):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E4', 'STAGE': stage, 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts/cresco8-prefill.sbatch')], env=env, capture_output=True, text=True,
+                                    timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return result.stdout.splitlines()
+
+    def runs(self, stage='bench', **extra):
+        from summarize_campaign import parse_label
+        runs = [line for line in self.run_phase(stage, **extra) if line.startswith('RUN ')]
+        for line in runs:
+            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
+        return runs
+
+    def test_bench_matrix(self):
+        runs = self.runs()
+        self.assertEqual(len(runs), 256)  # 2 models x 8 rung-variant pairs x 2 prompts x 2 sockets x (3 repeats + 1 profile)
+        timed = [line for line in runs if '-xattn' in line]
+        self.assertEqual(len(timed), 192)
+        self.assertTrue(all('gen=32' in line for line in timed))
+        profiled = [line for line in runs if '-xprof' in line]
+        self.assertEqual(len(profiled), 64)
+        self.assertTrue(all('LLAMA_PROFILE=1' in line and 'gen=1 ' in line for line in profiled))
+        self.assertFalse(any('LLAMA_PROFILE=1' in line for line in timed))
+        self.assertEqual({line.split('-s')[1][0] for line in runs}, {'1', '2'})
+        self.assertEqual({line.split('-p')[1].split('-')[0] for line in runs}, {'2048', '8192'})
+        self.assertEqual({line.split('-m')[1].split('-')[0] for line in runs}, {'64', '128', '256'})
+        self.assertFalse(any('LLAMA_ATTN=amx' in line for line in runs))
+        self.assertTrue(all('LLAMA_SOCKETS=2' in line for line in runs if '-s2-' in line))
+        self.assertTrue(all('cpu=0 ' in line for line in runs if '-s1-' in line))
+        self.assertTrue(all('LLAMA_PLACEMENT=hbm' in line for line in runs))
+        self.assertTrue(all('LLAMA_KERNELS=amx' in line for line in runs if 'kamx_int8' in line))
+
+    def test_amx_only_on_the_bf16_rung_and_only_when_opted_in(self):
+        runs = self.runs(E4_AMX='1')
+        self.assertEqual(len(runs), 288)
+        amx = [line for line in runs if 'LLAMA_ATTN=amx' in line]
+        self.assertEqual(len(amx), 32)  # 2 models x 2 prompts x 2 sockets x 4 runs
+        self.assertTrue(all('kamx_bf16' in line and 'LLAMA_PRECISION=bf16' in line for line in amx))
+        self.assertTrue(all('-xattnamx-' not in line or 'kamx_bf16' in line for line in runs))
+
+    def test_attention_list_and_tiled_knob_are_overridable(self):
+        knob = 'LLAMA_ATTN_TILED_QUERIES=8 LLAMA_ATTN_TILED_ORDER=natural'
+        runs = self.runs(E4_ATTN='tiled', E4_TILED_ENV=knob)
+        self.assertEqual(len(runs), 128)
+        self.assertTrue(all(line.endswith(f'LLAMA_ATTN=tiled {knob}') for line in runs))
+        both = self.runs(E4_TILED_ENV='LLAMA_ATTN_TILED_QUERIES=8')
+        self.assertTrue(all('TILED_QUERIES' not in line for line in both if 'LLAMA_ATTN=split' in line))
+        self.assertEqual(sum('TILED_QUERIES=8' in line for line in both), 128)
+        self.assertEqual(len(self.runs(REPEATS='1')), 128)  # (1 repeat + 1 profile) x 32 cells x 2 models
+
+    def test_check_gates_every_variant(self):
+        lines = self.run_phase('check')
+        names = [line.split()[1] for line in lines if line.startswith('EXPECT ')]
+        self.assertEqual(len(names), 42)
+        for model in ('m1b', 'm8b'):
+            for attn in ('split', 'tiled'):
+                for case in (f'compare-{model}-fp32-e4-{attn}-m64-prompt86', f'compare-{model}-fp32-e4-{attn}-m64-prompt2048',
+                             f'compare-{model}-fp32-e4-{attn}-m128-prompt2048', f'compare-{model}-fp32-e4-s2-{attn}-m64-prompt2048',
+                             f'compare-{model}-fp32-e4-s2-bf16-{attn}-m256-prompt2048',
+                             f'compare-{model}-int8-e4-s2-w8a8-{attn}-m256-prompt2048',
+                             f'gen-fp32-e4-{model}-2048-{attn}-s1-vs-s2-1', f'gen-fp32-e4-{model}-short-{attn}-s1-vs-s2-1'):
+                    self.assertIn(case, names)
+            self.assertIn(f'compare-{model}-fp32-e4-bf16-tiled-vs-split-prompt86', names)
+            self.assertIn(f'compare-{model}-int8-e4-w8a8-tiled-vs-split-prompt2048', names)
+            self.assertIn(f'gen-fp32-e4-{model}-2048-split-vs-tiled-1', names)
+            self.assertNotIn(f'compare-{model}-fp32-e4-bf16-split-vs-split-prompt86', names)
+        self.assertFalse(any('amx' in name for name in names))
+        self.assertNotIn('LLAMA_ATTN=amx', '\n'.join(lines))
+        # FP32 strict against the one-socket per-token reference, BF16 and W8A8 their statistical gates, two sockets checked
+        fp32 = [line for line in lines if line.startswith('EXPECT compare-m8b-fp32-e4-tiled-m64-prompt2048')][0]
+        self.assertIn('--max-abs 1e-3 --batch-a 1 --batch-b 64 --last-only', fp32)
+        two = [line for line in lines if line.startswith('EXPECT compare-m8b-fp32-e4-s2-tiled-m64')][0]
+        self.assertIn('--env-b LLAMA_SOCKETS=2 --env-b LLAMA_TP_CHECK=1', two)
+        self.assertIn('--env-a LLAMA_SOCKETS=1', two)
+        self.assertIn('--max-abs 2 --rms-max 0.05 --argmax-min 0.97', [x for x in lines if 'e4-bf16-tiled-vs-split-prompt86' in x][0])
+        self.assertIn('--max-abs 16 --rms-max 0.2', [x for x in lines if 'e4-w8a8-tiled-vs-split-prompt2048' in x][0])
+        self.assertIn('--env-a LLAMA_ATTN=split', [x for x in lines if 'gen-fp32-e4-m8b-2048-split-vs-tiled' in x][0])
+
+    def test_check_with_amx_and_the_tiled_knob(self):
+        lines = self.run_phase('check', E4_AMX='1', E4_TILED_ENV='LLAMA_ATTN_TILED_QUERIES=8')
+        names = [line.split()[1] for line in lines if line.startswith('EXPECT ')]
+        self.assertEqual(len(names), 56)
+        amx = [name for name in names if 'amx' in name]
+        self.assertEqual(len(amx), 14)  # per model: bf16 against split x 2, two sockets, and 4 generation comparisons
+        self.assertTrue(all('bf16' in name for name in amx))
+        self.assertIn('gen-bf16-e4-m8b-2048-split-vs-amx-1', names)
+        for line in lines:
+            if line.startswith('EXPECT ') and 'LLAMA_ATTN=tiled' in line:
+                self.assertIn('LLAMA_ATTN_TILED_QUERIES=8', line)
+
+    def test_models_empty_is_recorded(self):
+        lines = self.run_phase('bench', MODELS='')
+        self.assertTrue(any('no E4 run was made' in line for line in lines))
 
 
 if __name__ == '__main__':
