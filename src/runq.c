@@ -438,7 +438,7 @@ static float *forward(Transformer *t, int token, int pos) {
   return forward_logits(t, s);
 }
 
-float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want) {
+static float *forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want) {
   prefill_validate(model, tokens, count, pos0, want);
   Transformer *t = model->implementation;
   Config *p = &t->config;
@@ -569,7 +569,14 @@ float *engine_forward(Model *model, int token, int position) {
   if (token < 0 || token >= model->config.vocab_size || position < 0 || position >= model->config.seq_len)
     fail("forward input out of range: token=%d position=%d", token, position);
   Transformer *t = model->implementation;
-  return t->tp ? tp_forward(t->tp, token, position) : forward(t, token, position);
+  float *logits = t->tp ? tp_forward(t->tp, token, position) : forward(t, token, position);
+  park_if_failing();
+  return logits;
+}
+float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want) {
+  float *logits = forward_batch(model, tokens, count, pos0, want);
+  park_if_failing();
+  return logits;
 }
 void engine_free(Model *model) {
   if (model->implementation) {

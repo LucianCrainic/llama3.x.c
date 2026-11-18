@@ -27,6 +27,10 @@ void log_message(LogLevel level, const char *format, ...);
       log_message(level, __VA_ARGS__);                                                                                 \
   } while (0)
 _Noreturn void fail(const char *format, ...);
+/* fail() releases every wait of the pool and the exchange (workers_abort) before its exit handlers run, so another
+ * thread can come back from a forward pass with results nothing computed while the process is ending. The engines
+ * call this before handing logits out: if a fail() is under way, the caller parks until the process exits. */
+void park_if_failing(void);
 extern char failure_message[512];
 
 /* Allocator categories are the future memory-placement boundary. Mapped weights

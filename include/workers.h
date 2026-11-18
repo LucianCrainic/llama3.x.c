@@ -65,7 +65,7 @@ int team_affinity_verified(const Team *team);
 typedef struct Exchange Exchange;
 
 /* Bytes a socket's partial buffers occupy; a region passed to exchange_create must hold at least this. */
-size_t exchange_region_bytes(int elements_max);
+size_t exchange_region_bytes(size_t elements_max);
 /* Needs a started pool with two teams. socket_regions[s] (NULL, or NULL entries = heap) holds socket s's buffers
  * and is owned by the caller, who releases it only after exchange_destroy. */
 Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2]);
