@@ -1285,8 +1285,9 @@ e2_bench() {
     done
     e0_collect "bench-$attn.jsonl" "bench-$attn-*.out"
   done
-  # (2) the tiled knobs on the two cells that matter; every collected line carries its knobs.
-  for cell in 8192:256 2048:64; do
+  # (2) the tiled knobs on the two cells that matter (E2_SWEEP_CELLS="PROMPT:M ..." overrides them); every collected line
+  # carries its knobs.
+  for cell in ${E2_SWEEP_CELLS:-8192:256 2048:64}; do
     n=${cell%:*} m=${cell#*:}
     for q in 4 8 16; do
       for order in longest natural; do

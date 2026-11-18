@@ -40,9 +40,10 @@ static int initialized;
 enum { BATCH_MAX_ROW_BLOCK = 16 };
 static int attention_row_block = 4;
 /* E2 tiled attention: query vectors per task (rows of a block x heads of the group, 1..16, LLAMA_ATTN_TILED_QUERIES) and
- * whether the tasks of a wave are claimed longest first (LLAMA_ATTN_TILED_ORDER=longest|natural). Neither changes how a
+ * whether the tasks of a wave are claimed in plan order (default, LLAMA_ATTN_TILED_ORDER=natural) or longest first
+ * (longest; E2 bench: natural was faster at 2048 and 8192 tokens). Neither changes how a
  * row is computed once its block is fixed; the block size sets the chunk plan, the order only the schedule. */
-static int attention_tiled_queries = 16, attention_tiled_longest_first = 1;
+static int attention_tiled_queries = 16, attention_tiled_longest_first = 0;
 /* With a team set, kernels run on it instead of opening OpenMP regions. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
@@ -130,7 +131,7 @@ void kernels_init(void) {
     attention_row_block = (int)value;
   }
   const char *queries = getenv("LLAMA_ATTN_TILED_QUERIES"), *order = getenv("LLAMA_ATTN_TILED_ORDER");
-  attention_tiled_queries = 16, attention_tiled_longest_first = 1;
+  attention_tiled_queries = 16, attention_tiled_longest_first = 0;
   if (queries && *queries) {
     char *end;
     long value = strtol(queries, &end, 10);
