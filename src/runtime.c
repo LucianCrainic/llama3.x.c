@@ -40,15 +40,19 @@ void log_message(LogLevel level, const char *format, ...) {
   fputc('\n', stderr);
 }
 
+/* The thread that owns a fail() is ending the process; any other thread waits here for that. */
+static _Noreturn void park_until_exit(void) {
+  for (;;)
+    pause();
+}
+
 _Noreturn void fail(const char *format, ...) {
   /* Attention heads can discover the same corrupt input concurrently. Exactly
    * one thread owns fatal diagnostics and exit handlers; other failing workers
    * wait for process termination instead of truncating the report again. */
   static atomic_flag fatal_started = ATOMIC_FLAG_INIT;
-  if (atomic_flag_test_and_set_explicit(&fatal_started, memory_order_relaxed)) {
-    for (;;)
-      pause();
-  }
+  if (atomic_flag_test_and_set_explicit(&fatal_started, memory_order_relaxed))
+    park_until_exit();
   workers_abort(); /* wait loops must not spin on memory the exit handlers release */
   va_list args;
   va_start(args, format);
@@ -56,6 +60,11 @@ _Noreturn void fail(const char *format, ...) {
   va_end(args);
   log_message(LOG_ERROR, "%s", failure_message);
   exit(EXIT_FAILURE);
+}
+
+void park_if_failing(void) {
+  if (workers_aborted())
+    park_until_exit();
 }
 
 size_t checked_mul(size_t a, size_t b) {

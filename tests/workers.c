@@ -353,8 +353,15 @@ static void exchange_case(const ExchangeCase *c) {
   if (c->fail_at)
     pthread_detach(thread); /* fail() ends the process; nothing joins the coordinator of socket 1 */
   run_side(&side[0]);
-  if (!c->fail_at)
-    pthread_join(thread, NULL);
+  if (c->fail_at) {
+    /* Socket 1 failed: its fail() released socket 0's waits (workers_abort), so socket 0 may come back with garbage
+     * before exit(1) has finished. The process must end from there; if it does not, that is the failure. */
+    for (int i = 0; i < 20; i++)
+      sleep(1);
+    fprintf(stderr, "fail() on socket 1 did not end the process\n");
+    exit(4);
+  }
+  pthread_join(thread, NULL);
   for (int g = 1; g <= c->generations; g++)
     for (int i = 0; i < gen_elements(&side[0], (unsigned)g); i++)
       reference[i] += partial_value(1234, (unsigned)g, 0, i) + partial_value(1234, (unsigned)g, 1, i);

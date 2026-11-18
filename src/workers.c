@@ -360,10 +360,10 @@ struct Exchange {
   double phase_seconds[2][5];
 };
 
-size_t exchange_region_bytes(int elements_max) {
+size_t exchange_region_bytes(size_t elements_max) {
   size_t line = 64 / sizeof(float);
-  size_t stride = (((size_t)elements_max + line - 1) / line) * line;
-  return 3 * stride * sizeof(float); /* two partial buffers, then one generation flag per row */
+  size_t stride = checked_mul(checked_add(elements_max, line - 1) / line, line);
+  return checked_mul(3 * sizeof(float), stride); /* two partial buffers, then one generation flag per row */
 }
 
 Exchange *exchange_create(int elements_max, NumaRegion *const socket_regions[2]) {

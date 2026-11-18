@@ -756,7 +756,7 @@ size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
 }
 
 size_t tp_exchange_bytes(const Config *p, int rows) {
-  return exchange_region_bytes(rows * p->dim);
+  return exchange_region_bytes(checked_mul((size_t)rows, (size_t)p->dim));
 }
 
 size_t tp_exchange_payload_bytes(const Config *p, int rows) {
@@ -1066,7 +1066,7 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     if (repack_bytes)
       region_reserve(&sk->repack, repack_bytes, s, node, ROLE_PACKED, thp);
     region_reserve(&sk->work, work_bytes(tp), s, node, ROLE_WORK, 0);
-    region_reserve(&sk->exchange, exchange_region_bytes(tp->rows * p->dim), s, node, ROLE_WORK, 0);
+    region_reserve(&sk->exchange, tp_exchange_bytes(p, tp->rows), s, node, ROLE_WORK, 0);
     exchange_regions[s] = &sk->exchange;
     region_mark_populated(&sk->kv_k);
     region_mark_populated(&sk->kv_v);
