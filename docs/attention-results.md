@@ -78,6 +78,8 @@ the non-FMA work around the FMAs: transposes, loads, max and exp of the online s
 | 2048, 64 | 18.03 [16.74-21.33] | **17.54 [15.53-19.60]** | 20-23 | 35-42 |
 
 - 16 query vectors per task is clearly best, so the default stays.
+- After this run the default task order was changed to `natural` (owner decision with E3, 2026-11-18). A rerun confirms it, with
+  small-prompt M 16 cells added to the sweep.
 - Natural task order beats longest-first by 8% at 8192. The ranges overlap at their top ends, so this is not yet beyond
   variability. E0 found the tail under 1% at 8192, so ordering has little to fix there, and the longest-first sort seems
   to cost locality. Task order does not change any numbers, because each task writes its own partial.

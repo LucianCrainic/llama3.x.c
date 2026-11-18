@@ -19,7 +19,7 @@ BUILD = Path(os.environ['BUILD_DIR']).resolve() if os.environ.get('BUILD_DIR') e
 # Knobs the campaign scripts read from the environment. A test that runs a script starts from the caller's environment
 # without them, so a run inside a campaign job (which exports BASELINE_ROOT, STAGE, MODELS and so on) sees what it sets.
 CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOKENS', 'CONTEXT', 'CPU_BIND', 'D2_M1', 'D2_M2',
-                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'GATES_ONLY',
+                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'E2_SWEEP_CELLS', 'GATES_ONLY',
                   'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
                   'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
                   'WARM'}
