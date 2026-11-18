@@ -39,6 +39,10 @@ static int initialized;
  * bitwise independent of it. */
 enum { BATCH_MAX_ROW_BLOCK = 16 };
 static int attention_row_block = 4;
+/* E2 tiled attention: query vectors per task (rows of a block x heads of the group, 1..16, LLAMA_ATTN_TILED_QUERIES) and
+ * whether the tasks of a wave are claimed longest first (LLAMA_ATTN_TILED_ORDER=longest|natural). Neither changes how a
+ * row is computed once its block is fixed; the block size sets the chunk plan, the order only the schedule. */
+static int attention_tiled_queries = 16, attention_tiled_longest_first = 1;
 /* With a team set, kernels run on it instead of opening OpenMP regions. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
@@ -124,6 +128,20 @@ void kernels_init(void) {
     if (*end || value < 1 || value > BATCH_MAX_ROW_BLOCK)
       fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
     attention_row_block = (int)value;
+  }
+  const char *queries = getenv("LLAMA_ATTN_TILED_QUERIES"), *order = getenv("LLAMA_ATTN_TILED_ORDER");
+  attention_tiled_queries = 16, attention_tiled_longest_first = 1;
+  if (queries && *queries) {
+    char *end;
+    long value = strtol(queries, &end, 10);
+    if (*end || value < 1 || value > 16)
+      fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
+    attention_tiled_queries = (int)value;
+  }
+  if (order && *order) {
+    if (strcmp(order, "longest") && strcmp(order, "natural"))
+      fail("LLAMA_ATTN_TILED_ORDER must be longest or natural");
+    attention_tiled_longest_first = !strcmp(order, "longest");
   }
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
@@ -1837,6 +1855,13 @@ static void attention_chunk_portable(const float *q, const float *kc, const floa
 
 enum { BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
 
+void k_attention_set_tiled(int queries, int longest_first) {
+  if (queries < 1 || queries > 16)
+    fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
+  attention_tiled_queries = queries;
+  attention_tiled_longest_first = longest_first != 0;
+}
+
 void k_attention_set_row_block(int rows) {
   if (rows < 1 || rows > BATCH_MAX_ROW_BLOCK)
     fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
@@ -2021,9 +2046,6 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
 // Tiled batched attention (E2)
 
 #if HAVE_AVX512
-/* Query vectors per task (rows of a block x heads of the group), at most TILED_MAX_Q; LLAMA_ATTN_TILED_QUERIES. */
-static int attention_tiled_queries = TILED_MAX_Q;
-
 typedef struct {
   int g, block, chunk, cost;
 } TiledTask;
@@ -2153,7 +2175,8 @@ static TiledTask *tiled_tasks(TiledJob *j) {
     }
   }
   j->tasks = count;
-  qsort(list, (size_t)count, sizeof(*list), tiled_compare);
+  if (attention_tiled_longest_first)
+    qsort(list, (size_t)count, sizeof(*list), tiled_compare);
   return list;
 }
 

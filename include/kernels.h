@@ -175,6 +175,10 @@ void k_attention_free(AttentionWork *work);
  * rows of a block are computed independently, so the results are bitwise the same for every value. */
 void k_attention_set_row_block(int rows);
 int k_attention_row_block(void);
+/* Tiled attention (LLAMA_ATTN=tiled): query vectors per task, 1..16 (default 16; a block is that many divided by the heads
+ * of a KV group, rows), and whether a wave's tasks are claimed longest first (default) or in plan order. Diagnostic knobs
+ * for the sweep: the order never changes a result bit; the block size changes the chunk plan, so results move by rounding. */
+void k_attention_set_tiled(int queries, int longest_first);
 /* Opt-in timing of the attention tasks for tests/attention_bench.c: while a hook is set, every (kv group, chunk[, row
  * block]) task reports who ran it, what it read and when (monotonic_seconds). The hook runs on the worker threads; set and
  * clear it between kernel calls. With no hook (the default) the kernels are unchanged. */

@@ -1213,6 +1213,76 @@ static void test_attention_forced_plans(void) {
   attn_force_workers = 0;
 }
 
+/* E2 knobs: every block size matches the reference through the whole matrix harness, and the claim order of the tasks
+ * (longest first or in plan order) changes nothing bit for bit, also with several waves and with the hook set. */
+static atomic_long hook_tasks, hook_positions;
+static void count_task(void *ctx, const AttentionTaskInfo *info) {
+  (void)ctx;
+  atomic_fetch_add(&hook_tasks, 1);
+  atomic_fetch_add(&hook_positions, info->positions);
+}
+
+static void test_attention_tiled_knobs(void) {
+  const int queries[] = {1, 3, 4, 8, 16};
+  for (size_t i = 0; i < sizeof(queries) / sizeof(*queries); i++) {
+    k_attention_set_tiled(queries[i], 1);
+    attn_force_workers = 6;
+    attention_batch_case((AttnShape){2, 4, 64}, 13, 61, 0);
+    attention_batch_case((AttnShape){2, 2, 40}, 9, 33, 0);
+    attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
+    attn_force_workers = 0;
+  }
+  const AttnShape shapes[] = {{2, 4, 64}, {2, 2, 128}, {2, 1, 40}};
+  for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
+    int heads = shapes[sh].kv_heads * shapes[sh].group, kv_heads = shapes[sh].kv_heads, hd = shapes[sh].hd;
+    int m = 21, pos0 = 200, seq = pos0 + m, workers = 6;
+    size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+    float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+    float *vc = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+    float *want = zeroed(m * dim, sizeof(float)), *got = zeroed(m * dim, sizeof(float));
+    fill(q, m * dim, 2), fill(kc, seq * kv_dim, 2), fill(vc, seq * kv_dim, 1);
+    AttentionWork work;
+    k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
+    k_attention_free(&work);
+    work.workers = workers, work.max_chunks = (workers + kv_heads - 1) / kv_heads > (seq + 255) / 256
+                                                  ? (workers + kv_heads - 1) / kv_heads
+                                                  : (seq + 255) / 256;
+    size_t one_row = (size_t)heads * work.max_chunks * (hd + 2);
+    work.partial = zeroed(m * one_row, sizeof(float)), work.external = 1;
+    for (int pass = 0; pass < 2; pass++) {
+      work.capacity = pass ? 3 * one_row : m * one_row; /* pass 1: waves of three rows */
+      assert(kernels_attention_select("tiled", NULL));
+      k_attention_set_tiled(16, 1);
+      k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      k_attention_set_tiled(16, 0);
+      memset(got, 0xAB, m * dim * sizeof(float));
+      atomic_store(&hook_tasks, 0), atomic_store(&hook_positions, 0);
+      k_attention_set_task_hook(count_task, NULL); /* the benchmark's path through the tasks */
+      k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+      k_attention_set_task_hook(NULL, NULL);
+      k_attention_set_tiled(16, 1);
+      /* every row sees pos0 + i + 1 positions and each of them is scored by one task per KV head */
+      long visible = 0;
+      for (int i = 0; i < m; i++)
+        visible += (long)(pos0 + i + 1) * kv_heads;
+      int ran_tiled = strcmp(kernels_name(), "scalar") != 0; /* the scalar level hands tiled to split, which has no hook */
+      checks += 2;
+      if (ran_tiled && atomic_load(&hook_tasks) <= 0 && failures++ < 20)
+        fprintf(stderr, "tiled hook [%s]: no task reported\n", current);
+      if (ran_tiled && atomic_load(&hook_positions) != visible && failures++ < 20)
+        fprintf(stderr, "tiled hook [%s]: %ld positions reported, %ld expected\n", current,
+                (long)atomic_load(&hook_positions), visible);
+      assert(kernels_attention_select("split", NULL));
+      checks++;
+      if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
+        fprintf(stderr, "tiled order [%s] hd=%d g=%d pass=%d: natural order changed the result\n", current, hd,
+                shapes[sh].group, pass);
+    }
+    free(work.partial), free(q), free(kc), free(vc), free(att), free(want), free(got);
+  }
+  k_attention_set_tiled(16, 1);
+}
+
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
@@ -1303,6 +1373,7 @@ int main(int argc, char **argv) {
     test_attention_matrix();
     test_attention_forced_plans();
     test_attention_empty_partial();
+    test_attention_tiled_knobs();
     test_partial();
     test_packed4();
     test_row_parallel();
