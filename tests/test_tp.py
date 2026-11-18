@@ -329,6 +329,28 @@ class TensorParallelTests(unittest.TestCase):
                                   self.logits('int8', 'wide', 'batch', sockets, **args, LLAMA_ATTN='tiled'),
                                   TP_WIDE_CONFIG[5])
 
+    def test_group_decode_attention_agrees_with_split(self):
+        """E5: LLAMA_ATTN_DECODE=group on the AVX-512 kernels (the scalar model of the intrinsics, so the group kernel itself
+        runs), per-token over 64 positions (the chunk plan has two chunks past position 32 on three threads), on one socket
+        and on two (virtual 2x3, LLAMA_TP_CHECK=1), against split on the same kernels. `run` (FP32) and `runq` (W8A8) are
+        covered by the two probes; the wide fixture has scores in the hundreds, hence the looser budget as for tiled."""
+        self.need('probe-fp32-avx512-emul')
+        self.need('probe-int8-avx512-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(64)]
+        for precision, binary in (('fp32', 'probe-fp32-avx512-emul'), ('int8', 'probe-int8-avx512-emul')):
+            for name, vocab, tolerance in (('shared', TP_CONFIG[5], (ABS, REL)), ('wide', TP_WIDE_CONFIG[5], (2e-4, 2e-4))):
+                for sockets in (1, 2):
+                    with self.subTest(precision=precision, fixture=name, sockets=sockets):
+                        args = dict(tokens=tokens, binary=binary, LLAMA_KERNELS='avx512')
+                        self.assert_agree(self.logits(precision, name, None, sockets, **args, LLAMA_ATTN_DECODE='split'),
+                                          self.logits(precision, name, None, sockets, **args, LLAMA_ATTN_DECODE='group'),
+                                          vocab, *tolerance)
+        generated = [self.probe(precision, 'unshared', 'generate', sockets, binary=binary, LLAMA_KERNELS='avx512',
+                                LLAMA_ATTN_DECODE='group')
+                     for precision, binary in (('fp32', 'probe-fp32-avx512-emul'),) for sockets in (1, 2)]
+        self.assertGreaterEqual(len(generated[0].split()), 8)
+        self.assertEqual(generated[0], generated[1])
+
     def test_packed4_decode_layout_agrees_with_the_row_layout(self):
         """B7: LLAMA_FP32_LAYOUT=packed4 streams a second, four-rows-per-stream copy of the FP32 shards in decode (the shards
         stay for the batched GEMM). Same arithmetic per row, so the logits agree to the kernel budget (the AVX-512 kernels

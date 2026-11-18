@@ -1219,5 +1219,75 @@ class PhaseE4DryRunTests(unittest.TestCase):
         self.assertTrue(any('no E4 run was made' in line for line in lines))
 
 
+class DecodeAttentionCampaignTests(unittest.TestCase):
+    """E5: phase_E5 of scripts/cresco8-tp.sbatch (LLAMA_ATTN_DECODE=group) prints its matrix without running anything."""
+
+    def e5(self, stage, **extra):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': stage, 'REPEATS': '3',
+                   'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
+                                    text=True, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return result.stdout.splitlines()
+
+    def test_check_stage_matrix(self):
+        out = self.e5('check')
+        compares = [l for l in out if l.startswith('EXPECT compare-')]
+        self.assertEqual(len(compares), 2 * 2 * 3)  # models x precisions x (one socket, split vs two-socket group, 2048)
+        for line in compares:
+            self.assertIn('LLAMA_ATTN_DECODE=split', line)
+            self.assertIn('LLAMA_ATTN_DECODE=group', line)
+            self.assertNotIn('--batch-a', line)  # the per-token path: the knob acts in decode
+            self.assertNotIn('--batch-b', line)
+            self.assertNotIn('--last-only', line)
+            gate = '--rms-max 0.2' if '-int8-' in line else '--max-abs 1e-3'
+            self.assertIn(gate, line)
+        self.assertTrue(all('LLAMA_TP_CHECK=1' in l and 'LLAMA_SOCKETS=2' in l for l in compares if 's1split-vs-s2group' in l))
+        self.assertTrue(all('m8b-tokens-2048' in l or 'm1b-tokens-2048' in l for l in compares if '-2048-' in l))
+        gen = [l for l in out if 'compare_generation.py' in l]
+        self.assertEqual(len(gen), 2 * 2 * 2)  # models x precisions x (one socket, two sockets)
+        for line in gen:
+            for word in ('--steps 128', '--warm-context 8192', '--env-a LLAMA_ATTN_DECODE=split',
+                         '--env-b LLAMA_ATTN_DECODE=group', '--probe-batch 64'):
+                self.assertIn(word, line)
+        self.assertTrue(all('LLAMA_TP_CHECK=1' in l for l in gen if '-s2-' in l))
+        hf = [l for l in out if l.startswith('VALIDATE ')]
+        self.assertEqual(len(hf), 2 * 2)  # FP32 only, one socket and two sockets
+        self.assertTrue(all('fp32' in l and 'LLAMA_ATTN_DECODE=group' in l for l in hf))
+        self.assertEqual(len([l for l in hf if 'LLAMA_SOCKETS=2' in l and 'LLAMA_TP_CHECK=1' in l]), 2)
+        self.assertEqual([l for l in out if l.startswith('RUN ')], [])
+        # HF_GATE=0 records that the Hugging Face gate was not run
+        self.assertEqual([l for l in self.e5('check', HF_GATE='0') if l.startswith('VALIDATE ')], [])
+
+    def test_bench_stage_matrix(self):
+        from summarize_campaign import parse_label
+        out = self.e5('bench')
+        runs = [l for l in out if l.startswith('RUN ')]
+        # models x precisions x (3 repeats x 3 contexts + 3 profiled) x two configurations x two kernels
+        self.assertEqual(len(runs), 2 * 2 * (3 * 3 + 3) * 2 * 2)
+        for line in runs:
+            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
+            kernel = 'group' if '-xattngroup' in line else 'split'
+            self.assertIn(f'LLAMA_ATTN_DECODE={kernel}', line)
+            self.assertEqual(line.count('LLAMA_ATTN_DECODE='), 1)
+            self.assertIn('LLAMA_PROFILE=1' if 'prof ' in line else 'LLAMA_PREFILL_GEMM=on', line)
+        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '8192', '32768'})
+        self.assertEqual({l.split('-s')[1][0] for l in (r.split()[1] for r in runs)}, {'1', '2'})
+        self.assertTrue(all('LLAMA_PROFILE=1' in l for l in runs if 'prof ' in l))
+        self.assertFalse([l for l in runs if 'LLAMA_PROFILE=1' in l and 'prof ' not in l])
+        self.assertFalse([l for l in runs if '-s2-t14-' in l or 'xctl' in l or 'xp4' in l])  # a subset of B7
+        bench = [l for l in out if l.startswith('EXPECT bench-decode-') and 'attention-bench' in l]
+        self.assertEqual(len(bench), 2 * 2 * 2)  # shapes x KV heads (all, half) x kernels
+        for line in bench:
+            for word in ('--mode decode', '--context 512,8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
+                self.assertIn(word, line)
+        self.assertEqual(sorted(l.split('LLAMA_ATTN_DECODE=')[1].split()[0] for l in bench), ['group'] * 4 + ['split'] * 4)
+        self.assertEqual([l for l in out if l.startswith('EXPECT compare-')], [])  # the correctness gates are the check stage's
+
+
 if __name__ == '__main__':
     unittest.main()

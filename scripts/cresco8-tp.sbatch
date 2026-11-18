@@ -354,6 +354,170 @@ phase_B7() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
 }
 
+# ---- E5: decode attention, LLAMA_ATTN_DECODE=group ---------------------------------------------------------------------
+# Opt-in single-row attention kernel (one task per KV group and position chunk, scores of 16 positions reduced by one
+# transpose-add, online softmax and PV fused, split-K partials merged as before); the default stays split. Both stages
+# need the models; submit them one after the other. Estimates (not measurements): check 1.5-2.5 h, bench 5-7 h for 1B and 8B,
+# FP32 and W8A8 (split the job with MODELS / PRECISIONS if the allocation is shorter; DRY_RUN=1 prints every launch).
+# STAGE=check (E5/compare-*.json, E5/gen-*.json, correctness-*-group*.json): after the common `make test`,
+#   per-token path (no batched prefill) at every position, LLAMA_ATTN_DECODE=split against group, on every model:
+#     FP32 gate (max |dlogit| <= 1e-3, argmax 100%) at 86 and 2048 tokens, one socket; one socket split against two sockets
+#     group (LLAMA_TP_CHECK=1) at 86 tokens; W8A8 (W8A8_GATE) at 86 and 2048 tokens one socket, 86 two sockets;
+#   Hugging Face gate (validate.py, per-token) FP32 with group: one socket (OpenMP, as the common gate) and two sockets
+#     (teams, LLAMA_TP_CHECK=1); HF_GATE=0 skips and records it;
+#   determinism (tools/compare_generation.py, recorded, not gated): 128 greedy tokens from a warm 8192-token context, split
+#     against group, one socket and two sockets, FP32 and W8A8, E5/gen-*.json.
+# STAGE=bench (reports $OUT/*-xattn{split,group}-N.json, -xattn{split,group}prof-1.json with LLAMA_PROFILE=1): the B7 subset,
+#   1B and 8B, FP32 and W8A8, contexts 512 / 8192 / 32768, one socket and two sockets x 56 workers, split against group,
+#   alternating inside each repeat, REPEATS repeats plus one profiled repeat; then the attention bench decode cells
+#   (E5/bench-decode-KERNEL-SHAPE-kvN.out and E5/bench-decode.jsonl: 8B and 1B, all KV heads and half of them as one socket
+#   of two holds, 56 threads, 1000 repetitions: the bench caps --reps at 1024).
+E5_CONTEXTS="512 8192 32768"
+E5_KERNELS="split group"
+
+# e5_pair DIR NAME PRECISION STAGED LABEL SOCKETS_A SOCKETS_B: per-token logits with LLAMA_ATTN_DECODE=split on SOCKETS_A against
+# group on SOCKETS_B; the gate flags come from B_FLAGS (b_compare's default is the FP32 gate), the tokens from CMP_TOKENS.
+e5_pair() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 a=$6 b=$7 check=()
+  [[ $b != 2 ]] || check=(LLAMA_TP_CHECK=1)
+  b_compare "$dir" "$name" "$precision" "$staged" "$label" "${TP_ENV[@]}" "LLAMA_SOCKETS=$a" LLAMA_ATTN_DECODE=split -- \
+    "${TP_ENV[@]}" "LLAMA_SOCKETS=$b" ${check[@]+"${check[@]}"} LLAMA_ATTN_DECODE=group
+}
+
+# e5_generation DIR NAME PRECISION STAGED TOKENIZER SOCKETS: 128 greedy tokens from a warm 8192-token context, split against
+# group on the same number of sockets (B7's configuration and warm-up path), recorded by compare_generation.py.
+e5_generation() {
+  local dir=$1 name=$2 precision=$3 staged=$4 tokenizer=$5 sockets=$6 engine=run probe=probe-fp32 args=() word
+  [[ $precision == fp32 ]] || { engine=runq; probe=probe-int8; }
+  b7_config 1s56 "$precision"
+  for word in "${B7_ENV[@]}"; do
+    [[ $word == LLAMA_SOCKETS=* ]] || args+=(--env-a "$word" --env-b "$word")
+  done
+  args+=(--env-a "LLAMA_SOCKETS=$sockets" --env-b "LLAMA_SOCKETS=$sockets" --env-a LLAMA_ATTN_DECODE=split
+    --env-b LLAMA_ATTN_DECODE=group)
+  [[ $sockets != 2 ]] || args+=(--env-a LLAMA_TP_CHECK=1 --env-b LLAMA_TP_CHECK=1)
+  expect "gen-$name-$precision-s$sockets-split-vs-group" ok "$dir" -- "$PYTHON" "$ROOT/tools/compare_generation.py" \
+    --engine "$ROOT/build/release/$engine" --checkpoint "$staged" --tokenizer "$tokenizer" --prompt-file "$OUT/short.txt" \
+    --steps 128 --warm-context 8192 --engine-args "--context-length 8448 --chat-template" "${args[@]}" \
+    --probe "$ROOT/build/release/$probe" --probe-batch "$B7_BATCH" \
+    --output "$dir/gen-$name-$precision-s$sockets-split-vs-group.json"
+}
+
+e5_check() {
+  local dir="$OUT/E5" entry name artifacts hf precision staged tokenizer
+  a_models "$dir" 2048
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    tokens_of "$name" "$OUT/prompt-2048.txt" "$dir/$name-tokens-2048.txt"
+    for precision in $PRECISIONS; do
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      if [[ $precision == fp32 ]]; then
+        B_FLAGS=(--max-abs 1e-3)
+        e5_pair "$dir" "$name" fp32 "$staged" e5-pertoken-1s 1 1
+        e5_pair "$dir" "$name" fp32 "$staged" e5-pertoken-s1split-vs-s2group 1 2
+        CMP_TOKENS="$dir/$name-tokens-2048.txt" e5_pair "$dir" "$name" fp32 "$staged" e5-pertoken-2048-1s 1 1
+      else
+        B_FLAGS=("${W8A8_GATE[@]}")
+        e5_pair "$dir" "$name" int8 "$staged" e5-w8a8-pertoken-1s 1 1
+        e5_pair "$dir" "$name" int8 "$staged" e5-w8a8-pertoken-s1split-vs-s2group 1 2
+        CMP_TOKENS="$dir/$name-tokens-2048.txt" e5_pair "$dir" "$name" int8 "$staged" e5-w8a8-pertoken-2048-1s 1 1
+      fi
+      B_FLAGS=()
+      e5_generation "$dir" "$name" "$precision" "$staged" "$tokenizer" 1
+      e5_generation "$dir" "$name" "$precision" "$staged" "$tokenizer" 2
+      unstage_model_on 0 "$name" "$precision"
+    done
+    # the Hugging Face gate of the FP32 per-token path with group (the common prelude ran the default kernel)
+    if [[ " $PRECISIONS " == *" fp32 "* ]]; then
+      if [[ ${HF_GATE:-1} != 0 ]]; then
+        if validate_gate "$name" "$artifacts" "$hf" fp32 fp32-group LLAMA_ATTN_DECODE=group; then
+          record_result "hf-$name-fp32-group" PASS
+        else
+          record_result "hf-$name-fp32-group" FAIL
+        fi
+        if tp_validate "$name" "$artifacts" "$hf" fp32 fp32-group-2s "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 \
+          LLAMA_ATTN_DECODE=group; then
+          record_result "hf-$name-fp32-group-2s" PASS
+        else
+          record_result "hf-$name-fp32-group-2s" FAIL
+        fi
+      else
+        echo "HF_GATE=0: the Hugging Face gate with LLAMA_ATTN_DECODE=group was not run for $name" | tee -a "$dir/no-hf-gate.txt"
+      fi
+    fi
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
+}
+
+# e5_bench_cell NAME KERNEL SHAPE KV: one attention-bench decode launch on socket 0's HBM, all contexts.
+e5_bench_cell() {
+  local name=$1 kernel=$2 shape=$3 kv=$4
+  expect "$name" ok "$OUT/E5" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false \
+    LLAMA_KERNELS=avx512 "LLAMA_ATTN_DECODE=$kernel" "$ROOT/build/release/attention-bench" --node 2 --mode decode \
+    --shape "$shape" --context "${E5_CONTEXTS// /,}" --reps 1000 --kv-heads-local "$kv"
+}
+
+e5_bench() {
+  local dir="$OUT/E5" entry name artifacts hf precision staged tokenizer rep ctx config kernel shape kv engine_precision
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    for precision in $PRECISIONS; do
+      engine_precision=int8
+      [[ $precision != fp32 ]] || engine_precision=fp32
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      for ((rep = 1; rep <= REPEATS; rep++)); do
+        for ctx in $E5_CONTEXTS; do
+          for config in 1s56 2s56; do
+            for kernel in $E5_KERNELS; do
+              b7_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=attn$kernel" -- \
+                "LLAMA_ATTN_DECODE=$kernel"
+            done
+          done
+        done
+      done
+      # One profiled repeat per configuration and context (the per-socket profile lines go to the .stderr files).
+      for ctx in $E5_CONTEXTS; do
+        for config in 1s56 2s56; do
+          for kernel in $E5_KERNELS; do
+            b7_launch "$name" "$engine_precision" "$config" "$ctx" 1 "$staged" "$tokenizer" "x=attn${kernel}prof" -- \
+              "LLAMA_ATTN_DECODE=$kernel" LLAMA_PROFILE=1
+          done
+        done
+      done
+      unstage_model_on 0 "$name" "$precision"
+    done
+  done
+  # the attention bench: the layer's decode attention alone, all KV heads and the half one socket of two holds
+  for shape in 8b 1b; do
+    for kv in 8 4; do
+      for kernel in $E5_KERNELS; do
+        e5_bench_cell "bench-decode-$kernel-$shape-kv$kv" "$kernel" "$shape" "$kv"
+      done
+    done
+  done
+  if ! dry_run; then
+    if compgen -G "$dir/bench-decode-*.out" > /dev/null; then cat "$dir"/bench-decode-*.out > "$dir/bench-decode.jsonl"; else : > "$dir/bench-decode.jsonl"; fi
+    "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+  fi
+}
+
+phase_E5() {
+  local dir="$OUT/E5"
+  if [[ -z $MODELS ]]; then
+    echo 'MODELS is empty: no E5 model run was made' | tee "$dir/no-models.txt"
+    return 0
+  fi
+  need_shm
+  if [[ $STAGE == check ]]; then
+    e5_check
+  else
+    a_models "$dir"
+    e5_bench
+  fi
+}
+
 require_phases
 if ! dry_run; then
   check_stage
