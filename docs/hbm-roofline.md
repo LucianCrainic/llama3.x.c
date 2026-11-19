@@ -257,6 +257,13 @@ or more than all of Q8_0's. Fixes, roughly in order:
 This is secondary at the current 2K context. It becomes the main decode
 bottleneck in long-context experiments.
 
+**Prefill attention, measured (E2, E4).** The fused register-tiled kernel (`LLAMA_ATTN=tiled`) reaches about 1.9-2.1 TFLOP/s on
+8B at 8192 and 2048 tokens (M 64-256, 56 threads), 22-24% of the 8800 GFLOP/s FP32 peak
+([attention-results.md](attention-results.md) sections 1.3 and 1.5); it is limited by the instructions around the FMAs, not by HBM
+bandwidth. In the engine, 8B AMX-BF16 prefill on one socket spends 69% of the forward in attention at 8192 tokens with the split kernel
+and 55% with `tiled` (34% and 23% at 2048). On the AVX-512 FP32 rung the shares are 35% and 26% (M 64) at 8192 tokens. The
+effect on time to first token is 1.55x on AMX-BF16 at 8192 tokens (section 2).
+
 ### 5.7 Fewer bytes per weight
 
 Decode tokens/s scale ~linearly with bytes/weight: BF16 gives 2× and Q8_0 3.8×
