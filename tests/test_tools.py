@@ -24,6 +24,7 @@ CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOK
                   'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
                   'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
                   'WARM'}
+CAMPAIGN_KNOBS |= {'E6_ATTN_CONTEXTS', 'E6_BATCH', 'E6_COLD_MIB', 'E6_CONTEXTS', 'E6_MODELS_BENCH', 'E6_MS', 'E6_REPS', 'E6_THP'}
 
 
 def campaign_env():
@@ -1325,6 +1326,211 @@ class DecodeAttentionCampaignTests(unittest.TestCase):
                 self.assertIn(word, line)
         self.assertEqual(sorted(l.split('LLAMA_ATTN_DECODE=')[1].split()[0] for l in bench), ['group'] * 4 + ['split'] * 4)
         self.assertEqual([l for l in out if l.startswith('EXPECT compare-')], [])  # the correctness gates are the check stage's
+
+
+class E6Tests(unittest.TestCase):
+    """The E6 batched-decode experiment: its shapes, its job matrix (DRY_RUN) and the two benchmarks it relies on."""
+
+    def run_phase(self, **extra):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E6', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-e6.sbatch')], env=env, capture_output=True, text=True,
+                                    timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return result.stdout.splitlines()
+
+    def test_decode_shapes_and_kv_capacity(self):
+        import e6_model as e6
+        self.assertEqual(e6.decode_shapes('8b', 1), [('qkv', 6144, 4096), ('wo', 4096, 4096), ('w13', 28672, 4096),
+                                                     ('w2', 4096, 14336), ('cls', 128256, 4096)])
+        # two sockets: rows are split for QKV, W1/W3 and the classifier, columns for Wo and W2; the bytes add up
+        for model in ('8b', '1b'):
+            one, two = e6.decode_shapes(model, 1), e6.decode_shapes(model, 2)
+            self.assertEqual([2 * n * k for _, n, k in two], [n * k for _, n, k in one])
+        self.assertEqual(e6.kv_bytes_per_token('8b'), 256 * 1024)  # the 256 KiB per token of the plan
+        self.assertEqual(e6.kv_bytes_per_token('1b'), 64 * 1024)
+        self.assertEqual(e6.weight_bytes('8b', 'int8') // 10**6, 7_973)
+        out = subprocess.run([sys.executable, str(TOOLS/'e6_model.py'), 'shapes', '1b', '2'], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), '1536x2048,2048x1024,8192x2048,2048x4096,64128x2048')
+
+    def test_step_model_interpolates_and_charges_attention_per_request(self):
+        import e6_model as e6
+        gemm = {p: {1: 1e-3, 8: 1.5e-3, 32: 3e-3} for p in e6.PHASES}
+        base = e6.step_seconds('1b', gemm, 0.1, 1)
+        self.assertAlmostEqual(base, 16 * 4e-3 + 1e-3 + 16 * 1e-4)
+        eight = e6.step_seconds('1b', gemm, 0.1, 8)
+        self.assertAlmostEqual(eight, 16 * 4 * 1.5e-3 + 1.5e-3 + 8 * 16 * 1e-4)
+        self.assertAlmostEqual(e6.step_seconds('1b', gemm, 0.1, 20), 16 * 4 * (1.5e-3 + 12 / 24 * 1.5e-3) + 2.25e-3 + 20 * 16 * 1e-4)
+        tokens, latency = e6.throughput(eight, 8)
+        self.assertAlmostEqual(tokens * latency, 8)
+        self.assertGreater(e6.exchange_seconds('8b', 32), e6.exchange_seconds('8b', 1))
+
+    def test_dry_run_matrix(self):
+        from summarize_campaign import parse_label
+        out = self.run_phase()
+        gemm = [l for l in out if l.startswith('GEMM ')]
+        self.assertEqual(len(gemm), 2 * 2 * 4)  # models x socket counts x kernels
+        for line in gemm:
+            for word in ('--m 1,2,4,8,16,32', '--cold-mib 1024', '--reps 100'):
+                self.assertIn(word, line)
+        self.assertEqual(len([l for l in gemm if '--gemv' in l]), 2 * 2 * 2)  # the GEMV baseline for FP32 and VNNI Q8 only
+        self.assertEqual({l.split()[1] for l in gemm}, {'f32', 'q8v', 'q8amx', 'bf16amx'})
+        self.assertTrue(all('kernels=amx' in l for l in gemm if l.split()[1] in ('q8amx', 'bf16amx')))
+        self.assertEqual(len([l for l in out if l.startswith('EXPECT amx-t')]), 4)
+        attention = [l for l in out if l.startswith('EXPECT attention-')]
+        self.assertEqual(len(attention), 8)
+        for line in attention:
+            for word in ('--mode decode', '--context 512,2048,8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
+                self.assertIn(word, line)
+        runs = [l for l in out if l.startswith('RUN ')]
+        self.assertEqual(len(runs), 2 * 2 * (2 * 2 * 3 + 2))  # models x precisions x (contexts x sockets x repeats + profiled)
+        for line in runs:
+            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
+        profiled = [l for l in runs if 'xe6prof' in l]
+        self.assertEqual(len(profiled), 2 * 2 * 2)
+        self.assertTrue(all('LLAMA_PROFILE=1' in l and 'p2048' in l for l in profiled))
+        self.assertFalse([l for l in runs if 'LLAMA_PROFILE=1' in l and 'xe6prof' not in l])
+        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '2048'})
+        self.assertTrue(all('LLAMA_SOCKETS=2' in l for l in runs if '-s2-' in l))
+        self.assertTrue(all('cpu=0 ' in l for l in runs if '-s1-' in l))
+
+    def test_dry_run_without_models_skips_the_engine_cells(self):
+        out = self.run_phase(MODELS='')
+        self.assertFalse([l for l in out if l.startswith('RUN ')])
+        self.assertEqual(len([l for l in out if l.startswith('GEMM ')]), 16)
+
+    def synthetic_job(self, root):
+        """A fake job directory: 1B FP32 on one socket. GEMM time grows slowly with M (weights read once), the GEMV baseline
+        linearly; attention 0.05 ms per layer at every context; a profiled run and three timed runs at N = 1."""
+        import e6_model as e6
+        e6dir = root/'E6'
+        e6dir.mkdir(parents=True)
+        for tag, kernel, per_row in (('f32', 'gemm', 0.1e-3), ('f32', 'gemv_rows', 1e-3)):
+            lines = []
+            for phase, n, k in e6.decode_shapes('1b', 1):
+                for m in e6.NS:
+                    t = 1e-3 + (m - 1) * per_row if kernel == 'gemm' else m * 1e-3
+                    lines.append(json.dumps(dict(kernel=kernel, n=n, k=k, m=m, median_s=t, best_s=t)))
+            path = e6dir/'gemm-f32-1b-s1.out'
+            path.write_text((path.read_text() if path.exists() else '') + '\n'.join(lines) + '\n')
+        att = [dict(mode='decode', shape='1b', kv_heads_local=8, attn_decode=kernel, context=c, ms_layer_median=0.05)
+               for kernel in ('split', 'group') for c in e6.CONTEXTS]
+        (e6dir/'attention-1b.out').write_text('\n'.join(json.dumps(a) for a in att) + '\n')
+        label = 'm1b-fp32-teams-hbm-s1-t56-p{}-{}'
+        for context in (512, 2048):
+            for rep in (1, 2, 3):
+                report = dict(status='completed', timing_seconds=dict(decode=1.28), tokens=dict(decode_steps=128))
+                (root/(label.format(context, 'xe6') + f'-{rep}.json')).write_text(json.dumps(report))
+        profile = dict(forward_passes=128, forward=1.28, qkv=0.128, wo=0.128, w1_w3_swiglu=0.4, w2=0.2, classifier=0.1,
+                       attention=0.1, embedding=0.01)
+        report = dict(status='completed', profile_seconds=dict(decode=profile))
+        (root/(label.format(2048, 'xe6prof') + '-1.json')).write_text(json.dumps(report))
+        return e6dir
+
+    def test_model_report_from_a_synthetic_job(self):
+        import e6_model as e6
+        with tempfile.TemporaryDirectory() as temp:
+            e6dir = self.synthetic_job(Path(temp))
+            result = e6.report(e6dir)
+            rows = result['rows']
+            one = next(r for r in rows if (r['model'], r['precision'], r['n'], r['context'], r['kernel']) == ('1b', 'fp32', 1, 2048, 'split'))
+            # 16 layers x 4 phases x 1 ms + classifier 1 ms + 16 x 0.05 ms attention + other (10 ms in the profile) = 10 ms + ...
+            other = 1e3 * (1.28 - 0.128 - 0.128 - 0.6 - 0.1 - 0.1) / 128
+            self.assertAlmostEqual(one['step_ms'], 16 * 4 + 1 + 0.8 + other, places=6)
+            eight = next(r for r in rows if (r['model'], r['precision'], r['n'], r['context'], r['kernel']) == ('1b', 'fp32', 8, 2048, 'split'))
+            self.assertAlmostEqual(eight['gemm_ms'], 16 * 4 * 1.7 + 1.7, places=6)  # the GEMM (1.7 ms), not 8 GEMVs, is used at M = 8
+            self.assertAlmostEqual(eight['attention_ms'], 8 * 16 * 0.05, places=6)
+            self.assertEqual(len(result['repro']), 2)  # contexts 512 and 2048, one socket, FP32 only
+            repro = next(r for r in result['repro'] if r['context'] == 2048)
+            self.assertAlmostEqual(repro['measured_ms'], 10.0)
+            self.assertAlmostEqual(repro['modeled_ms'], one['step_ms'])
+            self.assertEqual(len(result['phases']), 1)
+            text = e6.markdown(result)
+            for word in ('N = 1 reproduction', 'E6.3 gate', 'N=32'):
+                self.assertIn(word, text)
+            self.assertEqual(e6.gate(rows), [])  # the gate row is 8B W8A8: nothing to judge in this job
+            result_cli = subprocess.run([sys.executable, str(TOOLS/'e6_model.py'), 'model', str(e6dir)], capture_output=True, text=True)
+            self.assertEqual(result_cli.returncode, 0, result_cli.stderr)
+            self.assertIn('1b fp32 (avx512), 1 socket(s)', result_cli.stdout)
+
+    def test_gate_needs_both_conditions(self):
+        import e6_model as e6
+        def rows(step8):
+            common = dict(model='8b', precision='int8', policy='avx512', sockets=1, kernel='split', context=2048)
+            return [dict(common, n=1, step_ms=20.0, agg_tok_s=50.0), dict(common, n=8, step_ms=step8, agg_tok_s=8000 / step8)]
+        self.assertEqual([g['passes'] for g in e6.gate(rows(25.0))], [True])
+        both = e6.gate(rows(60.0))[0]  # 3x the step: 2.67x the throughput passes, but the latency is 3x
+        self.assertTrue(both['throughput_ok'] and not both['latency_ok'] and not both['passes'])
+        self.assertFalse(e6.gate(rows(100.0))[0]['throughput_ok'])
+
+    def test_kv_capacity(self):
+        import e6_model as e6
+        self.assertAlmostEqual(e6.kv_gib_per_request('8b', 32768), 8.0)
+        self.assertAlmostEqual(e6.kv_gib_per_request('1b', 2048), 0.125)
+        self.assertLess(e6.fit_requests('8b', 'fp32', 32768, 1), e6.fit_requests('8b', 'int8', 32768, 1))
+        self.assertGreater(e6.fit_requests('8b', 'int8', 32768, 2), 2 * e6.fit_requests('8b', 'int8', 32768, 1) - 1)
+
+    def bench(self, name, *args, env=None):
+        if BUILD is None or not (BUILD/name).exists():
+            self.skipTest(f'{name} is not built')
+        result = subprocess.run([str(BUILD/name), *args], capture_output=True, text=True, timeout=120,
+                                env={**os.environ, 'LLAMA_BACKEND': 'omp', **(env or {})})
+        self.assertEqual(result.returncode, 0, result.stderr[-1000:])
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+    def check_cells(self, rows, kernel, shapes, ms):
+        self.assertEqual(len(rows), len(shapes) * len(ms))
+        for row in rows:
+            self.assertEqual(row['kernel'], kernel)
+            self.assertIn((row['n'], row['k']), shapes)
+            self.assertIn(row['m'], ms)
+            self.assertGreater(row['median_s'], 0)
+            self.assertGreaterEqual(row['median_s'], row['best_s'])
+            self.assertGreater(row['weight_bytes'], 0)
+        return rows
+
+    def test_gemm_bench_kernels_report_cells_and_cold_copies(self):
+        shapes, ms = [(192, 128), (64, 256)], [1, 3, 20]
+        args = ['--m', '1,3,20', '--shapes', '192x128,64x256', '--reps', '3', '--cold-mib', '1']
+        f32 = self.check_cells(self.bench('gemm-bench', '--kernel', 'f32', *args), 'gemm', shapes, ms)
+        self.assertEqual([r['weight_bytes'] for r in f32][:1], [192 * 128 * 4])
+        self.assertGreater(f32[0]['cold_copies'], 1)  # 1 MiB of copies of a 96 KiB matrix
+        q8 = self.check_cells(self.bench('gemm-bench', '--kernel', 'q8', *args), 'gemm_q8', shapes, ms)
+        self.assertEqual(q8[0]['weight_bytes'], 192 * 128 + 192 * 2 * 4)  # int8 values plus one FP32 scale per 64
+        self.assertTrue(all(r['quant_median_s'] >= 0 for r in q8))
+        self.check_cells(self.bench('gemm-bench', '--kernel', 'bf16', *args), 'gemm_bf16', shapes, ms)
+        rows = self.bench('gemm-bench', '--kernel', 'q8', '--gemv', *args)
+        self.assertEqual(sorted({r['kernel'] for r in rows}), ['gemm_q8', 'gemv_rows_q8'])
+        self.assertEqual(len([r for r in rows if r['kernel'] == 'gemv_rows_q8']), len(shapes) * len(ms))
+        rows = self.bench('gemm-bench', '--kernel', 'f32', '--gemv', '--m', '4', '--shapes', '64x64', '--reps', '2')
+        self.assertEqual(sorted(r['kernel'] for r in rows), ['gemm', 'gemv_rows'])
+        self.assertEqual(rows[0]['cold_copies'], 1)  # the C2 behaviour without --cold-mib
+        for bad in (['--kernel', 'fp8'], ['--kernel', 'bf16', '--gemv'], ['--kernel', 'q8', '--shapes', '64x100']):
+            if BUILD is not None and (BUILD/'gemm-bench').exists():
+                result = subprocess.run([str(BUILD/'gemm-bench'), *bad], capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0, bad)
+
+    def test_gemm_bench_amx_kernels_on_the_software_tile_model(self):
+        shapes, ms = [(96, 128), (32, 192)], [1, 7, 33]
+        args = ['--m', '1,7,33', '--shapes', '96x128,32x192', '--reps', '2', '--cold-mib', '1']
+        env = {'LLAMA_KERNELS': 'amx'}
+        q8 = self.check_cells(self.bench('gemm-bench-emul', '--kernel', 'q8', *args, env=env), 'gemm_q8', shapes, ms)
+        self.assertEqual({r['impl'] for r in q8}, {'amx_int8'})
+        bf16 = self.check_cells(self.bench('gemm-bench-emul', '--kernel', 'bf16', *args, env=env), 'gemm_bf16', shapes, ms)
+        self.assertEqual({r['impl'] for r in bf16}, {'amx_bf16'})
+
+    def test_amx_bench_rows(self):
+        rows = self.bench('amx-bench-emul', '--k', '128', '--reps', '2', '--m', '1,16,32', env={'LLAMA_KERNELS': 'amx'})
+        self.assertEqual(sorted((r['kind'], r['m']) for r in rows),
+                         [(kind, m) for kind in ('bf16', 'int8') for m in (1, 16, 32)])
+        self.assertTrue(all(r['tera_ops'] >= 0 and r['best_s'] > 0 for r in rows))
+        result = subprocess.run([str(BUILD/'amx-bench-emul'), '--m', '33'], capture_output=True, text=True,
+                                env={**os.environ, 'LLAMA_KERNELS': 'amx'}) if BUILD is not None else None
+        if result is not None:
+            self.assertEqual(result.returncode, 2)
 
 
 if __name__ == '__main__':
