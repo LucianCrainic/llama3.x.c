@@ -1416,7 +1416,7 @@ class E6Tests(unittest.TestCase):
                     lines.append(json.dumps(dict(kernel=kernel, n=n, k=k, m=m, median_s=t, best_s=t)))
             path = e6dir/'gemm-f32-1b-s1.out'
             path.write_text((path.read_text() if path.exists() else '') + '\n'.join(lines) + '\n')
-        att = [dict(mode='decode', shape='1b', kv_heads_local=8, attn_decode=kernel, context=c, ms_layer_median=0.05)
+        att = [dict(mode='decode', shape='1b', kv_heads=8, attn_decode=kernel, context=c, ms_layer_median=0.05)
                for kernel in ('split', 'group') for c in e6.CONTEXTS]
         (e6dir/'attention-1b.out').write_text('\n'.join(json.dumps(a) for a in att) + '\n')
         label = 'm1b-fp32-teams-hbm-s1-t56-p{}-{}'

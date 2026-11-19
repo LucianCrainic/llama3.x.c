@@ -111,12 +111,13 @@ def decode_cells(directory, model, sockets, precision, policy):
 
 
 def attention_cells(directory):
-    """{(shape, kv_heads_local, kernel, context): median ms per layer} from the attention-*.out files."""
+    """{(shape, kv_heads, kernel, context): median ms per layer} from the attention-*.out files (kv_heads is the local count
+    the cell ran with, --kv-heads-local; kv_heads_model is the model's)."""
     cells = {}
     for path in sorted(Path(directory).glob('attention-*.out')):
         for r in read_jsonl(path):
             if r.get('mode') == 'decode':
-                cells[(r['shape'], r['kv_heads_local'], r['attn_decode'], r['context'])] = r['ms_layer_median']
+                cells[(r['shape'], r['kv_heads'], r['attn_decode'], r['context'])] = r['ms_layer_median']
     return cells
 
 
