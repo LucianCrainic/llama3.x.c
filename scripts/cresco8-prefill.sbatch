@@ -1099,7 +1099,8 @@ e1_side() {
 # e1_case CASE REP SOCKETS_A RUNG_A M_A SOCKETS_B RUNG_B M_B: one recorded generation comparison with tools/compare_generation.py
 # (A is the reference, and its probe gives the top-2 margin at the divergence). E1_XENV_A / E1_XENV_B (words, default none) add
 # environment words to one side (E4: LLAMA_ATTN). The run is described by E1_ENGINE, E1_PROBE,
-# E1_STAGED, E1_TOKENIZER, E1_PROMPT, E1_CTX (context length), E1_WARM (retained context, 0 for none) and E1_PBATCH.
+# E1_STAGED, E1_TOKENIZER, E1_PROMPT, E1_CTX (context length), E1_WARM (retained context, 0 for none) and E1_PBATCH; it writes
+# into E1_DIR (default $OUT/E1, which exists only when E1 is a phase of the job: E4 sets it to its own directory).
 e1_case() {
   local case=$1 rep=$2 a b warm=() args=() word
   e1_side "$3" "$4" "$5"
@@ -1114,10 +1115,11 @@ e1_case() {
   [[ $E1_WARM == 0 ]] || warm=(--warm-context "$E1_WARM")
   for word in "${a[@]}"; do args+=(--env-a "$word"); done
   for word in "${b[@]}"; do args+=(--env-b "$word"); done
-  expect "gen-$case-$rep" ok "$OUT/E1" -- "$PYTHON" "$ROOT/tools/compare_generation.py" --engine "$ROOT/build/release/$E1_ENGINE" \
+  local out=${E1_DIR:-$OUT/E1}
+  expect "gen-$case-$rep" ok "$out" -- "$PYTHON" "$ROOT/tools/compare_generation.py" --engine "$ROOT/build/release/$E1_ENGINE" \
     --checkpoint "$E1_STAGED" --tokenizer "$E1_TOKENIZER" --prompt-file "$E1_PROMPT" --steps 128 ${warm[@]+"${warm[@]}"} \
     --engine-args "--context-length $E1_CTX --chat-template" "${args[@]}" \
-    --probe "$ROOT/build/release/$E1_PROBE" --probe-batch "$E1_PBATCH" --output "$OUT/E1/gen-$case-$rep.json"
+    --probe "$ROOT/build/release/$E1_PROBE" --probe-batch "$E1_PBATCH" --output "$out/gen-$case-$rep.json"
 }
 
 phase_E1() {
@@ -1503,7 +1505,7 @@ e4_check() {
       tee "$dir/make-test-not-verified.txt"
   fi
   c_prompts "$dir" 2048
-  E2_PFX=e4
+  E2_PFX=e4 E1_DIR=$dir
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
     staged=$(stage_model_on 0 "$name" fp32 "$artifacts")
@@ -1547,7 +1549,7 @@ e4_check() {
     done
     unstage_model_on 0 "$name" int8
   done
-  E2_PFX=
+  E2_PFX= E1_DIR=
   # the exit status of the summary is the failure count; the failures are already in phase-results.txt
   if ! dry_run; then
     "$PYTHON" "$ROOT/tools/summarize_e4.py" checks "$dir" > "$dir/summary.md" || true
