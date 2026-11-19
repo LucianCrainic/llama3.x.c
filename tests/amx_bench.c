@@ -1,6 +1,8 @@
 /* AMX tile microbenchmark (C4): the BF16 and int8 2 x 2 tile microkernels on operands that stay in L2, one private
  * working set per worker, so the number is the tile engine's, not the memory system's. One JSON object per line.
- *   amx-bench [--kind bf16|int8|both] [--k K] [--reps R]
+ *   amx-bench [--kind bf16|int8|both] [--k K] [--reps R] [--m 1,2,4,...]
+ * --m lists the activation rows of the call (1..32, default 32; E6): the call costs the same for 1..16 rows because the tile
+ * unit works on whole 16-row tiles, and tera_ops counts only the useful rows.
  * Threads, pinning and the instruction set come from the engine's environment, as for gemm-bench:
  * LLAMA_KERNELS=amx LLAMA_BACKEND=teams LLAMA_THREADS=1|56 under numactl --cpunodebind=0. Compare the result with
  * the measured peaks of docs/hbm-roofline.md (112 TFLOP/s BF16 and 225 TOPS int8 for 56 cores). */
@@ -12,7 +14,7 @@
 #include <string.h>
 
 typedef struct {
-  int bf16, k, reps, workers;
+  int bf16, k, reps, workers, m;
   void **base; /* per worker: A panel, packed B, C */
 } Job;
 
@@ -45,16 +47,16 @@ static void run(const void *p, int worker, int workers) {
   /* B is already in the packed layout: any bytes are valid operands for a throughput test. */
   for (int r = 0; r < job->reps; r++) {
     if (job->bf16)
-      amx_bf16_tile_gemm((float *)c, N, (const uint16_t *)a, kp, (const uint16_t *)b, M, N, job->k);
+      amx_bf16_tile_gemm((float *)c, N, (const uint16_t *)a, kp, (const uint16_t *)b, job->m, N, job->k);
     else
-      amx_s8_tile_gemm((int32_t *)c, N, (const int8_t *)a, kp, (const int8_t *)b, M, N, job->k);
+      amx_s8_tile_gemm((int32_t *)c, N, (const int8_t *)a, kp, (const int8_t *)b, job->m, N, job->k);
   }
 }
 
-static void bench(int bf16, int k, int reps) {
+static void bench(int bf16, int k, int reps, int m) {
   Team *team = pool_team(0);
   int workers = team ? team_size(team) : 1;
-  Job job = {.bf16 = bf16, .k = k, .reps = reps, .workers = workers, .base = calloc((size_t)workers, sizeof(void *))};
+  Job job = {.bf16 = bf16, .k = k, .reps = reps, .workers = workers, .m = m, .base = calloc((size_t)workers, sizeof(void *))};
   if (team) {
     team_run(team, prepare, &job);
     team_run(team, run, &job); /* warm-up */
@@ -72,10 +74,10 @@ static void bench(int bf16, int k, int reps) {
     double elapsed = monotonic_seconds() - start;
     best = elapsed < best ? elapsed : best;
   }
-  double ops = 2.0 * M * N * k * reps * workers;
-  printf("{\"kind\": \"%s\", \"isa\": \"%s\", \"backend\": \"%s\", \"workers\": %d, \"k\": %d, \"reps\": %d, "
+  double ops = 2.0 * m * N * k * reps * workers;
+  printf("{\"kind\": \"%s\", \"isa\": \"%s\", \"backend\": \"%s\", \"workers\": %d, \"m\": %d, \"k\": %d, \"reps\": %d, "
          "\"best_s\": %.9f, \"tera_ops\": %.3f, \"tera_ops_per_worker\": %.4f}\n",
-         bf16 ? "bf16" : "int8", kernels_name(), kernels_backend_name(), workers, k, reps, best, ops / best / 1e12,
+         bf16 ? "bf16" : "int8", kernels_name(), kernels_backend_name(), workers, m, k, reps, best, ops / best / 1e12,
          ops / best / 1e12 / workers);
   fflush(stdout);
   for (int w = 0; w < workers; w++)
@@ -84,7 +86,7 @@ static void bench(int bf16, int k, int reps) {
 }
 
 int main(int argc, char **argv) {
-  int k = 512, reps = 20000, bf16 = 1, int8 = 1;
+  int k = 512, reps = 20000, bf16 = 1, int8 = 1, ms[32] = {M}, nm = 1;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--kind") && i + 1 < argc) {
       i++;
@@ -94,8 +96,19 @@ int main(int argc, char **argv) {
       k = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc)
       reps = atoi(argv[++i]);
-    else {
-      fprintf(stderr, "usage: amx-bench [--kind bf16|int8|both] [--k K] [--reps R]\n");
+    else if (!strcmp(argv[i], "--m") && i + 1 < argc) {
+      nm = 0;
+      char *copy = strdup(argv[++i]);
+      for (char *token = strtok(copy, ","); token && nm < 32; token = strtok(NULL, ","))
+        ms[nm++] = atoi(token);
+      free(copy);
+      for (int j = 0; j < nm; j++)
+        if (ms[j] < 1 || ms[j] > M) {
+          fprintf(stderr, "amx-bench: --m values must be 1..%d\n", M);
+          return 2;
+        }
+    } else {
+      fprintf(stderr, "usage: amx-bench [--kind bf16|int8|both] [--k K] [--reps R] [--m LIST]\n");
       return 2;
     }
   }
@@ -103,10 +116,12 @@ int main(int argc, char **argv) {
   if (!kernels_amx_active())
     fail("amx-bench needs LLAMA_KERNELS=amx");
   kernels_backend_init();
-  if (bf16)
-    bench(1, k, reps);
-  if (int8)
-    bench(0, k, reps);
+  for (int j = 0; j < nm; j++) {
+    if (bf16)
+      bench(1, k, reps, ms[j]);
+    if (int8)
+      bench(0, k, reps, ms[j]);
+  }
   kernels_backend_free();
   return 0;
 }
