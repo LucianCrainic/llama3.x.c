@@ -187,6 +187,10 @@ BF16 weights, plus any retained FP32 copy.
 
 ### 6.1 Backends and runtime knobs
 
+> The table below is the plan's record and is not maintained: the current list of knobs, including the ones retired after
+> measurement (packed4, the unfused and barrier decode reductions, the counter join, the reduction trace), is
+> [configuration.md](../configuration.md).
+
 The existing configuration is env-only (`LLAMA_KERNELS`, `LLAMA_Q8_ACTIVATIONS`). New
 knobs follow the same style, and are recorded in the report (F3). With every default
 below, the engine runs exactly as it does today; the OpenMP path is the
