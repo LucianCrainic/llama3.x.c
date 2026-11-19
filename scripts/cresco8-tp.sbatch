@@ -372,8 +372,48 @@ phase_B7() {
 #   alternating inside each repeat, REPEATS repeats plus one profiled repeat; then the attention bench decode cells
 #   (E5/bench-decode-KERNEL-SHAPE-kvN.out and E5/bench-decode.jsonl: 8B and 1B, all KV heads and half of them as one socket
 #   of two holds, 56 threads, 1000 repetitions: the bench caps --reps at 1024).
-E5_CONTEXTS="512 8192 32768"
-E5_KERNELS="split group"
+# Knobs of the bench stage (E5 follow-ups; every default reproduces the matrix above, DRY_RUN=1 prints it):
+#   E5_CONTEXTS ("512 8192 32768") contexts of the engine runs and, by default, of the microbenchmark; E5_KERNELS
+#   ("split group"), the order within a repeat; E5_SOCKETS ("1 2") socket counts of the engine runs; E5_PROFILED (1)
+#   profiled repeats per configuration, context and kernel (-xattnKERNELprof-1 ... -N); E5_ALTERNATE (0) 1 reverses the
+#   kernel order in even repeats, so neither kernel is always launched second; E5_SKIP_ENGINE (0) 1 skips the engine runs;
+#   E5_SKIP_MICRO (0) 1 skips the microbenchmark; E5_MICRO_SHAPES ("8b 1b"), E5_MICRO_KV ("8 4": local KV heads),
+#   E5_MICRO_CONTEXTS (E5_CONTEXTS), E5_MICRO_REPS (1000, at most 1024) and E5_LAYOUTS ("rows"): K/V layouts of the
+#   microbenchmark, rows (the engine's) and head ([kv_head][position][head_dim], the E5.2 probe). With the default layout
+#   the cells are those of the first E5 job; otherwise every cell takes --kv-layout and a -LAYOUT name suffix.
+#   MODELS and PRECISIONS restrict the engine runs as in every phase.
+E5_CONTEXTS=${E5_CONTEXTS:-"512 8192 32768"}
+E5_KERNELS=${E5_KERNELS:-"split group"}
+E5_SOCKETS=${E5_SOCKETS:-"1 2"}
+E5_PROFILED=${E5_PROFILED:-1}
+E5_ALTERNATE=${E5_ALTERNATE:-0}
+E5_SKIP_ENGINE=${E5_SKIP_ENGINE:-0}
+E5_SKIP_MICRO=${E5_SKIP_MICRO:-0}
+E5_MICRO_SHAPES=${E5_MICRO_SHAPES:-"8b 1b"}
+E5_MICRO_KV=${E5_MICRO_KV:-"8 4"}
+E5_MICRO_CONTEXTS=${E5_MICRO_CONTEXTS:-$E5_CONTEXTS}
+E5_MICRO_REPS=${E5_MICRO_REPS:-1000}
+E5_LAYOUTS=${E5_LAYOUTS:-rows}
+
+# e5_knobs: the E5 knobs are words from fixed sets or positive integers; anything else stops the phase before a launch.
+e5_knobs() {
+  local word
+  [[ -n $E5_CONTEXTS && -n $E5_KERNELS && -n $E5_SOCKETS && -n $E5_LAYOUTS ]] || die "E5 knob lists must not be empty"
+  for word in $E5_CONTEXTS $E5_MICRO_CONTEXTS $E5_MICRO_KV; do
+    [[ $word =~ ^[1-9][0-9]*$ ]] || die "E5 contexts and KV heads must be positive integers, got '$word'"
+  done
+  for word in $E5_KERNELS; do [[ $word == split || $word == group ]] || die "E5_KERNELS words are split or group, got '$word'"; done
+  for word in $E5_SOCKETS; do [[ $word == 1 || $word == 2 ]] || die "E5_SOCKETS words are 1 or 2, got '$word'"; done
+  for word in $E5_LAYOUTS; do [[ $word == rows || $word == head ]] || die "E5_LAYOUTS words are rows or head, got '$word'"; done
+  for word in $E5_MICRO_SHAPES; do
+    [[ $word =~ ^(8b|1b|[1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*)$ ]] || die "bad E5_MICRO_SHAPES word '$word'"
+  done
+  [[ $E5_PROFILED =~ ^[0-9]+$ ]] || die "E5_PROFILED must be a non-negative integer, got '$E5_PROFILED'"
+  [[ $E5_MICRO_REPS =~ ^[1-9][0-9]*$ ]] && ((E5_MICRO_REPS <= 1024)) || die "E5_MICRO_REPS must be 1..1024, got '$E5_MICRO_REPS'"
+  for word in "$E5_ALTERNATE" "$E5_SKIP_ENGINE" "$E5_SKIP_MICRO"; do
+    [[ $word == 0 || $word == 1 ]] || die "E5_ALTERNATE, E5_SKIP_ENGINE and E5_SKIP_MICRO are 0 or 1, got '$word'"
+  done
+}
 
 # e5_pair DIR NAME PRECISION STAGED LABEL SOCKETS_A SOCKETS_B: per-token logits with LLAMA_ATTN_DECODE=split on SOCKETS_A against
 # group on SOCKETS_B; the gate flags come from B_FLAGS (b_compare's default is the FP32 gate), the tokens from CMP_TOKENS.
@@ -450,16 +490,21 @@ e5_check() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
 }
 
-# e5_bench_cell NAME KERNEL SHAPE KV: one attention-bench decode launch on socket 0's HBM, all contexts.
+# e5_bench_cell NAME KERNEL SHAPE KV [LAYOUT]: one attention-bench decode launch on socket 0's HBM, all microbenchmark
+# contexts; a LAYOUT adds --kv-layout (E5.2).
 e5_bench_cell() {
-  local name=$1 kernel=$2 shape=$3 kv=$4
+  local name=$1 kernel=$2 shape=$3 kv=$4 layout=${5:-} layout_args=()
+  [[ -z $layout ]] || layout_args=(--kv-layout "$layout")
   expect "$name" ok "$OUT/E5" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false \
     LLAMA_KERNELS=avx512 "LLAMA_ATTN_DECODE=$kernel" "$ROOT/build/release/attention-bench" --node 2 --mode decode \
-    --shape "$shape" --context "${E5_CONTEXTS// /,}" --reps 1000 --kv-heads-local "$kv"
+    --shape "$shape" --context "${E5_MICRO_CONTEXTS// /,}" --reps "$E5_MICRO_REPS" --kv-heads-local "$kv" \
+    ${layout_args[@]+"${layout_args[@]}"}
 }
 
-e5_bench() {
-  local dir="$OUT/E5" entry name artifacts hf precision staged tokenizer rep ctx config kernel shape kv engine_precision
+# e5_engine_runs: the engine decode runs of the bench stage.
+e5_engine_runs() {
+  local entry name artifacts hf precision staged tokenizer rep ctx config kernel engine_precision kernels configs=()
+  for ctx in $E5_SOCKETS; do configs+=("${ctx}s56"); done
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
     tokenizer="$artifacts/tokenizer-v2.bin"
@@ -468,35 +513,57 @@ e5_bench() {
       [[ $precision != fp32 ]] || engine_precision=fp32
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
       for ((rep = 1; rep <= REPEATS; rep++)); do
+        kernels=$E5_KERNELS
+        # E5_ALTERNATE: even repeats launch the kernels in the reverse order
+        if [[ $E5_ALTERNATE == 1 && $((rep % 2)) == 0 ]]; then
+          kernels=
+          for kernel in $E5_KERNELS; do kernels="$kernel $kernels"; done
+        fi
         for ctx in $E5_CONTEXTS; do
-          for config in 1s56 2s56; do
-            for kernel in $E5_KERNELS; do
+          for config in "${configs[@]}"; do
+            for kernel in $kernels; do
               b7_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=attn$kernel" -- \
                 "LLAMA_ATTN_DECODE=$kernel"
             done
           done
         done
       done
-      # One profiled repeat per configuration and context (the per-socket profile lines go to the .stderr files).
-      for ctx in $E5_CONTEXTS; do
-        for config in 1s56 2s56; do
-          for kernel in $E5_KERNELS; do
-            b7_launch "$name" "$engine_precision" "$config" "$ctx" 1 "$staged" "$tokenizer" "x=attn${kernel}prof" -- \
-              "LLAMA_ATTN_DECODE=$kernel" LLAMA_PROFILE=1
+      # Profiled repeats per configuration and context (the per-socket profile lines go to the .stderr files).
+      for ((rep = 1; rep <= E5_PROFILED; rep++)); do
+        for ctx in $E5_CONTEXTS; do
+          for config in "${configs[@]}"; do
+            for kernel in $E5_KERNELS; do
+              b7_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=attn${kernel}prof" -- \
+                "LLAMA_ATTN_DECODE=$kernel" LLAMA_PROFILE=1
+            done
           done
         done
       done
       unstage_model_on 0 "$name" "$precision"
     done
   done
+}
+
+e5_bench() {
+  local dir="$OUT/E5" shape kv kernel layout
+  e5_knobs
+  [[ $E5_SKIP_ENGINE == 1 ]] || e5_engine_runs
   # the attention bench: the layer's decode attention alone, all KV heads and the half one socket of two holds
-  for shape in 8b 1b; do
-    for kv in 8 4; do
-      for kernel in $E5_KERNELS; do
-        e5_bench_cell "bench-decode-$kernel-$shape-kv$kv" "$kernel" "$shape" "$kv"
+  if [[ $E5_SKIP_MICRO != 1 ]]; then
+    for shape in $E5_MICRO_SHAPES; do
+      for kv in $E5_MICRO_KV; do
+        for kernel in $E5_KERNELS; do
+          if [[ $E5_LAYOUTS == rows ]]; then
+            e5_bench_cell "bench-decode-$kernel-${shape//\//x}-kv$kv" "$kernel" "$shape" "$kv"
+          else
+            for layout in $E5_LAYOUTS; do
+              e5_bench_cell "bench-decode-$kernel-${shape//\//x}-kv$kv-$layout" "$kernel" "$shape" "$kv" "$layout"
+            done
+          fi
+        done
       done
     done
-  done
+  fi
   if ! dry_run; then
     if compgen -G "$dir/bench-decode-*.out" > /dev/null; then cat "$dir"/bench-decode-*.out > "$dir/bench-decode.jsonl"; else : > "$dir/bench-decode.jsonl"; fi
     "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
