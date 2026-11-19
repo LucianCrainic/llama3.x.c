@@ -19,7 +19,7 @@ BUILD = Path(os.environ['BUILD_DIR']).resolve() if os.environ.get('BUILD_DIR') e
 # Knobs the campaign scripts read from the environment. A test that runs a script starts from the caller's environment
 # without them, so a run inside a campaign job (which exports BASELINE_ROOT, STAGE, MODELS and so on) sees what it sets.
 CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOKENS', 'CONTEXT', 'CPU_BIND', 'D2_M1', 'D2_M2',
-                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'E2_SWEEP_CELLS',
+                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_DIR', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'E2_SWEEP_CELLS',
                   'E4_AMX', 'E4_ATTN', 'E4_RUNGS', 'E4_TILED_ENV', 'GATES_ONLY',
                   'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
                   'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
@@ -1155,6 +1155,14 @@ class PhaseE4DryRunTests(unittest.TestCase):
         self.assertTrue(all('cpu=0 ' in line for line in runs if '-s1-' in line))
         self.assertTrue(all('LLAMA_PLACEMENT=hbm' in line for line in runs))
         self.assertTrue(all('LLAMA_KERNELS=amx' in line for line in runs if 'kamx_int8' in line))
+
+    def test_check_writes_only_into_its_own_directory(self):
+        # Job 5864123: the generation comparisons wrote into E1/, which a job without phase E1 does not create.
+        lines = [line for line in self.run_phase('check') if line.startswith('EXPECT ')]
+        gen = [line for line in lines if line.startswith('EXPECT gen-')]
+        self.assertEqual(len(gen), 12)
+        self.assertTrue(all('/out/E4/gen-' in line for line in gen), gen[0])
+        self.assertFalse(any('/out/E1/' in line for line in lines))
 
     def test_amx_only_on_the_bf16_rung_and_only_when_opted_in(self):
         runs = self.runs(E4_AMX='1')
