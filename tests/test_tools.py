@@ -1072,6 +1072,31 @@ class SummarizeE4Tests(unittest.TestCase):
         self.assertIn('| m8b | amx_bf16 | 256 | 8192 | tiled | 20.400 [19.200-20.600] | 10.100 [10.000-10.200] | 2.02x |', out)
         self.assertIn('- value: PASS', out)
 
+    def test_decode_noise_and_placement_evidence(self):
+        # Job 5864134: with three repeats a variant median just outside the split range is noise when the ranges overlap; a
+        # faster variant is not a regression; two-socket reports say placement 'file' and one-socket work regions are not
+        # verified by design. Only non-overlapping slower decode or bad region evidence fails.
+        def gates(decode_tiled, regions=None, placement='hbm'):
+            with tempfile.TemporaryDirectory() as temp:
+                self.populate(temp, decode_tiled=decode_tiled)
+                if regions is not None:
+                    for path in Path(temp).glob('m8b-*-s1-*-xattntiled-*.json'):
+                        data = json.loads(path.read_text())
+                        data['regions'], data['runtime']['placement'] = regions, placement
+                        path.write_text(json.dumps(data))
+                out = self.bench(temp)
+            return ('Decode gate: **PASS**' in out, 'Placement gate: **PASS**' in out)
+        full = lambda role: dict(role=role, verified='full', pages_mismatched=0, pages_missing=0, bytes=1 << 30)
+        self.assertEqual(gates((5.15, 5.25, 5.3))[0], True)   # median 5.25 above split's 5.2, ranges overlap
+        self.assertEqual(gates((5.3, 5.4, 5.5))[0], True)     # faster, no overlap: not a regression
+        self.assertEqual(gates((4.5, 4.6, 4.7))[0], False)    # slower, no overlap
+        work = dict(role='work', verified='unverified', pages_mismatched=0, pages_missing=0, bytes=70 << 20)
+        self.assertEqual(gates((5.0, 5.1, 5.2), [full('weights'), full('kv.k'), work])[1], True)
+        self.assertEqual(gates((5.0, 5.1, 5.2), [full('weights'), full('kv.k')], placement='file')[1], True)
+        self.assertEqual(gates((5.0, 5.1, 5.2), [dict(full('weights'), pages_mismatched=3)])[1], False)
+        self.assertEqual(gates((5.0, 5.1, 5.2), [dict(full('kv.k'), verified='sampled')])[1], False)
+        self.assertEqual(gates((5.0, 5.1, 5.2), [])[1], False)
+
     def test_each_gate_fails_on_its_own_condition(self):
         for name, kwargs, text in [
                 ('value', dict(tiled8192=(25.0, 25.5, 26.0)), 'Value gate (the amx_bf16 rung): **FAIL**'),
