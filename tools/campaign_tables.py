@@ -41,10 +41,13 @@ def dig(obj, *keys):
 
 
 def attention_tag(report):
-    """The attention variants of a run (report build.attention for prefill, build.attention_decode for decode), written
-    only when they are not the default `split`, so default runs and old reports keep their columns unchanged."""
+    """The attention variants of a run (report build.attention for prefill, build.attention_decode for decode, and the K/V
+    layout build.kv_layout), written only when they are not the default (`split`, `rows`), so default runs and old reports
+    keep their columns unchanged."""
     parts = [f'{label}={value}' for label, key in (('attn', 'attention'), ('decode-attn', 'attention_decode'))
              for value in [dig(report, 'build', key)] if value not in (None, 'split')]
+    if dig(report, 'build', 'kv_layout') not in (None, 'rows'):  # E5.4: LLAMA_KV_LAYOUT=head; rows is the default
+        parts.append(f"kv={dig(report, 'build', 'kv_layout')}")
     return ' '.join(parts)
 
 

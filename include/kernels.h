@@ -43,6 +43,13 @@ int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
 const char *kernels_attention_name(void);
 const char *kernels_attention_decode_name(void);
 int kernels_attention_select(const char *batch, const char *decode);
+/* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default rows). rows: a layer's cache is
+ * [position][kv_head][head_dim]; head: [kv_head][position][head_dim] with room for seq_len positions per head (the same
+ * bytes). Engines address the cache through the helpers at the end of this header; the results are bitwise the same in
+ * both layouts. kernels_kv_layout_select picks one directly (returns 0 for an unknown name); tests use it. */
+int kernels_kv_layout_head(void);
+const char *kernels_kv_layout_name(void);
+int kernels_kv_layout_select(const char *name);
 typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
 void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
 
@@ -204,5 +211,26 @@ void k_attention(float *out, const float *q, const float *key_cache, const float
 void k_attention_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                         AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position,
                         size_t pos_stride, size_t head_base);
+
+/* The batched attention on a caller-chosen K/V layout (the strides of k_attention_layout). k_attention_batch is
+ * pos_stride = n_kv_heads * head_dim, head_base = head_dim; results are bitwise those of the rows layout. */
+void k_attention_batch_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                              AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
+                              int m, size_t pos_stride, size_t head_base);
+void k_attention_batch_portable_layout(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
+                                       int pos0, int m, size_t pos_stride, size_t head_base);
+
+/* Engine-facing K/V cache helpers (LLAMA_KV_LAYOUT). `cache` is one layer's K or V cache of the (local) KV heads.
+ * k_kv_strides gives the pos_stride / head_base of the active layout. k_kv_store copies `count` rows of
+ * n_kv_heads * head_dim floats (row stride src_ld) to positions pos0.. . k_attention_kv / k_attention_batch_kv are
+ * k_attention / k_attention_batch on the active layout (the plain calls themselves for rows). */
+void k_kv_strides(int n_kv_heads, int head_dim, int seq_len, size_t *pos_stride, size_t *head_base);
+void k_kv_store(float *cache, const float *src, size_t src_ld, int pos0, int count, int n_kv_heads, int head_dim,
+                int seq_len);
+void k_attention_kv(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);
+void k_attention_batch_kv(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                          AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m);
 
 #endif

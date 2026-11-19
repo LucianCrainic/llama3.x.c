@@ -382,6 +382,25 @@ phase_B7() {
 #   microbenchmark, rows (the engine's) and head ([kv_head][position][head_dim], the E5.2 probe). With the default layout
 #   the cells are those of the first E5 job; otherwise every cell takes --kv-layout and a -LAYOUT name suffix.
 #   MODELS and PRECISIONS restrict the engine runs as in every phase.
+# Knobs of the K/V layout study (E5.4, LLAMA_KV_LAYOUT=head; every default leaves the matrices above unchanged):
+#   E5_KV_LAYOUTS (empty): "rows", "head" or "rows head" adds LLAMA_KV_LAYOUT=LAYOUT to the engine runs of the bench stage,
+#   as a cell of its own per (kernel, layout) variant (label tag attnKERNELkvLAYOUT, profiled runs ...prof), so a repeat runs
+#   every variant once, in the reverse order in even repeats with E5_ALTERNATE=1; the layouts of the engine runs, not of the
+#   microbenchmark (E5_LAYOUTS). E5_ATTN (empty, split or tiled) sets LLAMA_ATTN (the batched prefill kernel, which builds
+#   the warm contexts and runs the timed prompt) for the engine runs; empty keeps the job-wide default. E5_PREFILL_PROMPTS
+#   (empty, e.g. "2048 8192") adds the time-to-first-token cells (V4): one socket, one cell per prompt length, rung and
+#   layout, REPEATS repeats alternating the layout order, tiled prefill (E5_ATTN, default tiled), 32 generated tokens;
+#   E5_PREFILL_RUNGS ("avx512_fp32 amx_bf16 avx512_q8 amx_int8", those of the precision of the checkpoint run) names the
+#   rungs and M the one-socket choice of C7 (128, 256, 256, 256). E5_KV_CHECK (0): STAGE=check runs the correctness gates
+#   of the layout (C2) instead of the split-against-group gates: rows against head, bitwise, on every model, precision,
+#   socket count and decode kernel; a short prompt per token, a warm 8192-token context (tiled batched prefill, last row),
+#   the decode path after it (tools/compare_engines.py --tail), 128 greedy tokens, the AMX rungs, and the Hugging Face
+#   gate of FP32 with the head layout.
+E5_KV_LAYOUTS=${E5_KV_LAYOUTS:-}
+E5_ATTN=${E5_ATTN:-}
+E5_PREFILL_PROMPTS=${E5_PREFILL_PROMPTS:-}
+E5_PREFILL_RUNGS=${E5_PREFILL_RUNGS:-"avx512_fp32 amx_bf16 avx512_q8 amx_int8"}
+E5_KV_CHECK=${E5_KV_CHECK:-0}
 E5_CONTEXTS=${E5_CONTEXTS:-"512 8192 32768"}
 E5_KERNELS=${E5_KERNELS:-"split group"}
 E5_SOCKETS=${E5_SOCKETS:-"1 2"}
@@ -408,6 +427,17 @@ e5_knobs() {
   for word in $E5_MICRO_SHAPES; do
     [[ $word =~ ^(8b|1b|[1-9][0-9]*/[1-9][0-9]*/[1-9][0-9]*)$ ]] || die "bad E5_MICRO_SHAPES word '$word'"
   done
+  for word in $E5_KV_LAYOUTS; do [[ $word == rows || $word == head ]] || die "E5_KV_LAYOUTS words are rows or head, got '$word'"; done
+  [[ -z $E5_ATTN || $E5_ATTN == split || $E5_ATTN == tiled ]] || die "E5_ATTN is empty, split or tiled, got '$E5_ATTN'"
+  for word in $E5_PREFILL_PROMPTS; do
+    [[ $word =~ ^[1-9][0-9]*$ ]] || die "E5_PREFILL_PROMPTS words are prompt lengths, got '$word'"
+  done
+  [[ -z $E5_PREFILL_PROMPTS || -n $E5_KV_LAYOUTS ]] || die "E5_PREFILL_PROMPTS needs E5_KV_LAYOUTS (the cells compare layouts)"
+  for word in $E5_PREFILL_RUNGS; do
+    [[ $word == avx512_fp32 || $word == amx_bf16 || $word == avx512_q8 || $word == amx_int8 ]] ||
+      die "E5_PREFILL_RUNGS words are avx512_fp32, amx_bf16, avx512_q8 or amx_int8, got '$word'"
+  done
+  [[ $E5_KV_CHECK == 0 || $E5_KV_CHECK == 1 ]] || die "E5_KV_CHECK is 0 or 1, got '$E5_KV_CHECK'"
   [[ $E5_PROFILED =~ ^[0-9]+$ ]] || die "E5_PROFILED must be a non-negative integer, got '$E5_PROFILED'"
   [[ $E5_MICRO_REPS =~ ^[1-9][0-9]*$ ]] && ((E5_MICRO_REPS <= 1024)) || die "E5_MICRO_REPS must be 1..1024, got '$E5_MICRO_REPS'"
   for word in "$E5_ALTERNATE" "$E5_SKIP_ENGINE" "$E5_SKIP_MICRO"; do
@@ -490,6 +520,98 @@ e5_check() {
   dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
 }
 
+# ---- E5.4: correctness gates of LLAMA_KV_LAYOUT=head (C2) --------------------------------------------------------------------
+# e5_kv_pair DIR NAME PRECISION STAGED LABEL SOCKETS ENV...: logits with LLAMA_KV_LAYOUT=rows against head, ENV on both
+# sides, one or two sockets (LLAMA_TP_CHECK=1 on two); the gate flags come from B_FLAGS (always --bitwise here) and the
+# tokens from CMP_TOKENS.
+e5_kv_pair() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 sockets=$6 check=()
+  shift 6
+  [[ $sockets != 2 ]] || check=(LLAMA_TP_CHECK=1)
+  b_compare "$dir" "$name" "$precision" "$staged" "$label" "${TP_ENV[@]}" "LLAMA_SOCKETS=$sockets" ${check[@]+"${check[@]}"} "$@" \
+    LLAMA_KV_LAYOUT=rows -- "${TP_ENV[@]}" "LLAMA_SOCKETS=$sockets" ${check[@]+"${check[@]}"} "$@" LLAMA_KV_LAYOUT=head
+}
+
+# e5_kv_generation DIR NAME PRECISION STAGED TOKENIZER SOCKETS KERNEL: 128 greedy tokens from a warm 8192-token context and the
+# short prompt (tiled batched prefill), rows against head with decode KERNEL, which must be identical (compare_generation.py).
+e5_kv_generation() {
+  local dir=$1 name=$2 precision=$3 staged=$4 tokenizer=$5 sockets=$6 kernel=$7 engine=run probe=probe-fp32 args=() word
+  [[ $precision == fp32 ]] || { engine=runq; probe=probe-int8; }
+  b7_config 1s56 "$precision"
+  for word in "${B7_ENV[@]}"; do
+    [[ $word == LLAMA_SOCKETS=* ]] || args+=(--env-a "$word" --env-b "$word")
+  done
+  args+=(--env-a "LLAMA_SOCKETS=$sockets" --env-b "LLAMA_SOCKETS=$sockets" --env-a "LLAMA_ATTN_DECODE=$kernel"
+    --env-b "LLAMA_ATTN_DECODE=$kernel" --env-a LLAMA_ATTN=tiled --env-b LLAMA_ATTN=tiled --env-a LLAMA_KV_LAYOUT=rows
+    --env-b LLAMA_KV_LAYOUT=head)
+  [[ $sockets != 2 ]] || args+=(--env-a LLAMA_TP_CHECK=1 --env-b LLAMA_TP_CHECK=1)
+  expect "gen-$name-$precision-s$sockets-$kernel-rows-vs-head" ok "$dir" -- "$PYTHON" "$ROOT/tools/compare_generation.py" \
+    --engine "$ROOT/build/release/$engine" --checkpoint "$staged" --tokenizer "$tokenizer" --prompt-file "$OUT/short.txt" \
+    --steps 128 --warm-context 8192 --engine-args "--context-length 8448 --chat-template" "${args[@]}" \
+    --probe "$ROOT/build/release/$probe" --probe-batch "$B7_BATCH" --require-identical \
+    --output "$dir/gen-$name-$precision-s$sockets-$kernel-rows-vs-head.json"
+}
+
+e5_kv_check() {
+  local dir="$OUT/E5" entry name artifacts hf precision staged tokenizer sockets kernel batch=("--batch-a" "$B7_BATCH" "--batch-b" "$B7_BATCH")
+  a_models "$dir" 2048,8192
+  for entry in $MODELS; do
+    IFS=: read -r name artifacts hf <<< "$entry"
+    tokenizer="$artifacts/tokenizer-v2.bin"
+    tokens_of "$name" "$OUT/prompt-8192.txt" "$dir/$name-tokens-8192.txt"
+    for precision in $PRECISIONS; do
+      staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
+      for sockets in 1 2; do
+        for kernel in split group; do
+          # the short prompt per token (every position), and the decode path on a warm 8192-token context: the first
+          # 8184 tokens through the tiled batched prefill, the last 8 per token
+          B_FLAGS=(--bitwise)
+          CMP_TOKENS= e5_kv_pair "$dir" "$name" "$precision" "$staged" "kv-short-s$sockets-$kernel" "$sockets" \
+            "LLAMA_ATTN_DECODE=$kernel"
+          B_FLAGS=(--bitwise "${batch[@]}" --tail 8)
+          CMP_TOKENS="$dir/$name-tokens-8192.txt" e5_kv_pair "$dir" "$name" "$precision" "$staged" "kv-tail8192-s$sockets-$kernel" \
+            "$sockets" "LLAMA_ATTN_DECODE=$kernel" LLAMA_ATTN=tiled LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$B7_BATCH"
+          e5_kv_generation "$dir" "$name" "$precision" "$staged" "$tokenizer" "$sockets" "$kernel"
+        done
+        # the logits after the tiled batched prefill of the 8192 tokens (the last row), and the AMX rungs that write K/V
+        B_FLAGS=(--bitwise "${batch[@]}" --last-only)
+        CMP_TOKENS="$dir/$name-tokens-8192.txt" e5_kv_pair "$dir" "$name" "$precision" "$staged" "kv-prefill8192-s$sockets" \
+          "$sockets" LLAMA_ATTN=tiled LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$B7_BATCH"
+        if [[ $precision == fp32 ]]; then
+          B_FLAGS=(--bitwise --batch-a 256 --batch-b 256 --last-only)
+          CMP_TOKENS="$dir/$name-tokens-8192.txt" e5_kv_pair "$dir" "$name" "$precision" "$staged" "kv-amxbf16-8192-s$sockets" \
+            "$sockets" LLAMA_ATTN=tiled LLAMA_KERNELS=amx LLAMA_PRECISION=bf16 LLAMA_PREFILL_BATCH=256
+        else
+          B_FLAGS=(--bitwise --batch-a 256 --batch-b 256 --last-only)
+          CMP_TOKENS="$dir/$name-tokens-8192.txt" e5_kv_pair "$dir" "$name" "$precision" "$staged" "kv-amxint8-8192-s$sockets" \
+            "$sockets" LLAMA_ATTN=tiled LLAMA_KERNELS=amx LLAMA_PREFILL_BATCH=256
+        fi
+      done
+      B_FLAGS=()
+      unstage_model_on 0 "$name" "$precision"
+    done
+    # the Hugging Face gate of the FP32 per-token path with the head-major cache, one socket and two sockets
+    if [[ " $PRECISIONS " == *" fp32 "* ]]; then
+      if [[ ${HF_GATE:-1} != 0 ]]; then
+        if validate_gate "$name" "$artifacts" "$hf" fp32 fp32-head LLAMA_KV_LAYOUT=head; then
+          record_result "hf-$name-fp32-head" PASS
+        else
+          record_result "hf-$name-fp32-head" FAIL
+        fi
+        if tp_validate "$name" "$artifacts" "$hf" fp32 fp32-head-2s "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 \
+          LLAMA_KV_LAYOUT=head; then
+          record_result "hf-$name-fp32-head-2s" PASS
+        else
+          record_result "hf-$name-fp32-head-2s" FAIL
+        fi
+      else
+        echo "HF_GATE=0: the Hugging Face gate with LLAMA_KV_LAYOUT=head was not run for $name" | tee -a "$dir/no-hf-gate.txt"
+      fi
+    fi
+  done
+  dry_run || "$PYTHON" "$ROOT/tools/summarize_generation.py" "$dir" > "$dir/summary.md"
+}
+
 # e5_bench_cell NAME KERNEL SHAPE KV [LAYOUT]: one attention-bench decode launch on socket 0's HBM, all microbenchmark
 # contexts; a LAYOUT adds --kv-layout (E5.2).
 e5_bench_cell() {
@@ -501,9 +623,78 @@ e5_bench_cell() {
     ${layout_args[@]+"${layout_args[@]}"}
 }
 
+# e5_variants REVERSE: the (kernel, layout) variants of a repeat as words "kernel:layout" in E5_VARIANTS ("kernel:" when
+# E5_KV_LAYOUTS is empty), in the reverse order when REVERSE is 1 (E5_ALTERNATE, even repeats).
+e5_variants() {
+  local kernel layout word
+  E5_VARIANTS=()
+  for kernel in $E5_KERNELS; do
+    for layout in ${E5_KV_LAYOUTS:-@}; do
+      word="$kernel:${layout/@/}"
+      if [[ ${1:-0} == 1 ]]; then E5_VARIANTS=("$word" ${E5_VARIANTS[@]+"${E5_VARIANTS[@]}"}); else E5_VARIANTS+=("$word"); fi
+    done
+  done
+}
+
+# e5_decode_launch NAME PRECISION CONFIG CONTEXT REP STAGED TOKENIZER VARIANT PROFILED: one decode run of a variant.
+e5_decode_launch() {
+  local name=$1 precision=$2 config=$3 ctx=$4 rep=$5 staged=$6 tokenizer=$7 variant=$8 profiled=$9
+  local kernel=${variant%%:*} layout=${variant#*:} tag env_words
+  tag="attn$kernel"
+  env_words=("LLAMA_ATTN_DECODE=$kernel")
+  [[ -z $layout ]] || { tag+="kv$layout"; env_words+=("LLAMA_KV_LAYOUT=$layout"); }
+  [[ -z $E5_ATTN ]] || env_words+=("LLAMA_ATTN=$E5_ATTN")
+  [[ $profiled != 1 ]] || { tag+=prof; env_words+=(LLAMA_PROFILE=1); }
+  b7_launch "$name" "$precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=$tag" -- "${env_words[@]}"
+}
+
+# e5_rung RUNG M: RUNG_PREC, RUNG_ENGINE, RUNG_ENV of the prefill rungs of the layout cells (as c_rung of the prefill script).
+e5_rung() {
+  local m=$2
+  case $1 in
+    avx512_fp32) RUNG_PREC=fp32 RUNG_ENGINE=run RUNG_ENV=(LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$m") ;;
+    amx_bf16) RUNG_PREC=bf16 RUNG_ENGINE=run RUNG_ENV=(LLAMA_KERNELS=amx LLAMA_PRECISION=bf16 "LLAMA_PREFILL_BATCH=$m") ;;
+    avx512_q8) RUNG_PREC=int8 RUNG_ENGINE=runq RUNG_ENV=(LLAMA_KERNELS=avx512 LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$m") ;;
+    amx_int8) RUNG_PREC=int8 RUNG_ENGINE=runq RUNG_ENV=(LLAMA_KERNELS=amx "LLAMA_PREFILL_BATCH=$m") ;;
+    *) die "unknown prefill rung '$1'" ;;
+  esac
+}
+
+# e5_prefill_runs NAME PRECISION STAGED TOKENIZER: the time-to-first-token cells (V4) of one checkpoint: one socket, every
+# prompt, rung of the precision and layout, REPEATS repeats; the layouts alternate their order in even repeats (E5_ALTERNATE).
+e5_prefill_runs() {
+  local name=$1 precision=$2 staged=$3 tokenizer=$4 rep n rung m layout layouts prompt
+  for ((rep = 1; rep <= REPEATS; rep++)); do
+    layouts=$E5_KV_LAYOUTS
+    if [[ $E5_ALTERNATE == 1 && $((rep % 2)) == 0 ]]; then
+      layouts=
+      for layout in $E5_KV_LAYOUTS; do layouts="$layout $layouts"; done
+    fi
+    for n in $E5_PREFILL_PROMPTS; do
+      prompt="$OUT/prompt-$n.txt"
+      for rung in $E5_PREFILL_RUNGS; do
+        case $rung in
+          avx512_fp32 | amx_bf16) [[ $precision == fp32 ]] || continue ;;
+          *) [[ $precision == int8 ]] || continue ;;
+        esac
+        m=256
+        [[ $rung != avx512_fp32 ]] || m=128
+        for layout in $layouts; do
+          e5_rung "$rung" "$m"
+          b7_config 1s56 "$RUNG_PREC"
+          CPU_BIND=$B7_CPU REP=$rep CONTEXT=$((n + 256)) GENERATION=32 LOG_LEVEL=warn run_engine \
+            "$(run_label "$name" "$RUNG_PREC" teams hbm 1 56 "m=$m" "p=$n" "k=$rung" "x=kv$layout")" "$RUNG_ENGINE" "$staged" \
+            "$tokenizer" "$prompt" 1 "$([[ $rep == 1 ]] && echo "$PERF" || echo 0)" "${B7_ENV[@]}" "${RUNG_ENV[@]}" \
+            "LLAMA_ATTN=${E5_ATTN:-tiled}" "LLAMA_KV_LAYOUT=$layout"
+        done
+      done
+    done
+  done
+}
+
 # e5_engine_runs: the engine decode runs of the bench stage.
 e5_engine_runs() {
-  local entry name artifacts hf precision staged tokenizer rep ctx config kernel engine_precision kernels configs=()
+  local entry name artifacts hf precision staged tokenizer rep ctx config variant engine_precision configs=()
   for ctx in $E5_SOCKETS; do configs+=("${ctx}s56"); done
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
@@ -513,32 +704,28 @@ e5_engine_runs() {
       [[ $precision != fp32 ]] || engine_precision=fp32
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
       for ((rep = 1; rep <= REPEATS; rep++)); do
-        kernels=$E5_KERNELS
-        # E5_ALTERNATE: even repeats launch the kernels in the reverse order
-        if [[ $E5_ALTERNATE == 1 && $((rep % 2)) == 0 ]]; then
-          kernels=
-          for kernel in $E5_KERNELS; do kernels="$kernel $kernels"; done
-        fi
+        # E5_ALTERNATE: even repeats launch the variants in the reverse order
+        e5_variants "$([[ $E5_ALTERNATE == 1 && $((rep % 2)) == 0 ]] && echo 1 || echo 0)"
         for ctx in $E5_CONTEXTS; do
           for config in "${configs[@]}"; do
-            for kernel in $kernels; do
-              b7_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=attn$kernel" -- \
-                "LLAMA_ATTN_DECODE=$kernel"
+            for variant in "${E5_VARIANTS[@]}"; do
+              e5_decode_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "$variant" 0
             done
           done
         done
       done
       # Profiled repeats per configuration and context (the per-socket profile lines go to the .stderr files).
+      e5_variants 0
       for ((rep = 1; rep <= E5_PROFILED; rep++)); do
         for ctx in $E5_CONTEXTS; do
           for config in "${configs[@]}"; do
-            for kernel in $E5_KERNELS; do
-              b7_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "x=attn${kernel}prof" -- \
-                "LLAMA_ATTN_DECODE=$kernel" LLAMA_PROFILE=1
+            for variant in "${E5_VARIANTS[@]}"; do
+              e5_decode_launch "$name" "$engine_precision" "$config" "$ctx" "$rep" "$staged" "$tokenizer" "$variant" 1
             done
           done
         done
       done
+      [[ -z $E5_PREFILL_PROMPTS ]] || e5_prefill_runs "$name" "$precision" "$staged" "$tokenizer"
       unstage_model_on 0 "$name" "$precision"
     done
   done
@@ -576,9 +763,10 @@ phase_E5() {
     echo 'MODELS is empty: no E5 model run was made' | tee "$dir/no-models.txt"
     return 0
   fi
+  [[ $E5_KV_CHECK == 0 || $E5_KV_CHECK == 1 ]] || die "E5_KV_CHECK is 0 or 1, got '$E5_KV_CHECK'"
   need_shm
   if [[ $STAGE == check ]]; then
-    e5_check
+    if [[ $E5_KV_CHECK == 1 ]]; then e5_knobs && e5_kv_check; else e5_check; fi
   else
     a_models "$dir"
     e5_bench

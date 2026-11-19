@@ -315,29 +315,27 @@ static void forward_layer_batch(Transformer *t, RunState *s, size_t l, int pos0,
   int dim = p->dim, kv_dim = p->head_dim * p->n_kv_heads, hidden_dim = p->hidden_dim, head_size = p->head_dim;
   size_t loff = l * p->seq_len * kv_dim;
   float *kc = s->key_cache + loff, *vc = s->value_cache + loff;
+  /* rows: the projections are written straight into the cache rows. head: into the K/V row buffers (s->k, s->v), stored
+   * per head after RoPE. */
+  int head_layout = kernels_kv_layout_head();
+  float *kd = head_layout ? s->k : kc + (size_t)pos0 * kv_dim, *vd = head_layout ? s->v : vc + (size_t)pos0 * kv_dim;
   static const PackedLayer none;
   const PackedLayer *pl = t->packed ? &t->packed[l] : &none;
 
   PROFILE(PHASE_RMSNORM, k_rmsnorm_rows(s->xb, s->x, w->rms_att_weight + l * dim, count, dim, p->norm_eps));
   PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
-  GemmQ8Segment qkv[3] = {{.c = s->q, .ldc = dim, .w = weight(w->wq + l), .pw = pl->wq, .n = dim, .kind = GEMM_STORE},
-                          {.c = kc + (size_t)pos0 * kv_dim,
-                           .ldc = kv_dim,
-                           .w = weight(w->wk + l),
-                           .pw = pl->wk,
-                           .n = kv_dim,
-                           .kind = GEMM_STORE},
-                          {.c = vc + (size_t)pos0 * kv_dim,
-                           .ldc = kv_dim,
-                           .w = weight(w->wv + l),
-                           .pw = pl->wv,
-                           .n = kv_dim,
-                           .kind = GEMM_STORE}};
+  GemmQ8Segment qkv[3] = {
+      {.c = s->q, .ldc = dim, .w = weight(w->wq + l), .pw = pl->wq, .n = dim, .kind = GEMM_STORE},
+      {.c = kd, .ldc = kv_dim, .w = weight(w->wk + l), .pw = pl->wk, .n = kv_dim, .kind = GEMM_STORE},
+      {.c = vd, .ldc = kv_dim, .w = weight(w->wv + l), .pw = pl->wv, .n = kv_dim, .kind = GEMM_STORE}};
   PROFILE(PHASE_QKV, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, qkv, 3));
-  PROFILE(PHASE_ROPE, k_rope_apply_rows(s->q, (size_t)dim, kc + (size_t)pos0 * kv_dim, (size_t)kv_dim, s->rope,
-                                        (size_t)2 * head_size, count, p->n_heads, p->n_kv_heads, head_size));
-  PROFILE(PHASE_ATTENTION, k_attention_batch(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
-                                             head_size, p->seq_len, pos0, count));
+  PROFILE(PHASE_ROPE, k_rope_apply_rows(s->q, (size_t)dim, kd, (size_t)kv_dim, s->rope, (size_t)2 * head_size, count,
+                                        p->n_heads, p->n_kv_heads, head_size));
+  if (head_layout)
+    PROFILE(PHASE_KV_STORE, k_kv_store(kc, kd, (size_t)kv_dim, pos0, count, p->n_kv_heads, head_size, p->seq_len);
+            k_kv_store(vc, vd, (size_t)kv_dim, pos0, count, p->n_kv_heads, head_size, p->seq_len));
+  PROFILE(PHASE_ATTENTION, k_attention_batch_kv(s->xb, s->q, kc, vc, s->att, &s->attention, p->n_heads, p->n_kv_heads,
+                                                head_size, p->seq_len, pos0, count));
   PROFILE(PHASE_QUANTIZE, k_quantize_rows(s->xq.q, s->xq.s, s->xb, (size_t)dim, count, dim, GS));
   GemmQ8Segment wo = {.c = s->x, .ldc = dim, .w = weight(w->wo + l), .pw = pl->wo, .n = dim, .kind = GEMM_ADD};
   PROFILE(PHASE_WO, k_gemm_q8(s->xq.q, s->xq.s, count, dim, GS, &wo, 1));
@@ -391,12 +389,17 @@ static void forward_layer(Transformer *t, RunState *s, size_t l, int pos) {
   size_t loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
   float *key_cache_row = s->key_cache + loff + (size_t)pos * kv_dim;
   float *value_cache_row = s->value_cache + loff + (size_t)pos * kv_dim;
-  PROFILE(PHASE_KV_STORE, memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
-          memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row)));
+  if (kernels_kv_layout_head())
+    PROFILE(PHASE_KV_STORE,
+            k_kv_store(s->key_cache + loff, s->k, (size_t)kv_dim, pos, 1, p->n_kv_heads, head_size, p->seq_len);
+            k_kv_store(s->value_cache + loff, s->v, (size_t)kv_dim, pos, 1, p->n_kv_heads, head_size, p->seq_len));
+  else
+    PROFILE(PHASE_KV_STORE, memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
+            memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row)));
 
   // multihead attention over positions 0..pos, output into xb
-  PROFILE(PHASE_ATTENTION, k_attention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, &s->attention,
-                                       p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos));
+  PROFILE(PHASE_ATTENTION, k_attention_kv(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att,
+                                          &s->attention, p->n_heads, p->n_kv_heads, head_size, p->seq_len, pos));
 
   // final matmul to get the output of the attention, with the residual connection back into x
   PROFILE(PHASE_QUANTIZE, in = prepare_input(&s->xq, s->xb, dim));
