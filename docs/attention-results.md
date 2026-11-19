@@ -210,8 +210,8 @@ GEMMs are already fast, so attention is the larger share. On the FP32 rung atten
 | AVX-512 FP32 (64) | 1.05x (10.000 → 9.493 s) | 1.04x | 1.08x | 1.07x | 11% → 8% |
 | AVX-512 FP32 (128) | 1.05x (10.504 → 9.974 s) | 1.05x | 1.09x | 1.08x | 11% → 7% |
 
-All 16 cells are faster than `split`. The full ranges, and the 1B shares, are in the job's `E4/campaign-summary.md`. 8B AMX-BF16 on one
-socket takes 2.42 s here against D2's 2.9 s (different commit and attention code).
+All 16 cells are faster than `split`. The full ranges and the 1B shares are in the E4 summary (`tools/summarize_e4.py bench`, run
+again on the job's reports after the gate fix in da6ce2b).
 
 ### 2.5 Item 2a: does the two-socket gain above 2x persist?
 

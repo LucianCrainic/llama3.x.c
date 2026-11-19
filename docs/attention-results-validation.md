@@ -48,7 +48,7 @@ skipped the engine runs. It produced no results that are used here.
 
 | Item | Check job | Bench job | Determinism rerun |
 | --- | --- | --- | --- |
-| Date (UTC) | not recorded in the local copy of the summary | 2026-11-19 | queued, no result yet |
+| Date (UTC) | 2026-11-18 (start 23:55) | 2026-11-19 | queued, no result yet |
 | Slurm job ID | 5864123 (`STAGE=check PHASE=E4`) | 5864134 (`STAGE=bench PHASE=E4`, `REPEATS=3`, `SKIP_TEST=1`) | 5864239 |
 | Commit | 5a354ea (`develop`) | 5a354ea (`develop`) | b318378 (fixes the generation-comparison output directory) |
 | Node, memory mode | one node of the HBM partition, exclusive; Flat mode; 2 x Xeon Max 9480, 56 cores per socket | same | same |
