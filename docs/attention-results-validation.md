@@ -40,5 +40,6 @@ skipped the engine runs. It produced no results that are used here.
    decode after prefill for `split` and `tiled` under identical settings.
 2. **Bench and engine attention differ in absolute terms.** This carries over from E0. The value gate on TTFT uses the engine, and the bench
    is used for relative comparison only.
-3. **The task-order knob** favours `natural` by 8% at 8192 (overlapping ranges). It has not been re-measured with `natural` as the
-   default.
+3. **The task-order knob** was re-measured with `natural` as the default in job 5864122 (commit 5a354ea, `make test` on the hardware
+   passed, 41 of 41 launches PASS, five repeats). Natural is faster in 3 of the 4 sweep cells; the exception is 2048 tokens at M 16, with
+   overlapping ranges. See [attention-results.md](attention-results.md) §1.5.

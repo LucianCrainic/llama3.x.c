@@ -78,13 +78,32 @@ the non-FMA work around the FMAs: transposes, loads, max and exp of the online s
 | 2048, 64 | 18.03 [16.74-21.33] | **17.54 [15.53-19.60]** | 20-23 | 35-42 |
 
 - 16 query vectors per task is clearly best, so the default stays.
-- After this run the default task order was changed to `natural` (owner decision with E3, 2026-11-18). A rerun confirms it, with
-  small-prompt M 16 cells added to the sweep.
 - Natural task order beats longest-first by 8% at 8192. The ranges overlap at their top ends, so this is not yet beyond
   variability. E0 found the tail under 1% at 8192, so ordering has little to fix there, and the longest-first sort seems
   to cost locality. Task order does not change any numbers, because each task writes its own partial.
 - The sweep cell and the matrix cell for the same default configuration differ (264 against 283 ms). The same job ran
   them at different times, which shows the run-to-run spread at 56 threads.
+
+**Rerun with `natural` as the default (job 5864122, commit 5a354ea, five repeats, M 16 cells added).** Bench, 8B, queries 16,
+ms per layer, median [min-max]:
+
+| prompt, M | longest-first | natural |
+| --- | ---: | ---: |
+| 512, 16 | 4.12 [4.06-4.16] | **3.68 [3.64-3.71]** |
+| 2048, 16 | **18.73 [18.25-20.61]** | 20.69 [19.13-25.81] |
+| 2048, 64 | 16.89 [16.22-21.07] | **15.63 [14.93-18.19]** |
+| 8192, 256 | 266.05 [262.94-291.87] | **261.18 [241.64-279.76]** |
+
+- Natural wins 3 of the 4 cells. At 512 tokens and M 16 the ranges are apart, which is the cell longest-first was meant
+  to help.
+- The one loss, 2048 tokens at M 16, lies within overlapping, noisy ranges.
+- The default stays `natural`.
+- The gate cell is 2.03x in this job.
+- Engine TTFT with the new default, five repeats:
+  - 8B AMX-BF16 at 8192 tokens: **17.75 [17.70-17.78] s against split's 30.74 [30.70-30.75] s (1.73x)**, against 18.52
+    [18.42-18.57] s with longest-first in job 5864099.
+  - 1B AMX-BF16 at 8192 tokens: 4.38 against 7.15 s (1.63x).
+  - Every 2048-token rung is again faster than split (1.06-1.37x).
 
 ### 1.6 Decode
 
