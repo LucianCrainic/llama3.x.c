@@ -10,8 +10,10 @@
         value      8B, 8192 tokens, one socket, best variant against split >= 1.5x TTFT (headline: the AMX-BF16 rung; every rung
                    is listed; "beyond variability" when the ranges do not overlap)
         2048       not slower: the variant's median TTFT is within the split range (not above its slowest repeat)
-        decode     the variant's median decode tokens/s lies inside the split range
-        placement  every report's placement verified
+        decode     not slower: the variant's decode tokens/s range overlaps the split range, or its median is at least split's
+                   (with three repeats a median outside the other's range is a coin toss, so the ranges are compared)
+        placement  the region evidence of every report: no mismatched page anywhere, every region fully verified except the
+                   one-socket work region, which is reserved but not verified by design (as in D2's validation record)
         two sockets  the TTFT gain of two sockets over one at 8192 per rung and variant (item 2a of the plan)
     The exit status of bench is 0: a missed gate is a result, written in the text.
 """
@@ -75,7 +77,7 @@ def load(root):
             cell['failed'] += 1
             failed_runs += 1
             continue
-        cell['placement'].append(sc.placement_status(report))
+        cell['placement'].append(placement_evidence(report))
         if tag['kind'] == 'prof':
             stage = sc.dig(report, 'profile_seconds', 'prefill') or {}
             forward, attention = number(stage.get('forward')), number(stage.get('attention'))
@@ -85,6 +87,22 @@ def load(root):
             cell['ttft'].append(sc.dig(report, 'timing_seconds', 'time_to_first_token'))
             cell['decode'].append(sc.dig(report, 'throughput_tokens_per_second', 'decode'))
     return cells, failed_runs
+
+
+def placement_evidence(report):
+    """'verified', or what is wrong, from the report's region table: the runtime.placement label is not enough (two-socket
+    reports say 'file', the shard loader's staging, while their regions are verified on their nodes)."""
+    regions = report.get('regions') or []
+    if not regions:
+        return 'no region table'
+    if any((r.get('pages_mismatched') or 0) > 0 for r in regions):
+        return 'mismatched pages'
+    for r in regions:
+        if r.get('role') == 'work' and r.get('verified') == 'unverified':
+            continue
+        if r.get('verified') != 'full':
+            return f"{r.get('role')} {r.get('verified')}"
+    return 'verified'
 
 
 def ordered(attns):
@@ -171,7 +189,8 @@ def not_slower_gate(cells):
 
 def decode_gate(cells):
     lines = ['### Decode unchanged', '',
-             'The variant median decode tokens/s must lie inside the split range of the same cell.', '',
+             'Not slower than split: the variant decode tokens/s range overlaps the split range of the same cell, or its median is '
+             'at least the split median.', '',
              '| model | rung | M | prompt | sockets | attention | split decode tok/s | variant decode tok/s | gate |',
              '| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |']
     failed = rows = 0
@@ -182,7 +201,7 @@ def decode_gate(cells):
             stat = stats(cells[key][attn]['decode'])
             if attn == 'split' or not split or not stat:
                 continue
-            ok = split[1] <= stat[0] <= split[2]
+            ok = (stat[1] <= split[2] and split[1] <= stat[2]) or stat[0] >= split[0]
             rows += 1
             failed += not ok
             lines.append(f'| {model} | {kernel} | {m} | {prompt} | {sockets} | {attn} | {span(split, 1)} | {span(stat, 1)} | '
@@ -195,9 +214,11 @@ def decode_gate(cells):
 
 def placement_gate(cells):
     reports = [p for by in cells.values() for cell in by.values() for p in cell['placement']]
-    bad = [p for p in reports if not p.endswith('(verified)')]
+    bad = [p for p in reports if p != 'verified']
     failed = sum(cell['failed'] for by in cells.values() for cell in by.values())
-    lines = ['### Placement', '', f'{len(reports) - len(bad)} of {len(reports)} completed reports have placement verified'
+    lines = ['### Placement', '', 'From each report\'s region table: no mismatched page, every region fully verified except the '
+             'one-socket work region (not verified by design).', '',
+             f'{len(reports) - len(bad)} of {len(reports)} completed reports have placement verified'
              + (f'; {failed} runs failed' if failed else '') + '.']
     if bad:
         counts = {p: bad.count(p) for p in sorted(set(bad))}
