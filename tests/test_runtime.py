@@ -517,7 +517,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(data['runtime']['placement'], 'ddr')
         # The FP32 copy stays: decode reads it.
         self.assertGreater(data['memory_bytes']['owned_weights_peak'], 0)
-        # Dropping the FP32 copy is reserved for a future BF16 decode GEMV.
+        # Dropping the FP32 copy is not supported: decode reads it.
         _, data = self.execute('run', success=False, env={'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4',
                                                           'LLAMA_BF16_DROP_FP32': '1'})
         self.assertIn('LLAMA_BF16_DROP_FP32', data['error'])

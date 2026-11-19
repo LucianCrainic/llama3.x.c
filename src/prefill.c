@@ -15,10 +15,6 @@ int prefill_precision(int quantized) {
     else if (strcmp(value, "fp32"))
       fail("LLAMA_PRECISION must be fp32 or bf16");
   }
-  const char *drop = getenv("LLAMA_BF16_DROP_FP32");
-  if (bf16 && drop && *drop && strcmp(drop, "0"))
-    fail("LLAMA_BF16_DROP_FP32 is reserved for a future BF16 decode GEMV and is not supported: decode reads the FP32 "
-         "weights");
   if (bf16 && quantized)
     fail("LLAMA_PRECISION=bf16 applies to FP32 checkpoints (run); Q8_0 checkpoints keep their int8 semantics (runq)");
   if (!quantized && !bf16 && kernels_amx_active())

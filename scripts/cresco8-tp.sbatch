@@ -200,8 +200,8 @@ phase_B6() {
 # old kernel campaign, 112 OpenMP threads without tensor parallelism on a copy interleaved over HBM 2 and 3. Precisions
 # FP32 and Q8 W8A8, and W8A32 at two sockets x 56 only. Contexts 512, 8192 and 32768 for the 56-worker configurations; the
 # worker-count sweep and the control run at 512 only, which keeps the campaign inside its time budget (the grid of
-# study 10.3 is trimmed the same way as C7's). FP32 also runs two sockets x 56 from the packed4 copy of the shards
-# (LLAMA_FP32_LAYOUT=packed4, decision L8; tag p4), at every context, with its own profiled run. REPEATS interleaved repeats (configurations alternate within a repeat),
+# study 10.3 is trimmed the same way as C7's). (The packed4 FP32 decode layout that B7 also measured was not adopted and
+# has been removed from the engine.) REPEATS interleaved repeats (configurations alternate within a repeat),
 # plus one LLAMA_PROFILE=1 run per configuration and context whose per-socket profile lines (log level info) go to the
 # .stderr files, and perf counters on the first repeat. The LLAMA_TP_PARTITION=rows comparator is not built (decision L8:
 # only if B7 shows reductions plus waits above 20%). Gates first: one socket against two with batched prefill (the warm-up
@@ -219,11 +219,6 @@ b7_config() {
   B7_MEM= B7_BACKEND=teams B7_PREC=$2
   [[ $2 != w8a32 ]] || B7_ENV_EXTRA=(LLAMA_Q8_ACTIVATIONS=fp32)
   [[ $2 == w8a32 ]] || B7_ENV_EXTRA=()
-  # A p4 suffix (FP32 only) streams the packed4 copy of the shards in decode (LLAMA_FP32_LAYOUT=packed4, decision L8).
-  if [[ $config == *p4 ]]; then
-    config=${config%p4}
-    B7_ENV_EXTRA+=(LLAMA_FP32_LAYOUT=packed4)
-  fi
   case $config in
     1s56 | 2s[0-9]*)
       B7_SOCKETS=${config:0:1} B7_TPS=${config:2} B7_CPU=
@@ -275,13 +270,6 @@ b7_gates() {
       b_compare "$dir" "$name" int8 "$staged" b7-w8a32-1s-vs-2s "${TP_ENV[@]}" LLAMA_SOCKETS=1 LLAMA_Q8_ACTIVATIONS=fp32 -- \
         "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_TP_CHECK=1 LLAMA_Q8_ACTIVATIONS=fp32
     fi
-    if [[ $precision == fp32 ]]; then
-      # The packed4 decode layout does the same arithmetic as the row layout: bitwise, on the AVX-512 kernels, under a
-      # claiming schedule (the row layout then also forms whole four-row groups), on one socket's worth and on two.
-      B_FLAGS=(--bitwise)
-      b_compare "$dir" "$name" fp32 "$staged" b7-packed4-vs-rows-2s "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_GEMV_SCHED=dynamic -- \
-        "${TP_ENV[@]}" LLAMA_SOCKETS=2 LLAMA_GEMV_SCHED=dynamic LLAMA_FP32_LAYOUT=packed4 LLAMA_TP_CHECK=1
-    fi
     B_FLAGS=()
     unstage_model_on 0 "$name" "$precision"
   done
@@ -319,10 +307,6 @@ phase_B7() {
           for config in $configs; do
             b7_launch "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" "$config" "$ctx" "$rep" "$staged" "$tokenizer"
           done
-          # FP32: the same two-socket decode from the packed4 copy of the shards (decision L8).
-          if [[ $precision == fp32 ]]; then
-            b7_launch "$name" fp32 2s56p4 "$ctx" "$rep" "$staged" "$tokenizer" x=p4
-          fi
           # W8A32 at two sockets x 56 only; its warm-up runs per token, so not at the longest context.
           if [[ $precision == int8 && $ctx != 32768 ]]; then
             b7_launch "$name" w8a32 2s56 "$ctx" "$rep" "$staged" "$tokenizer"
@@ -337,9 +321,6 @@ phase_B7() {
           b7_launch "$name" "$([[ $precision == fp32 ]] && echo fp32 || echo int8)" "$config" "$ctx" 1 "$staged" "$tokenizer" \
             x=prof -- LLAMA_PROFILE=1
         done
-        if [[ $precision == fp32 ]]; then
-          b7_launch "$name" fp32 2s56p4 "$ctx" 1 "$staged" "$tokenizer" x=p4prof -- LLAMA_PROFILE=1
-        fi
       done
       unstage_model_on 0 "$name" "$precision"
       # The control: 112 threads, no tensor parallelism, the copy interleaved over HBM 2 and 3 (the old kernel campaign).

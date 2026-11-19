@@ -86,30 +86,6 @@ typedef void (*RowsDoneFn)(void *ctx, int r0, int r1);
 void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind, int worker,
                         int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx);
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d);
-/* Packed four-row layout for FP32 decode (B7, LLAMA_FP32_LAYOUT=packed4). The rows of a group of four are one sequential
- * stream: for each block of 16 columns, 16 floats of row 0, of row 1, 2 and 3 (the last block zero-padded), group after
- * group. Streaming it measured 612 GB/s per socket against 529 for four row streams. The kernels below take such a matrix
- * with n columns and d rows (d a multiple of 4) and compute exactly what their row-layout counterparts compute, row by row
- * (bitwise equal when both form whole four-row groups); every row range is split in whole groups. */
-size_t k_pack4_floats(int rows, int n);
-/* Packs groups [first, last) of a rows x n matrix with row stride ld into dst (k_pack4_floats(rows, n) floats). */
-void k_pack4_groups(float *dst, const float *w, size_t ld, int n, int first, int last);
-typedef struct {
-  float *dst;
-  const float *w;
-  int rows, n;
-  size_t ld;
-} Pack4Job;
-/* Packs many matrices with the active worker team (or OpenMP, or serially). */
-void k_pack4_many(const Pack4Job *jobs, int count);
-void k_matmul_p4(float *out, const float *x, const float *wp, int n, int d, int kind);
-void k_matmul_p4_worker(float *out, const float *x, const float *wp, int n, int d, int kind, int worker, int workers,
-                        atomic_int *claim, RowsDoneFn done, void *done_ctx);
-void k_matmul_qkv_p4(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv,
-                     int n, int dq, int dkv);
-void k_matmul_swiglu_p4(float *out, const float *x, const float *w1, const float *w3, int n, int d);
-
-
 /* Q8_0: int8 rows with one FP32 scale per group of gs inputs. Values must lie in
  * [-127, 127] (the exporter and k_quantize guarantee it). An input with q == NULL
  * multiplies dequantized weights by the FP32 activations f (W8A32); otherwise

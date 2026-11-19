@@ -19,31 +19,7 @@ enum { SOCKETS = 2, SPIN_LIMIT = 2048 };
 /* Per-socket profile slots: the engine's phases, then the projections that end in a reduction, timed on their own. */
 enum { TP_WO_MM = PHASE_COUNT, TP_W2_MM, TP_SLOTS };
 
-/* LLAMA_TP_TRACE=FILE: one record per Wo/W2 projection+reduction and socket, written to FILE as CSV when the engine is
- * freed (microseconds relative to the leader's dispatch of the team job). Needs the fused form. Every worker stamps the
- * end of its share of the projection and the steps of exchange_reduce_add (workers.h); the leader folds them into a
- * record after the join. The stamps cost a few clock reads per worker, so a traced run is slightly slower. */
-typedef struct {
-  _Alignas(64) double start, proj_end;
-  ReduceStamps r;
-  double pad[2];
-} WorkerStamp;
-
-typedef struct {
-  int kind, stage;                   /* 0 = Wo, 1 = W2; Stage */
-  double disp;                       /* leader's clock (seconds) when it dispatched the team job */
-  double start_mean, start_max;      /* workers entering the job */
-  double end_first, end_mean, end_last; /* workers finishing their share of the projection */
-  double b1_leader, b1_last;         /* leaving the first barrier */
-  double peer_leader, peer_last;     /* seeing the other socket's partial */
-  double add_mean, add_last;         /* finishing the add */
-  double b2_leader, b2_last;         /* leaving the closing barrier */
-  double ret;                        /* team_run returned */
-  int last_worker;                   /* the worker whose projection ended last */
-} TraceRec;
-enum { TRACE_MAX_RECORDS = 40000, TRACE_MAX_WORKERS = 256 };
-
-typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_REPACK, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP } Command;
+typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP } Command;
 
 /* The seven matrices of a layer that get a packed copy, in the order of TpSocket.packed_at. */
 static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W3};
@@ -51,8 +27,7 @@ static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W
 typedef struct {
   int socket;
   Team *team;
-  NumaRegion weights, kv_k, kv_v, work, exchange, packed, packed_cls, repack;
-  float **repack_at;    /* [layer * 7 + PACK_ROLES index]: the packed4 copy (LLAMA_FP32_LAYOUT=packed4) used by decode, or NULL */
+  NumaRegion weights, kv_k, kv_v, work, exchange, packed, packed_cls;
   void **packed_at;     /* [layer * 7 + PACK_ROLES index]: the packed copy in `packed`, or NULL */
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
@@ -67,30 +42,17 @@ typedef struct {
   float *xs;
   int8_t *aq; /* quantized slice that feeds Wo / W2 */
   float *as;
-  /* LLAMA_TP_TRACE */
-  WorkerStamp *stamps;
-  TraceRec *records;
-  size_t record_count;
-  unsigned last_count[2][TRACE_MAX_WORKERS];
-  double late_sum[2][TRACE_MAX_WORKERS];
-  size_t reductions[2];
 } TpSocket;
 
 struct Tp {
   Config c;
   int quantized, gs, check, fp32_activations;
-  const char *trace_path;
-  int reduce_flags; /* LLAMA_TP_REDUCE=flags (default, fused only): per-row flags instead of two team barriers */
-  int fused; /* LLAMA_TP_FUSED (default 1): the partial projection and the reduction run in one team job */
   ShardSet set;
   NumaRegion global;
   TpSocket s[SOCKETS];
   Exchange *exchange;
   float *logits;
   TpPack pack;
-  int packed4; /* LLAMA_FP32_LAYOUT=packed4: decode streams a packed4 copy of the FP32 shards (the shards stay for the GEMM) */
-  Pack4Job *rjobs[SOCKETS];
-  int rjobs_n[SOCKETS];
   PackBf16 *bjobs[SOCKETS]; /* the packing work of each socket, planned on the main thread (regions are not thread-safe) */
   PackS8 *sjobs[SOCKETS];
   int njobs[SOCKETS];
@@ -218,12 +180,10 @@ typedef struct {
   float *partial, *residual;
   size_t ld;
   const float *x, *w;               /* FP32 */
-  const float *wp;                  /* FP32, packed4 copy of w (decode); NULL: stream w by rows */
   const K8Input *input;             /* Q8 */
   const K8Weight *wq;               /* Q8; NULL for FP32 */
-  double *leader_seconds;           /* fused: the leader's own share of the projection */
-  atomic_int claim;                 /* fused: row counter shared by the members (zero before the team starts) */
-  WorkerStamp *stamps;              /* fused, traced: one per member */
+  double *leader_seconds;           /* LLAMA_PROFILE: the leader's own share of the projection */
+  atomic_int claim;                 /* row counter shared by the members (zero before the team starts) */
 } ProjectJob;
 
 static void rows_done_fn(void *p, int r0, int r1) {
@@ -231,80 +191,22 @@ static void rows_done_fn(void *p, int r0, int r1) {
   exchange_rows_done(job->tp->exchange, job->socket, r0, r1);
 }
 
-static void project_share(const ProjectJob *job, int worker, int workers) {
-  RowsDoneFn done = job->tp->reduce_flags ? rows_done_fn : NULL;
-  if (job->wq)
-    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
-                          workers, (atomic_int *)&job->claim, done, (void *)job);
-  else if (job->wp)
-    k_matmul_p4_worker(job->partial, job->x, job->wp, job->n, job->d, K_PARTIAL, worker, workers,
-                       (atomic_int *)&job->claim, done, (void *)job);
-  else
-    k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
-                       (atomic_int *)&job->claim, done, (void *)job);
-}
-
-/* Fused form: every member computes its rows of the partial and goes straight into the reduction, whose first barrier
- * is the join of the projection. One team dispatch and join instead of two. */
+/* Decode's Wo/W2: projection and reduction fused into one team job, with no team barrier. Every member computes its
+ * rows of the partial and flags them (rows_done_fn), then adds its own element range of both sockets' partials as soon as
+ * the producers of those rows, on both sockets, have flagged them (exchange_reduce_add_flags). Measured on the 8B model:
+ * one dispatch and no barrier instead of two jobs and two barriers saves 17-19 us per reduction (B7 findings). */
 static void project_reduce_fn(const void *p, int worker, int workers) {
   const ProjectJob *job = p;
-  WorkerStamp *stamp = job->stamps ? &job->stamps[worker] : NULL;
   double start = worker == 0 && job->leader_seconds ? monotonic_seconds() : 0.0;
-  if (stamp)
-    stamp->start = start ? start : monotonic_seconds();
-  project_share(job, worker, workers);
-  if (stamp)
-    stamp->proj_end = monotonic_seconds();
-  if (start)
-    *job->leader_seconds = (stamp ? stamp->proj_end : monotonic_seconds()) - start;
-  if (job->tp->reduce_flags)
-    exchange_reduce_add_flags(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
-                              stamp ? &stamp->r : NULL);
+  if (job->wq)
+    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
+                          workers, (atomic_int *)&job->claim, rows_done_fn, (void *)job);
   else
-    exchange_reduce_add_stamped(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
-                                stamp ? &stamp->r : NULL);
-}
-
-/* Folds the members' stamps of the reduction that just ended into one record of the socket. */
-static void trace_record(Tp *tp, TpSocket *sk, const ProjectJob *job, int kind, double disp, double ret) {
-  if (sk->record_count >= TRACE_MAX_RECORDS)
-    return;
-  int n = team_size(sk->team);
-  TraceRec *r = &sk->records[sk->record_count++];
-  *r = (TraceRec){.kind = kind, .stage = (int)profile_stage, .disp = disp, .ret = ret, .end_first = 1e30};
-  const WorkerStamp *w = job->stamps;
-  for (int i = 0; i < n; i++) {
-    r->start_mean += w[i].start;
-    r->end_mean += w[i].proj_end;
-    r->add_mean += w[i].r.after_add;
-    if (w[i].start > r->start_max)
-      r->start_max = w[i].start;
-    if (w[i].proj_end < r->end_first)
-      r->end_first = w[i].proj_end;
-    if (w[i].proj_end > r->end_last) {
-      r->end_last = w[i].proj_end;
-      r->last_worker = i;
-    }
-    if (w[i].r.after_barrier1 > r->b1_last)
-      r->b1_last = w[i].r.after_barrier1;
-    if (w[i].r.after_peer > r->peer_last)
-      r->peer_last = w[i].r.after_peer;
-    if (w[i].r.after_add > r->add_last)
-      r->add_last = w[i].r.after_add;
-    if (w[i].r.after_barrier2 > r->b2_last)
-      r->b2_last = w[i].r.after_barrier2;
-  }
-  r->start_mean /= n;
-  r->end_mean /= n;
-  r->add_mean /= n;
-  r->b1_leader = w[0].r.after_barrier1;
-  r->peer_leader = w[0].r.after_peer;
-  r->b2_leader = w[0].r.after_barrier2;
-  sk->reductions[kind]++;
-  sk->last_count[kind][r->last_worker < TRACE_MAX_WORKERS ? r->last_worker : 0]++;
-  for (int i = 0; i < n && i < TRACE_MAX_WORKERS; i++)
-    sk->late_sum[kind][i] += w[i].proj_end - r->end_mean;
-  (void)tp;
+    k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
+                       (atomic_int *)&job->claim, rows_done_fn, (void *)job);
+  if (start)
+    *job->leader_seconds = monotonic_seconds() - start;
+  exchange_reduce_add_flags(job->tp->exchange, job->socket, worker, workers, job->residual, job->d, NULL);
 }
 
 static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
@@ -312,30 +214,11 @@ static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
   atomic_init(&job->claim, 0);
   job->socket = sk->socket;
   job->residual = sk->x;
-  double *prof = &tp->prof[sk->socket][profile_stage][slot];
-  if (tp->fused) {
-    double leader = 0.0;
-    job->leader_seconds = profile_enabled ? &leader : NULL;
-    job->stamps = sk->stamps;
-    double disp = sk->stamps ? monotonic_seconds() : 0.0;
-    team_run(sk->team, project_reduce_fn, job);
-    if (tp->reduce_flags)
-      exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
-    if (sk->stamps)
-      trace_record(tp, sk, job, slot - TP_WO_MM, disp, monotonic_seconds());
-    *prof += leader;
-    return;
-  }
-  double start = profile_enabled ? monotonic_seconds() : 0.0;
-  if (job->wq)
-    k_matmul_q8_ld(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL);
-  else if (job->wp)
-    k_matmul_p4(job->partial, job->x, job->wp, job->n, job->d, K_PARTIAL);
-  else
-    k_matmul_ld(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL);
-  if (profile_enabled)
-    *prof += monotonic_seconds() - start;
-  reduce(tp, sk, sk->x, job->d);
+  double leader = 0.0;
+  job->leader_seconds = profile_enabled ? &leader : NULL;
+  team_run(sk->team, project_reduce_fn, job);
+  exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
+  tp->prof[sk->socket][profile_stage][slot] += leader;
 }
 
 static const float *norm_weight(const Tp *tp, TensorRole role, int layer, int socket) {
@@ -389,11 +272,6 @@ static const float *embedding_row(const Tp *tp, int token) {
       tp->prof[s][profile_stage][phase] += monotonic_seconds() - sprofile_start_;                                      \
   } while (0)
 
-/* The packed4 copy of matrix `index` (PACK_ROLES order) of layer l on this socket, or NULL. */
-static const float *repack_copy(const TpSocket *sk, int layer, int index) {
-  return sk->repack_at ? sk->repack_at[(size_t)layer * 7 + (size_t)index] : NULL;
-}
-
 static void forward_fp32(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
@@ -407,11 +285,7 @@ static void forward_fp32(Tp *tp, int s) {
     float *k = sk->key_cache + layer + (size_t)pos * kvl, *v = sk->value_cache + layer + (size_t)pos * kvl;
     const float *wq = shards_find(&tp->set, T_WQ, l, s)->q, *wk = shards_find(&tp->set, T_WK, l, s)->q,
                 *wv = shards_find(&tp->set, T_WV, l, s)->q;
-    const float *rq = repack_copy(sk, l, 0), *rk = repack_copy(sk, l, 1), *rv = repack_copy(sk, l, 2);
-    if (rq && rk && rv)
-      SPROFILE(PHASE_QKV, k_matmul_qkv_p4(sk->q, k, v, sk->xb, rq, rk, rv, dim, dim / SOCKETS, kvl));
-    else
-      SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / SOCKETS, kvl));
+    SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / SOCKETS, kvl));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     SPROFILE(PHASE_ATTENTION, k_attention(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
                                           &sk->attention, hl, kl, hd, p->seq_len, pos));
@@ -419,23 +293,17 @@ static void forward_fp32(Tp *tp, int s) {
     float *partial = exchange_partial(tp->exchange, s);
     if (!partial)
       return;
-    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .partial = partial, .ld = wo->ld, .x = sk->xb, .w = wo->q,
-                         .wp = repack_copy(sk, l, 3)};
+    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .partial = partial, .ld = wo->ld, .x = sk->xb, .w = wo->q};
     SPROFILE(PHASE_WO, project_reduce(tp, sk, &wo_job, TP_WO_MM));
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     const float *w1 = shards_find(&tp->set, T_W1, l, s)->q, *w3 = shards_find(&tp->set, T_W3, l, s)->q;
-    const float *r1 = repack_copy(sk, l, 4), *r3 = repack_copy(sk, l, 6);
-    if (r1 && r3)
-      SPROFILE(PHASE_W1_W3, k_matmul_swiglu_p4(sk->hb, sk->xb, r1, r3, dim, hidden_l));
-    else
-      SPROFILE(PHASE_W1_W3, k_matmul_swiglu(sk->hb, sk->xb, w1, w3, dim, hidden_l));
+    SPROFILE(PHASE_W1_W3, k_matmul_swiglu(sk->hb, sk->xb, w1, w3, dim, hidden_l));
     const Shard *w2 = shards_find(&tp->set, T_W2, l, s);
     partial = exchange_partial(tp->exchange, s);
     if (!partial)
       return;
-    ProjectJob w2_job = {.n = hidden_l, .d = dim, .partial = partial, .ld = w2->ld, .x = sk->hb, .w = w2->q,
-                         .wp = repack_copy(sk, l, 5)};
+    ProjectJob w2_job = {.n = hidden_l, .d = dim, .partial = partial, .ld = w2->ld, .x = sk->hb, .w = w2->q};
     SPROFILE(PHASE_W2, project_reduce(tp, sk, &w2_job, TP_W2_MM));
     if (sk->debug)
       memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
@@ -738,7 +606,7 @@ static void setup_socket(Tp *tp, int s) {
   sk->value_cache = sk->kv_v.data;
 }
 
-/* ---- sizing (D1 §4.2) -------------------------------------------------------------------------------------------- */
+/* ---- region sizes -------------------------------------------------------------------------------------------- */
 
 size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
   int hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS;
@@ -759,46 +627,6 @@ size_t tp_exchange_bytes(const Config *p, int rows) {
   return exchange_region_bytes(checked_mul((size_t)rows, (size_t)p->dim));
 }
 
-size_t tp_exchange_payload_bytes(const Config *p, int rows) {
-  return (size_t)rows * (size_t)p->dim * sizeof(float);
-}
-
-size_t tp_peer_bytes_per_token(const Config *p) {
-  return 2 * (size_t)p->n_layers * (size_t)p->dim * sizeof(float);
-}
-
-static double exchange_us(const Config *p, int rows, const TpSizingInput *in) {
-  return 2.0 * (in->exchange_latency_us + (double)tp_exchange_payload_bytes(p, rows) / (in->exchange_gbps * 1e3));
-}
-
-double tp_exchange_fraction(const Config *p, int rows, const TpSizingInput *in) {
-  double exchange = exchange_us(p, rows, in), compute = rows * in->layer_us_per_row;
-  if (compute < in->layer_weight_us)
-    compute = in->layer_weight_us; /* below the ridge a layer costs what streaming its shard costs */
-  return exchange / (exchange + compute);
-}
-
-int tp_choose_batch(const Config *p, int quantized, int gs, const TpSizingInput *in, const int *candidates, int count,
-                    TpSizingRow *out) {
-  int chosen = 0;
-  for (int i = 0; i < count; i++) {
-    int m = candidates[i];
-    TpSizingRow *row = &out[i];
-    row->rows = m;
-    row->work_bytes = tp_work_bytes(p, quantized, gs, m);
-    row->exchange_bytes = tp_exchange_bytes(p, m);
-    row->fits = m >= 1 && (size_t)m * (size_t)p->dim <= (size_t)INT_MAX &&
-                row->work_bytes + row->exchange_bytes <= in->work_budget;
-    row->ridge = m >= in->ridge;
-    row->fraction = tp_exchange_fraction(p, m, in);
-    row->exchange_ok = row->fraction <= in->max_exchange_fraction;
-    row->feasible = row->fits && row->ridge && row->exchange_ok;
-    if (row->feasible && m > chosen)
-      chosen = m;
-  }
-  return chosen;
-}
-
 static size_t work_bytes(const Tp *tp) {
   return tp_work_bytes(&tp->c, tp->quantized, tp->gs, tp->rows);
 }
@@ -817,9 +645,6 @@ static void socket_command(Tp *tp, int socket) {
       pack_bf16_vnni_many(tp->bjobs[socket], tp->njobs[socket]);
     else
       pack_s8_vnni_many(tp->sjobs[socket], tp->njobs[socket]);
-    break;
-  case CMD_REPACK:
-    k_pack4_many(tp->rjobs[socket], tp->rjobs_n[socket]);
     break;
   case CMD_PACK_CLS:
     pack_bf16_vnni_many(tp->bjobs[socket], 1);
@@ -889,60 +714,17 @@ static size_t packed_region_bytes(const Tp *tp, int s) {
 
 /* The per-socket HBM budget counts everything a socket holds: its weight shards (the FP32 copy stays for decode), the
  * packed copies, both KV caches, the work region and the exchange buffers. */
-static void check_budget(const Tp *tp, int s, const char *mode, size_t kv_bytes, size_t packed_bytes,
-                         size_t repack_bytes) {
+static void check_budget(const Tp *tp, int s, const char *mode, size_t kv_bytes, size_t packed_bytes) {
   size_t budget = placement_hbm_budget();
   if (strcmp(mode, "hbm"))
     return;
   size_t used = tp->set.region_bytes[s] + 2 * kv_bytes + work_bytes(tp) + tp_exchange_bytes(&tp->c, tp->rows) +
-                packed_bytes + repack_bytes;
+                packed_bytes;
   if (used > budget)
-    fail("socket %d needs %zu bytes of HBM (%zu of shards, %zu of packed %s copies, %zu of packed4 decode copies, %zu of "
-         "KV caches) but LLAMA_HBM_BUDGET_GIB allows %zu per socket",
-         s, used, tp->set.region_bytes[s], packed_bytes, tp->pack == TP_PACK_BF16 ? "BF16" : "int8", repack_bytes,
-         2 * kv_bytes, budget);
-}
-
-/* ---- packed4 decode copies (B7) ------------------------------------------------------------------------------------ */
-
-/* Whether the shard can be packed in four-row groups. */
-static int repackable_shape(const Shard *sh) {
-  return sh && (sh->kind == SHARD_ROWS || sh->kind == SHARD_COLS) && sh->rows > 0 && sh->rows % 4 == 0 && sh->cols > 0;
-}
-
-/* What socket s's repack region must hold: its shard of every matrix of every layer that can be packed. */
-static size_t repack_region_bytes(const Tp *tp, int s) {
-  size_t total = 0;
-  for (int l = 0; l < tp->c.n_layers; l++)
-    for (int i = 0; i < 7; i++) {
-      const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
-      if (repackable_shape(sh))
-        total = align_line(total) + k_pack4_floats(sh->rows, sh->cols) * sizeof(float);
-    }
-  return total;
-}
-
-/* Main thread, after the shards are bound: carves the region and plans the packing jobs the coordinators run. */
-static void plan_repack(Tp *tp) {
-  for (int s = 0; s < SOCKETS; s++) {
-    TpSocket *sk = &tp->s[s];
-    size_t count = (size_t)tp->c.n_layers * 7, used = 0;
-    sk->repack_at = memory_alloc(count, sizeof(float *), MEM_METADATA);
-    tp->rjobs[s] = memory_alloc(count, sizeof(Pack4Job), MEM_METADATA);
-    for (int l = 0; l < tp->c.n_layers; l++)
-      for (int i = 0; i < 7; i++) {
-        const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
-        if (!repackable_shape(sh) || !sh->q)
-          continue;
-        used = align_line(used);
-        float *dst = (float *)((char *)sk->repack.data + used);
-        used += k_pack4_floats(sh->rows, sh->cols) * sizeof(float);
-        sk->repack_at[(size_t)l * 7 + (size_t)i] = dst;
-        tp->rjobs[s][tp->rjobs_n[s]++] = (Pack4Job){dst, sh->q, sh->rows, sh->cols, sh->ld};
-      }
-    if (used > sk->repack.logical_bytes)
-      fail("socket %d repack region holds %zu bytes, %zu needed", s, sk->repack.logical_bytes, used);
-  }
+    fail("socket %d needs %zu bytes of HBM (%zu of shards, %zu of packed %s copies, %zu of KV caches) but "
+         "LLAMA_HBM_BUDGET_GIB allows %zu per socket",
+         s, used, tp->set.region_bytes[s], packed_bytes, tp->pack == TP_PACK_BF16 ? "BF16" : "int8", 2 * kv_bytes,
+         budget);
 }
 
 /* Main thread, after the shards are bound: carves the packed region of every socket and plans the packing jobs. The
@@ -1021,24 +803,6 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   if (check && *check && strcmp(check, "0") && strcmp(check, "1"))
     fail("LLAMA_TP_CHECK must be 0 or 1");
   tp->check = check && !strcmp(check, "1");
-  const char *fused = getenv("LLAMA_TP_FUSED");
-  if (fused && *fused && strcmp(fused, "0") && strcmp(fused, "1"))
-    fail("LLAMA_TP_FUSED must be 0 or 1");
-  tp->fused = !(fused && !strcmp(fused, "0"));
-  const char *reduce = getenv("LLAMA_TP_REDUCE");
-  if (reduce && *reduce && strcmp(reduce, "flags") && strcmp(reduce, "barrier"))
-    fail("LLAMA_TP_REDUCE must be flags or barrier");
-  tp->reduce_flags = tp->fused && !(reduce && !strcmp(reduce, "barrier"));
-  const char *layout = getenv("LLAMA_FP32_LAYOUT");
-  if (layout && *layout && strcmp(layout, "rows") && strcmp(layout, "packed4"))
-    fail("LLAMA_FP32_LAYOUT must be rows or packed4");
-  tp->packed4 = layout && !strcmp(layout, "packed4");
-  if (tp->packed4 && quantized)
-    fail("LLAMA_FP32_LAYOUT=packed4 applies to FP32 checkpoints");
-  const char *trace = getenv("LLAMA_TP_TRACE");
-  tp->trace_path = trace && *trace ? trace : NULL;
-  if (tp->trace_path && !tp->fused)
-    fail("LLAMA_TP_TRACE needs the fused reduction (LLAMA_TP_FUSED=1)");
   shards_plan(&tp->set, m, p, SOCKETS, gs);
   const char *mode = placement_mode();
   tp_check_topology(mode);
@@ -1059,28 +823,15 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     region_reserve(&sk->kv_k, kv_bytes, s, node, ROLE_KV_K, thp);
     region_reserve(&sk->kv_v, kv_bytes, s, node, ROLE_KV_V, thp);
     size_t packed_bytes = pack == TP_PACK_NONE ? 0 : packed_region_bytes(tp, s);
-    size_t repack_bytes = tp->packed4 ? repack_region_bytes(tp, s) : 0;
-    check_budget(tp, s, mode, kv_bytes, packed_bytes, repack_bytes);
+    check_budget(tp, s, mode, kv_bytes, packed_bytes);
     if (packed_bytes)
       region_reserve(&sk->packed, packed_bytes, s, node, ROLE_PACKED, thp);
-    if (repack_bytes)
-      region_reserve(&sk->repack, repack_bytes, s, node, ROLE_PACKED, thp);
     region_reserve(&sk->work, work_bytes(tp), s, node, ROLE_WORK, 0);
     region_reserve(&sk->exchange, tp_exchange_bytes(p, tp->rows), s, node, ROLE_WORK, 0);
     exchange_regions[s] = &sk->exchange;
     region_mark_populated(&sk->kv_k);
     region_mark_populated(&sk->kv_v);
     region_mark_populated(&sk->work);
-    if (tp->trace_path) {
-      int n = team_size(sk->team);
-      if (n > TRACE_MAX_WORKERS)
-        fail("LLAMA_TP_TRACE supports at most %d workers per socket", TRACE_MAX_WORKERS);
-      if (posix_memalign((void **)&sk->stamps, 64, (size_t)n * sizeof(WorkerStamp)))
-        fail("cannot allocate the trace stamps");
-      sk->records = calloc(TRACE_MAX_RECORDS, sizeof(TraceRec));
-      if (!sk->records)
-        fail("cannot allocate the trace records");
-    }
   }
   if (tp->set.global_bytes)
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
@@ -1146,25 +897,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     LOG(LOG_INFO, "packed %zu + %zu bytes of %s shard copies in %.2f s", tp->s[0].packed.logical_bytes,
         tp->s[1].packed.logical_bytes, pack == TP_PACK_BF16 ? "BF16" : "int8", monotonic_seconds() - start);
   }
-  if (tp->packed4) {
-    start = monotonic_seconds();
-    plan_repack(tp);
-    run_both(tp, CMD_REPACK);
-    for (int s = 0; s < SOCKETS; s++)
-      if (tp->s[s].repack.mapping_base) {
-        region_mark_populated(&tp->s[s].repack);
-        region_protect(&tp->s[s].repack);
-      }
-    metrics.weight_pack_s += monotonic_seconds() - start;
-    metrics.weight_packed = 1;
-    LOG(LOG_INFO, "packed4 decode copies: %zu + %zu bytes in %.2f s", tp->s[0].repack.logical_bytes,
-        tp->s[1].repack.logical_bytes, monotonic_seconds() - start);
-  }
   start = monotonic_seconds();
   for (int s = 0; s < SOCKETS; s++) {
     verify_bound(&tp->s[s].weights, mode);
     verify_bound(&tp->s[s].packed, mode);
-    verify_bound(&tp->s[s].repack, mode);
     verify_bound(&tp->s[s].work, mode);
     verify_bound(&tp->s[s].exchange, mode);
   }
@@ -1176,57 +912,9 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
 }
 
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
- * including its reduction, wo_mm/w2_mm the projection alone (unfused: its team job; fused: the leader's own share, so the
- * slowest member's lateness shows up as `straggler`). The exchange components are the leader's: straggler (waiting for
- * the socket's last partial write), peer (waiting for the other socket), add, close (final barrier) and buffer (waiting
- * for a free partial buffer). */
-static void write_trace(const Tp *tp) {
-  FILE *f = fopen(tp->trace_path, "w");
-  if (!f) {
-    LOG(LOG_WARN, "cannot write the reduction trace %s", tp->trace_path);
-    return;
-  }
-  fprintf(f, "socket,stage,kind,index,disp_s,start_mean,start_max,end_first,end_mean,end_last,b1_leader,b1_last,"
-             "peer_leader,peer_last,add_mean,add_last,b2_leader,b2_last,ret,last_worker\n");
-  for (int s = 0; s < SOCKETS; s++)
-    for (size_t i = 0; i < tp->s[s].record_count; i++) {
-      const TraceRec *r = &tp->s[s].records[i];
-#define US(field) ((r->field - r->disp) * 1e6)
-      fprintf(f, "%d,%d,%d,%zu,%.9f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n", s,
-              r->stage, r->kind, i, r->disp, US(start_mean), US(start_max), US(end_first), US(end_mean), US(end_last),
-              US(b1_leader), US(b1_last), US(peer_leader), US(peer_last), US(add_mean), US(add_last), US(b2_leader),
-              US(b2_last), US(ret), r->last_worker);
-#undef US
-    }
-  fclose(f);
-  LOG(LOG_INFO, "reduction trace written to %s", tp->trace_path);
-  /* The members that finish their share last most often, and how late the usual suspects are. */
-  for (int s = 0; s < SOCKETS; s++)
-    for (int kind = 0; kind < 2; kind++) {
-      const TpSocket *sk = &tp->s[s];
-      if (!sk->reductions[kind])
-        continue;
-      int n = team_size(sk->team), top[3] = {-1, -1, -1};
-      for (int w = 0; w < n && w < TRACE_MAX_WORKERS; w++)
-        for (int t = 0; t < 3; t++)
-          if (top[t] < 0 || sk->last_count[kind][w] > sk->last_count[kind][top[t]]) {
-            for (int u = 2; u > t; u--)
-              top[u] = top[u - 1];
-            top[t] = w;
-            break;
-          }
-      char line[512];
-      size_t used = (size_t)snprintf(line, sizeof(line), "trace socket %d %s (%zu reductions): last to finish the projection:", s,
-                                     kind ? "w2" : "wo", sk->reductions[kind]);
-      for (int t = 0; t < 3; t++)
-        if (top[t] >= 0)
-          used += (size_t)snprintf(line + used, sizeof(line) - used, " worker %d %.1f%% (mean %+.2f us)", top[t],
-                                   100.0 * sk->last_count[kind][top[t]] / (double)sk->reductions[kind],
-                                   sk->late_sum[kind][top[t]] / (double)sk->reductions[kind] * 1e6);
-      LOG(LOG_INFO, "%s", line);
-    }
-}
-
+ * including its reduction, wo_mm/w2_mm the leader's own share of the projection, so the slowest member's lateness shows up
+ * as `straggler`. The exchange components are the leader's: straggler (waiting for the socket's last partial write), peer
+ * (waiting for the other socket), add, close (final barrier) and buffer (waiting for a free partial buffer). */
 static void log_profile(const Tp *tp) {
   static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
                                               "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
@@ -1237,9 +925,8 @@ static void log_profile(const Tp *tp) {
       continue;
     for (int s = 0; s < SOCKETS; s++) {
       char line[1024];
-      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token, fused=%d, reduce=%s):",
-                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage], tp->fused,
-                                     tp->reduce_flags ? "flags" : "barrier");
+      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token):",
+                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage]);
       for (int i = 0; i < TP_SLOTS && used < sizeof(line); i++)
         if (tp->prof[s][stage][i] > 0)
           used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%.3f", names[i],
@@ -1307,10 +994,6 @@ float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWa
   return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? tp->batch_logits : tp->logits;
 }
 
-int tp_batch_capacity(const Tp *tp) {
-  return tp->rows;
-}
-
 void tp_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
   size_t per_socket =
       checked_mul(checked_mul((size_t)tp->c.n_layers, (size_t)tp->c.seq_len), (size_t)tp->kv_dim_local * sizeof(float));
@@ -1357,10 +1040,6 @@ void tp_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
   out->resident_bytes = (size_t)(resident + 0.5);
 }
 
-size_t tp_shard_bytes(const Tp *tp, int socket) {
-  return tp->set.region_bytes[socket];
-}
-
 void tp_free(Tp *tp) {
   if (!tp)
     return;
@@ -1370,21 +1049,14 @@ void tp_free(Tp *tp) {
   }
   if (profile_enabled)
     log_profile(tp);
-  if (tp->trace_path)
-    write_trace(tp);
   exchange_destroy(tp->exchange);
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];
     memory_free(sk->debug);
     memory_free(sk->debug_hash);
-    free(sk->stamps);
-    free(sk->records);
     region_release(&sk->weights);
     region_release(&sk->packed);
     region_release(&sk->packed_cls);
-    region_release(&sk->repack);
-    memory_free(sk->repack_at);
-    memory_free(tp->rjobs[s]);
     memory_free(sk->packed_at);
     memory_free(tp->bjobs[s]);
     memory_free(tp->sjobs[s]);

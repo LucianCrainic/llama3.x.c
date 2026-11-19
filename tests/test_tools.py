@@ -104,12 +104,11 @@ class CampaignSummaryTests(unittest.TestCase):
     def test_campaign_scripts_dry_run_and_their_labels_parse(self):
         """L6: the B7, C7, D1 and D2 matrices print without running anything, with labels the summarizer understands."""
         b7 = self.dry_run('cresco8-tp.sbatch', 'B7')
-        self.assertEqual(len(b7), 192)  # 96 launches per model: gates aside, see phase_B7
+        self.assertEqual(len(b7), 168)  # 84 launches per model (96 before packed4 was removed): gates aside, see phase_B7
         self.assertTrue(all('warm=' in line and 'warm=0 ' not in line for line in b7))
         self.assertEqual({line.split('warm=')[1].split()[0] for line in b7}, {'512', '8192', '32768'})
         self.assertTrue(any('-s2-t14-' in line for line in b7) and any('xctl' in line for line in b7))
-        self.assertTrue(any('xp4 ' in line and 'LLAMA_FP32_LAYOUT=packed4' in line for line in b7))
-        self.assertTrue(all('LLAMA_PROFILE=1' in line for line in b7 if 'xp4prof' in line))
+        self.assertFalse(any('LLAMA_FP32_LAYOUT' in line for line in b7))  # packed4 was removed from the engine
         self.assertTrue(all('LLAMA_PROFILE=1' in line for line in b7 if 'xprof' in line))
         d1 = self.dry_run('cresco8-prefill.sbatch', 'D1')
         self.assertEqual(len(d1), 240)

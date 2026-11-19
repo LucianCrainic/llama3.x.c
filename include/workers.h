@@ -78,14 +78,14 @@ float *exchange_partial(Exchange *exchange, int socket);
  * pointer exchange_partial returned. A no-op after an abort. */
 void exchange_reduce_add(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements);
 /* Seconds (monotonic_seconds) at which one worker passed each step of exchange_reduce_add: left the first barrier, saw
- * the peer's partial, finished adding, left the closing barrier. For tracing (LLAMA_TP_TRACE); see tp.c. */
+ * the peer's partial, finished adding, left the closing barrier. For tests/reduce_bench.c. */
 typedef struct {
   double after_barrier1, after_peer, after_add, after_barrier2;
 } ReduceStamps;
 /* exchange_reduce_add that also records the worker's step times in *stamps (NULL: none). */
 void exchange_reduce_add_stamped(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements,
                                  ReduceStamps *stamps);
-/* Flag form of the reduction (the fused projection, LLAMA_TP_REDUCE=flags): no team barrier at all. Each socket keeps one
+/* Flag form of the reduction (decode's fused Wo/W2 projection in tp.c): no team barrier at all. Each socket keeps one
  * generation flag per output row next to its partial buffers. A member that finished output rows [r0, r1) of the partial
  * calls exchange_rows_done (the kernels' RowsDoneFn, with the Exchange and socket as context via a thin wrapper); then,
  * for its own add range, exchange_reduce_add_flags waits for the flags of those rows of BOTH sockets and adds, so it
@@ -100,13 +100,11 @@ void exchange_reduce_finish(Exchange *exchange, int socket);
 /* Process-wide and irreversible in production (it is workers_abort): every wait loop of the exchange and of the
  * team barriers returns, and the results of the generation in flight are garbage. */
 void exchange_abort(Exchange *exchange);
-/* Seconds the leader of `socket` spent adding (step 3) and waiting (steps 2-4 barriers and ready), when timing is on.
- */
-void exchange_set_timing(Exchange *exchange, int on);
-void exchange_timing(const Exchange *exchange, int socket, double *reduce_seconds, double *wait_seconds);
-/* The same split further: seconds[0] waiting for the team's last partial write (the slowest member of the socket),
+/* With timing on (LLAMA_PROFILE), the leader of each socket accumulates where its reductions spend time:
+ * seconds[0] waiting for the team's last partial write (the slowest member of the socket),
  * [1] waiting for the peer socket's partial, [2] adding, [3] the closing barrier, [4] waiting for a free partial buffer
  * in exchange_partial. Leader only. Read it only while no reduction is running. */
+void exchange_set_timing(Exchange *exchange, int on);
 void exchange_timing_detail(const Exchange *exchange, int socket, double seconds[5]);
 
 /* fail() sets this before running exit handlers, so no wait loop outlives the memory it spins on. After it, stop

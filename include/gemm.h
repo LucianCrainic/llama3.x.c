@@ -53,8 +53,7 @@ const char *gemm_amx_unavailable(void);
 const char *gemm_amx_permission(void);
 void gemm_amx_enable(int on); /* set by the kernel selection */
 int gemm_amx_active(void);
-int gemm_amx_compiled(void); /* the build has AMX code (real or emulated) */
-int gemm_amx_emulated(void); /* ... and it runs on the software tile model (test builds) */
+int gemm_amx_emulated(void); /* the build runs AMX code on the software tile model (test builds) */
 /* Releases the calling thread's tile state. Worker threads release it themselves when they exit. */
 void gemm_amx_thread_release(void);
 

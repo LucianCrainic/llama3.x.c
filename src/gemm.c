@@ -321,10 +321,6 @@ int gemm_amx_active(void) {
   return amx_active;
 }
 
-int gemm_amx_compiled(void) {
-  return GEMM_AMX;
-}
-
 int gemm_amx_emulated(void) {
   return GEMM_AMX_EMULATED;
 }

@@ -107,6 +107,7 @@ static GemvSched effective_f32(size_t bytes) {
 }
 
 void kernels_init(void) {
+  check_retired_knobs();
   const char *sched = getenv("LLAMA_GEMV_SCHED");
   gemv_sched_f32 = SCHED_AUTO;
   gemv_sched_q8 = SCHED_STATIC;
@@ -329,44 +330,6 @@ AVX512 static void dots_f32_avx512(const float *w, size_t stride, int rows, cons
     }
     out[r] = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3)));
   }
-}
-
-/* The same four dot products over the packed4 layout (see k_pack4): group g holds rows 4g..4g+3 as one sequential stream,
- * [column block b][row r][16 floats]. Every row sees exactly the operations of the rows == 4 path above (two accumulators,
- * 32 columns per step, the masked tail into the first), so the results are bitwise equal; only the addresses differ.
- * Weight lines are prefetched P4_PREFETCH_BYTES ahead along the stream (prefetching past the end never faults). */
-enum { P4_PREFETCH_BYTES = 4096 };
-AVX512 static void dots_p4_avx512(const float *p, const float *x, int n, float *out) {
-  const size_t ahead = P4_PREFETCH_BYTES / sizeof(float);
-  __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
-  int j = 0;
-  for (; j + 32 <= n; j += 32) {
-    const float *q = p + (size_t)(j / 16) * 64, *q2 = q + 64;
-    for (int line = 0; line < 8; line++)
-      _mm_prefetch((const char *)(q + ahead + (size_t)line * 16), _MM_HINT_T0);
-    __m512 x0 = _mm512_loadu_ps(x + j), x1 = _mm512_loadu_ps(x + j + 16);
-    a0 = _mm512_fmadd_ps(_mm512_loadu_ps(q), x0, a0);
-    b0 = _mm512_fmadd_ps(_mm512_loadu_ps(q2), x1, b0);
-    a1 = _mm512_fmadd_ps(_mm512_loadu_ps(q + 16), x0, a1);
-    b1 = _mm512_fmadd_ps(_mm512_loadu_ps(q2 + 16), x1, b1);
-    a2 = _mm512_fmadd_ps(_mm512_loadu_ps(q + 32), x0, a2);
-    b2 = _mm512_fmadd_ps(_mm512_loadu_ps(q2 + 32), x1, b2);
-    a3 = _mm512_fmadd_ps(_mm512_loadu_ps(q + 48), x0, a3);
-    b3 = _mm512_fmadd_ps(_mm512_loadu_ps(q2 + 48), x1, b3);
-  }
-  for (; j < n; j += 16) {
-    __mmask16 m = tail_mask(n - j);
-    const float *q = p + (size_t)(j / 16) * 64;
-    __m512 x0 = _mm512_maskz_loadu_ps(m, x + j);
-    a0 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, q), x0, a0);
-    a1 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, q + 16), x0, a1);
-    a2 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, q + 32), x0, a2);
-    a3 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, q + 48), x0, a3);
-  }
-  out[0] = _mm512_reduce_add_ps(_mm512_add_ps(a0, b0));
-  out[1] = _mm512_reduce_add_ps(_mm512_add_ps(a1, b1));
-  out[2] = _mm512_reduce_add_ps(_mm512_add_ps(a2, b2));
-  out[3] = _mm512_reduce_add_ps(_mm512_add_ps(a3, b3));
 }
 
 /* The Q8 bodies take a compile-time row count and are force-inlined into one
@@ -1171,22 +1134,6 @@ static void f32_dots(const float *w, size_t ld, int rows, const float *x, int n,
   }
 }
 
-/* Four rows against x over the packed4 layout; the scalar form sums each row in ascending column order, as f32_dots does. */
-static void f32_dots_p4(const float *p, int n, const float *x, float *out) {
-#if HAVE_AVX512
-  if (isa == KERNELS_AVX512) {
-    dots_p4_avx512(p, x, n, out);
-    return;
-  }
-#endif
-  for (int r = 0; r < BLOCK; r++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++)
-      val += p[(size_t)(j / 16) * 64 + (size_t)r * 16 + (size_t)(j % 16)] * x[j];
-    out[r] = val;
-  }
-}
-
 typedef struct {
   float *out;
   const float *w, *w3;
@@ -1200,26 +1147,16 @@ typedef struct {
   atomic_int next; /* dynamic scheduling: the next unclaimed row (zero before the team starts) */
   RowsDoneFn done; /* worker entry points only (one segment): called after each range of rows is stored */
   void *done_ctx;
-  int packed; /* the segments' weights are in the packed4 layout (k_pack4): every row range is whole four-row groups */
 } F32Job;
 
 static void f32_range(const F32Job *job, const F32Segment *seg, int r0, int r1) {
   float dots[BLOCK], gates[BLOCK];
   size_t ld = job->ld ? job->ld : (size_t)job->n;
-  const size_t group = (size_t)((job->n + 15) / 16) * 64; /* floats of one packed four-row group */
   for (int i = r0; i < r1; i += BLOCK) {
     int rows = r1 - i < BLOCK ? r1 - i : BLOCK;
-    if (job->packed) {
-      if (rows != BLOCK || i % BLOCK)
-        fail("packed4 GEMV: rows [%d, %d) are not whole four-row groups", i, r1);
-      f32_dots_p4(seg->w + (size_t)(i / BLOCK) * group, job->n, job->x, dots);
-      if (job->kind == SWIGLU)
-        f32_dots_p4(seg->w3 + (size_t)(i / BLOCK) * group, job->n, job->x, gates);
-    } else {
-      f32_dots(seg->w + (size_t)i * ld, ld, rows, job->x, job->n, dots);
-      if (job->kind == SWIGLU)
-        f32_dots(seg->w3 + (size_t)i * ld, ld, rows, job->x, job->n, gates);
-    }
+    f32_dots(seg->w + (size_t)i * ld, ld, rows, job->x, job->n, dots);
+    if (job->kind == SWIGLU)
+      f32_dots(seg->w3 + (size_t)i * ld, ld, rows, job->x, job->n, gates);
     for (int r = 0; r < rows; r++) {
       if (job->kind == ADD)
         seg->out[i + r] += dots[r];
@@ -1250,11 +1187,6 @@ static void f32_team_static(const F32Job *job, int worker, int workers) {
   for (int s = 0; s < job->count; s++) {
     const F32Segment *seg = &job->segment[s];
     int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
-    if (job->packed) { /* shares of whole four-row groups */
-      int groups = seg->d / BLOCK;
-      r0 = (int)((long long)groups * worker / workers) * BLOCK;
-      r1 = (int)((long long)groups * (worker + 1) / workers) * BLOCK;
-    }
     if (r1 > r0)
       f32_range(job, seg, r0, r1);
   }
@@ -1293,7 +1225,7 @@ static int job_rows_f32(const F32Job *job) {
 }
 
 static size_t job_bytes_f32(const F32Job *job) {
-  size_t row = job->packed ? (size_t)((job->n + 15) / 16) * 16 : (job->ld ? job->ld : (size_t)job->n);
+  size_t row = job->ld ? job->ld : (size_t)job->n;
   return (size_t)job_rows_f32(job) * row * sizeof(float) * (job->kind == SWIGLU ? 2 : 1);
 }
 
@@ -1310,41 +1242,30 @@ static void f32_team(const void *p, int worker, int workers) {
     f32_team_static(job, worker, workers);
 }
 
-/* Rows [4 * first, 4 * last) of the concatenated segments: the packed4 layout splits only between whole four-row groups. */
-static void f32_group_rows(const void *p, int first, int last) {
-  f32_rows(p, first * BLOCK, last * BLOCK);
-}
-
 static void f32_run(F32Job *job) {
   if (current_team) {
     team_run(current_team, f32_team, job);
     return;
   }
-  int rows = 0;
-  for (int s = 0; s < job->count; s++)
-    rows += job->segment[s].d;
-  if (job->packed)
-    parallel_rows(rows / BLOCK, f32_group_rows, job); /* every segment has a multiple of four rows */
-  else
-    parallel_rows(rows, f32_rows, job);
+  parallel_rows(job_rows_f32(job), f32_rows, job);
 }
 
 void k_matmul(float *out, const float *x, const float *w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
-  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL, 0};
+  F32Job job = {x, n, STORE, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_add(float *out, const float *x, const float *w, int n, int d) {
-  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL, 0};
+  F32Job job = {x, n, ADD, 1, {{out, w, NULL, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_qkv(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv, int n,
                   int dq, int dkv) {
-  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0, NULL, NULL, 0};
+  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_swiglu(float *out, const float *x, const float *w1, const float *w3, int n, int d) {
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL, 0};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL};
   f32_run(&job);
 }
 
@@ -1504,7 +1425,7 @@ void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, i
   check_epilogue(kind, "k_matmul_ld");
   if (ld < (size_t)n)
     fail("k_matmul_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, NULL, NULL, 0};
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, NULL, NULL};
   f32_run(&job);
 }
 /* The body of k_matmul_ld for one member of a team, to be called from inside a TeamFn on every member (the same row
@@ -1515,7 +1436,7 @@ void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, i
   check_epilogue(kind, "k_matmul_ld_worker");
   if (ld < (size_t)n)
     fail("k_matmul_ld_worker: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, done, done_ctx, 0};
+  F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, done, done_ctx};
   GemvSched sched = effective_f32(job_bytes_f32(&job));
   if (sched != SCHED_STATIC && claim && workers > 1)
     f32_team_claim(&job, claim, worker, workers, sched);
@@ -1525,101 +1446,7 @@ void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, i
 void k_matmul_swiglu_ld(float *out, const float *x, const float *w1, const float *w3, size_t ld, int n, int d) {
   if (ld < (size_t)n)
     fail("k_matmul_swiglu_ld: row stride %zu is shorter than the %d inputs", ld, n);
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld, 0, NULL, NULL, 0};
-  f32_run(&job);
-}
-/* ---- Packed four-row layout (B7) -------------------------------------------------------------------------------------
- * The FP32 decode kernels stream each weight row as its own sequence, four rows at a time: four streams per core, and a
- * measured 408 GB/s per socket for one 112 MiB matrix per job against 518-529 GB/s when one team job covers 4 GiB. Packing
- * the four rows of a group into ONE sequential stream (16 floats of row 0, of row 1, 2, 3, then the next 16 columns)
- * measured 612 GB/s in tests/stream_bench.c (the raw stream is 601). The arithmetic of every row is unchanged, so the result
- * is bitwise equal to the row layout whenever the row layout also forms whole four-row groups (claiming schedules). */
-size_t k_pack4_floats(int rows, int n) {
-  return (size_t)(rows / BLOCK) * (size_t)((n + 15) / 16) * 64;
-}
-
-void k_pack4_groups(float *dst, const float *w, size_t ld, int n, int first, int last) {
-  const size_t blocks = (size_t)((n + 15) / 16);
-  for (int g = first; g < last; g++) {
-    float *out = dst + (size_t)g * blocks * 64;
-    for (size_t b = 0; b < blocks; b++) {
-      int count = n - (int)b * 16 < 16 ? n - (int)b * 16 : 16;
-      for (int r = 0; r < BLOCK; r++) {
-        const float *row = w + ((size_t)g * BLOCK + (size_t)r) * ld + b * 16;
-        float *to = out + b * 64 + (size_t)r * 16;
-        for (int c = 0; c < 16; c++)
-          to[c] = c < count ? row[c] : 0.0f;
-      }
-    }
-  }
-}
-
-typedef struct {
-  const Pack4Job *jobs;
-  int count;
-} Pack4All;
-
-static void pack4_chunks(const void *p, int s, int first, int last) {
-  const Pack4All *all = p;
-  (void)s;
-  int base = 0;
-  for (int i = 0; i < all->count && base < last; i++) {
-    const Pack4Job *job = &all->jobs[i];
-    int groups = job->rows / BLOCK;
-    if (base + groups > first)
-      k_pack4_groups(job->dst, job->w, job->ld, job->n, first > base ? first - base : 0,
-                     last < base + groups ? last - base : groups);
-    base += groups;
-  }
-}
-
-void k_pack4_many(const Pack4Job *jobs, int count) {
-  Pack4All all = {jobs, count};
-  long long groups = 0;
-  for (int i = 0; i < count; i++) {
-    if (jobs[i].rows % BLOCK || jobs[i].n < 1 || jobs[i].ld < (size_t)jobs[i].n)
-      fail("k_pack4_many: %d rows x %d columns (stride %zu) cannot be packed in four-row groups", jobs[i].rows,
-           jobs[i].n, jobs[i].ld);
-    groups += jobs[i].rows / BLOCK;
-  }
-  if (groups > INT32_MAX)
-    fail("too many weight groups to pack: %lld", groups);
-  int chunks = (int)groups;
-  kernels_parallel_segments(1, &chunks, pack4_chunks, &all);
-}
-
-static void check_p4(int d, const char *name) {
-  if (d % BLOCK)
-    fail("%s: %d rows are not a whole number of four-row groups", name, d);
-}
-
-void k_matmul_p4(float *out, const float *x, const float *wp, int n, int d, int kind) {
-  check_epilogue(kind, "k_matmul_p4");
-  check_p4(d, "k_matmul_p4");
-  F32Job job = {x, n, kind, 1, {{out, wp, NULL, d}}, 0, 0, NULL, NULL, 1};
-  f32_run(&job);
-}
-void k_matmul_p4_worker(float *out, const float *x, const float *wp, int n, int d, int kind, int worker, int workers,
-                        atomic_int *claim, RowsDoneFn done, void *done_ctx) {
-  check_epilogue(kind, "k_matmul_p4_worker");
-  check_p4(d, "k_matmul_p4_worker");
-  F32Job job = {x, n, kind, 1, {{out, wp, NULL, d}}, 0, 0, done, done_ctx, 1};
-  GemvSched sched = effective_f32(job_bytes_f32(&job));
-  if (sched != SCHED_STATIC && claim && workers > 1)
-    f32_team_claim(&job, claim, worker, workers, sched);
-  else
-    f32_team_static(&job, worker, workers);
-}
-void k_matmul_qkv_p4(float *q, float *k, float *v, const float *x, const float *wq, const float *wk, const float *wv,
-                     int n, int dq, int dkv) {
-  check_p4(dq, "k_matmul_qkv_p4");
-  check_p4(dkv, "k_matmul_qkv_p4");
-  F32Job job = {x, n, STORE, 3, {{q, wq, NULL, dq}, {k, wk, NULL, dkv}, {v, wv, NULL, dkv}}, 0, 0, NULL, NULL, 1};
-  f32_run(&job);
-}
-void k_matmul_swiglu_p4(float *out, const float *x, const float *w1, const float *w3, int n, int d) {
-  check_p4(d, "k_matmul_swiglu_p4");
-  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL, 1};
+  F32Job job = {x, n, SWIGLU, 1, {{out, w1, w3, d}}, ld, 0, NULL, NULL};
   f32_run(&job);
 }
 void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind) {

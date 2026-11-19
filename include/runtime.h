@@ -58,6 +58,8 @@ size_t checked_add(size_t a, size_t b);
 /* File bytes of a tensor: FP32 values, or Q8 values plus FP32 group scales (no padding). */
 size_t tensor_bytes(size_t count, int quantized, int gs);
 double monotonic_seconds(void);
+/* Fails when the environment sets a knob whose code path was removed. kernels_init() calls it. */
+void check_retired_knobs(void);
 
 /* Validation precedes pointer construction. The mapping owns no heap weights;
  * the caller owns `manifest` (manifest_free) once the call succeeds. */

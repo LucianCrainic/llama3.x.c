@@ -109,6 +109,24 @@ void memory_free(void *pointer) {
   free(block);
 }
 
+/* Knobs that selected experimental paths the measurements did not adopt; their code is gone (docs/audit-2026-11.md). A
+ * script that still sets one would silently measure the default path under the old label, so refuse to start instead. */
+void check_retired_knobs(void) {
+  static const char *const retired[][2] = {
+      {"LLAMA_FP32_LAYOUT", "the packed4 decode layout was not adopted (B7, D2); FP32 decode streams the row layout"},
+      {"LLAMA_TP_FUSED", "the Wo/W2 projection and its reduction always run fused in one team job"},
+      {"LLAMA_TP_REDUCE", "two-socket decode always uses the per-row flag reduction"},
+      {"LLAMA_TP_TRACE", "the reduction trace was a B7 diagnostic"},
+      {"LLAMA_TEAM_JOIN", "teams always join with per-member flags"},
+      {"LLAMA_BF16_DROP_FP32", "decode always reads the FP32 weights"},
+  };
+  for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); i++) {
+    const char *value = getenv(retired[i][0]);
+    if (value && *value)
+      fail("%s is no longer supported: %s", retired[i][0], retired[i][1]);
+  }
+}
+
 double monotonic_seconds(void) {
   struct timespec ts;
   if (clock_gettime(CLOCK_MONOTONIC, &ts))
