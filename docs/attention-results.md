@@ -127,3 +127,124 @@ Decode is untouched by construction (`LLAMA_ATTN_DECODE` keeps `split`). The dec
 No row matches exactly. The nearest is "tune E2 first": the FMA ports are idle about 73% of the time, so AMX's faster
 units would not be the binding constraint. The E4 TTFT target (≥ 1.5x at 8192 vs C7) is already met by `tiled` alone
 (1.66x). The decision is recorded in the plan (§4 E2 row and E2.8).
+
+## 2. E4: prefill attention campaign (`split` against `tiled`, 2026-11-19)
+
+### 2.1 Result in one paragraph
+
+`tiled` is faster than `split` in every one of the 32 timed prefill cells, and the E4 value gate is met. 8B AMX-BF16 prefill at 8192
+tokens on one socket goes from 25.06 s to 16.18 s time to first token (**1.55x**, ranges far apart). Against C7's 30.6 s that is 1.89x
+(**derived**), and the gate limit was 20.4 s. The gain is largest on the AMX rungs at 8192 tokens (1.38-1.58x) and small on the AVX-512
+FP32 rung (1.09-1.23x), where the GEMMs dominate. At 2048 tokens every cell is faster (1.04-1.32x). Decode after prefill is
+unchanged within noise. Placement is verified in all 256 reports. The two-socket gain at 8192 tokens, above 2x with `split` on 8B,
+is below 2x with `tiled` (at most 1.95x). The 30 logit comparisons of the check job pass. The 12 generation (determinism)
+comparisons did not run because of a script bug; the rerun (job 5864239) is **pending**. Provenance, gates and gaps:
+[attention-results-validation.md](attention-results-validation.md).
+
+The campaign ran from one commit (5a354ea) with D2's engine-owned HBM placement (`LLAMA_PLACEMENT=hbm`), three timed repeats and one
+`LLAMA_PROFILE=1` repeat per cell, and a 32-token decode after each prefill. `split` is faster here than in section 1 (25.06 s against
+30.68 s for the 8B AMX-BF16 8192 cell) because section 1 staged the checkpoint as files; `tiled` is also faster (16.18 s against 17.75 s
+in the E2 rerun). The split baseline of this campaign is therefore the harder one, and the gate against C7's file-staged 30.6 s is met
+with margin.
+
+### 2.2 E4.3 gates
+
+| Gate | Criterion | Observed | Result |
+| --- | --- | --- | --- |
+| Value | 8B, 8192, one socket, AMX-BF16, best variant ≥ 1.5x vs C7 (30.6 s → ≤ 20.4 s) | `tiled` 16.18 [16.16-16.18] s against `split` 25.06 [25.05-25.12] s in the same job = 1.55x; 1.89x against C7 (derived) | pass |
+| Value, other rungs (informational) | none in the plan | 8B AMX-INT8 1.50x; 8B AVX-512 FP32 1.16x (M 64) and 1.18x (M 128) | recorded |
+| 2048 not slower | variant median ≥ lower end of the `split` range, every rung | 16 of 16 cells faster, 1.04-1.32x | pass |
+| Decode unchanged | 32-token decode within the `split` range | median ratio `tiled`/`split` 0.997 over 32 cells (0.970-1.026), 15 faster and 17 slower; ranges overlap in 29 of 32 | pass, with the note below |
+| Placement | verification passes in every report | 256 of 256 reports, 0 mismatched pages | pass |
+| Two sockets | gates pass; gain at 8192 recorded; item 2a concluded | see 2.5 | pass |
+| Attention share | `-xprof` at 2048 and 8192 per variant | 2.3 and 2.4 | recorded |
+| Correctness (check job) | C3 and D1 logit gates, `LLAMA_TP_CHECK=1` on two sockets | 30 of 30 PASS (FP32 max 1.4e-4, BF16 max 0.77 at 86 tokens, W8A8 max 0.27; argmax 100%) | pass |
+| Determinism (check job) | generation comparisons identical | not run (script bug, fixed in b318378) | **pending**: rerun 5864239 |
+
+**Decode note.** The decode gate of the job's own summary was first marked FAIL (20 of 32 cells) by a rule that was too strict, and
+was then corrected to range overlap (`tools/summarize_e4.py`, commit da6ce2b). The corrected summary still lists one cell below
+`split` without range overlap: 8B AMX-BF16, 8192 tokens, two sockets, 25.5 [25.3-25.6] against 25.8 [25.6-25.8] tok/s (1.2% lower).
+With three repeats per side and 32 cells, about 1.6 such cells are expected by chance (**estimated**). Decode runs identical code for
+both variants, because `LLAMA_ATTN_DECODE` keeps `split`. The gate is treated as passed. It is not a clean pass by the summarizer's
+letter, which still prints 31 of 32.
+
+**Placement note.** Weights and KV are on HBM node 2 (one socket) and nodes 2 and 3 (two sockets) in every report. One-socket work
+regions are not verified, by design. The one-socket K-cache regions report a few missing (untouched) pages in every report; D2's
+reports (2026-11-17) show the same, so it predates E4.
+
+### 2.3 Time to first token at 8192 tokens
+
+Median [min-max] of three repeats, seconds. "Share" is attention over forward time of the profiled repeat. M is the batch size. All
+cells have a 32-token decode behind them.
+
+| model | rung (M) | sockets | split TTFT | tiled TTFT | speedup | share split → tiled |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 8b | AMX-BF16 (256) | 1 | 25.057 [25.047-25.120] | 16.182 [16.163-16.182] | **1.55x** | 69% → 55% |
+| 8b | AMX-BF16 (256) | 2 | 11.774 [11.771-11.777] | 8.308 [8.304-8.336] | 1.42x | 60% → 48% |
+| 8b | AMX-INT8 (256) | 1 | 24.626 [24.491-24.727] | 16.370 [16.356-16.383] | 1.50x | 70% → 56% |
+| 8b | AMX-INT8 (256) | 2 | 11.721 [11.694-11.722] | 8.504 [8.488-8.538] | 1.38x | 61% → 48% |
+| 8b | AVX-512 FP32 (64) | 1 | 53.491 [53.467-53.573] | 46.151 [46.143-46.189] | 1.16x | 35% → 26% |
+| 8b | AVX-512 FP32 (64) | 2 | 27.198 [27.190-27.211] | 24.901 [24.893-24.981] | 1.09x | 28% → 24% |
+| 8b | AVX-512 FP32 (128) | 1 | 55.610 [55.543-55.767] | 46.934 [46.924-47.568] | 1.18x | 32% → 21% |
+| 8b | AVX-512 FP32 (128) | 2 | 27.743 [27.721-27.747] | 24.226 [24.220-24.254] | 1.15x | 27% → 18% |
+| 1b | AMX-BF16 (256) | 1 | 5.992 [5.950-5.999] | 3.788 [3.780-4.069] | 1.58x | 75% → 61% |
+| 1b | AMX-BF16 (256) | 2 | 3.201 [3.193-3.217] | 2.106 [2.085-2.119] | 1.52x | 68% → 54% |
+| 1b | AMX-INT8 (256) | 1 | 6.165 [6.155-6.274] | 4.050 [4.016-4.057] | 1.52x | 72% → 58% |
+| 1b | AMX-INT8 (256) | 2 | 3.314 [3.307-3.345] | 2.282 [2.267-2.298] | 1.45x | 65% → 49% |
+| 1b | AVX-512 FP32 (64) | 1 | 10.976 [10.933-10.985] | 9.384 [9.370-9.412] | 1.17x | 44% → 36% |
+| 1b | AVX-512 FP32 (64) | 2 | 6.159 [6.098-6.175] | 5.181 [5.174-5.185] | 1.19x | 39% → 31% |
+| 1b | AVX-512 FP32 (128) | 1 | 10.435 [10.433-10.442] | 8.480 [8.429-8.498] | 1.23x | 44% → 33% |
+| 1b | AVX-512 FP32 (128) | 2 | 5.747 [5.728-5.751] | 4.681 [4.679-4.683] | 1.23x | 40% → 27% |
+
+The profiled repeat of the gate cell gives attention 17.43 s → 9.06 s (1.92x) out of a forward of 25.20 s → 16.48 s, in line
+with the kernel bench (section 1.3). On two sockets the same cell gives 7.01 s → 3.88 s. The AMX rungs gain most because their
+GEMMs are already fast, so attention is the larger share. On the FP32 rung attention is only 27-44% of the `split` forward (2048-token share
+10-18%), so removing part of it moves TTFT by 1.09-1.23x at most.
+
+### 2.4 Time to first token at 2048 tokens
+
+| rung | 8b, 1 socket | 8b, 2 sockets | 1b, 1 socket | 1b, 2 sockets | share split → tiled (8b, 1 socket) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| AMX-BF16 (256) | 1.21x (2.937 → 2.423 s) | 1.18x | 1.32x | 1.23x | 34% → 23% |
+| AMX-INT8 (256) | 1.18x (2.839 → 2.401 s) | 1.16x | 1.27x | 1.19x | 35% → 24% |
+| AVX-512 FP32 (64) | 1.05x (10.000 → 9.493 s) | 1.04x | 1.08x | 1.07x | 11% → 8% |
+| AVX-512 FP32 (128) | 1.05x (10.504 → 9.974 s) | 1.05x | 1.09x | 1.08x | 11% → 7% |
+
+All 16 cells are faster than `split`. The full ranges and the 1B shares are in the E4 summary (`tools/summarize_e4.py bench`, run
+again on the job's reports after the gate fix in da6ce2b).
+
+### 2.5 Item 2a: does the two-socket gain above 2x persist?
+
+Two-socket TTFT gain = one-socket median over two-socket median, 8192 tokens.
+
+| model | rung (M) | split | tiled |
+| --- | --- | ---: | ---: |
+| 8b | AMX-BF16 (256) | 2.13x | 1.95x |
+| 8b | AMX-INT8 (256) | 2.10x | 1.93x |
+| 8b | AVX-512 FP32 (64) | 1.97x | 1.85x |
+| 8b | AVX-512 FP32 (128) | 2.00x | 1.94x |
+| 1b | AMX-BF16 (256) | 1.87x | 1.80x |
+| 1b | AMX-INT8 (256) | 1.86x | 1.77x |
+| 1b | AVX-512 FP32 (64) | 1.78x | 1.81x |
+| 1b | AVX-512 FP32 (128) | 1.82x | 1.81x |
+
+**Conclusion.** The gain above 2x does not persist. With `split` the 8B cells at 8192 tokens reach 2.00-2.13x (D2: 2.05-2.15x). With
+`tiled` none exceeds 1.95x, and every 8B cell drops by 0.06-0.18. The 1B cells, already below 2x, move by at most 0.09. This
+matches E0's H6 ([attention-profile.md](attention-profile.md)): the surplus above 2x belongs to attention at long prompts, and it
+shrinks once attention is fast. This campaign has no cache counters, so the mechanism (L2/L3 fit of the halved K/V) stays unconfirmed.
+At 2048 tokens the gain barely moves (8B AMX-BF16 1.83x → 1.79x). The two-socket path is still the faster choice everywhere: 8B
+AMX-BF16 at 8192 tokens takes 8.31 s with `tiled` against 11.77 s with `split`, and 16.18 s on one socket.
+
+### 2.6 Recommendation for `LLAMA_ATTN`
+
+| Rung | Recommended | Gain at 8192 / 2048 tokens (8B, one socket) |
+| --- | --- | --- |
+| AMX-BF16 | `tiled` | 1.55x / 1.21x |
+| AMX-INT8 (Q8) | `tiled` | 1.50x / 1.18x |
+| AVX-512 FP32 | `tiled` | 1.16-1.18x / 1.05x |
+
+`tiled` was faster on every rung tested, with no cell slower and decode unchanged. The gain is small on FP32, where the GEMMs
+dominate, but it costs nothing there. `amx` (E3) was not built, so it was not tested. The code default stays `split` after this
+phase (plan, E4.4); the owner flips it. The decision table entry is in
+[numa-tp-prefill-results.md](numa-tp-prefill-results.md) section 7. The one open item is the determinism comparison (job 5864239); the
+default should not be flipped before it passes.
