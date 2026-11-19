@@ -1,6 +1,6 @@
 # Prefill attention results (E2-E4): validation record
 
-**Status: E2 run (2026-11-18); E4 run (2026-11-19), determinism rerun pending.** Provenance, gates and gaps. Results: [attention-results.md](attention-results.md). Evidence file names are
+**Status: E2 run (2026-11-18); E4 run (2026-11-19), including the determinism rerun.** Provenance, gates and gaps. Results: [attention-results.md](attention-results.md). Evidence file names are
 relative to each job's results directory.
 
 ## E2 provenance
@@ -48,13 +48,13 @@ skipped the engine runs. It produced no results that are used here.
 
 | Item | Check job | Bench job | Determinism rerun |
 | --- | --- | --- | --- |
-| Date (UTC) | 2026-11-18 (start 23:55) | 2026-11-19 | queued, no result yet |
-| Slurm job ID | 5864123 (`STAGE=check PHASE=E4`) | 5864134 (`STAGE=bench PHASE=E4`, `REPEATS=3`, `SKIP_TEST=1`) | 5864239 |
+| Date (UTC) | 2026-11-18 (start 23:55) | 2026-11-19 | 2026-11-19 (04:28-05:03) |
+| Slurm job ID | 5864123 (`STAGE=check PHASE=E4`) | 5864134 (`STAGE=bench PHASE=E4`, `REPEATS=3`, `SKIP_TEST=1`) | 5864239 (`STAGE=check PHASE=E4`, `SKIP_TEST=1`) |
 | Commit | 5a354ea (`develop`) | 5a354ea (`develop`) | b318378 (fixes the generation-comparison output directory) |
 | Node, memory mode | one node of the HBM partition, exclusive; Flat mode; 2 x Xeon Max 9480, 56 cores per socket | same | same |
 | Placement | engine-owned HBM (`LLAMA_PLACEMENT=hbm`), as D2 | same | same |
-| Script | `scripts/cresco8-prefill.sbatch`, `phase_E4`; summary `tools/summarize_e4.py` | same; 256 reports (2 models x 16 cells x `split`/`tiled` x 3 timed repeats plus one `-xprof`) | same script, generation comparisons only |
-| Result | 30 of 30 logit comparisons PASS; 12 generation comparisons did not run | all E4.3 gates evaluated | pending |
+| Script | `scripts/cresco8-prefill.sbatch`, `phase_E4`; summary `tools/summarize_e4.py` | same; 256 reports (2 models x 16 cells x `split`/`tiled` x 3 timed repeats plus one `-xprof`) | same script, whole check phase (30 logit and 12 generation comparisons) |
+| Result | 30 of 30 logit comparisons PASS; 12 generation comparisons did not run | all E4.3 gates evaluated | 42 of 42 PASS: the 30 logit comparisons again and 12 of 12 generation comparisons identical |
 
 `make test` passed on the hardware for commit 5a354ea in job 5864122 (the E2 rerun, section E2 gap 3). The summarizer of the bench job
 was corrected after the job in commit da6ce2b, and the numbers in [attention-results.md](attention-results.md) section 2 come from the
@@ -67,7 +67,7 @@ corrected summarizer run on the job's 256 reports.
 | Logits, FP32 | tiled and split vs per-token, max \|Δ\| ≤ 1e-3, argmax 100%; 86 and 2048 tokens, M 64 and 128, two sockets with `LLAMA_TP_CHECK=1` | 1B max 1.62e-5; 8B max 1.37e-4 (tiled, 86 tokens); argmax 100% | pass | check job `E4/summary.md`, `compare-*-e4-*.json` |
 | Logits, BF16 | tiled vs split, `BF16_GATE`; two sockets | max 0.084 (1B), 0.768 (8B) at 86 tokens; 0.043 and 0.042 at 2048; argmax 100% | pass | same |
 | Logits, W8A8 | tiled vs split, `W8A8_GATE`; two sockets | max 0.215-0.268; argmax 100% | pass | same |
-| Determinism | generation comparisons identical | 12 comparisons did not run (wrote to a missing `E1/` directory) | **pending** (rerun 5864239, commit b318378) | none yet |
+| Determinism | generation comparisons identical | check job: did not run (wrote to a missing `E1/` directory); rerun: 12 of 12 identical | pass (rerun 5864239, commit b318378); 128 generated tokens each; FP32, 1B and 8B, 86- and 2048-token prompts; `split` vs `tiled`, and one vs two sockets for each | rerun job `E4/gen-fp32-e4-*.json` |
 | Run completeness (bench) | every launch produced a report | 256 reports | pass | bench job `E4/campaign-summary.md` |
 | Value | 8B AMX-BF16 8192 one socket ≥ 1.5x vs C7 (≤ 20.4 s), beyond variability | 16.182 [16.163-16.182] s; split in the same job 25.057 [25.047-25.120] s (1.55x) | pass | bench job `E4/campaign-summary.md`; `8b-bf16-teams-hbm-s1-t56-m256-p8192-kamx_bf16-xattn{split,tiled}-{1,2,3}.json` |
 | 2048 not slower | tiled median ≥ lower end of the split range, 16 cells | 16 of 16 | pass | same |
@@ -79,8 +79,10 @@ corrected summarizer run on the job's 256 reports.
 ## E4 gaps
 
 1. **Generation (determinism) comparisons.** The 12 comparisons of the check job did not run, because the script wrote into an `E1/`
-   directory that did not exist (fixed in b318378). Job 5864239 reruns them and is queued. Until it passes, `tiled` has logit-level
-   correctness evidence only, and the `LLAMA_ATTN` default should not be flipped.
+   directory that did not exist (fixed in b318378). Job 5864239 reran them on 2026-11-19 and all 12 were identical, so this gap is
+   closed. The rerun skipped `make test` (`SKIP_TEST=1`). Its engine code is that of 9d3f72b (5a354ea plus the opt-in E5 decode kernel,
+   default off), for which `make test` passed on the hardware in job 5864135; b318378 differs from 9d3f72b only in the campaign
+   script and its test.
 2. **Summarizer gates fixed after the job.** The job's own summary marked decode FAIL (20 of 32 cells) and placement FAIL. The decode
    rule was too strict for three-repeat noise on identical decode code. The placement rule read the placement label instead of the region table. Both were corrected in da6ce2b and the summary was
    regenerated from the same reports. Nothing was remeasured. The corrected decode rule (range overlap, or median not lower)

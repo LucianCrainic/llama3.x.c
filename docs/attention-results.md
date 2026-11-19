@@ -138,7 +138,7 @@ tokens on one socket goes from 25.06 s to 16.18 s time to first token (**1.55x**
 FP32 rung (1.09-1.23x), where the GEMMs dominate. At 2048 tokens every cell is faster (1.04-1.32x). Decode after prefill is
 unchanged within noise. Placement is verified in all 256 reports. The two-socket gain at 8192 tokens, above 2x with `split` on 8B,
 is below 2x with `tiled` (at most 1.95x). The 30 logit comparisons of the check job pass. The 12 generation (determinism)
-comparisons did not run because of a script bug; the rerun (job 5864239) is **pending**. Provenance, gates and gaps:
+comparisons did not run in that job because of a script bug; the rerun (job 5864239) found all 12 identical. Provenance, gates and gaps:
 [attention-results-validation.md](attention-results-validation.md).
 
 The campaign ran from one commit (5a354ea) with D2's engine-owned HBM placement (`LLAMA_PLACEMENT=hbm`), three timed repeats and one
@@ -159,7 +159,7 @@ with margin.
 | Two sockets | gates pass; gain at 8192 recorded; item 2a concluded | see 2.5 | pass |
 | Attention share | `-xprof` at 2048 and 8192 per variant | 2.3 and 2.4 | recorded |
 | Correctness (check job) | C3 and D1 logit gates, `LLAMA_TP_CHECK=1` on two sockets | 30 of 30 PASS (FP32 max 1.4e-4, BF16 max 0.77 at 86 tokens, W8A8 max 0.27; argmax 100%) | pass |
-| Determinism (check job) | generation comparisons identical | not run (script bug, fixed in b318378) | **pending**: rerun 5864239 |
+| Determinism (check job) | generation comparisons identical | check job: not run (script bug, fixed in b318378); rerun 5864239: 12 of 12 identical over 128 tokens | pass |
 
 **Decode note.** The decode gate of the job's own summary was first marked FAIL (20 of 32 cells) by a rule that was too strict, and
 was then corrected to range overlap (`tools/summarize_e4.py`, commit da6ce2b). The corrected summary still lists one cell below
@@ -246,5 +246,5 @@ AMX-BF16 at 8192 tokens takes 8.31 s with `tiled` against 11.77 s with `split`, 
 `tiled` was faster on every rung tested, with no cell slower and decode unchanged. The gain is small on FP32, where the GEMMs
 dominate, but it costs nothing there. `amx` (E3) was not built, so it was not tested. The code default stays `split` after this
 phase (plan, E4.4); the owner flips it. The decision table entry is in
-[numa-tp-prefill-results.md](numa-tp-prefill-results.md) section 7. The one open item is the determinism comparison (job 5864239); the
-default should not be flipped before it passes.
+[numa-tp-prefill-results.md](numa-tp-prefill-results.md) section 7. The determinism comparison (job 5864239) passed, so nothing blocks
+the owner's flip.
