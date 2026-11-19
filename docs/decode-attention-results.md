@@ -165,3 +165,52 @@ storage, which halves the bytes) does not go to the owner now. The evidence for 
 - E6 (batched decode design) can use these measurements. Decode attention at long contexts is limited by the access pattern,
   not by bandwidth. Each sequence has its own K/V, so batching sequences over shared weights would not by itself shorten
   attention time per sequence (an inference, not measured).
+
+## 8. Follow-ups: the 512 rerun and the K/V layout probe
+
+This section settles the first two follow-ups of section 7. The decision rules below were written **before** any follow-up
+job ran (commit of this section's rules precedes the jobs; the validation record names the commits and job ids). Results are
+appended under "8.3" and "8.4" after the jobs.
+
+### 8.1 Decision rules (fixed before the runs)
+
+**512 gate and the 8B one-socket shapes.** Cells: 8B FP32 and 8B W8A8, one socket x 56 workers, context 512 (the gate) and
+8192 (the one shape where the profiled attention of `group` was slower). Per cell, nine repeats of `split` and `group`
+interleaved inside each repeat; odd repeats launch `split` first and even repeats `group` first (`E5_ALTERNATE=1`), so
+neither kernel is always second. The 8192 cells run the same nine repeats (the requirement is five). Three profiled runs per
+kernel and cell (`LLAMA_PROFILE=1`, per-step phase times from `profile_seconds.decode`). Same node, same build as the first E5
+bench job; the B7 range is the reference of section 3.
+
+- **Verdict A (the E5.5 gate as written).** The 512 gate passes if the median decode tok/s of `group` is within or above the
+  B7 range of that cell (8B FP32 16.13-16.44, 8B W8A8 49.52-49.73), i.e. not below its lower end.
+- **Verdict B (relative to the same job).** Otherwise it passes in-job if the median of `group` is at least the lower end (the
+  minimum) of `split`'s nine repeats **and** the two ranges overlap. If B holds and A does not, the report says whether
+  `split` itself reproduced B7 in the job (median of `split` within the B7 range); if it did not, the B7 reference is not
+  reproduced on that day and only B counts.
+- **Fail.** Neither A nor B. The report then gives the median ratio, and the cell stays a recorded loss.
+- Also reported, not gating: the median ratio `group / split`; the number of repeats (of nine) in which `group` was faster
+  than `split` of the same repeat (paired); and the spread (min-max) of each kernel.
+- **Does the weight-phase cost follow the kernel or the process?** From the three profiled runs of each kernel, take the
+  sum of the weight phases `qkv + w1_w3 + w2` per decode step (ms), `W`. Let `d` = median(`W` of `group`) - median(`W` of
+  `split`) and `s` the larger of the two kernels' (max - min) over their three runs. If `|d| <= s` the difference is not
+  attributable to the kernel (it is run-to-run or process variation). If `d > s` the weight phases are slower under `group`
+  (follows the kernel). If `d < -s` they are faster. The attention phase gets the same test, with `s` from its own runs.
+- **8B at 8192 one socket.** `group`'s attention is called slower than `split`'s only if its median profiled attention time
+  exceeds `split`'s by more than `s` (same test); the token rate is judged by the rule "beyond variability" of section 3
+  (ranges do not overlap), and the microbenchmark cell (8B, 8 local KV heads, 8192) is repeated in the layout job with the
+  rows layout (one repeat of 1000 repetitions per kernel).
+
+**K/V layout probe (E5.2 candidate 3).** `attention-bench --kv-layout rows|head` reads the same values in the engine's
+`[position][kv_head][head_dim]` layout (`rows`) or in `[kv_head][position][head_dim]` (`head`: position stride `head_dim`
+floats, head base `context x head_dim` floats). Shapes 1B (head_dim 64) and 8B (head_dim 128); local KV heads 4 and 8;
+contexts 8192 and 32768 (512 reported as well); kernels `split` and `group`; 1000 repetitions per cell, 56 threads on the HBM
+node 2. Per cell the speedup is `median ms (rows) / median ms (head)`; the bench's `gbs_median` and `gbs_best`, `busy_mean`
+and `tail_fraction` are reported with it.
+
+- **Cell gate.** A cell passes if the speedup is at least 1.2 (the plan's threshold for touching the engine).
+- **Verdict.** The engine change (head-major KV cache) is recommended only if `group` (the kernel proposed for the default)
+  passes in all four cells at 32768 (the contexts where attention dominates a step) **and** none of its 8192 cells is slower
+  than 0.95. If only some cells pass, the report lists them and recommends no engine change, naming the cells as the evidence
+  to extend. If no `group` cell reaches 1.2, the layout is closed as a candidate.
+- If the verdict is "recommended", the section lists what the engine change touches (KV append in `src/run.c` and
+  `src/runq.c`, the local KV of `src/tp.c`, A5 placement, prefill attention reading the cache) and does **not** implement it.
