@@ -2445,11 +2445,16 @@ static void attention_tiled_driver(float *out, const float *q, const float *key_
 }
 #endif
 
-/* One note per process when `tiled` hands a call to `split`: the precision is the same, only the speed differs. */
+/* Set when the batched variant was chosen explicitly (LLAMA_ATTN or kernels_attention_select), not by default. */
+static int attention_batch_requested;
+
+/* One note per process when `tiled` hands a call to `split`: the precision is the same, only the speed differs. It is
+ * an INFO note when tiled was asked for and a DEBUG note when it is only the default (every host without AVX-512). */
 static void attention_tiled_fallback(const char *reason) {
   static atomic_flag noted = ATOMIC_FLAG_INIT;
   if (!atomic_flag_test_and_set(&noted))
-    LOG(LOG_INFO, "LLAMA_ATTN=tiled: %s, running split attention instead", reason);
+    LOG(attention_batch_requested ? LOG_INFO : LOG_DEBUG, "LLAMA_ATTN=tiled: %s, running split attention instead",
+        reason);
 }
 
 static void attention_batch_tiled(float *out, const float *q, const float *key_cache, const float *value_cache,
@@ -2478,7 +2483,8 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
  * (batched, prefill) and LLAMA_ATTN_DECODE (single row). A later variant is one new table entry plus its function;
  * run.c, runq.c and tp.c need no change. An entry without a function is a known name that is not built yet: it is
- * refused with a message rather than silently running the default. The first entry is the default. */
+ * refused with a message rather than silently running the default. The first entry is the default: tiled for the
+ * batched path since E4 (owner decision, 2026-11-19; split stays selectable with LLAMA_ATTN=split), split for decode. */
 typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
                                  int seq_len, int pos0, int m);
@@ -2497,8 +2503,8 @@ typedef struct {
 } AttentionDecodeEntry;
 
 static const AttentionBatchEntry attention_batch_table[] = {
-    {"split", attention_batch_split, NULL},
     {"tiled", attention_batch_tiled, NULL},
+    {"split", attention_batch_split, NULL},
     {"amx", NULL, "E3"},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
@@ -2519,8 +2525,10 @@ int kernels_attention_select(const char *batch, const char *decode) {
       d = &attention_decode_table[i];
   if ((batch && !(b && b->run)) || (decode && !(d && d->run)))
     return 0;
-  if (b)
+  if (b) {
     attention_batch_active = b;
+    attention_batch_requested = 1;
+  }
   if (d)
     attention_decode_active = d;
   return 1;
@@ -2539,6 +2547,7 @@ static void attention_init_from_env(void) {
   const char *batch = getenv("LLAMA_ATTN"), *decode = getenv("LLAMA_ATTN_DECODE");
   attention_batch_active = &attention_batch_table[0];
   attention_decode_active = &attention_decode_table[0];
+  attention_batch_requested = 0;
   if (batch && *batch && strcmp(batch, "auto")) {
     const AttentionBatchEntry *found = NULL;
     for (size_t i = 0; i < sizeof(attention_batch_table) / sizeof(*attention_batch_table); i++)
@@ -2549,6 +2558,7 @@ static void attention_init_from_env(void) {
     if (!found->run)
       fail("LLAMA_ATTN=%s is not implemented yet (%s)", found->name, found->phase);
     attention_batch_active = found;
+    attention_batch_requested = 1;
   }
   if (decode && *decode && strcmp(decode, "auto")) {
     const AttentionDecodeEntry *found = NULL;

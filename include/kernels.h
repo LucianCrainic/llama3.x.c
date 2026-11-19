@@ -36,7 +36,8 @@ const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after
 int kernels_avx512_active(void);
 int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
 /* Attention variants (E1). kernels_init reads LLAMA_ATTN (batched, prefill: split|tiled|amx) and LLAMA_ATTN_DECODE
- * (single row: split|group) once; split, the default, is the split-K kernel. A variant that is not built yet is refused
+ * (single row: split|group) once. The defaults are tiled for the batched path (since E4; it runs split where AVX-512
+ * is not active) and split, the split-K kernel, for decode. A variant that is not built yet is refused
  * with a message. The names are recorded in the run report. kernels_attention_select picks them directly (NULL leaves
  * one unchanged) and returns 0 for an unknown or unimplemented name; tests use it to run every variant. */
 const char *kernels_attention_name(void);

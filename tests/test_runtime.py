@@ -422,10 +422,27 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('LLAMA_KERNELS must be auto, scalar, avx512 or amx', result.stderr)
 
     def test_attention_variant_knobs_are_reported_and_validated(self):
-        """E1: LLAMA_ATTN / LLAMA_ATTN_DECODE default to split, are recorded in the report, and refuse variants that are not
-        built yet or are unknown, with a non-zero exit."""
-        _, data = self.execute('run')
-        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'split'))
+        """E1: LLAMA_ATTN / LLAMA_ATTN_DECODE are recorded in the report, and refuse variants that are not built yet or are
+        unknown, with a non-zero exit. Since E4 LLAMA_ATTN defaults to tiled (split where AVX-512 is not active, with the
+        fallback note only at debug level unless tiled was asked for); LLAMA_ATTN_DECODE defaults to split."""
+        result, data = self.execute('run')
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'split'))
+        self.assertNotIn('running split attention instead', result.stderr)
+        _, data = self.execute('run', env={'LLAMA_ATTN': 'auto'})
+        self.assertEqual(data['build']['attention'], 'tiled')
+        # the fallback note on a batched prefill (scalar kernels, so tiled falls back on every host): INFO only when asked for
+        note = 'LLAMA_ATTN=tiled: '
+        for extra, level, shown in (({}, 'info', False), ({}, 'debug', True), ({'LLAMA_ATTN': 'tiled'}, 'info', True),
+                                    ({'LLAMA_ATTN': 'split'}, 'debug', False)):
+            result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
+                                     '-i', 'A B C D E F G H', '-t', '0', '-n', '30', '--log-level', level],
+                                    capture_output=True, text=True, timeout=30,
+                                    env={**os.environ, 'LLAMA_KERNELS': 'scalar', 'LLAMA_PREFILL_GEMM': 'on',
+                                         'LLAMA_PREFILL_BATCH': '8', **extra})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(note in result.stderr, shown, (extra, level, result.stderr))
+            if shown and level == 'info':
+                self.assertIn(f'[INFO] {note}', result.stderr)
         _, data = self.execute('run', env={'LLAMA_ATTN': 'split', 'LLAMA_ATTN_DECODE': 'split'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'split'))
         # E2: tiled is built; it runs the same on any host (split where AVX-512 is not active) and is recorded
@@ -433,7 +450,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'split'))
         # E5: group is built; it is recorded, and runs split where AVX-512 is not active
         _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
-        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('split', 'group'))
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'group'))
         for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN=amx is not implemented yet (E3)'),
                                      ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be split, tiled or amx'),
                                      ('LLAMA_ATTN_TILED_QUERIES', '0', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
