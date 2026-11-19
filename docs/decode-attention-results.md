@@ -161,7 +161,238 @@ storage, which halves the bytes) does not go to the owner now. The evidence for 
   decides.
 - Follow-ups, in order: a targeted rerun of 8B at 512 on one socket (both precisions, more repeats, `split` and `group`
   interleaved) to settle the 512 gate; the K/V layout flag in the bench (candidate 3); the chunk plan at 8192 (candidate 2 and
-  the 8B 8-head shape).
+  the 8B 8-head shape). **Status after section 8:** the 512 rerun and the layout flag are done. The 512 gate fails in one cell
+  (8B FP32, one socket, 0.953x, in the weight phases, cause not identified); the head-major layout is faster by 1.5-2.8x in the
+  microbenchmark at 8192 and 32768 and is recommended for an engine implementation (8.4). The chunk plan at 8192 (candidate 2)
+  and the 8B 8-head shape remain: in the engine that shape shows no attention loss (8.3), but its microbenchmark does.
 - E6 (batched decode design) can use these measurements. Decode attention at long contexts is limited by the access pattern,
   not by bandwidth. Each sequence has its own K/V, so batching sequences over shared weights would not by itself shorten
   attention time per sequence (an inference, not measured).
+
+## 8. Follow-ups: the 512 rerun and the K/V layout probe
+
+This section settles the first two follow-ups of section 7. The decision rules below were written **before** any follow-up
+job ran (commit of this section's rules precedes the jobs; the validation record names the commits and job ids). Results are
+appended under "8.3" and "8.4" after the jobs.
+
+### 8.1 Decision rules (fixed before the runs)
+
+**512 gate and the 8B one-socket shapes.** Cells: 8B FP32 and 8B W8A8, one socket x 56 workers, context 512 (the gate) and
+8192 (the one shape where the profiled attention of `group` was slower). Per cell, nine repeats of `split` and `group`
+interleaved inside each repeat; odd repeats launch `split` first and even repeats `group` first (`E5_ALTERNATE=1`), so
+neither kernel is always second. The 8192 cells run the same nine repeats (the requirement is five). Three profiled runs per
+kernel and cell (`LLAMA_PROFILE=1`, per-step phase times from `profile_seconds.decode`). Same node, same build as the first E5
+bench job; the B7 range is the reference of section 3.
+
+- **Verdict A (the E5.5 gate as written).** The 512 gate passes if the median decode tok/s of `group` is within or above the
+  B7 range of that cell (8B FP32 16.13-16.44, 8B W8A8 49.52-49.73), i.e. not below its lower end.
+- **Verdict B (relative to the same job).** Otherwise it passes in-job if the median of `group` is at least the lower end (the
+  minimum) of `split`'s nine repeats **and** the two ranges overlap. If B holds and A does not, the report says whether
+  `split` itself reproduced B7 in the job (median of `split` within the B7 range); if it did not, the B7 reference is not
+  reproduced on that day and only B counts.
+- **Fail.** Neither A nor B. The report then gives the median ratio, and the cell stays a recorded loss.
+- Also reported, not gating: the median ratio `group / split`; the number of repeats (of nine) in which `group` was faster
+  than `split` of the same repeat (paired); and the spread (min-max) of each kernel.
+- **Does the weight-phase cost follow the kernel or the process?** From the three profiled runs of each kernel, take the
+  sum of the weight phases `qkv + w1_w3 + w2` per decode step (ms), `W`. Let `d` = median(`W` of `group`) - median(`W` of
+  `split`) and `s` the larger of the two kernels' (max - min) over their three runs. If `|d| <= s` the difference is not
+  attributable to the kernel (it is run-to-run or process variation). If `d > s` the weight phases are slower under `group`
+  (follows the kernel). If `d < -s` they are faster. The attention phase gets the same test, with `s` from its own runs.
+- **8B at 8192 one socket.** `group`'s attention is called slower than `split`'s only if its median profiled attention time
+  exceeds `split`'s by more than `s` (same test); the token rate is judged by the rule "beyond variability" of section 3
+  (ranges do not overlap), and the microbenchmark cell (8B, 8 local KV heads, 8192) is repeated in the layout job with the
+  rows layout (one repeat of 1000 repetitions per kernel).
+
+**K/V layout probe (E5.2 candidate 3).** `attention-bench --kv-layout rows|head` reads the same values in the engine's
+`[position][kv_head][head_dim]` layout (`rows`) or in `[kv_head][position][head_dim]` (`head`: position stride `head_dim`
+floats, head base `context x head_dim` floats). Shapes 1B (head_dim 64) and 8B (head_dim 128); local KV heads 4 and 8;
+contexts 8192 and 32768 (512 reported as well); kernels `split` and `group`; 1000 repetitions per cell, 56 threads on the HBM
+node 2. Per cell the speedup is `median ms (rows) / median ms (head)`; the bench's `gbs_median` and `gbs_best`, `busy_mean`
+and `tail_fraction` are reported with it.
+
+- **Cell gate.** A cell passes if the speedup is at least 1.2 (the plan's threshold for touching the engine).
+- **Verdict.** The engine change (head-major KV cache) is recommended only if `group` (the kernel proposed for the default)
+  passes in all four cells at 32768 (the contexts where attention dominates a step) **and** none of its 8192 cells is slower
+  than 0.95. If only some cells pass, the report lists them and recommends no engine change, naming the cells as the evidence
+  to extend. If no `group` cell reaches 1.2, the layout is closed as a candidate.
+- If the verdict is "recommended", the section lists what the engine change touches (KV append in `src/run.c` and
+  `src/runq.c`, the local KV of `src/tp.c`, A5 placement, prefill attention reading the cache) and does **not** implement it.
+
+### 8.2 What ran
+
+- **Code.** Branch `feature/attn-e5-followups`, build commit 961af17 (the four commits above `develop` b111e98; the decode kernels
+  take a position stride and a per-head base, `k_attention` keeps the engine's values, `attention-bench --kv-layout`, the E5
+  bench-stage knobs). Same HBM node as B7 and the first E5 jobs, exclusive; Flat mode; gcc `-O3 -fopenmp`.
+- **512 and 8192 engine job** 5876099 (`E5_CONTEXTS="512 8192" E5_SOCKETS=1 E5_PROFILED=3 E5_ALTERNATE=1 E5_SKIP_MICRO=1
+  REPEATS=9`, 8B only): 96 reports (FP32 and W8A8 x contexts 512 and 8192 x kernels x (9 timed + 3 profiled)), all completed,
+  exit 0, 56 minutes.
+- **Layout jobs** 5876098 (rows measured first, then head) and 5876113 (head first, then rows, an order control added after the
+  first result): `attention-bench` decode, 1B and 8B shapes, 8 and 4 local KV heads, contexts 512 / 8192 / 32768, `split` and
+  `group`, 1000 repetitions, 56 threads, HBM node 2, 16 launches each, all passed, 31 s each.
+- `make test` on the hardware ran in job 5875780 (all ten C test suites with 0 failures at the scalar, AVX-512 and AMX levels, 69 Python tests: PASS), which
+  I cancelled afterwards because its remaining time was the common one-socket Hugging Face prelude, which the follow-up jobs
+  skip (`SKIP_PRELUDE_HF=1`). Job 5875772 failed at start (PYTHON not exported, 0 s).
+
+### 8.3 The 512 gate and the 8B 8192 shape
+
+Decode tok/s of the nine timed repeats, median [min-max]. "Paired" counts repeats in which `group` beat `split` of the same
+repeat. B7 is the range of the first E5 section 3.
+
+| Cell (8B, one socket) | split | group | group / split | Paired | B7 | A | B |
+| --- | --- | --- | ---: | ---: | --- | --- | --- |
+| FP32 512 | 16.42 [16.30-16.45] | 15.65 [15.56-15.72] | 0.953 | 0 of 9 | 16.13-16.44 | **fail** (below 16.13) | **fail** (below split's 16.30, ranges apart) |
+| W8A8 512 | 49.36 [49.10-49.55] | 49.46 [49.08-49.66] | 1.002 | 6 of 9 | 49.52-49.73 | fail by 0.12% (`split` itself is 0.3% below the range today) | **pass** |
+| FP32 8192 | 13.29 [13.20-13.38] | 13.63 [13.62-13.66] | 1.026 | 9 of 9 | 13.24-13.42 | above | faster beyond variability (ranges apart) |
+| W8A8 8192 | 28.72 [28.20-29.40] | 30.60 [30.51-30.67] | 1.065 | 9 of 9 | 28.48-28.57 | above | faster beyond variability |
+
+**Verdict by the rules of 8.1.** 8B FP32 at 512 on one socket **fails**, and the loss is reproducible, not bimodal: nine of nine
+repeats favour `split`, 4.7% apart, with narrow ranges (the first job's bimodal `split` repeat did not recur: its nine repeats
+span 16.30-16.45). 8B W8A8 at 512 **passes in-job** (verdict B): the medians differ by 0.2%, and verdict A is missed
+only because `split` itself is 0.3% below the B7 range on this day, so the B7 reference is not reproduced for that cell. The E5.5
+gate "context 512 not slower" therefore stays failed in one cell (8B FP32, one socket), where the first job had two.
+
+**Profiled runs** (three per kernel, ms per decode step, median [min-max]; `W` = qkv + w1_w3 + w2, `s` = the larger run-to-run
+spread of the two kernels):
+
+| Cell | Kernel | step | qkv | attention | w1_w3 | w2 | W = qkv + w1_w3 + w2 | d(W) vs split, spread s | W verdict | attention verdict |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8B FP32 512 | split | 60.95 [60.80-60.98] | 6.54 [6.45-6.57] | 1.66 [1.66-1.68] | 30.43 [30.28-30.51] | 14.01 [14.01-14.02] | 50.96 [50.83-51.02] |  | |  |
+|  | group | 64.02 [63.84-64.02] | 7.03 [7.02-7.05] | 1.58 [1.55-1.59] | 31.87 [31.79-31.87] | 14.74 [14.67-14.79] | 53.64 [53.49-53.71] | +2.68, 0.22 | group slower | group faster |
+| 8B FP32 8192 | split | 75.70 [74.99-76.00] | 6.45 [6.41-6.46] | 15.87 [15.68-16.15] | 30.71 [30.48-30.76] | 14.28 [14.16-14.36] | 51.46 [51.05-51.58] |  | |  |
+|  | group | 73.32 [73.31-73.41] | 6.35 [6.33-6.43] | 15.93 [15.88-16.11] | 29.59 [29.57-29.64] | 13.62 [13.62-13.73] | 49.64 [49.54-49.69] | -1.82, 0.53 | group faster | not attributable to the kernel |
+| 8B W8A8 512 | split | 20.24 [20.17-20.29] | 1.90 [1.89-1.94] | 1.71 [1.70-1.72] | 8.82 [8.81-8.88] | 4.30 [4.30-4.32] | 15.07 [15.01-15.10] |  | |  |
+|  | group | 20.25 [20.20-20.28] | 1.92 [1.92-1.93] | 1.66 [1.65-1.67] | 8.88 [8.85-8.88] | 4.33 [4.32-4.34] | 15.12 [15.09-15.15] | +0.06, 0.10 | not attributable to the kernel | group faster |
+| 8B W8A8 8192 | split | 34.99 [34.66-35.16] | 1.96 [1.95-2.07] | 16.11 [15.81-16.16] | 8.79 [8.78-8.81] | 4.39 [4.39-4.41] | 15.13 [15.12-15.29] |  | |  |
+|  | group | 32.67 [32.61-32.75] | 1.83 [1.81-1.84] | 15.16 [15.10-15.18] | 8.31 [8.30-8.34] | 4.17 [4.15-4.17] | 14.31 [14.26-14.34] | -0.83, 0.16 | group faster | group faster |
+
+**Does the weight-phase cost follow the kernel or the process?** The data support "the kernel setting", not a one-off process
+effect, but they do not say why. At 8B FP32 and 512 tokens `group` is 5.0% slower per step (64.02 against 60.95 ms) although its
+attention phase is 5% shorter (1.58 against 1.66 ms): every weight phase, `qkv` (+7.5%), `w1_w3` (+4.7%), `w2` (+5.2%), and
+also `wo` (+4.6%) and the classifier (+8%) which the table does not list, is slower, by more than ten times the run-to-run spread
+(`d` = +2.68 ms against `s` = 0.22 ms), in all nine timed repeats whichever kernel was launched first, and in the first job's
+profiled run. At W8A8 and 512 tokens there is no such effect (`d` = +0.06 ms, inside `s`). At 8192 tokens the sign reverses:
+the weight phases are *faster* under `group` (FP32 -1.8 ms, W8A8 -0.8 ms, beyond `s`), and the attention phase is the same
+(FP32: 15.93 against 15.87 ms, inside `s` = 0.47) or 6% shorter (W8A8: 15.16 against 16.11 ms). I did not identify the
+mechanism. Phases that `group` does not run (weights, norms) change by 3-7% with the attention kernel, in either direction
+depending on precision and context. Candidates, none tested: cache or prefetcher state left by the attention tasks (the group
+kernel keeps up to 16 query heads' accumulators and software-prefetches V rows), the effect on the HBM page state, and a
+frequency or power state change of the 56 cores.
+
+**The 8B 8-head shape at 8192.** In the engine, `group`'s attention phase is **not slower** than `split`'s: FP32 15.93 against
+15.87 ms (difference inside the spread; the first job's 0.96x was a single run), W8A8 15.16 against 16.11 ms. The token-rate gains
+(1.026x and 1.065x, nine of nine repeats, ranges apart) come mostly from the weight phases for FP32 (-1.8 ms of the -2.4 ms step
+difference) and from both phases for W8A8. The microbenchmark still shows the slowdown, reproducibly: 8B, 8 local KV heads, 8192,
+rows layout, `split` 0.371 ms and `group` 0.480 ms (0.77x; the first job had 0.372 and 0.481 ms, and the layout job with the
+reverse order 0.370 and 0.479 ms). The engine does not show it. With the head-major layout `group` is the faster kernel there
+(0.170 against 0.204 ms, 1.20x).
+
+### 8.4 The K/V layout probe (E5.2 candidate 3)
+
+Attention time of one layer, microbenchmark, median of 1000 repetitions; speed = `rows ms / head ms`, so a value above 1
+means head-major is faster; bold marks the gate (at least 1.2). The two speed columns are the two launch orders (rows layout
+first, then head; head first, then rows). GB/s is the bench's own figure (unique K/V bytes over the time), median and, in
+brackets, the best repetition; busy and tail are the workers' busy and idle-after-last-task fractions of the traced pass.
+
+| Shape | Local KV heads | Context | Kernel | rows ms | head ms | head/rows speed (rows first) | (head first) | rows GB/s med (best) | head GB/s med (best) | busy rows / head | tail rows / head |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| 8b | 4 | 512 | split | 0.048 | 0.035 | **1.37** | **1.61** | 44 (61) | 60 (67) | 0.69 / 0.66 | 0.16 / 0.16 |
+| 8b | 4 | 512 | group | 0.039 | 0.033 | 1.17 | 1.15 | 54 (69) | 63 (77) | 0.60 / 0.54 | 0.22 / 0.24 |
+| 8b | 4 | 8192 | split | 0.264 | 0.118 | **2.23** | **2.24** | 127 (282) | 283 (336) | 0.78 / 0.75 | 0.19 / 0.21 |
+| 8b | 4 | 8192 | group | 0.238 | 0.102 | **2.34** | **2.37** | 141 (315) | 330 (403) | 0.80 / 0.73 | 0.17 / 0.21 |
+| 8b | 4 | 32768 | split | 0.650 | 0.405 | **1.61** | **1.49** | 206 (301) | 331 (407) | 0.93 / 0.90 | 0.05 / 0.06 |
+| 8b | 4 | 32768 | group | 0.579 | 0.337 | **1.72** | **1.57** | 232 (349) | 399 (531) | 0.92 / 0.90 | 0.05 / 0.05 |
+| 8b | 8 | 512 | split | 0.080 | 0.034 | **2.39** | **2.31** | 52 (108) | 125 (134) | 0.72 / 0.71 | 0.23 / 0.13 |
+| 8b | 8 | 512 | group | 0.061 | 0.030 | **2.07** | **1.96** | 69 (116) | 142 (157) | 0.71 / 0.64 | 0.19 / 0.18 |
+| 8b | 8 | 8192 | split | 0.371 | 0.204 | **1.82** | **1.85** | 181 (290) | 329 (397) | 0.86 / 0.87 | 0.07 / 0.08 |
+| 8b | 8 | 8192 | group | 0.480 | 0.170 | **2.83** | **2.66** | 140 (369) | 395 (506) | 0.87 / 0.84 | 0.09 / 0.09 |
+| 8b | 8 | 32768 | split | 1.141 | 0.760 | **1.50** | **1.60** | 235 (290) | 353 (414) | 0.96 / 0.95 | 0.03 / 0.02 |
+| 8b | 8 | 32768 | group | 0.955 | 0.633 | **1.51** | **1.51** | 281 (386) | 424 (508) | 0.94 / 0.94 | 0.03 / 0.03 |
+| 1b | 4 | 512 | split | 0.038 | 0.034 | 1.10 | 1.04 | 28 (33) | 31 (39) | 0.67 / 0.61 | 0.13 / 0.18 |
+| 1b | 4 | 512 | group | 0.035 | 0.032 | 1.07 | 1.02 | 30 (35) | 32 (38) | 0.45 / 0.43 | 0.28 / 0.29 |
+| 1b | 4 | 8192 | split | 0.186 | 0.076 | **2.45** | **2.42** | 90 (230) | 220 (255) | 0.78 / 0.70 | 0.14 / 0.22 |
+| 1b | 4 | 8192 | group | 0.136 | 0.066 | **2.06** | **2.06** | 123 (270) | 253 (312) | 0.78 / 0.67 | 0.16 / 0.22 |
+| 1b | 4 | 32768 | split | 0.614 | 0.243 | **2.52** | **2.52** | 109 (280) | 276 (343) | 0.94 / 0.90 | 0.04 / 0.05 |
+| 1b | 4 | 32768 | group | 0.468 | 0.199 | **2.35** | **2.44** | 143 (349) | 336 (427) | 0.93 / 0.86 | 0.03 / 0.05 |
+| 1b | 8 | 512 | split | 0.054 | 0.032 | **1.68** | 1.14 | 39 (72) | 65 (77) | 0.72 / 0.65 | 0.20 / 0.16 |
+| 1b | 8 | 512 | group | 0.035 | 0.028 | **1.23** | 1.15 | 60 (77) | 74 (87) | 0.59 / 0.58 | 0.20 / 0.20 |
+| 1b | 8 | 8192 | split | 0.316 | 0.125 | **2.53** | **2.62** | 106 (261) | 269 (316) | 0.87 / 0.83 | 0.08 / 0.09 |
+| 1b | 8 | 8192 | group | 0.299 | 0.105 | **2.86** | **2.78** | 112 (326) | 320 (392) | 0.85 / 0.81 | 0.09 / 0.09 |
+| 1b | 8 | 32768 | split | 0.712 | 0.457 | **1.56** | **1.56** | 189 (253) | 294 (371) | 0.95 / 0.94 | 0.03 / 0.02 |
+| 1b | 8 | 32768 | group | 0.703 | 0.364 | **1.93** | **1.75** | 191 (314) | 368 (480) | 0.91 / 0.91 | 0.05 / 0.02 |
+
+**Gate (at least 1.2x on attention time).** Passed in 45 of 48 cells of the main order and 43 of 48 of the control order;
+every exception is at 512 (the optional context): 8B kv4 512 `group` (1.17 and 1.15), 1B kv4 512 `split` and `group` (1.10 and
+1.07; 1.04 and 1.02), and in the control order also 1B kv8 512 `split` and `group` (1.14, 1.15). Every cell at 8192 passes (1.82-2.86 in both orders) and every cell at 32768 passes (1.49-2.52 for `split`,
+1.51-2.44 for `group`). The lower of the two orders is used below. The 512 cells are noisy (0.03-0.08 ms per layer, the 1B kv8
+rows value moved from 0.054 to 0.040 ms between orders), so they are neither evidence for nor against.
+
+**Verdict by the rule of 8.1: the engine change is recommended.** `group` passes in all four 32768 cells (8B kv4 1.57, 8B kv8
+1.51, 1B kv4 2.35, 1B kv8 1.75, lower of the two orders) and no `group` 8192 cell is slower than 0.95 (the lowest is 2.06). The
+bandwidth figures go with it. At 32768 the median of `group` is 336-424 GB/s in the head-major layout (1B kv4 336, 1B kv8
+368, 8B kv4 399, 8B kv8 424) against 143-281 GB/s in the rows layout (143, 191, 232, 281), and its best repetition reaches 531
+GB/s (96% of 552, 8B kv4). The gap between 1B and 8B at 32768 narrows (1B kv8 over 8B kv8: 87% of the bandwidth against 68% in
+the rows layout), which supports the section 6 explanation (short contiguous runs per head under a `kv_dim` stride). The gains
+do not single out a page-sized stride: 8B with 8 local heads (stride 4096 bytes, one page) gains 2.66-2.83 for `group` at 8192
+and 1B with 8 local heads (stride 2048 bytes) 2.78-2.86. I did not isolate the mechanism (prefetcher streams, TLB reach, cache
+set aliasing).
+
+**Derived effect on decode** (the microbenchmark speed applied to the profiled attention time of the first E5 job, nothing
+else changing; this is an **upper-end estimate**, not a measurement, because the engine's attention phase also includes
+effects the microbenchmark does not have, such as 32 layers sharing the caches and the K/V append):
+
+| Model | Precision | Sockets | Context | group tok/s (E5) | attention ms | micro speedup (lower of two orders) | derived step ms | derived tok/s | vs group | vs split |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1B | FP32 | 1 | 8192 | 71.39 | 4.01 | 2.78 | 11.44 | 87.4 | 1.22 | 1.23 |
+| 1B | FP32 | 1 | 32768 | 48.19 | 11.03 | 1.75 | 16.03 | 62.4 | 1.29 | 1.39 |
+| 1B | FP32 | 2 | 8192 | 142.32 | 1.66 | 2.06 | 6.17 | 162.0 | 1.14 | 1.24 |
+| 1B | FP32 | 2 | 32768 | 84.81 | 6.74 | 2.35 | 7.92 | 126.2 | 1.49 | 1.80 |
+| 1B | W8A8 | 1 | 8192 | 129.13 | 4.39 | 2.78 | 4.93 | 202.8 | 1.57 | 1.66 |
+| 1B | W8A8 | 1 | 32768 | 69.28 | 10.87 | 1.75 | 9.78 | 102.2 | 1.48 | 1.63 |
+| 1B | W8A8 | 2 | 8192 | 262.02 | 1.79 | 2.06 | 2.90 | 345.2 | 1.32 | 1.81 |
+| 1B | W8A8 | 2 | 32768 | 100.82 | 7.57 | 2.35 | 5.57 | 179.4 | 1.78 | 2.29 |
+| 8B | FP32 | 1 | 8192 | 13.66 | 16.21 | 2.66 | 63.08 | 15.9 | 1.16 | 1.19 |
+| 8B | FP32 | 1 | 32768 | 10.89 | 30.73 | 1.51 | 81.51 | 12.3 | 1.13 | 1.28 |
+| 8B | FP32 | 2 | 8192 | 27.09 | 7.39 | 2.34 | 32.68 | 30.6 | 1.13 | 1.21 |
+| 8B | FP32 | 2 | 32768 | 20.37 | 19.53 | 1.57 | 41.99 | 23.8 | 1.17 | 1.24 |
+| 8B | W8A8 | 1 | 8192 | 30.65 | 15.22 | 2.66 | 23.12 | 43.3 | 1.41 | 1.51 |
+| 8B | W8A8 | 1 | 32768 | 19.82 | 31.53 | 1.51 | 39.86 | 25.1 | 1.27 | 1.61 |
+| 8B | W8A8 | 2 | 8192 | 58.91 | 7.35 | 2.34 | 12.77 | 78.3 | 1.33 | 1.55 |
+| 8B | W8A8 | 2 | 32768 | 34.05 | 19.17 | 1.57 | 22.40 | 44.6 | 1.31 | 1.52 |
+
+If these held, 1B at 32768 on one socket would reach 62 tok/s (FP32, 1.39x `split`, 1.29x `group`) and 102 tok/s (W8A8, 1.63x
+`split`), and the 1B W8A8 two-socket gain at 32768 would be 179 / 102 = 1.76x. The value gates of section 5 (1.3x on 1B at
+32768, two-socket gain 1.5x) would be met by the layout change **if the microbenchmark's speed carries over**. This needs the
+engine implementation to be measured; nothing in this section is an engine measurement.
+
+**What the engine change touches** (not implemented; it is the next step if the owner agrees):
+
+- KV append: `src/run.c` and `src/runq.c` write each token's K and V as one `kv_dim` row at `position * kv_dim`; head-major
+  writes `n_kv_heads` pieces of `head_dim` floats at `(head * seq_len + position) * head_dim`. The cache size is unchanged;
+  the per-head capacity is `seq_len` (the context length), so a head's rows are contiguous up to the context limit.
+- `src/tp.c`: the local KV of the two-socket runs (4 local heads per socket) with the same indexing and the same append; the
+  head split between sockets becomes a contiguous block of the cache, which also simplifies the placement of the K/V region.
+- A5 placement (engine-owned HBM regions, `ROLE_KV_K` and `ROLE_KV_V`): the byte size per region is unchanged; first-touch and
+  verification do not depend on the layout, but any code that assumes a row-major cache (sampled verification, the tests of
+  regions) must be checked.
+- Prefill attention (`k_attention_batch`, split and tiled, `attention_chunk_avx512`, `tiled_transpose_keys`) reads the same
+  cache with `kv_dim` as the position stride; they already take `kv_dim` as a parameter, so they need the same stride and head
+  base parameters (`k_attention_layout`'s approach), and the tests of E1/E2 would run on both layouts.
+- Anything that copies or shifts the cache (context shifting, warm-context paths of `tools/compare_generation.py`, the
+  batched-prefill K/V writes) must use the same indexing. Results must stay bitwise equal to the rows layout (unit tests of
+  8.2 already prove it for the decode kernels).
+- It would be opt-in (`LLAMA_KV_LAYOUT=head`, name not fixed) until the owner's decision table changes the default.
+
+### 8.5 Updates to sections 1, 5 and 7
+
+- **512 gate (section 5).** The 8B W8A8 one-socket cell no longer fails: in this job `split` itself is 0.3% below the B7 range
+  and `group` equals `split` within 0.2% (verdict B). The 8B FP32 one-socket cell fails reproducibly (0.953x, 0 of 9 paired),
+  with the loss in the weight phases, not in attention (8.3). The note under section 5 that "the ranges overlap within this job"
+  holds for W8A8 only; for FP32 they do not.
+- **8B 8192 (sections 4 and 6, item 3).** The profiled attention of `group` at 8192 on one socket is not slower than `split`'s
+  (8.3); the microbenchmark's 0.77x for that shape is reproduced but does not appear in the engine.
+- **Section 6, item 1 (K/V access pattern)** is confirmed by the layout probe (8.4): head-major raises the bandwidth of `group`
+  to 336-424 GB/s median in all shapes at 32768, and the difference between 1B and 8B nearly disappears.
+- **Decision.** The default stays `split` (owner decision). Two things are open before `group` could be proposed as the
+  decode default: the 5% weight-phase loss at 8B FP32 and 512 tokens (a context-dependent choice of kernel would remove the
+  attention part only if the cause is the kernel's own execution, which is not shown), and the head-major layout, which the
+  data recommend implementing and measuring in the engine first.

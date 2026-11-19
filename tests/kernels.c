@@ -1326,6 +1326,75 @@ static void test_attention_decode_long(void) {
   matrix_seconds_long += monotonic_seconds() - started;
 }
 
+
+/* E5.2: the decode kernels on a head-major K/V layout [kv_head][position][head_dim] (k_attention_layout with a position
+ * stride of head_dim and a head base wider than the head's rows). The same values as the rows layout, so:
+ *   - split and group each give the result of the rows layout BIT FOR BIT (the arithmetic does not depend on where a row
+ *     is, only on its values), here also with padding between the heads;
+ *   - against the double reference at 2e-5, and group against split at 1e-5 (as the rows-layout cases);
+ *   - rows after the position and the padding are NaN, so a read past the context turns into a NaN and fails. */
+static void attention_head_layout_case(AttnShape shape, const int *positions, int count) {
+  int heads = shape.kv_heads * shape.group, kv_heads = shape.kv_heads, hd = shape.hd, last = positions[count - 1];
+  int seq = last + 1 + ATTN_GUARD_ROWS;
+  size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd;
+  size_t head_base = ((size_t)seq + 3) * hd;
+  float *q = zeroed(dim, sizeof(float)), *kc = zeroed(seq * kv_dim, sizeof(float));
+  float *vc = zeroed(seq * kv_dim, sizeof(float)), *kp = zeroed(seq * kv_dim, sizeof(float));
+  float *vp = zeroed(seq * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * seq, sizeof(float));
+  float *kh = zeroed(head_base * kv_heads, sizeof(float)), *vh = zeroed(head_base * kv_heads, sizeof(float));
+  float *rows = zeroed(dim, sizeof(float)), *head = zeroed(dim, sizeof(float)), *split_head = zeroed(dim, sizeof(float));
+  double *ref = zeroed(dim, sizeof(double)), *scores = zeroed(seq, sizeof(double));
+  fill(q, dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
+  AttentionWork work;
+  k_attention_init(&work, heads, kv_heads, hd, seq);
+  char label[160];
+  for (int p = 0; p < count; p++) {
+    int position = positions[p];
+    attention_reference(q, kc, vc, heads, kv_heads, hd, position, ref, scores);
+    memcpy(kp, kc, seq * kv_dim * sizeof(float)), memcpy(vp, vc, seq * kv_dim * sizeof(float));
+    poison(kp + (size_t)(position + 1) * kv_dim, (size_t)(seq - position - 1) * kv_dim);
+    poison(vp + (size_t)(position + 1) * kv_dim, (size_t)(seq - position - 1) * kv_dim);
+    poison(kh, head_base * kv_heads), poison(vh, head_base * kv_heads);
+    for (int t = 0; t < seq; t++)
+      for (int g = 0; g < kv_heads; g++) {
+        memcpy(kh + g * head_base + (size_t)t * hd, kp + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+        memcpy(vh + g * head_base + (size_t)t * hd, vp + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+      }
+    const char *kernel[2] = {"split", "group"};
+    for (int k = 0; k < 2; k++) {
+      assert(kernels_attention_select(NULL, kernel[k]));
+      snprintf(label, sizeof(label), "attention head layout %s g=%d hd=%d pos=%d", kernel[k], shape.group, hd, position);
+      poison(rows, dim), poison(att, (size_t)heads * seq), poison(work.partial, work.capacity);
+      k_attention(rows, q, kp, vp, att, &work, heads, kv_heads, hd, seq, position);
+      poison(head, dim), poison(att, (size_t)heads * seq), poison(work.partial, work.capacity);
+      k_attention_layout(head, q, kh, vh, att, &work, heads, kv_heads, hd, seq, position, (size_t)hd, head_base);
+      for (size_t i = 0; i < dim; i++)
+        check(label, head[i], ref[i], 2e-5);
+      expect(!memcmp(rows, head, dim * sizeof(float)), "%s [%s]: head-major result differs from rows bit for bit\n",
+             label, current);
+      if (k == 0)
+        memcpy(split_head, head, dim * sizeof(float));
+      else
+        for (size_t i = 0; i < dim; i++)
+          check(label, head[i], split_head[i], 1e-5); /* group against split, both head-major */
+    }
+    assert(kernels_attention_select(NULL, "split"));
+  }
+  k_attention_free(&work);
+  free(q), free(kc), free(vc), free(kp), free(vp), free(att), free(kh), free(vh), free(rows), free(head),
+      free(split_head), free(ref), free(scores);
+}
+
+static void test_attention_head_layout(int with_long) {
+  const int boundary[] = {0, 1, 31, 32, 33, 255, 256, 257, 511, 512, 513};
+  const AttnShape shapes[] = {{2, 1, 64}, {2, 4, 64}, {2, 4, 128}, {2, 8, 40}, {4, 4, 128}};
+  for (size_t i = 0; i < sizeof(shapes) / sizeof(*shapes); i++)
+    attention_head_layout_case(shapes[i], boundary, sizeof(boundary) / sizeof(*boundary));
+  const int long_positions[] = {1023, 8191, 32767};
+  if (with_long)
+    attention_head_layout_case((AttnShape){2, 4, 128}, long_positions, sizeof(long_positions) / sizeof(*long_positions));
+}
+
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
@@ -1415,6 +1484,7 @@ int main(int argc, char **argv) {
     test_attention_batch_row_block();
     test_attention_matrix();
     test_attention_decode_long();
+    test_attention_head_layout(1);
     test_attention_forced_plans();
     test_attention_empty_partial();
     test_attention_tiled_knobs();
@@ -1470,6 +1540,7 @@ int main(int argc, char **argv) {
       test_attention();
       test_attention_batch();
       test_attention_matrix();
+      test_attention_head_layout(0);
       test_partial();
       test_packed4();
       test_row_parallel();

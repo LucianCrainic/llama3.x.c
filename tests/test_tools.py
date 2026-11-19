@@ -25,6 +25,9 @@ CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOK
                   'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
                   'WARM'}
 CAMPAIGN_KNOBS |= {'E6_ATTN_CONTEXTS', 'E6_BATCH', 'E6_COLD_MIB', 'E6_CONTEXTS', 'E6_MODELS_BENCH', 'E6_MS', 'E6_REPS', 'E6_THP'}
+# Knobs of phase E5's bench stage (E5 follow-ups).
+CAMPAIGN_KNOBS |= {'E5_ALTERNATE', 'E5_CONTEXTS', 'E5_KERNELS', 'E5_LAYOUTS', 'E5_MICRO_CONTEXTS', 'E5_MICRO_KV',
+                   'E5_MICRO_REPS', 'E5_MICRO_SHAPES', 'E5_PROFILED', 'E5_SKIP_ENGINE', 'E5_SKIP_MICRO', 'E5_SOCKETS'}
 
 
 def campaign_env():
@@ -1531,6 +1534,128 @@ class E6Tests(unittest.TestCase):
                                 env={**os.environ, 'LLAMA_KERNELS': 'amx'}) if BUILD is not None else None
         if result is not None:
             self.assertEqual(result.returncode, 2)
+
+
+class DecodeAttentionFollowupTests(unittest.TestCase):
+    """E5 follow-ups: the bench stage of phase E5 is selectable by knobs (E5_CONTEXTS, E5_KERNELS, E5_SOCKETS, E5_PROFILED,
+    E5_ALTERNATE, E5_SKIP_ENGINE, E5_SKIP_MICRO, E5_MICRO_*, E5_LAYOUTS); the defaults are the first E5 job's matrix."""
+
+    MODELS = 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b'
+
+    def run_e5(self, expect_ok=True, **extra):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': 'bench', 'REPEATS': '3', 'MODELS': self.MODELS, **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
+                                    text=True, timeout=120)
+        if expect_ok:
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return result
+
+    def lines(self, **extra):
+        return self.run_e5(**extra).stdout.splitlines()
+
+    @staticmethod
+    def runs(out):
+        return [l for l in out if l.startswith('RUN ')]
+
+    @staticmethod
+    def cells(out):
+        return [l for l in out if l.startswith('EXPECT bench-decode-') and 'attention-bench' in l]
+
+    @staticmethod
+    def label(line):
+        return line.split()[1]
+
+    @staticmethod
+    def kernel(line):
+        return line.split()[1].rsplit('xattn', 1)[1].replace('prof', '')
+
+    def test_defaults_are_the_first_job_matrix(self):
+        out = self.lines()
+        runs = self.runs(out)
+        self.assertEqual(len(runs), 2 * 2 * (3 * 3 + 3) * 2 * 2)
+        cells = self.cells(out)
+        self.assertEqual(sorted(self.label(l) for l in cells),
+                         sorted(f'bench-decode-{k}-{s}-kv{v}' for k in ('split', 'group') for s in ('8b', '1b') for v in (8, 4)))
+        self.assertFalse([l for l in cells if '--kv-layout' in l])  # the rows layout is the default and adds no flag
+        self.assertTrue(all('--reps 1000' in l and '--context 512,8192,32768' in l for l in cells))
+        # one profiled repeat, and the kernel order is split then group in every repeat
+        self.assertEqual({l.split()[2] for l in runs if 'prof' in self.label(l)}, {'reps=1-1'})
+        one = [self.kernel(l) for l in runs if 'm1b-fp32' in l and '-p512-' in l and '-s1-' in l and 'prof' not in self.label(l)]
+        self.assertEqual(one, ['split', 'group'] * 3)
+
+    def test_settle_matrix_for_the_512_gate(self):
+        # 8B, one socket, FP32 and W8A8, contexts 512 and 8192, nine interleaved repeats and three profiled runs per kernel
+        out = self.lines(MODELS='m8b:/a/m8b:/hf/m8b', E5_CONTEXTS='512 8192', E5_SOCKETS='1', E5_PROFILED='3',
+                         E5_ALTERNATE='1', E5_SKIP_MICRO='1', REPEATS='9')
+        runs = self.runs(out)
+        prof = [l for l in runs if 'prof' in self.label(l)]
+        timed = [l for l in runs if 'prof' not in self.label(l)]
+        self.assertEqual(len(timed), 2 * 9 * 2 * 2)  # precisions x repeats x contexts x kernels
+        self.assertEqual(len(prof), 2 * 3 * 2 * 2)   # precisions x profiled repeats x contexts x kernels
+        self.assertTrue(all('m8b-' in l and '-s1-t56-' in l and 'LLAMA_SOCKETS=1' in l for l in runs))
+        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '8192'})
+        self.assertEqual({l.split()[2] for l in prof}, {'reps=1-1', 'reps=2-2', 'reps=3-3'})
+        self.assertTrue(all('LLAMA_PROFILE=1' in l for l in prof))
+        self.assertFalse([l for l in timed if 'LLAMA_PROFILE=1' in l])
+        self.assertEqual(self.cells(out), [])
+        # interleaved and alternating: odd repeats launch split first, even repeats group first, within one cell
+        one = [(l.split()[2], self.kernel(l)) for l in timed if '-fp32-' in l and '-p512-' in l]
+        self.assertEqual(one[:4], [('reps=1-1', 'split'), ('reps=1-1', 'group'), ('reps=2-2', 'group'), ('reps=2-2', 'split')])
+        self.assertEqual(one[-2:], [('reps=9-9', 'split'), ('reps=9-9', 'group')])
+        # without E5_ALTERNATE every repeat is split then group
+        plain = self.lines(MODELS='m8b:/a/m8b:/hf/m8b', E5_CONTEXTS='512', E5_SOCKETS='1', E5_SKIP_MICRO='1',
+                           PRECISIONS='fp32', REPEATS='2')
+        self.assertEqual([self.kernel(l) for l in self.runs(plain) if 'prof' not in self.label(l)],
+                         ['split', 'group', 'split', 'group'])
+
+    def test_one_kernel_and_socket_lists(self):
+        out = self.lines(E5_KERNELS='group', E5_SOCKETS='2', E5_CONTEXTS='32768', E5_SKIP_MICRO='1', E5_PROFILED='0')
+        runs = self.runs(out)
+        self.assertEqual(len(runs), 2 * 2 * 3)  # models x precisions x repeats
+        self.assertTrue(all('LLAMA_ATTN_DECODE=group' in l and 'LLAMA_SOCKETS=2' in l and 'warm=32768' in l for l in runs))
+        self.assertFalse([l for l in runs if 'prof' in self.label(l)])
+
+    def test_skip_switches(self):
+        engine_off = self.lines(E5_SKIP_ENGINE='1')
+        self.assertEqual(self.runs(engine_off), [])
+        self.assertEqual(len(self.cells(engine_off)), 8)
+        both = self.lines(E5_SKIP_ENGINE='1', E5_SKIP_MICRO='1')
+        self.assertEqual(self.runs(both) + self.cells(both), [])
+
+    def test_microbenchmark_layout_cells(self):
+        out = self.lines(E5_SKIP_ENGINE='1', E5_LAYOUTS='rows head', E5_MICRO_CONTEXTS='8192 32768', E5_MICRO_REPS='1000')
+        cells = self.cells(out)
+        self.assertEqual(len(cells), 2 * 2 * 2 * 2)  # kernels x shapes x KV heads x layouts
+        for line in cells:
+            layout = self.label(line).rsplit('-', 1)[1]
+            self.assertIn(layout, ('rows', 'head'))
+            self.assertIn(f'--kv-layout {layout}', line)
+            for word in ('--context 8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
+                self.assertIn(word, line)
+        self.assertEqual({self.label(l).rsplit('-', 1)[1] for l in cells}, {'rows', 'head'})
+        self.assertEqual(len({self.label(l) for l in cells}), 16)
+        head_only = self.cells(self.lines(E5_SKIP_ENGINE='1', E5_LAYOUTS='head', E5_MICRO_SHAPES='1b', E5_MICRO_KV='4',
+                                          E5_KERNELS='group'))
+        self.assertEqual(len(head_only), 1)
+        for word in ('bench-decode-group-1b-kv4-head', '--shape 1b', '--kv-heads-local 4', '--kv-layout head'):
+            self.assertIn(word, head_only[0])
+        # the microbenchmark contexts follow E5_CONTEXTS unless named
+        followed = self.cells(self.lines(E5_SKIP_ENGINE='1', E5_CONTEXTS='512 8192'))
+        self.assertTrue(followed and all('--context 512,8192 ' in l for l in followed))
+
+    def test_bad_values_stop_before_any_launch(self):
+        for knob, value in (('E5_KERNELS', 'tiled'), ('E5_SOCKETS', '3'), ('E5_LAYOUTS', 'columns'), ('E5_CONTEXTS', '512 x'),
+                            ('E5_MICRO_REPS', '2000'), ('E5_PROFILED', '-1'), ('E5_ALTERNATE', '2'), ('E5_SKIP_MICRO', 'yes'),
+                            ('E5_MICRO_SHAPES', 'huge')):
+            result = self.run_e5(expect_ok=False, **{knob: value})
+            self.assertNotEqual(result.returncode, 0, f'{knob}={value}')
+            self.assertIn('E5', result.stderr + result.stdout, f'{knob}={value}')
+            self.assertEqual([l for l in result.stdout.splitlines() if l.startswith(('RUN ', 'EXPECT bench-decode'))], [],
+                             f'{knob}={value}')
 
 
 if __name__ == '__main__':
