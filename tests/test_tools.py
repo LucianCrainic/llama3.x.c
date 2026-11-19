@@ -29,7 +29,7 @@ CAMPAIGN_KNOBS |= {'E6_ATTN_CONTEXTS', 'E6_BATCH', 'E6_COLD_MIB', 'E6_CONTEXTS',
 CAMPAIGN_KNOBS |= {'E5_ALTERNATE', 'E5_CONTEXTS', 'E5_KERNELS', 'E5_LAYOUTS', 'E5_MICRO_CONTEXTS', 'E5_MICRO_KV',
                    'E5_MICRO_REPS', 'E5_MICRO_SHAPES', 'E5_PROFILED', 'E5_SKIP_ENGINE', 'E5_SKIP_MICRO', 'E5_SOCKETS'}
 # Knobs of phase E5's K/V layout study (E5.4).
-CAMPAIGN_KNOBS |= {'E5_ATTN', 'E5_KV_CHECK', 'E5_KV_LAYOUTS', 'E5_PREFILL_PROMPTS', 'E5_PREFILL_RUNGS'}
+CAMPAIGN_KNOBS |= {'E5_ATTN', 'E5_KV_CHECK', 'E5_SKIP_DECODE', 'E5_KV_LAYOUTS', 'E5_PREFILL_PROMPTS', 'E5_PREFILL_RUNGS'}
 
 
 def campaign_env():
@@ -1819,6 +1819,26 @@ class KvLayoutCampaignTests(unittest.TestCase):
         self.assertEqual([self.label(l) for l in some if 'warm=0 ' in l],
                          ['m1b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16-xkvhead'])
         self.assertTrue(all('LLAMA_ATTN=split' in l for l in some))
+
+    def test_bench_stage_writes_the_prompt_files_of_the_prefill_cells(self):
+        """Jobs 5876582 and 5876584: the prefill cells read prompt-N.txt, which only the check stage wrote. The bench stage
+        must ask for exactly the lengths of E5_PREFILL_PROMPTS (the dry run names them) and nothing without the cells."""
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_MICRO='1')
+        self.assertEqual([l for l in out if l.startswith('E5 prompts')], ['E5 prompts: 2048,8192'])
+        self.assertFalse([l for l in self.lines() if l.startswith('E5 prompts')])
+        # the same call the real stage makes: make_prompt writes prompt-N.txt for every length it is given
+        script = (ROOT/'scripts'/'cresco8-tp.sbatch').read_text()
+        self.assertIn('a_models "$dir" "${E5_PREFILL_PROMPTS// /,}"', script)
+
+    def test_skip_decode_leaves_only_the_prefill_cells(self):
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_DECODE='1', E5_SKIP_MICRO='1',
+                         E5_ALTERNATE='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')
+        runs = self.runs(out)
+        self.assertEqual(len(runs), 2 * 4 * 2 * 2 * 3)  # models x rungs (two per precision) x prompts x layouts x repeats
+        self.assertTrue(all('warm=0 ' in l and 'LLAMA_ATTN_DECODE' not in l and 'LLAMA_PROFILE' not in l for l in runs))
+        self.assertEqual(self.runs(self.lines(E5_SKIP_DECODE='1', E5_SKIP_MICRO='1')), [])
+        result = self.run_e5(expect_ok=False, E5_SKIP_DECODE='2')
+        self.assertNotEqual(result.returncode, 0)
 
     def test_check_stage_gates_rows_against_head_bitwise(self):
         out = self.lines('check', E5_KV_CHECK='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')

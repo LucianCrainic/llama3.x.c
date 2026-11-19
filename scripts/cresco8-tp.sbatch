@@ -395,12 +395,14 @@ phase_B7() {
 #   of the layout (C2) instead of the split-against-group gates: rows against head, bitwise, on every model, precision,
 #   socket count and decode kernel; a short prompt per token, a warm 8192-token context (tiled batched prefill, last row),
 #   the decode path after it (tools/compare_engines.py --tail), 128 greedy tokens, the AMX rungs, and the Hugging Face
-#   gate of FP32 with the head layout.
+#   gate of FP32 with the head layout. E5_SKIP_DECODE (0): 1 leaves out the decode runs of the engine stage (a job of the
+#   time-to-first-token cells alone); the stage writes the prompt files of E5_PREFILL_PROMPTS itself.
 E5_KV_LAYOUTS=${E5_KV_LAYOUTS:-}
 E5_ATTN=${E5_ATTN:-}
 E5_PREFILL_PROMPTS=${E5_PREFILL_PROMPTS:-}
 E5_PREFILL_RUNGS=${E5_PREFILL_RUNGS:-"avx512_fp32 amx_bf16 avx512_q8 amx_int8"}
 E5_KV_CHECK=${E5_KV_CHECK:-0}
+E5_SKIP_DECODE=${E5_SKIP_DECODE:-0}
 E5_CONTEXTS=${E5_CONTEXTS:-"512 8192 32768"}
 E5_KERNELS=${E5_KERNELS:-"split group"}
 E5_SOCKETS=${E5_SOCKETS:-"1 2"}
@@ -438,6 +440,7 @@ e5_knobs() {
       die "E5_PREFILL_RUNGS words are avx512_fp32, amx_bf16, avx512_q8 or amx_int8, got '$word'"
   done
   [[ $E5_KV_CHECK == 0 || $E5_KV_CHECK == 1 ]] || die "E5_KV_CHECK is 0 or 1, got '$E5_KV_CHECK'"
+  [[ $E5_SKIP_DECODE == 0 || $E5_SKIP_DECODE == 1 ]] || die "E5_SKIP_DECODE is 0 or 1, got '$E5_SKIP_DECODE'"
   [[ $E5_PROFILED =~ ^[0-9]+$ ]] || die "E5_PROFILED must be a non-negative integer, got '$E5_PROFILED'"
   [[ $E5_MICRO_REPS =~ ^[1-9][0-9]*$ ]] && ((E5_MICRO_REPS <= 1024)) || die "E5_MICRO_REPS must be 1..1024, got '$E5_MICRO_REPS'"
   for word in "$E5_ALTERNATE" "$E5_SKIP_ENGINE" "$E5_SKIP_MICRO"; do
@@ -703,7 +706,7 @@ e5_engine_runs() {
       engine_precision=int8
       [[ $precision != fp32 ]] || engine_precision=fp32
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
-      for ((rep = 1; rep <= REPEATS; rep++)); do
+      for ((rep = 1; rep <= REPEATS && E5_SKIP_DECODE == 0; rep++)); do
         # E5_ALTERNATE: even repeats launch the variants in the reverse order
         e5_variants "$([[ $E5_ALTERNATE == 1 && $((rep % 2)) == 0 ]] && echo 1 || echo 0)"
         for ctx in $E5_CONTEXTS; do
@@ -716,7 +719,7 @@ e5_engine_runs() {
       done
       # Profiled repeats per configuration and context (the per-socket profile lines go to the .stderr files).
       e5_variants 0
-      for ((rep = 1; rep <= E5_PROFILED; rep++)); do
+      for ((rep = 1; rep <= E5_PROFILED && E5_SKIP_DECODE == 0; rep++)); do
         for ctx in $E5_CONTEXTS; do
           for config in "${configs[@]}"; do
             for variant in "${E5_VARIANTS[@]}"; do
@@ -768,7 +771,13 @@ phase_E5() {
   if [[ $STAGE == check ]]; then
     if [[ $E5_KV_CHECK == 1 ]]; then e5_knobs && e5_kv_check; else e5_check; fi
   else
-    a_models "$dir"
+    if [[ -n $E5_PREFILL_PROMPTS ]]; then
+      # the time-to-first-token cells read prompt-N.txt (only the check stage used to write them: jobs 5876582 and 5876584)
+      dry_run && echo "E5 prompts: ${E5_PREFILL_PROMPTS// /,}"
+      a_models "$dir" "${E5_PREFILL_PROMPTS// /,}"
+    else
+      a_models "$dir"
+    fi
     e5_bench
   fi
 }
