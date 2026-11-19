@@ -396,3 +396,78 @@ engine implementation to be measured; nothing in this section is an engine measu
   decode default: the 5% weight-phase loss at 8B FP32 and 512 tokens (a context-dependent choice of kernel would remove the
   attention part only if the cause is the kernel's own execution, which is not shown), and the head-major layout, which the
   data recommend implementing and measuring in the engine first.
+
+## 9. The head-major K/V cache in the engine (E5.4)
+
+The repository owner approved building the layout that section 8.4 recommended. It is implemented as an opt-in knob,
+`LLAMA_KV_LAYOUT=rows|head` (default `rows`, the engine's layout since A5; an unknown value is refused). `head` stores a layer's
+cache as `[kv_head][position][head_dim]`, each head with room for `seq_len` positions, so the cache is the same size. Every reader
+and writer of the cache follows the knob: the per-token and batched K/V stores of `run.c` and `runq.c` (the projections go to a row
+buffer and are stored per head after RoPE), the socket-local caches of `tp.c`, the decode kernels (the position stride and head
+base of `k_attention_layout`) and the batched prefill kernels (`split`, `tiled`, the portable driver), which take the same two
+strides. The code is on branch `feature/kv-head-layout`. Provenance, gates and gaps:
+[decode-attention-results-validation.md](decode-attention-results-validation.md) (E5.4 block). Every number below is **measured**
+unless labelled **derived**.
+
+### 9.1 Decision rules (fixed before any cluster job)
+
+These rules were committed before the first job was submitted; the build commit of every job is the commit that holds this
+section (the validation record names it). No rule is changed after a result is seen; a cell that fails is reported as failed.
+
+**Jobs.** One check job (C1, C2) on one Flat node. Only if every C gate passes, two bench jobs in parallel, 1B on one Flat node
+and 8B on the other (one job each, each job holds both layouts, so every rows against head comparison is inside one job on one
+node). Engine bench cells: contexts 512 / 8192 / 32768 (`--warm-context`), one and two sockets x 56 workers, FP32 and W8A8, decode
+kernels `split` and `group`, layouts `rows` and `head`; three timed repeats in which the four (kernel, layout) variants of a cell
+run once, in the reverse order in even repeats (`E5_ALTERNATE=1`), plus one profiled run (`LLAMA_PROFILE=1`) per variant and cell.
+The batched prefill kernel of the engine runs (warm-up and timed prompt) is set explicitly to `LLAMA_ATTN=tiled`
+(`E5_ATTN=tiled`; the campaign default `split` is overridden and recorded in `build.attention` of every report). Prefill cells
+(V4): one socket, prompts of 2048 and 8192 tokens, `LLAMA_ATTN=tiled`, the rungs `avx512_fp32` (M = 128) and `amx_bf16` (M = 256)
+on the FP32 checkpoint and `avx512_q8` and `amx_int8` (M = 256) on the W8A8 checkpoint, both layouts, three repeats with the
+layout order alternating, 32 generated tokens. "Range" is min-max of the three timed repeats and "median" their median, as in
+section 3. A run that does not produce a report counts as a failed cell.
+
+**C1. `make test` on the hardware.** Passes if the common `make test` of the job exits 0 (all C suites at the scalar, AVX-512 and
+AMX levels with 0 failures, the Python suites OK), including the new head-layout cases.
+
+**C2. Bitwise equality of the layouts.** For 1B and 8B, FP32 and W8A8, one socket and two sockets (two with
+`LLAMA_TP_CHECK=1`), with `LLAMA_KV_LAYOUT=rows` against `head` on the same binary, same staged checkpoint, same environment:
+- logits of the 86-token short prompt, per token at every position, for each decode kernel `split` and `group`
+  (`tools/compare_engines.py --bitwise`: max |dlogit| = 0 and argmax agreement 100% at every position);
+- a warm 8192-token context: the first 8184 tokens through the tiled batched prefill (`LLAMA_ATTN=tiled`, M = 64), the last 8
+  per token (`--tail 8`), for each decode kernel, `--bitwise`;
+- the last row after the tiled batched prefill of the 8192 tokens, `--bitwise`;
+- the AMX rungs that write K/V: AMX-BF16 on the FP32 checkpoint and AMX-INT8 on the W8A8 checkpoint, 8192 tokens (M = 256), last
+  row, `--bitwise`;
+- 128 greedy tokens from the warm 8192-token context and the short prompt (`tools/compare_generation.py`, tiled prefill), for each
+  decode kernel: the generated token sequences must be identical;
+- the Hugging Face gate (`tools/validate.py`, FP32, per token) with `LLAMA_KV_LAYOUT=head`, 1B and 8B, one socket (OpenMP) and two
+  sockets (teams, `LLAMA_TP_CHECK=1`): passes if it exits 0, which is the gate of the first E5 check job.
+Any failure stops the campaign: no bench job is submitted, the failure is reported, and no gate is relaxed.
+
+**V1. Decode gain, 1B at 32768, one socket.** `(head, group)` against `(rows, split)` (the engine as shipped), FP32 and W8A8
+separately. Passes if the ratio of medians is at least 1.3 **and** the ranges do not overlap (the slowest `(head, group)`
+repeat is faster than the fastest `(rows, split)` repeat). This is the original E5 target.
+
+**V2. Two-socket gain, 1B W8A8 at 32768.** Using the head layout, for each decode kernel the ratio of the two-socket median to
+the one-socket median; the larger of the two kernels' ratios is the "best kernel" gain. Passes if it is at least 1.5.
+
+**V3. 512 not slower.** For every model, precision and socket count at context 512 (8 cells) and each decode kernel separately
+(16 comparisons): `head` against `rows` with the same kernel passes if the median of `head` is at least the minimum of the
+`rows` repeats (so it is either faster or within the spread of `rows`). The gate passes if all 16 do; failing cells are listed.
+
+**V4. Prefill not slower.** For each prompt (2048, 8192), rung and model, `head` against `rows` (time to first token, one socket):
+the cell fails if `head` is slower beyond variability (the fastest `head` repeat is slower than the slowest `rows` repeat);
+otherwise it passes. The gate covers the 8B cells of `avx512_fp32` and `amx_bf16` at both prompt lengths (4 cells); the other
+rungs and 1B are reported against the same rule.
+
+**Also reported (no gate).** `head` against `rows` for each kernel separately in every cell (median ratio and whether beyond
+variability); the attention phase of the profiled run per step (`profile_seconds.decode.attention` per forward pass) and the
+derived K/V bandwidth (2 x local KV heads x head_dim x 4 bytes x mean context x layers, divided by the attention time, as in
+section 4), and the K/V store phase; the two-socket gains of both layouts and kernels; the time to first token of every
+prefill cell; for any cell the results are compared with the first E5 job's `split` figures of section 3 only as context, since
+that job ran on another day (the comparison of the gates is inside each job).
+
+**Verdict and what it does not decide.** The layout is recommended for adoption as the default only if C1, C2, V1, V2, V3 and V4
+all pass. If only some pass, the section states which, and the layout stays opt-in. Whatever the outcome, this work does not
+change the default of `LLAMA_KV_LAYOUT` and does not merge: the decision table of [numa-tp-prefill-results.md](numa-tp-prefill-results.md)
+and the plan files are updated by the owner.
