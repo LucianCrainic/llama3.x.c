@@ -496,9 +496,12 @@ class CompareEnginesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_batched_prefill_is_bitwise_equal_to_per_token(self):
+        # split's invariant (the batched default is tiled since E4, which agrees within the FP32 gate, not bitwise,
+        # where AVX-512 runs; tests/test_tp.py holds its gate)
+        split = ('--env-a', 'LLAMA_ATTN=split', '--env-b', 'LLAMA_ATTN=split')
         for engine in ('fp32', 'int8'):
             for batch in ('3', '32'):
-                result, data = self.compare(engine, '--batch-b', batch, '--bitwise')
+                result, data = self.compare(engine, *split, '--batch-b', batch, '--bitwise')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(data['summary']['bitwise'])
                 self.assertEqual(data['batch_b'], int(batch))
@@ -520,9 +523,11 @@ class CompareEnginesTests(unittest.TestCase):
 
     def test_scalar_gemm_prefill_is_bitwise_equal_to_per_token(self):
         # The scalar GEMM sums each output like the GEMV (one K block, ascending k); the Q8 engine has no GEMM yet.
+        # Attention is pinned to split, whose batched path is bitwise equal to per-token (see above).
         for engine in ('fp32', 'int8'):
             for batch in ('2', '7', '32'):
-                result, data = self.compare(engine, '--env-b', 'LLAMA_PREFILL_GEMM=on', '--batch-b', batch, '--bitwise')
+                result, data = self.compare(engine, '--env-a', 'LLAMA_ATTN=split', '--env-b', 'LLAMA_ATTN=split',
+                                            '--env-b', 'LLAMA_PREFILL_GEMM=on', '--batch-b', batch, '--bitwise')
                 self.assertEqual(result.returncode, 0, (engine, batch, result.stderr))
                 self.assertTrue(data['summary']['bitwise'])
         result, _ = self.compare('fp32', '--env-b', 'LLAMA_PREFILL_GEMM=sometimes', '--batch-b', '2')

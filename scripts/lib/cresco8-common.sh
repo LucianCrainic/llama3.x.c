@@ -58,6 +58,11 @@ job_begin() {
   # process that links it to one core at load, and teams workers would inherit that single-CPU mask. run_engine sets
   # it for omp runs only.
   export OMP_DYNAMIC=FALSE
+  # The engine's batched attention defaults to tiled since E4; campaigns keep split, the kernel every earlier campaign
+  # measured, whose batched prefill is bitwise equal to per-token (the A, C, D and E0 gates rely on it). A phase that
+  # wants tiled names it per run (E2, E4), which overrides this; a submitter may export LLAMA_ATTN to change it job-wide.
+  # `make test` runs without it, so the tests see the engine's own default.
+  export LLAMA_ATTN=${LLAMA_ATTN:-split}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -68,6 +73,7 @@ record_environment() {
     gcc --version; pkg-config --modversion libpcre2-8
     printf "%s %s\n" "$ROOT" "$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD)"
     printf 'STAGE=%s REPEATS=%s PRECISIONS=%s PHASE=%s MODELS=%s\n' "$STAGE" "$REPEATS" "$PRECISIONS" "$PHASE" "$MODELS"
+    printf 'LLAMA_ATTN=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_ATTN:-}"
   } > "$OUT/environment.txt"
   (cd "$ROOT" && find src include tests tools scripts Makefile -type f ! -path '*/__pycache__/*' -print0 | sort -z |
     xargs -0 sha256sum) > "$OUT/source-$(basename "$ROOT").sha256"
@@ -462,7 +468,8 @@ check_stage() {
     # the phases that run a unit test binary (C5, C6, ...) still need the binaries
     (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1 ||
+    (cd "$ROOT" && env -u LLAMA_ATTN OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
+      > "$OUT/test.log" 2>&1 ||
       status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
   fi

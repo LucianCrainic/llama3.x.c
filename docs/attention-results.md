@@ -247,5 +247,6 @@ AMX-BF16 at 8192 tokens takes 8.31 s with `tiled` against 11.77 s with `split`, 
 dominate, but it costs nothing there. `amx` (E3) was not built, so it was not tested. The plan (E4.4) left the default to the owner. After the
 determinism comparison (job 5864239) passed, the owner switched the code default to `tiled` (2026-11-19). `LLAMA_ATTN=split` keeps
 the earlier kernel; runs meant to match earlier campaigns (B, C and D series, E2 and E4 baselines) should set it, because `tiled`
-agrees with `split` within the gates but not bit for bit. Hosts without AVX-512 run `split` under either setting. The decision
+agrees with `split` within the gates but not bit for bit. Hosts without AVX-512 run `split` under either setting. The campaign scripts keep `split` for every engine run that does not name a variant
+(`scripts/lib/cresco8-common.sh`), so the A, C, D and E0 bitwise gates and earlier baselines stay reproducible. The decision
 table entry is in [numa-tp-prefill-results.md](numa-tp-prefill-results.md) section 7.
