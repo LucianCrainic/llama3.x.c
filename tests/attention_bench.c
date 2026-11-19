@@ -1,7 +1,7 @@
 /* Attention microbenchmark (E0): the engine's batched prefill attention and its single-row decode attention on one
  * layer, with K/V in a region bound to one NUMA node. One JSON object per line on stdout.
  *   attention-bench --mode prefill [--shape 8b|1b|H/KV/HD,...] [--prompt 512,2048,8192] [--m 16,64,256] [--reps R]
- *   attention-bench --mode decode  [--shape ...] [--context 8192,32768] [--reps R]
+ *   attention-bench --mode decode  [--shape ...] [--context 8192,32768] [--reps R] [--kv-layout rows|head]
  * Common: [--node N] [--kv-heads-local N] [--seq-extra N] [--portable] [--cold-mib N]
  * Prefill runs the whole prompt of one layer as src/run.c does (microbatches at pos0 = 0, M, 2M, ...; the workspace of
  * k_attention_init_rows with rows = M; k_attention_batch), so ms_layer * layers is comparable with the engine's profiled
@@ -11,6 +11,9 @@
  * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_DECODE (split|group; decode mode),
  * LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
  * LLAMA_ATTN_WORKSPACE_MIB.
+ * --kv-layout (decode only) picks the K/V layout the kernels read: rows (default, the engine's [position][kv_head][head_dim],
+ * k_attention) or head ([kv_head][position][head_dim], k_attention_layout with a position stride of head_dim; the E5.2
+ * layout probe, no engine path stores K/V like this). Same values, same kernels, same bytes.
  * One extra pass per cell runs with the kernels' task hook on (k_attention_set_task_hook) to measure how the workers are
  * used: the timed repetitions run without it. --portable runs the batched driver with the scalar chunk kernel
  * (k_attention_batch_portable), the only way to see tasks on a host without AVX-512. */
@@ -221,16 +224,16 @@ static void json_stats(const TraceStats *t, double kv_bytes_per_position) {
 
 typedef struct {
   Shape shape;
-  int heads, kv_heads, hd, node, portable;
+  int heads, kv_heads, hd, node, portable, head_major;
 } Setup;
 
 static void common_fields(const Setup *s, const char *mode, int workers) {
   printf("{\"mode\": \"%s\", \"isa\": \"%s\", \"backend\": \"%s\", \"workers\": %d, \"node\": %d, \"shape\": \"%s\", "
          "\"heads\": %d, \"kv_heads\": %d, \"head_dim\": %d, \"kv_heads_model\": %d, \"row_block\": %d, \"portable\": %s, "
-         "\"attn\": \"%s\", \"attn_decode\": \"%s\", ",
+         "\"attn\": \"%s\", \"attn_decode\": \"%s\", \"kv_layout\": \"%s\", ",
          mode, kernels_name(), kernels_backend_name(), workers, s->node, s->shape.name, s->heads, s->kv_heads, s->hd,
          s->shape.kv_model, k_attention_row_block(), s->portable ? "true" : "false", kernels_attention_name(),
-         kernels_attention_decode_name());
+         kernels_attention_decode_name(), s->head_major ? "head" : "rows");
 }
 
 static void prefill_cell(const Setup *s, int prompt, int m, int reps, int seq_extra) {
@@ -329,8 +332,21 @@ static void decode_cell(const Setup *s, int context, int reps, int cold_mib) {
   NumaRegion kr, vr, qr, wr;
   float *kc = carve(&kr, copies * copy_floats * sizeof(float), ROLE_KV_K, s->node);
   float *vc = carve(&vr, copies * copy_floats * sizeof(float), ROLE_KV_V, s->node);
+  /* the same values in either layout: the bytes read are the same, only their order in memory differs */
   for (size_t i = 0; i < copy_floats; i++)
     kc[i] = uniform(), vc[i] = uniform();
+  if (s->head_major) { /* [position][kv_head][head_dim] -> [kv_head][position][head_dim] */
+    float *tk = malloc(copy_floats * sizeof(float)), *tv = malloc(copy_floats * sizeof(float));
+    if (!tk || !tv)
+      fail("out of memory for the layout copy");
+    for (int t = 0; t < context; t++)
+      for (int g = 0; g < kv_heads; g++) {
+        memcpy(tk + ((size_t)g * context + t) * hd, kc + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+        memcpy(tv + ((size_t)g * context + t) * hd, vc + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+      }
+    memcpy(kc, tk, copy_floats * sizeof(float)), memcpy(vc, tv, copy_floats * sizeof(float));
+    free(tk), free(tv);
+  }
   for (int c = 1; c < copies; c++)
     memcpy(kc + c * copy_floats, kc, copy_floats * sizeof(float)), memcpy(vc + c * copy_floats, vc, copy_floats * sizeof(float));
   region_mark_populated(&kr), region_mark_populated(&vr);
@@ -358,8 +374,12 @@ static void decode_cell(const Setup *s, int context, int reps, int cold_mib) {
     if (traced)
       atomic_fetch_add(&trace->call, 1);
     double t = monotonic_seconds();
-    k_attention(out, q, kc + copy * copy_floats, vc + copy * copy_floats, att, &work, heads, kv_heads, hd, context,
-                context - 1);
+    if (s->head_major)
+      k_attention_layout(out, q, kc + copy * copy_floats, vc + copy * copy_floats, att, &work, heads, kv_heads, hd,
+                         context, context - 1, (size_t)hd, (size_t)context * hd);
+    else
+      k_attention(out, q, kc + copy * copy_floats, vc + copy * copy_floats, att, &work, heads, kv_heads, hd, context,
+                  context - 1);
     double elapsed = monotonic_seconds() - t;
     if (traced)
       traced_seconds += elapsed;
@@ -398,13 +418,13 @@ static void decode_cell(const Setup *s, int context, int reps, int cold_mib) {
 
 static void usage(void) {
   fprintf(stderr, "usage: attention-bench --mode prefill|decode [--shape 8b|1b|H/KV/HD,...] [--prompt LIST] [--m LIST] "
-                  "[--context LIST] [--reps R] [--node N] [--kv-heads-local N] [--seq-extra N] [--cold-mib N] "
+                  "[--context LIST] [--reps R] [--kv-layout rows|head] [--node N] [--kv-heads-local N] [--seq-extra N] [--cold-mib N] "
                   "[--portable]\n");
 }
 
 int main(int argc, char **argv) {
   const char *mode = "prefill", *shape_text = "8b";
-  int node = -1, reps = 3, kv_local = 0, seq_extra = 256, cold_mib = 1024, portable = 0;
+  int node = -1, reps = 3, kv_local = 0, seq_extra = 256, cold_mib = 1024, portable = 0, head_major = 0;
   int prompts[MAX_LIST] = {512, 2048, 8192}, np = 3, ms[MAX_LIST] = {16, 64, 256}, nm = 3;
   int contexts[MAX_LIST] = {8192, 32768}, nc = 2;
   for (int i = 1; i < argc; i++) {
@@ -430,7 +450,17 @@ int main(int argc, char **argv) {
       seq_extra = atoi(argv[++i]);
     else if (!strcmp(a, "--cold-mib") && more)
       cold_mib = atoi(argv[++i]);
-    else if (!strcmp(a, "--portable"))
+    else if (!strcmp(a, "--kv-layout") && more) {
+      const char *layout = argv[++i];
+      if (!strcmp(layout, "head"))
+        head_major = 1;
+      else if (!strcmp(layout, "rows"))
+        head_major = 0;
+      else {
+        usage();
+        return 2;
+      }
+    } else if (!strcmp(a, "--portable"))
       portable = 1;
     else {
       usage();
@@ -438,6 +468,10 @@ int main(int argc, char **argv) {
     }
   }
   int decode = !strcmp(mode, "decode");
+  if (head_major && !decode) {
+    fprintf(stderr, "attention-bench: --kv-layout head is a decode-mode option\n");
+    return 2;
+  }
   if ((!decode && strcmp(mode, "prefill")) || reps < 1 || reps > MAX_REPS || seq_extra < 0 || cold_mib < 0) {
     usage();
     return 2;
@@ -446,7 +480,7 @@ int main(int argc, char **argv) {
   kernels_backend_init();
   char *shapes_copy = strdup(shape_text);
   for (char *token = strtok(shapes_copy, ","); token; token = strtok(NULL, ",")) {
-    Setup setup = {.node = node, .portable = portable};
+    Setup setup = {.node = node, .portable = portable, .head_major = head_major};
     if (parse_shape(token, &setup.shape)) {
       fprintf(stderr, "attention-bench: bad shape '%s'\n", token);
       return 2;

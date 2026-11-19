@@ -196,5 +196,13 @@ typedef void (*AttentionTaskHook)(void *ctx, const AttentionTaskInfo *info);
 void k_attention_set_task_hook(AttentionTaskHook hook, void *ctx);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);
+/* k_attention on a caller-chosen K/V layout (E5.2 layout probe; no engine path uses it). Position t of KV head g starts at
+ * cache + t * pos_stride + g * head_base floats. k_attention is pos_stride = n_kv_heads * head_dim, head_base = head_dim
+ * (rows [position][kv_head][head_dim]); the head-major layout [kv_head][position][head_dim] is pos_stride = head_dim,
+ * head_base = seq_len * head_dim. The same decode kernel (LLAMA_ATTN_DECODE) runs, and the result is bitwise the one the
+ * rows layout gives on the same values. */
+void k_attention_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                        AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position,
+                        size_t pos_stride, size_t head_base);
 
 #endif

@@ -1780,10 +1780,11 @@ typedef struct {
   const float *q, *key_cache, *value_cache;
   float *att;
   int n_heads, n_kv_heads, head_size, seq_len, pos;
+  size_t pos_stride, head_base; /* floats between positions of a head and between the bases of KV heads */
 } ScalarAttention;
 
 static void attention_scalar_head(const ScalarAttention *j, int h) {
-  int head_size = j->head_size, pos = j->pos, kv_dim = j->n_kv_heads * head_size, kv_mul = j->n_heads / j->n_kv_heads;
+  int head_size = j->head_size, pos = j->pos, kv_mul = j->n_heads / j->n_kv_heads;
   // get the query vector for this head
   const float *qh = j->q + h * head_size;
   // attention scores for this head
@@ -1791,7 +1792,7 @@ static void attention_scalar_head(const ScalarAttention *j, int h) {
   // iterate over all timesteps, including the current one
   for (int t = 0; t <= pos; t++) {
     // get the key vector for this head and at this timestep
-    const float *k = j->key_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+    const float *k = j->key_cache + (size_t)t * j->pos_stride + (size_t)(h / kv_mul) * j->head_base;
     // calculate the attention score as the dot product of q and k
     float score = 0.0f;
     for (int i = 0; i < head_size; i++) {
@@ -1810,7 +1811,7 @@ static void attention_scalar_head(const ScalarAttention *j, int h) {
   memset(xb, 0, head_size * sizeof(float));
   for (int t = 0; t <= pos; t++) {
     // get the value vector for this head and at this timestep
-    const float *v = j->value_cache + (size_t)t * kv_dim + (h / kv_mul) * head_size;
+    const float *v = j->value_cache + (size_t)t * j->pos_stride + (size_t)(h / kv_mul) * j->head_base;
     // get the attention weight for this timestep
     float w = a[t];
     // accumulate the weighted value into xb
@@ -1826,8 +1827,10 @@ static void attention_scalar_rows(const void *p, int h0, int h1) {
 }
 
 static void attention_scalar(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
-                             int n_heads, int n_kv_heads, int head_size, int seq_len, int pos) {
-  ScalarAttention job = {out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_size, seq_len, pos};
+                             int n_heads, int n_kv_heads, int head_size, int seq_len, int pos, size_t pos_stride,
+                             size_t head_base) {
+  ScalarAttention job = {out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_size, seq_len, pos, pos_stride,
+                         head_base};
   if (current_team) {
     team_parallel_rows(current_team, n_heads, attention_scalar_rows, &job);
     return;
@@ -1893,6 +1896,7 @@ typedef struct {
   int n_heads, head_dim, seq_len, positions, kv_mul, kv_dim, chunks, tasks;
   int group; /* 1: the group kernel (E5) runs the (KV group, chunk) tasks instead of the per-head chunk kernel */
   size_t slot, head_stride;
+  size_t pos_stride, head_base; /* K/V layout (E5.2): floats between positions of a head, and between KV heads' bases */
   atomic_int next_task; /* team-local queue over (kv group, chunk) tasks */
   Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
 } SplitKJob;
@@ -1903,12 +1907,12 @@ static void attention_task(const SplitKJob *j, int task) {
   int h0 = g * j->kv_mul;
   if (j->group) {
     attention_group_avx512(j->q + (size_t)h0 * j->head_dim, j->kv_mul, j->head_dim, t0, t1,
-                           j->key_cache + (size_t)g * j->head_dim, j->value_cache + (size_t)g * j->head_dim, j->kv_dim,
-                           j->partial + h0 * j->head_stride + c * j->slot, j->head_stride);
+                           j->key_cache + (size_t)g * j->head_base, j->value_cache + (size_t)g * j->head_base,
+                           (int)j->pos_stride, j->partial + h0 * j->head_stride + c * j->slot, j->head_stride);
     return;
   }
-  attention_chunk_avx512(j->q + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_dim,
-                         j->value_cache + (size_t)g * j->head_dim, j->kv_dim, j->head_dim, j->kv_mul, t0, t1,
+  attention_chunk_avx512(j->q + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_base,
+                         j->value_cache + (size_t)g * j->head_base, (int)j->pos_stride, j->head_dim, j->kv_mul, t0, t1,
                          j->att + (size_t)h0 * j->seq_len + t0, j->seq_len,
                          j->partial + h0 * j->head_stride + c * j->slot, j->head_stride);
 }
@@ -1949,7 +1953,7 @@ static void attention_team(const void *p, int worker, int workers) {
  * the partial slots and the merge are the same for both. */
 static void attention_decode_splitk(float *out, const float *q, const float *key_cache, const float *value_cache,
                                     float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                    int seq_len, int position, int group) {
+                                    int seq_len, int position, int group, size_t pos_stride, size_t head_base) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && head_dim <= 256) {
     int positions = position + 1, kv_mul = n_heads / n_kv_heads, kv_dim = n_kv_heads * head_dim;
@@ -1966,6 +1970,8 @@ static void attention_decode_splitk(float *out, const float *q, const float *key
                      .positions = positions,
                      .kv_mul = kv_mul,
                      .kv_dim = kv_dim,
+                     .pos_stride = pos_stride,
+                     .head_base = head_base,
                      .chunks = chunks,
                      .tasks = n_kv_heads * chunks,
                      .group = group,
@@ -1996,20 +2002,21 @@ static void attention_decode_splitk(float *out, const float *q, const float *key
   }
 #endif
   (void)work, (void)group;
-  attention_scalar(out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_dim, seq_len, position);
+  attention_scalar(out, q, key_cache, value_cache, att, n_heads, n_kv_heads, head_dim, seq_len, position, pos_stride,
+                   head_base);
 }
 
 static void attention_decode_split(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                   int seq_len, int position) {
+                                   int seq_len, int position, size_t pos_stride, size_t head_base) {
   attention_decode_splitk(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position,
-                          0);
+                          0, pos_stride, head_base);
 }
 
 /* LLAMA_ATTN_DECODE=group (E5). One note per process when the call goes to `split`: same precision, different speed. */
 static void attention_decode_group(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                   int seq_len, int position) {
+                                   int seq_len, int position, size_t pos_stride, size_t head_base) {
   const char *why = NULL;
 #if HAVE_AVX512
   if (isa != KERNELS_AVX512)
@@ -2025,7 +2032,7 @@ static void attention_decode_group(float *out, const float *q, const float *key_
       LOG(LOG_INFO, "LLAMA_ATTN_DECODE=group: %s, running split attention instead", why);
   }
   attention_decode_splitk(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position,
-                          why == NULL);
+                          why == NULL, pos_stride, head_base);
 }
 
 // ----------------------------------------------------------------------------
@@ -2243,7 +2250,7 @@ static void attention_batch_split(float *out, const float *q, const float *key_c
   size_t dim = (size_t)n_heads * head_dim;
   for (int i = 0; i < m; i++)
     attention_decode_split(out + i * dim, q + i * dim, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim,
-                           seq_len, pos0 + i);
+                           seq_len, pos0 + i, (size_t)n_kv_heads * head_dim, head_dim);
 }
 
 void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
@@ -2490,7 +2497,7 @@ typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_ca
                                  int seq_len, int pos0, int m);
 typedef void (*AttentionDecodeFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                  int seq_len, int position);
+                                  int seq_len, int position, size_t pos_stride, size_t head_base);
 typedef struct {
   const char *name;
   AttentionBatchFn run;
@@ -2576,7 +2583,16 @@ static void attention_init_from_env(void) {
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position) {
   attention_decode_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len,
-                               position);
+                               position, (size_t)n_kv_heads * head_dim, head_dim);
+}
+
+void k_attention_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                        AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position,
+                        size_t pos_stride, size_t head_base) {
+  if (pos_stride < (size_t)head_dim || pos_stride > INT_MAX)
+    fail("k_attention_layout: position stride %zu is not in [head_dim, INT_MAX]", pos_stride);
+  attention_decode_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len,
+                               position, pos_stride, head_base);
 }
 
 void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
