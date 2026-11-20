@@ -125,15 +125,18 @@ section 8 come from the 96 reports (`throughput_tokens_per_second.decode`, `prof
 ## E5.4: head-major K/V layout in the engine (2026-11-19/20)
 
 **Status: run.** Results: [decode-attention-results.md](decode-attention-results.md) section 9. The decision rules (9.1) were
-committed in a35b3b4 before any job was submitted. Branch `feature/kv-head-layout` (not merged).
+committed in a35b3b4 before any job was submitted. Branch `feature/kv-head-layout`, merged into `develop` after review (the layout stays opt-in).
 
 ### Provenance
+
+Node A is the node of B7, E4 and E5; node B is the partition's second Flat-mode node (same hardware, `flat-mode.json` in
+each results directory).
 
 | Item | Check job | 1B bench job | 8B bench job | V4 job |
 | --- | --- | --- | --- | --- |
 | Slurm job ID | 5876167 | 5876582 | 5876584 | 5876592 |
 | State | COMPLETED, exit 0, 2 h 54 min | **FAILED**, exit 1, 1 h 14 min (decode reports complete, 48 prefill cells failed) | **FAILED**, exit 1, 5 h 16 min (same) | COMPLETED, exit 0, 26 min 31 s |
-| Node (Flat mode, exclusive) | cresco8-hbm14 | cresco8-hbm13 | cresco8-hbm14 | cresco8-hbm13 |
+| Node (Flat mode, exclusive) | node A | node B | node A | node B |
 | Commit | a35b3b4 | a35b3b4 | a35b3b4 | 2dd52c5 (only the campaign script and its test differ from a35b3b4) |
 | Results directory (under the results store) | `kvlayout-check-20261119-1` | `kvlayout-bench-20261119-1b` | `kvlayout-bench-20261119-8b-2` | `kvlayout-v4-20261119-1` |
 | Settings | `STAGE=check PHASE=E5 E5_KV_CHECK=1 SKIP_PRELUDE_HF=1` (common `make test` ran) | `STAGE=bench PHASE=E5 REPEATS=3 SKIP_TEST=1 SKIP_PRELUDE_HF=1 E5_KV_LAYOUTS="rows head" E5_ATTN=tiled E5_ALTERNATE=1 E5_PROFILED=1 E5_SKIP_MICRO=1 E5_PREFILL_PROMPTS="2048 8192"`, MODELS = 1B | same, MODELS = 8B | same layouts and prompts with `E5_SKIP_DECODE=1 E5_PROFILED=0`, MODELS = 1B and 8B |
@@ -146,14 +149,14 @@ Failed jobs and cells, recorded as they happened:
   therefore ended with exit 1. Their decode data is valid and is what section 9.4 uses; their prefill reports are `status: error`
   and are not used. The V4 figures come from job 5876592 (commit 2dd52c5), which includes the fix (the bench stage writes the prompt
   files of `E5_PREFILL_PROMPTS`) and a dry-run test for it.
-- **5876583** (the first 8B submission, hbm14, 3 s): `mv: cannot stat 'build/release/config.tmp'`. It started `make` in the staged
+- **5876583** (the first 8B submission, node A, 3 s): `mv: cannot stat 'build/release/config.tmp'`. It started `make` in the staged
   tree `repo-a35b3b4` at the same moment as the 1B job; the Makefile's `config` rule races when two jobs build in one tree. It
   produced no data and left an empty results directory (`kvlayout-bench-20261119-8b`); 5876584 was submitted after the 1B job's
   build, as a no-op build, with a new directory. For parallel submissions from one tree: build once first, or skip the build when
   it is current.
 
 The bench jobs ran with `LLAMA_ATTN=tiled` (`build.attention` of every decode and prefill report). The comparisons of the gates
-are inside each job. The 1B and 8B decode figures come from two different nodes (hbm13 and hbm14); no gate compares across them.
+are inside each job. The 1B and 8B decode figures come from two different nodes (node B and node A); no gate compares across them.
 
 ### Gates
 
@@ -187,7 +190,7 @@ change (compared with ROOT normalized).
 3. **Three repeats per variant**; ranges of three values are a coarse variability measure (the 1B W8A8 two-socket 512 `split`
    rows range is 390-470 tok/s).
 4. **AMX-level unit tests** ran on the hardware only inside `make test` (not locally: this host has no AMX).
-5. **The V4 cells ran in a separate short job** (hbm13) from the decode cells of the 1B (hbm13) and 8B (hbm14) jobs; the layouts
+5. **The V4 cells ran in a separate short job** (node B) from the decode cells of the 1B (node B) and 8B (node A) jobs; the layouts
    are compared inside each job.
 6. **No placement report check** was part of the gates; `tools/check_placement.py` was changed to allow the one partly touched page
    per (layer, KV head) that the head layout leaves, and is tested, but no cluster report was run through it.

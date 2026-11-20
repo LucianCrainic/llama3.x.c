@@ -405,7 +405,7 @@ cache as `[kv_head][position][head_dim]`, each head with room for `seq_len` posi
 and writer of the cache follows the knob: the per-token and batched K/V stores of `run.c` and `runq.c` (the projections go to a row
 buffer and are stored per head after RoPE), the socket-local caches of `tp.c`, the decode kernels (the position stride and head
 base of `k_attention_layout`) and the batched prefill kernels (`split`, `tiled`, the portable driver), which take the same two
-strides. The code is on branch `feature/kv-head-layout`. Provenance, gates and gaps:
+strides. The code is merged into `develop` (opt-in). Provenance, gates and gaps:
 [decode-attention-results-validation.md](decode-attention-results-validation.md) (E5.4 block). Every number below is **measured**
 unless labelled **derived**.
 
@@ -478,8 +478,8 @@ All jobs ran on Flat-mode nodes of the HBM partition, exclusive, gcc `-O3 -fopen
 one job on one node. Rules of 9.1 were committed before the first job (commit a35b3b4 holds them and was the build of the check
 job and the two bench jobs; 2dd52c5, which only changes the campaign script and its test, was the build of the V4 job).
 
-- **Check job 5876167** (hbm14, 2 h 54 min, exit 0): common `make test`, then `E5_KV_CHECK=1`.
-- **Bench jobs** 5876582 (1B, hbm13, 1 h 14 min) and 5876584 (8B, hbm14, 5 h 16 min), run in parallel, `E5_KV_LAYOUTS="rows head"
+- **Check job 5876167** (node A, 2 h 54 min, exit 0): common `make test`, then `E5_KV_CHECK=1`.
+- **Bench jobs** 5876582 (1B, node B, 1 h 14 min) and 5876584 (8B, node A, 5 h 16 min), run in parallel, `E5_KV_LAYOUTS="rows head"
   E5_ATTN=tiled E5_ALTERNATE=1 E5_PROFILED=1 E5_SKIP_MICRO=1 E5_PREFILL_PROMPTS="2048 8192" REPEATS=3`. Each produced all 192
   decode reports (2 precisions x 3 contexts x 2 socket counts x 4 variants x (3 timed + 1 profiled)), every one `completed`.
   **Both jobs exited 1 because their 48 prefill (V4) cells failed**: the bench stage did not write `prompt-2048.txt` and
@@ -487,7 +487,7 @@ job and the two bench jobs; 2dd52c5, which only changes the campaign script and 
   reports are unaffected. A first 8B submission, job 5876583, failed after 3 s: it built in the shared staged tree at the same
   time as the 1B job and `make` lost the `config.tmp` race (`mv: cannot stat`); it ran nothing and left an empty results
   directory, so 5876584 used a new one.
-- **V4 job 5876592** (hbm13, 26 min 31 s, exit 0, commit 2dd52c5): the fix (the bench stage writes the prompt files of
+- **V4 job 5876592** (node B, 26 min 31 s, exit 0, commit 2dd52c5): the fix (the bench stage writes the prompt files of
   `E5_PREFILL_PROMPTS`; new knob `E5_SKIP_DECODE=1` leaves out the decode runs; a dry-run test covers it) and one job holding
   the prefill cells of 1B and 8B, both layouts, three repeats alternating the layout order: 96 reports, all `completed`. The
   V4 figures below come from this job, not from the failed cells.
