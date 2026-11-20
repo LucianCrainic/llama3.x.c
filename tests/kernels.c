@@ -1445,7 +1445,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "quantize [%s]: scales differ bitwise\n", current);
   }
   /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
-   * against the same double-precision references as the OpenMP path. */
+   * against the same double-precision references as the serial path. */
   int team_sizes[8] = {1, 2, 3, 5, 7};
   size_t team_size_count = 5;
   const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "1,56" for a full socket on the cluster */

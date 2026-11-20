@@ -303,7 +303,7 @@ class DefaultTests(unittest.TestCase):
         for sysfs in (self.cache, self.no_numaperf, self.one):
             with self.subTest(sysfs=sysfs.name):
                 self.assertEqual(self.defaults(sysfs), (1, 'file'))
-        for env, expected in (({'LLAMA_SOCKETS': '1'}, (1, 'file')), ({'LLAMA_BACKEND': 'omp'}, (1, 'file')),
+        for env, expected in (({'LLAMA_SOCKETS': '1'}, (1, 'file')),
                               ({'LLAMA_PLACEMENT': 'ddr'}, (1, 'ddr')), ({'LLAMA_PLACEMENT': 'file'}, (1, 'file')),
                               ({'LLAMA_TOPOLOGY': 'virtual:2x2'}, (1, 'file'))):
             with self.subTest(env=env):

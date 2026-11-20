@@ -15,8 +15,10 @@
 # STAGE=check builds, tests and validates only; STAGE=bench (default) adds the
 # benchmark matrix. REPEATS defaults to three for the headline configurations.
 set -euo pipefail
-# Per-token prefill on OpenMP, as measured before batched prefill and worker teams became the defaults.
-export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
+# Per-token prefill, as measured before batched prefill became the default. The K campaign ran the tree under test on
+# OpenMP; that backend is gone (F2), so SIMD_ROOT now runs on worker teams of the same thread counts. BASE_ROOT is an
+# older tree with its own OpenMP build, and keeps it.
+export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1}
 : "${SLURM_JOB_ID:?submit through Slurm}"
 : "${SIMD_ROOT:?tree under test required}"
 : "${BASE_ROOT:?comparison tree required}"
@@ -69,15 +71,15 @@ assert 'Max 9480' in Path('/proc/cpuinfo').read_text(), 'unexpected CPU model'
 print(json.dumps(dict(mode='flat', ddr_nodes=[0, 1], hbm_nodes=[2, 3], nodes=nodes), indent=2))
 PY
 
+openmp=(OPENMP=1)
 for tree in "$BASE_ROOT" "$SIMD_ROOT"; do
-  make -C "$tree" CC=gcc OPENMP=1 all build/release/probe-fp32 build/release/probe-int8 > "$OUT/build-$(basename "$tree").log"
+  [[ $tree == "$BASE_ROOT" ]] || openmp=()
+  make -C "$tree" CC=gcc ${openmp[@]+"${openmp[@]}"} all build/release/probe-fp32 build/release/probe-int8 > "$OUT/build-$(basename "$tree").log"
   cp "$tree/build/release/config" "$OUT/build-config-$(basename "$tree").txt"
 done
-(cd "$SIMD_ROOT" && OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) > "$OUT/test.log" 2>&1
-for threads in 1 56 112; do
-  OMP_NUM_THREADS=$threads "$SIMD_ROOT/build/release/test-kernels" > "$OUT/test-kernels-t$threads.txt"
-done
-grep -q 'avx512 ok' "$OUT/test-kernels-t56.txt" || { echo 'AVX-512 kernels were not exercised' >&2; exit 1; }
+(cd "$SIMD_ROOT" && numactl --cpunodebind=0 --membind=0 make CC=gcc test) > "$OUT/test.log" 2>&1
+LLAMA_TEST_TEAMS=1,56,112 "$SIMD_ROOT/build/release/test-kernels" > "$OUT/test-kernels-teams.txt"
+grep -q 'avx512 teams:56 ok' "$OUT/test-kernels-teams.txt" || { echo 'AVX-512 kernels were not exercised' >&2; exit 1; }
 
 # Uncore CAS counters (64-byte lines) show which tier served the reads.
 EVENTS='uncore_imc/event=0x05,umask=0xcf,name=ddr_cas_rd/,uncore_type_14/event=0x05,umask=0xcf,name=hbm_cas_rd/,unc_upi_rxl_flits.all_data'
@@ -94,7 +96,7 @@ validate() { # name artifacts hf precision label [env...]
   shift 5
   local extra=()
   [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
-  (cd "$SIMD_ROOT" && env "$@" OMP_PROC_BIND=false OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 \
+  (cd "$SIMD_ROOT" && env "$@" numactl --cpunodebind=0 --membind=0 \
     "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
     --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
     --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
@@ -132,7 +134,7 @@ run() { # label tree engine checkpoint tokenizer cpunodes memnodes threads repea
   shift 10
   for ((r = 1; r <= repeats; r++)); do
     local prefix="$OUT/$label-$r"
-    env "$@" OMP_NUM_THREADS="$threads" numactl --cpunodebind="$cpus" --membind="$mems" \
+    env "$@" OMP_NUM_THREADS="$threads" LLAMA_THREADS="$threads" numactl --cpunodebind="$cpus" --membind="$mems" \
       "$tree/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length 2048 --benchmark \
       --chat-template --prompt-file "$OUT/short.txt" -t 0 --seed 42 --generation-length 128 --no-text \
       --log-level warn --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
@@ -172,7 +174,6 @@ for entry in $MODELS; do
       run "$tag-simd-w8a32-hbm-t56" "$SIMD_ROOT" "$engine" "$hbm" "$tokenizer" 0 2 56 "$REPEATS" 1 \
         LLAMA_Q8_ACTIVATIONS=fp32
     fi
-    run "$tag-simd-hbm-t56-active" "$SIMD_ROOT" "$engine" "$hbm" "$tokenizer" 0 2 56 1 0 OMP_WAIT_POLICY=active
     rm -f -- "$hbm" "$ddr" "$both"
   done
 done

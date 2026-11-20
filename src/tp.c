@@ -95,19 +95,15 @@ int tp_sockets_requested(void) {
   static int sockets;
   if (sockets)
     return sockets;
-  const char *value = getenv("LLAMA_SOCKETS"), *backend = getenv("LLAMA_BACKEND"), *topology = getenv("LLAMA_TOPOLOGY"),
-             *placement = getenv("LLAMA_PLACEMENT");
-  int omp = knob_set("LLAMA_BACKEND") && !strcmp(backend, "omp");
+  const char *value = getenv("LLAMA_SOCKETS"), *topology = getenv("LLAMA_TOPOLOGY"), *placement = getenv("LLAMA_PLACEMENT");
   if (knob_set("LLAMA_SOCKETS")) {
     if (strcmp(value, "1") && strcmp(value, "2"))
       fail("LLAMA_SOCKETS must be 1 or 2");
-    if (!strcmp(value, "2") && omp)
-      fail("LLAMA_SOCKETS=2 requires LLAMA_BACKEND=teams");
     return sockets = value[0] - '0';
   }
   /* D2 §7: unset, both sockets of a node whose sockets each have an allowed HBM node, unless the other knobs ask for a
-   * one-socket configuration (OpenMP, a given topology, file or DDR placement). */
-  int auto_two = !omp && !(knob_set("LLAMA_TOPOLOGY") && strcmp(topology, "auto")) &&
+   * one-socket configuration (a given topology, file or DDR placement). */
+  int auto_two = !(knob_set("LLAMA_TOPOLOGY") && strcmp(topology, "auto")) &&
                  !(knob_set("LLAMA_PLACEMENT") && strcmp(placement, "hbm")) && tp_hbm_pair();
   if (auto_two)
     LOG(LOG_INFO, "LLAMA_SOCKETS unset: both sockets have an HBM node, so the model runs on both (LLAMA_SOCKETS=1 keeps "

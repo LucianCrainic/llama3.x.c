@@ -21,9 +21,8 @@ typedef struct Tp Tp;
  * stay: decode reads them. */
 typedef enum { TP_PACK_NONE, TP_PACK_BF16, TP_PACK_INT8 } TpPack;
 
-/* LLAMA_SOCKETS validated (2 with LLAMA_BACKEND=omp is an error). Unset, it is 2 on a discovered topology whose two
- * sockets each have an allowed HBM node, unless LLAMA_BACKEND=omp, LLAMA_TOPOLOGY or LLAMA_PLACEMENT=file|ddr is set;
- * else 1. Resolved once per process, at the first call (kernels_backend_init, before any worker is pinned). */
+/* LLAMA_SOCKETS validated (1 or 2). Unset, it is 2 on a discovered topology whose two sockets each have an allowed HBM
+ * node, unless LLAMA_TOPOLOGY or LLAMA_PLACEMENT=file|ddr is set; else 1. Resolved once per process, at the first call (kernels_backend_init, before any worker is pinned). */
 int tp_sockets_requested(void);
 /* Both sockets of the discovered or explicit topology have an HBM node in this job's allowed memory set. */
 int tp_hbm_pair(void);

@@ -105,7 +105,7 @@ size_t k_gemm_bf16_panel_bytes(int m, int k);
 void k_gemm_bf16(const float *a, int lda, int m, int k, const GemmBf16Segment *segments, int count,
                  AlignedBuffer *panel);
 
-/* Packs many matrices with the active worker team (or OpenMP, or serially). */
+/* Packs many matrices with the active worker team (or serially without one). */
 typedef struct {
   uint16_t *dst;
   const float *w;
@@ -145,7 +145,7 @@ int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float 
                            const GemmQ8Segment *segments, int count);
 int k_gemm_q8_amx_dots_test(int32_t *dots, const int8_t *xq, int m, int k, int gs, const int8_t *packed, int n);
 
-/* Packs many int8 matrices with the active worker team (or OpenMP, or serially). */
+/* Packs many int8 matrices with the active worker team (or serially without one). */
 typedef struct {
   int8_t *dst;
   const int8_t *w;

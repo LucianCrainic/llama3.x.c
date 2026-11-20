@@ -1,7 +1,7 @@
 /* Compute kernels: runtime ISA dispatch, scalar references and AVX-512 paths.
- * Scalar paths reproduce the original per-engine loops exactly. OpenMP regions
- * live only in plain functions; ISA-specific work runs in target-attributed
- * helpers called once per row block, so no outlined region needs AVX-512. */
+ * Scalar paths reproduce the original per-engine loops exactly. Team jobs are
+ * plain functions; ISA-specific work runs in target-attributed helpers called
+ * once per row block, so the dispatch code never needs AVX-512 itself. */
 #include "gemm.h"
 #include "kernels.h"
 #include "numa.h"
@@ -14,9 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #if defined(KERNELS_EMULATE_AVX512)
 /* Test builds (make test-kernels-emul): the AVX-512 kernels of this file run on a scalar model of the intrinsics, so their
@@ -44,7 +41,7 @@ static int attention_row_block = 4;
  * (longest; E2 bench: natural was faster at 2048 and 8192 tokens). Neither changes how a
  * row is computed once its block is fixed; the block size sets the chunk plan, the order only the schedule. */
 static int attention_tiled_queries = 16, attention_tiled_longest_first = 0;
-/* With a team set, kernels run on it instead of opening OpenMP regions. */
+/* With a team set, kernels run on it; without one (unit tests) they run serially on the calling thread. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
  * process-wide default, so two coordinators can run kernels on two teams at the same time. */
@@ -224,12 +221,7 @@ void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const
     team_run(current_team, segments_team, &run);
     return;
   }
-#ifdef _OPENMP
-#pragma omp parallel
-  run_segments(&run, omp_get_thread_num(), omp_get_num_threads());
-#else
   run_segments(&run, 0, 1);
-#endif
 }
 
 /* Each thread receives one contiguous, balanced row range, so weight rows are
@@ -239,17 +231,7 @@ static void parallel_rows(int rows, RowFn fn, const void *job) {
     team_parallel_rows(current_team, rows, fn, job);
     return;
   }
-#ifdef _OPENMP
-#pragma omp parallel
-  {
-    int t = omp_get_thread_num(), nt = omp_get_num_threads();
-    int r0 = (int)((long long)rows * t / nt), r1 = (int)((long long)rows * (t + 1) / nt);
-    if (r1 > r0)
-      fn(job, r0, r1);
-  }
-#else
   fn(job, 0, rows);
-#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -1529,11 +1511,7 @@ void k_quantize(int8_t *q, float *s, const float *x, int n, int gs) {
 static int max_threads(void) {
   if (current_team)
     return team_size(current_team);
-#ifdef _OPENMP
-  return omp_get_max_threads();
-#else
   return 1;
-#endif
 }
 
 /* Enough chunks to occupy every thread, each of 32..256 positions where the
@@ -1584,7 +1562,7 @@ size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len)
 
 void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
                            float *memory) {
-  /* The team (or OpenMP thread count) must be set before this: it sizes the split-K workspace. */
+  /* The team must be set before this: it sizes the split-K workspace. */
   work->workers = max_threads();
   work->max_chunks = attention_max_chunks(n_kv_heads, seq_len, work->workers);
   work->n_heads = n_heads;
@@ -1673,12 +1651,7 @@ static void attention_scalar(float *out, const float *q, const float *key_cache,
     team_parallel_rows(current_team, n_heads, attention_scalar_rows, &job);
     return;
   }
-  // multihead attention. iterate over all heads
-  int h;
-#ifdef _OPENMP
-#pragma omp parallel for private(h)
-#endif
-  for (h = 0; h < n_heads; h++)
+  for (int h = 0; h < n_heads; h++)
     attention_scalar_head(&job, h);
 }
 
@@ -1715,15 +1688,6 @@ static void *attention_task_ctx;
 void k_attention_set_task_hook(AttentionTaskHook hook, void *ctx) {
   attention_task_ctx = ctx;
   atomic_store_explicit(&attention_task_hook, hook, memory_order_release);
-}
-
-/* worker < 0: the OpenMP thread number. */
-static int attention_worker_id(int worker) {
-#ifdef _OPENMP
-  return worker < 0 ? omp_get_thread_num() : worker;
-#else
-  return worker < 0 ? 0 : worker;
-#endif
 }
 
 #if HAVE_AVX512
@@ -1768,7 +1732,7 @@ static void attention_run(const SplitKJob *j, int task, int worker) {
   }
   int c = task % j->chunks, t0 = (int)((long long)j->positions * c / j->chunks),
       t1 = (int)((long long)j->positions * (c + 1) / j->chunks);
-  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .task = task, .rows = 1, .span = t1 - t0,
+  AttentionTaskInfo info = {.worker = worker, .task = task, .rows = 1, .span = t1 - t0,
                             .positions = t1 - t0};
   info.begin = monotonic_seconds();
   attention_task(j, task);
@@ -1821,21 +1785,10 @@ static void attention_decode_splitk(float *out, const float *q, const float *key
       team_run(current_team, attention_team, &job);
       return;
     }
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-    {
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic, 1)
-#endif
-      for (int task = 0; task < job.tasks; task++)
-        attention_run(&job, task, -1);
-#ifdef _OPENMP
-#pragma omp for
-#endif
-      for (int h = 0; h < n_heads; h++)
-        attention_merge(&job, h);
-    }
+    for (int task = 0; task < job.tasks; task++) /* no team (unit tests): serial */
+      attention_run(&job, task, 0);
+    for (int h = 0; h < n_heads; h++)
+      attention_merge(&job, h);
     return;
   }
 #endif
@@ -1995,7 +1948,7 @@ static void batch_run(const BatchJob *j, int task, int worker) {
     batch_task(j, task);
     return;
   }
-  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .wave = j->row0, .task = task};
+  AttentionTaskInfo info = {.worker = worker, .wave = j->row0, .task = task};
   batch_extent(j, task, &info);
   info.begin = monotonic_seconds();
   batch_task(j, task);
@@ -2048,22 +2001,11 @@ static void attention_batch_driver(float *out, const float *q, const float *key_
     job.team = current_team;
     if (current_team) {
       team_run(current_team, batch_team, &job);
-    } else {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-      {
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic, 1)
-#endif
-        for (int task = 0; task < job.tasks; task++)
-          batch_run(&job, task, -1);
-#ifdef _OPENMP
-#pragma omp for
-#endif
-        for (int item = 0; item < job.rows * n_heads; item++)
-          batch_merge(&job, item);
-      }
+    } else { /* no team (unit tests): serial */
+      for (int task = 0; task < job.tasks; task++)
+        batch_run(&job, task, 0);
+      for (int item = 0; item < job.rows * n_heads; item++)
+        batch_merge(&job, item);
     }
     row0 += rows;
   }
@@ -2162,7 +2104,7 @@ static void tiled_run(const TiledJob *j, int index, int worker) {
     tiled_task(j, t);
     return;
   }
-  AttentionTaskInfo info = {.worker = attention_worker_id(worker), .wave = j->row0, .task = index};
+  AttentionTaskInfo info = {.worker = worker, .wave = j->row0, .task = index};
   int first, last, t0, t1;
   tiled_extent(j, t, &first, &last, &t0, &t1);
   for (int row = first; row < last; row++) {
@@ -2267,22 +2209,11 @@ static void attention_tiled_driver(float *out, const float *q, const float *key_
     job.team = current_team;
     if (current_team) {
       team_run(current_team, tiled_team, &job);
-    } else {
-#ifdef _OPENMP
-#pragma omp parallel
-#endif
-      {
-#ifdef _OPENMP
-#pragma omp for schedule(dynamic, 1)
-#endif
-        for (int task = 0; task < job.tasks; task++)
-          tiled_run(&job, task, -1);
-#ifdef _OPENMP
-#pragma omp for
-#endif
-        for (int item = 0; item < job.rows * n_heads; item++)
-          tiled_merge(&job, item);
-      }
+    } else { /* no team (unit tests): serial */
+      for (int task = 0; task < job.tasks; task++)
+        tiled_run(&job, task, 0);
+      for (int item = 0; item < job.rows * n_heads; item++)
+        tiled_merge(&job, item);
     }
     free(order);
     row0 += rows;
@@ -2442,30 +2373,21 @@ void k_attention_batch(float *out, const float *q, const float *key_cache, const
 // ----------------------------------------------------------------------------
 // Execution backend
 
-static int backend_started, backend_used;
+static int backend_started;
 
 const char *kernels_backend_name(void) {
-  return backend_used ? "teams" : "omp";
+  return "teams";
 }
 
 void kernels_backend_init(void) {
-  int sockets = tp_sockets_requested(); /* LLAMA_SOCKETS=2 with LLAMA_BACKEND=omp fails here */
+  int sockets = tp_sockets_requested();
   /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
    * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
   const Topology *topology_result;
   char topology_error[512];
   numa_topology_try(&topology_result, topology_error, sizeof(topology_error));
-  const char *backend = getenv("LLAMA_BACKEND");
-  if (backend && *backend && strcmp(backend, "omp") && strcmp(backend, "teams"))
-    fail("LLAMA_BACKEND must be omp or teams");
-  /* Unset: teams (F2: faster than OpenMP, and the only backend that runs in parallel in a build without OpenMP). */
-  if (backend && *backend && !strcmp(backend, "omp"))
-    return;
   if (backend_started)
     return;
-#ifdef _OPENMP
-  LOG(LOG_INFO, "LLAMA_BACKEND=teams: OpenMP regions are unused");
-#endif
   int threads = 0, available;
   const char *requested = getenv("LLAMA_THREADS");
   if (requested && *requested) {
@@ -2491,7 +2413,7 @@ void kernels_backend_init(void) {
     }
     pool_start(&config);
     kernels_set_team(pool_team(0));
-    backend_started = backend_used = 1;
+    backend_started = 1;
     LOG(LOG_DEBUG, "worker teams: %d + %d threads", config.threads[0], config.threads[1]);
     return;
   }
@@ -2509,12 +2431,6 @@ void kernels_backend_init(void) {
   }
   if (available < 1)
     available = 1;
-  const char *bind = getenv("OMP_PROC_BIND");
-  if (!(topology && *topology) && available == 1 && bind && *bind && strcmp(bind, "false") && strcmp(bind, "FALSE"))
-    LOG(LOG_WARN,
-        "only one CPU is allowed and OMP_PROC_BIND=%s is set: the OpenMP runtime pins the launching thread to one "
-        "core at load. Unset it (or set OMP_PROC_BIND=false) for LLAMA_BACKEND=teams",
-        bind);
   if (!threads)
     threads = available;
   if (cpus && threads > available) {
@@ -2524,7 +2440,7 @@ void kernels_backend_init(void) {
   PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {cpus, NULL}};
   pool_start(&config);
   kernels_set_team(pool_team(0));
-  backend_started = backend_used = 1;
+  backend_started = 1;
   LOG(LOG_DEBUG, "worker team: %d threads, %s", threads, cpus ? "pinned" : "unpinned");
 }
 

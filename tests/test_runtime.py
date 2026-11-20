@@ -53,8 +53,8 @@ class RuntimeTests(unittest.TestCase):
         return result, data
 
     def test_baseline_numerical_regression(self):
-        # The OpenMP/serial path, then worker teams with odd counts that stress range splitting.
-        backends = [{'LLAMA_BACKEND': 'omp'}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
+        # The default team (the allowed CPUs), then teams with odd counts that stress range splitting.
+        backends = [{}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
         for env in backends:
             for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
                 result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True,
@@ -79,10 +79,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(data['runtime'], {'backend': 'teams', 'sockets': 1, 'placement': 'file', 'thp': 'off',
             'precision_mode': 'fp32', 'prefill_batch': 1 if scalar else 32, 'prefill_logits': 'last',
             'kernels_prefill': None if scalar else 'avx512', 'attn_row_block': 4})
-        self.assertEqual(len(data['teams']), 1)  # teams by default: one team on the allowed CPUs
-        _, omp = self.execute('run', env={'LLAMA_BACKEND': 'omp'})
-        self.assertEqual(omp['runtime']['backend'], 'omp')
-        self.assertIsNone(omp['teams'])
+        self.assertEqual(len(data['teams']), 1)  # one team on the allowed CPUs
+        self.assertNotIn('openmp', data['build'])
         self.assertEqual(data['regions'], [])
         self.assertIsNone(data['phase_seconds'])
         self.assertEqual(set(data['kv']), {'reserved_bytes', 'resident_bytes', 'active_bytes', 'node', 'verified', 'full',
@@ -102,14 +100,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(data['topology_error'])
         self.assertEqual(topology['sockets'], [{'package': -1, 'cpus': None, 'threads': 3, 'ddr_node': -1,
             'hbm_node': -1, 'ddr_allowed': True, 'hbm_allowed': True, 'classification': 'virtual'}])
-        # A topology that cannot be discovered is reported, not fatal, where nothing needs it: OpenMP, and the default
-        # teams without a LLAMA_TOPOLOGY map (they take the allowed CPUs). A team placed by a map does need it.
-        for env in ({'LLAMA_BACKEND': 'omp', 'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1'}, {}):
-            with self.subTest(env=env):
-                _, data = self.execute('run', env={**env, 'LLAMA_SYSFS_ROOT': '/nonexistent'})
-                self.assertIsNone(data['topology'])
-                self.assertIn('cannot read', data['topology_error'])
-                self.assertEqual(data['runtime']['sockets'], 1)
+        # A topology that cannot be discovered is reported, not fatal, where nothing needs it: a team without a
+        # LLAMA_TOPOLOGY map takes the allowed CPUs. A team placed by a map does need it, and the run fails.
+        _, data = self.execute('run', env={'LLAMA_SYSFS_ROOT': '/nonexistent'})
+        self.assertIsNone(data['topology'])
+        self.assertIn('cannot read', data['topology_error'])
+        self.assertEqual(data['runtime']['sockets'], 1)
+        self.execute('run', success=False, env={'LLAMA_SYSFS_ROOT': '/nonexistent',
+                                                'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1'})
 
     def test_tokens_out_records_prompt_and_generated_ids(self):
         """LLAMA_TOKENS_OUT: prompt = every id forwarded before the first sample (warm-up ids first), generated = every
@@ -137,7 +135,8 @@ class RuntimeTests(unittest.TestCase):
         self.execute('run', '-m', 'chat', success=False, env={'LLAMA_TOKENS_OUT': str(out)})
 
     def test_backend_environment_is_validated(self):
-        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),
+        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND=bogus is no longer supported'),
+                          ({'LLAMA_BACKEND': 'omp'}, 'the OpenMP backend was removed'),
                           ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '0'}, 'LLAMA_THREADS must be'),
                           ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': 'x'}, 'LLAMA_THREADS must be')]:
             with self.subTest(env=env):

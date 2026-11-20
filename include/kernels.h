@@ -17,10 +17,10 @@ void kernels_init(void);
 int kernels_select(KernelIsa isa); /* 0 when unsupported; used by tests */
 const char *kernels_name(void);    /* NULL before kernels_init() */
 
-/* Execution backend. With LLAMA_BACKEND=teams (the default) the engine starts one persistent worker team per socket
- * (LLAMA_THREADS threads, else the allowed CPUs; LLAMA_TOPOLOGY selects its CPUs) and every kernel runs on it;
- * LLAMA_BACKEND=omp opens OpenMP regions instead (serial in a build without OpenMP). kernels_set_team routes kernels to a team (NULL = OpenMP); set it before
- * k_attention_init, which sizes the split-K workspace from the worker count. */
+/* Execution backend: the engine starts one persistent worker team per socket (LLAMA_THREADS threads, else the allowed
+ * CPUs; LLAMA_TOPOLOGY selects its CPUs) and every kernel runs on it (F2; the OpenMP backend was removed).
+ * kernels_set_team routes kernels to a team (NULL = run serially on the calling thread, as the unit tests do); set it
+ * before k_attention_init, which sizes the split-K workspace from the worker count. */
 struct Team;
 void kernels_set_team(struct Team *team);
 /* Binds the calling thread's kernels to a team, overriding kernels_set_team for this thread only (NULL = back to the
@@ -28,9 +28,9 @@ void kernels_set_team(struct Team *team);
 void kernels_set_thread_team(struct Team *team);
 void kernels_backend_init(void);
 void kernels_backend_free(void);
-const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after the pool stops */
+const char *kernels_backend_name(void); /* "teams", for the report */
 
-/* Internal to gemm.c: the active instruction set, and the team-or-OpenMP choice. fn(job, segment, first, last) runs
+/* Internal to gemm.c: the active instruction set, and the team-or-serial choice. fn(job, segment, first, last) runs
  * for each segment's balanced share [first, last) of its chunks[segment] chunks; a worker's share never straddles
  * two segments. Returns after every share has run. */
 int kernels_avx512_active(void);
@@ -164,7 +164,7 @@ void k_attention_set_tiled(int queries, int longest_first);
  * block]) task reports who ran it, what it read and when (monotonic_seconds). The hook runs on the worker threads; set and
  * clear it between kernel calls. With no hook (the default) the kernels are unchanged. */
 typedef struct {
-  int worker;        /* team member, or OpenMP thread number */
+  int worker;        /* team member (0 when serial) */
   int wave;          /* first row of the wave inside the microbatch (0 for decode) */
   int task;          /* index in the wave */
   int rows;          /* rows of the block that take part */

@@ -54,20 +54,16 @@ job_begin() {
   }
   trap finish EXIT
   exec > >(tee "$OUT/job.stdout") 2> >(tee "$OUT/job.stderr" >&2)
-  # OMP_PROC_BIND is not exported job-wide: with it set, the OpenMP runtime pins the launching thread of every
-  # process that links it to one core at load, and teams workers would inherit that single-CPU mask. run_engine sets
-  # it for omp runs only.
-  export OMP_DYNAMIC=FALSE
   # The engine's batched attention defaults to tiled since E4; campaigns keep split, the kernel every earlier campaign
   # measured, whose batched prefill is bitwise equal to per-token (the A, C, D and E0 gates rely on it). A phase that
   # wants tiled names it per run (E2, E4), which overrides this; a submitter may export LLAMA_ATTN to change it job-wide.
   # `make test` runs without it, so the tests see the engine's own default.
   export LLAMA_ATTN=${LLAMA_ATTN:-split}
   # The same for the defaults that came after these campaigns (two sockets on an HBM node, batched prefill, AMX-INT8 for
-  # Q8, worker teams): campaigns keep the defaults they measured (one socket, per-token prefill, AVX-512, OpenMP), and
-  # every run that wants another names it. `make test` runs without these too.
+  # Q8): campaigns keep the defaults they measured (one socket, per-token prefill, AVX-512), and every run that wants
+  # another names it. `make test` runs without these too. The OpenMP backend the early campaigns used is gone (F2):
+  # every run is on the worker teams, so a rerun of an OpenMP configuration measures teams.
   export LLAMA_SOCKETS=${LLAMA_SOCKETS:-1} LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_KERNELS=${LLAMA_KERNELS:-avx512}
-  export LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -102,11 +98,11 @@ print(json.dumps(dict(mode='flat', ddr_nodes=[0, 1], hbm_nodes=[2, 3], nodes=nod
 PY
 }
 
-# build_tree OPENMP MODE [targets...]; the log and the build configuration go to OUT.
+# build_tree MODE [targets...]; the log and the build configuration go to OUT.
 build_tree() {
-  local openmp=$1 mode=$2
-  shift 2
-  make -C "$ROOT" CC=gcc OPENMP="$openmp" MODE="$mode" all "$@" > "$OUT/build-$(basename "$ROOT").log"
+  local mode=$1
+  shift
+  make -C "$ROOT" CC=gcc MODE="$mode" all "$@" > "$OUT/build-$(basename "$ROOT").log"
   cp "$ROOT/build/$mode/config" "$OUT/build-config-$(basename "$ROOT").txt"
 }
 
@@ -176,7 +172,7 @@ run_engine() {
   fi
   for ((r = first; r <= last; r++)); do
     local prefix="$OUT/$label-$r"
-    env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
+    env "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
       --chat-template --prompt-file "$prompt" -t 0 --seed 42 -n 0 --generation-length "${GENERATION:-128}" --no-text \
       ${WARM:+--warm-context "$WARM"} --log-level "${LOG_LEVEL:-warn}" --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
@@ -203,7 +199,7 @@ validate_gate() {
   fi
   local extra=()
   [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
-  (cd "$ROOT" && env "$@" OMP_PROC_BIND=false OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 \
+  (cd "$ROOT" && env "$@" numactl --cpunodebind=0 --membind=0 \
     "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
     --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
     --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
@@ -355,9 +351,8 @@ a_bitwise() {
     --tokens-file "$tokens" "${args[@]}" "${CMP_FLAGS[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }
 
-# F2, model-free part: kernels on teams at full-socket size on the hardware ISA, the pinning read-back, and the
-# per-barrier cost. The real-model gate and the omp-versus-teams decode comparison need MODELS and a Hugging Face
-# Python environment and are not part of this phase's model-free check.
+# F2: kernels on teams at full-socket size on the hardware ISA, the pinning read-back, and the per-barrier cost. (The
+# omp-versus-teams model comparison that followed with MODELS was removed with the OpenMP backend.)
 phase_F2() {
   local dir="$OUT/F2" bin="$ROOT/build/release"
   expect kernels-teams ok "$dir" -- numactl --cpunodebind=0 env LLAMA_TEST_TEAMS=1,56 "$bin/test-kernels"
@@ -379,7 +374,6 @@ PY
   fi
   expect barrier-cost ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" bench-barrier 200000 56
   expect barrier-stress ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" barrier 1000000 56
-  [[ -z $MODELS ]] || phase_F2_models
 }
 
 # stage_model NAME PRECISION ARTIFACTS: copies a checkpoint into tmpfs ($shm, created by the caller in the parent
@@ -419,45 +413,10 @@ need_shm() {
   fi
 }
 
-# backend_env omp|teams THREADS: the environment words that select a backend (same shape on both sides of a comparison).
+# backend_env teams THREADS: the environment words of a team of THREADS workers (the OpenMP backend was removed, F2).
 backend_env() {
-  if [[ $1 == teams ]]; then
-    printf '%s\n' LLAMA_BACKEND=teams "LLAMA_THREADS=$2" OMP_PROC_BIND=false
-  else
-    printf '%s\n' LLAMA_BACKEND=omp "OMP_NUM_THREADS=$2" OMP_PROC_BIND=close OMP_PLACES=cores
-  fi
-}
-
-# F2 with models, one socket (56 threads, weights staged on its HBM): the omp and teams backends agree at every
-# position of an 86-token prompt (C against C, same ISA), and decode speed of teams against omp over REPEATS runs.
-# The Hugging Face gate of a backend that agrees with the validated one is not repeated here (HF_GATE=0 records it).
-phase_F2_models() {
-  local dir="$OUT/F2" bin="$ROOT/build/release" entry name artifacts hf precision engine staged tokenizer label
-  need_shm
-  for entry in $MODELS; do
-    IFS=: read -r name artifacts hf <<< "$entry"
-    tokenizer="$artifacts/tokenizer-v2.bin"
-    make_prompt "$bin/probe-fp32" "$tokenizer" 128256 none
-    "$bin/probe-fp32" tokenize "$tokenizer" 128256 "@$OUT/short.txt" > "$dir/$name-tokens.txt"
-    for precision in $PRECISIONS; do
-      engine=run
-      [[ $precision == fp32 ]] || engine=runq
-      staged=$(stage_model "$name" "$precision" "$artifacts")
-      expect "compare-$name-$precision-omp-vs-teams" ok "$dir" -- numactl --cpunodebind=0 --membind=2 "$PYTHON" \
-        "$ROOT/tools/compare_engines.py" --probe "$bin/probe-$precision" --checkpoint "$staged" \
-        --tokens-file "$dir/$name-tokens.txt" --env-a LLAMA_BACKEND=omp --env-a OMP_NUM_THREADS=56 \
-        --env-b LLAMA_BACKEND=teams --env-b LLAMA_THREADS=56 --env-b OMP_PROC_BIND=false --output "$dir/compare-$name-$precision.json"
-      export CPU_BIND=0 MEM_BIND=2
-      label=$(run_label "$name" "$precision" omp file 1 56)
-      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=omp OMP_NUM_THREADS=56
-      label=$(run_label "$name" "$precision" teams file 1 56)
-      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=teams \
-        LLAMA_THREADS=56 OMP_PROC_BIND=false
-      unset CPU_BIND MEM_BIND
-      unstage_model_on 2 "$name" "$precision" # HBM node 2 holds 64 GiB: one staged checkpoint at a time
-    done
-  done
-  "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
+  [[ $1 == teams ]] || die "backend_env: only the teams backend exists (got '$1')"
+  printf '%s\n' LLAMA_BACKEND=teams "LLAMA_THREADS=$2"
 }
 
 # check_stage: everything every skeleton does before a phase matrix: environment, Flat-mode check, build, tests.
@@ -466,14 +425,14 @@ phase_F2_models() {
 check_stage() {
   record_environment
   check_flat_mode
-  build_tree 1 release build/release/probe-fp32 build/release/probe-int8
+  build_tree release build/release/probe-fp32 build/release/probe-int8
   local status=0
   if [[ ${SKIP_TEST:-0} == 1 ]]; then
     echo 'SKIP_TEST=1: make test was not run in this job' | tee "$OUT/test-skipped.txt"
     # the phases that run a unit test binary (C5, C6, ...) still need the binaries
-    (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
+    (cd "$ROOT" && make CC=gcc test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS -u LLAMA_BACKEND OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
+    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS -u LLAMA_BACKEND numactl --cpunodebind=0 --membind=0 make CC=gcc test) \
       > "$OUT/test.log" 2>&1 ||
       status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi

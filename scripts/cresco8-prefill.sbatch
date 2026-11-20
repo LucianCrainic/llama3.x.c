@@ -45,7 +45,7 @@ c_run() {
   [[ $precision == fp32 ]] || engine=runq
   label=$(run_label "$name" "$precision" teams file 1 56 "${label_words[@]}")
   CPU_BIND=0 MEM_BIND=2 REP=$rep run_engine "$label" "$engine" "$source" "$tokenizer" "$prompt" 1 "$PERF" \
-    LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "${env_words[@]}"
+    LLAMA_BACKEND=teams LLAMA_THREADS=56 "${env_words[@]}"
 }
 
 # ---- C1: batched forward API --------------------------------------------------------------------------------------
@@ -68,13 +68,11 @@ phase_C1() {
       # C2 GEMM, which sums in another order than the GEMV (its agreement is C2's budget gate), so FP32 pins it off here.
       gemm_env=()
       [[ $precision != fp32 ]] || gemm_env=(LLAMA_PREFILL_GEMM=off)
-      for backend in omp teams; do
-        read -r -a benv <<< "$(backend_env "$backend" 56 | tr '\n' ' ')"
-        for m in 7 32; do
-          CMP_FLAGS=(--bitwise --batch-b "$m")
-          a_bitwise "$dir" "$name" "$precision" "$staged" "$backend-m1-vs-m$m" "${benv[@]}" -- "${benv[@]}" \
-            ${gemm_env[@]+"${gemm_env[@]}"}
-        done
+      read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')" # C1 also ran these on OpenMP, now removed
+      for m in 7 32; do
+        CMP_FLAGS=(--bitwise --batch-b "$m")
+        a_bitwise "$dir" "$name" "$precision" "$staged" "teams-m1-vs-m$m" "${benv[@]}" -- "${benv[@]}" \
+          ${gemm_env[@]+"${gemm_env[@]}"}
       done
       if [[ $precision == int8 ]]; then
         read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
@@ -112,7 +110,7 @@ phase_C2() {
       record_result gemm-avx512-56 FAIL 'avx512 teams:56 was not exercised'
   fi
   # Weights bound to HBM node 2; the GEMV-per-row line is the per-token baseline at the same M.
-  expect gemm-bench ok "$dir" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false \
+  expect gemm-bench ok "$dir" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 \
     "$bin/gemm-bench" --node 2 --gemv
   if ! dry_run && [[ -s $dir/gemm-bench.out ]]; then
     cp "$dir/gemm-bench.out" "$dir/gemm-bench.jsonl"
@@ -264,7 +262,7 @@ c_launch() {
   c_rung "$rung" "$m"
   label=$(run_label "$name" "$RUNG_PREC" teams file 1 "$threads" "m=$m" "k=$rung" ${label_words[@]+"${label_words[@]}"})
   CPU_BIND=0 MEM_BIND=2 REP=$rep run_engine "$label" "$RUNG_ENGINE" "$staged" "$tokenizer" "$prompt" 1 "$PERF" \
-    LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false "${RUNG_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
+    LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" "${RUNG_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
 }
 
 # c_fixtures DIR: the synthetic checkpoints the engine-level AMX tests read (dim 128, group sizes 64 and 32).
@@ -309,7 +307,7 @@ phase_C4() {
   for threads in 1 56; do
     for kind in bf16 int8; do
       expect "amx-bench-$kind-t$threads" ok "$dir" -- numactl --cpunodebind=0 env LLAMA_KERNELS=amx LLAMA_BACKEND=teams \
-        LLAMA_THREADS=$threads OMP_PROC_BIND=false "$bin/amx-bench" --kind "$kind"
+        LLAMA_THREADS=$threads "$bin/amx-bench" --kind "$kind"
     done
   done
   dry_run || cat "$dir"/amx-bench-*.out > "$dir/amx-bench.jsonl" 2> /dev/null || true
@@ -360,7 +358,7 @@ phase_C5() {
         tee -a "$OUT/dry-run.txt"
     else
       (cd "$ROOT" && env LLAMA_KERNELS=amx LLAMA_PRECISION=bf16 LLAMA_PREFILL_BATCH=64 LLAMA_BACKEND=teams \
-        LLAMA_THREADS=56 OMP_PROC_BIND=false OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 "$PYTHON" \
+        LLAMA_THREADS=56 numactl --cpunodebind=0 --membind=0 "$PYTHON" \
         tools/validate.py --hf "$hf" --checkpoint "$artifacts/fp32-v3.bin" --tokenizer "$tokenizer" --precision fp32 \
         --threads 56 --batch 64 --record-only --max-abs 1.0 --rtol 0.05 --output "$dir/correctness-$name-bf16.json") \
         > "$dir/correctness-$name-bf16.stdout" 2> "$dir/correctness-$name-bf16.stderr" || status=$?
@@ -372,7 +370,7 @@ phase_C5() {
     staged=$(stage_model_on 2 "$name" fp32 "$artifacts")
     label=$(run_label "$name" bf16 teams hbm 1 56 m=64 p=86 k=amx_bf16 x=pack)
     CONTEXT=2048 GENERATION=4 CPU_BIND=0 run_engine "$label" run "$staged" "$tokenizer" "$OUT/short.txt" 1 "$PERF" \
-      LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_KERNELS=amx LLAMA_PRECISION=bf16 \
+      LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm LLAMA_KERNELS=amx LLAMA_PRECISION=bf16 \
       LLAMA_PREFILL_BATCH=64
     for ((rep = 1; rep <= REPEATS; rep++)); do
       for m in 32 64 128 256; do
@@ -456,7 +454,7 @@ phase_C6() {
         words=(LLAMA_KERNELS=avx512)
         [[ $variant == per-token ]] || words=(LLAMA_KERNELS=amx LLAMA_PREFILL_BATCH=64)
         status=0
-        (cd "$ROOT" && env "${words[@]}" LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false OMP_NUM_THREADS=56 \
+        (cd "$ROOT" && env "${words[@]}" LLAMA_BACKEND=teams LLAMA_THREADS=56 \
           numactl --cpunodebind=0 --membind=0 "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/int8-v3.bin" \
           --tokenizer "$tokenizer" --precision int8 --threads 56 --record-only --max-abs 1.0 --rtol 0.05 \
           $([[ $variant == per-token ]] || echo "--batch 64") --output "$dir/correctness-$name-q8-$variant.json") \
@@ -641,7 +639,7 @@ PY
 # and two socket numbers of a phase differ only in LLAMA_SOCKETS. D_THP follows A6 (default off).
 EXPLICIT='explicit:0/2/0,1/3/1'
 D_THP=${D_THP:-off}
-D_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm "LLAMA_THP=$D_THP")
+D_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm "LLAMA_THP=$D_THP")
 
 # d_launch NAME RUNG M SOCKETS REP PROMPT STAGED TOKENIZER [LABEL_WORDS...] [-- ENV_WORDS...]: one launch of a rung on one
 # or two sockets, REP selecting the repetition so a caller can interleave. A label word x=prof (or a tag that starts with
@@ -938,7 +936,7 @@ e0_bench() {
     if [[ $1 == -- ]]; then side=args; elif [[ $side == env ]]; then env_words+=("$1"); else args+=("$1"); fi
     shift
   done
-  expect "$name" ok "${E0_DIR:-$OUT/E0}" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false \
+  expect "$name" ok "${E0_DIR:-$OUT/E0}" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" \
     LLAMA_KERNELS=avx512 ${env_words[@]+"${env_words[@]}"} "$ROOT/build/release/attention-bench" --node 2 "${args[@]}"
 }
 
@@ -962,7 +960,7 @@ e0_counted() {
   fi
   [[ $E0_PERF == 1 ]] || return 0
   local dir=${E0_DIR:-$OUT/E0}
-  numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" OMP_PROC_BIND=false LLAMA_KERNELS=avx512 \
+  numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$threads" LLAMA_KERNELS=avx512 \
     ${E0_ATTN:+"LLAMA_ATTN=$E0_ATTN"} "$ROOT/build/release/attention-bench" --node 2 "$@" > "$dir/counters-$name.jsonl" \
     2> "$dir/counters-$name.err" &
   pid=$!

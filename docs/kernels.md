@@ -19,8 +19,12 @@ and the roofline behind each kernel are in [hbm-roofline.md](hbm-roofline.md).
 CPU without it fails rather than falling back silently. Reports record the active
 set as `build.kernels`. No compiler flag is required: AVX-512 functions use
 `target` attributes and are dispatched at runtime, so the default
-`make CC=gcc OPENMP=1` binary is portable. OpenMP regions live only in plain C
-drivers, which call one ISA-specific function per row block.
+`make CC=gcc` binary is portable. The parallel drivers are plain C and call one
+ISA-specific function per row block.
+
+The measurements below (K campaign) ran on the OpenMP backend, which was later
+replaced by the engine's worker teams and then removed
+([audit-2026-11.md](audit-2026-11.md) F2); the kernels themselves are unchanged.
 
 SIMD reductions change FP32 summation order. Agreement with the scalar
 reference is therefore within tolerance, not bitwise. The exceptions are RoPE
@@ -215,7 +219,7 @@ broken down in [Decode phase profile](#decode-phase-profile).
 ### Decode phase profile
 
 `LLAMA_PROFILE=1` times every forward-pass phase on the calling thread.
-Every phase is either serial or ends at an OpenMP barrier, so that thread's
+Every phase is either serial or ends at a team barrier, so that thread's
 wall time is the phase's time. Reports gain `profile_seconds` per stage, and
 "other" is forward time outside all phases.
 [tools/summarize_profile.py](../tools/summarize_profile.py) converts the

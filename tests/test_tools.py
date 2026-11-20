@@ -608,7 +608,7 @@ class CompareGenerationTests(unittest.TestCase):
         return result, (json.loads(result.stdout) if result.stdout else None)
 
     def test_identical_configurations_generate_identical_text(self):
-        result, data = self.compare('--env-a', 'LLAMA_BACKEND=omp', '--env-b', 'LLAMA_BACKEND=teams',
+        result, data = self.compare('--env-a', 'LLAMA_THREADS=1', '--env-b', 'LLAMA_BACKEND=teams',
                                     '--env-b', 'LLAMA_THREADS=3', '--probe', str(BUILD/'probe-fp32'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(data['identical'])
@@ -1479,7 +1479,7 @@ class E6Tests(unittest.TestCase):
         if BUILD is None or not (BUILD/name).exists():
             self.skipTest(f'{name} is not built')
         result = subprocess.run([str(BUILD/name), *args], capture_output=True, text=True, timeout=120,
-                                env={**os.environ, 'LLAMA_BACKEND': 'omp', **(env or {})})
+                                env={**os.environ, 'LLAMA_THREADS': '1', **(env or {})})
         self.assertEqual(result.returncode, 0, result.stderr[-1000:])
         return [json.loads(line) for line in result.stdout.splitlines()]
 

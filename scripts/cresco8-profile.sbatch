@@ -9,40 +9,21 @@
 # Per-phase decode profile (LLAMA_PROFILE=1) on one flat-mode socket with
 # weights on local HBM. Requires ROOT (source tree), OUT and MODELS, a
 # space-separated list of NAME:ARTIFACTS entries. Each configuration also runs
-# once unprofiled to bound the profiler's own cost, and an empty OpenMP region
-# loop measures the fork/join floor.
+# once unprofiled to bound the profiler's own cost, and test-workers measures
+# the team barrier floor.
 set -euo pipefail
-# Per-token prefill on OpenMP, as measured before batched prefill and worker teams became the defaults.
-export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
+# Per-token prefill, as measured before batched prefill became the default (the OpenMP backend this ran on is gone, F2).
+export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1}
 : "${ROOT:?}" "${OUT:?}" "${MODELS:?NAME:ARTIFACTS entries required}"
 REPEATS=${REPEATS:-2}
 mkdir -p "$OUT/unprofiled"
-export OMP_DYNAMIC=FALSE OMP_PROC_BIND=close OMP_PLACES=cores
 { date -u +%FT%TZ; hostname; cat "$ROOT/COMMIT" 2>/dev/null || git -C "$ROOT" rev-parse HEAD; } > "$OUT/environment.txt"
-(cd "$ROOT" && numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 build/release/run build/release/runq) \
+(cd "$ROOT" && numactl --cpunodebind=0 --membind=0 make CC=gcc build/release/run build/release/runq build/release/test-workers) \
   > "$OUT/build.log" 2>&1
 
-cat > "$OUT/fork-join.c" <<'EOF'
-#include <omp.h>
-#include <stdio.h>
-volatile int touched[256 * 16]; // one line per thread keeps the region from being elided
-int main(void) {
-  for (int pass = 0; pass < 2; pass++) {
-    double t0 = omp_get_wtime();
-    for (int i = 0; i < 100000; i++) {
-#pragma omp parallel
-      touched[omp_get_thread_num() * 16]++;
-    }
-    if (pass)
-      printf("threads=%d parallel-region=%.2f us\n", omp_get_max_threads(), (omp_get_wtime() - t0) * 10.0);
-  }
-  return 0;
-}
-EOF
-gcc -O2 -fopenmp "$OUT/fork-join.c" -o "$OUT/fork-join"
 for threads in 14 28 56; do
-  OMP_NUM_THREADS=$threads numactl --cpunodebind=0 --membind=0 "$OUT/fork-join"
-done > "$OUT/fork-join.txt"
+  numactl --cpunodebind=0 --membind=0 "$ROOT/build/release/test-workers" bench-barrier 100000 "$threads"
+done > "$OUT/barrier.txt"
 
 sentence='Explain how a CPU executes instructions and uses memory. '
 printf '%s%s%s%s%s' "$sentence" "$sentence" "$sentence" "$sentence" "$sentence" > "$OUT/short.txt"
@@ -52,7 +33,7 @@ run() { # label engine checkpoint tokenizer threads repeats [env...]
   local label=$1 engine=$2 checkpoint=$3 tokenizer=$4 threads=$5 repeats=$6
   shift 6
   for ((r = 1; r <= repeats; r++)); do
-    env "$@" OMP_NUM_THREADS="$threads" numactl --cpunodebind=0 --membind=2 "$ROOT/build/release/$engine" \
+    env "$@" LLAMA_THREADS="$threads" numactl --cpunodebind=0 --membind=2 "$ROOT/build/release/$engine" \
       "$checkpoint" -z "$tokenizer" --context-length 2048 --benchmark --chat-template --prompt-file "$OUT/short.txt" \
       -t 0 --seed 42 --generation-length 128 --no-text --log-level warn --json "$OUT/$label-$r.json" \
       > /dev/null 2> "$OUT/$label-$r.stderr"

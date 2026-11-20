@@ -31,8 +31,7 @@ exists for tests and measurements only and is never a deployment setting.
 | --- | --- | --- |
 | Scalar reference kernels (original llama2.c operation order) | Default where AVX-512 is absent | `tests/kernels.c` (double-precision references) |
 | AVX-512 GEMV / attention / norm kernels | Default on AVX-512 + VNNI CPUs | [kernels.md](kernels.md) |
-| OpenMP scheduling (`LLAMA_BACKEND=omp`) | Opt-in; serial in a build without `OPENMP=1` (the `make` default) | Kept as the reference backend; see section 8 |
-| Persistent worker teams (`LLAMA_BACKEND=teams`) | Default; used by every campaign since F2 | [F2](plans/00-foundations/F2-worker-teams.md): decode +4% to +11% against OpenMP |
+| Persistent worker teams | The only backend | [F2](plans/00-foundations/F2-worker-teams.md): decode +4% to +11% against OpenMP; one-socket A/B in [audit-2026-11.md](audit-2026-11.md) §6 |
 | Batched prefill (`LLAMA_PREFILL_BATCH=M`) | Default where the batched GEMM runs (AVX-512, AMX): section 2.1 | [batched-prefill.md](batched-prefill.md): 8B 2048-token TTFT 121 s to 10.5 s |
 | AMX-INT8 prefill for Q8_0 (`LLAMA_KERNELS=amx`, `runq`) | Default for W8A8 batched prefill where AMX can run | [numa-tp-prefill-results.md](numa-tp-prefill-results.md) §7: 3.4x AVX-512 Q8 |
 | AMX-BF16 prefill for FP32 (`LLAMA_PRECISION=bf16`, on AMX under `auto`) | Opt-in by user decision (BF16 never silent) | same, 3.6x the AVX-512 FP32 GEMM |
@@ -49,7 +48,8 @@ exists for tests and measurements only and is never a deployment setting.
 | AMX flash attention (E3) | Not implemented (postponed) | [E-followups](plans/E-followups/README.md) |
 
 Removed after measurement (setting their knobs is an error, see [audit-2026-11.md](audit-2026-11.md)): the packed4 FP32 decode
-layout, the unfused and two-barrier decode reductions, the counter team join, and the reduction trace.
+layout, the unfused and two-barrier decode reductions, the counter team join, the reduction trace, and the OpenMP backend
+(`LLAMA_BACKEND=omp`, `make OPENMP=1`).
 
 ### 2.1 How the defaults are resolved
 
@@ -58,14 +58,15 @@ set on 20 November 2026. Each rule applies only while its own knob is unset, and
 
 | Choice | Rule when unset |
 | --- | --- |
-| Sockets | 2 when the discovered topology has two sockets with allowed CPUs, each with an HBM node in the job's allowed memory (Flat mode on a Xeon Max), and none of `LLAMA_BACKEND=omp`, `LLAMA_TOPOLOGY`, `LLAMA_PLACEMENT=file\|ddr` is set; else 1. A job bound to one socket (`numactl --cpunodebind`, a one-socket allocation) therefore keeps one |
-| Backend | `teams` (F2: faster than OpenMP, and parallel in the default build, which has no OpenMP) |
+| Sockets | 2 when the discovered topology has two sockets with allowed CPUs, each with an HBM node in the job's allowed memory (Flat mode on a Xeon Max), and neither `LLAMA_TOPOLOGY` nor `LLAMA_PLACEMENT=file\|ddr` is set; else 1. A job bound to one socket (`numactl --cpunodebind`, a one-socket allocation) therefore keeps one |
 | Placement | `hbm` with two sockets on such a node (each socket's shards in its own HBM, verified), `file` otherwise |
 | Prefill batch | where the batched GEMM runs (AVX-512 or AMX, or `LLAMA_PREFILL_GEMM=on`): 128 rows for FP32 on one socket, 64 on two, 256 for W8A8 and AMX-BF16; 1 on the scalar kernels, with `LLAMA_PREFILL_GEMM=off`, and for W8A32 |
 | Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
 
-To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512
-LLAMA_BACKEND=omp` (and `LLAMA_ATTN=split` for runs before E4). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`).
+To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
+`LLAMA_ATTN=split` for runs before E4). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`). Runs made
+on OpenMP now run on worker teams of the same size: decode is 5-8% faster there and prefill within 2% (6.5% slower for 1B
+FP32), see [audit-2026-11.md](audit-2026-11.md) §6.
 
 ## 3. Source map
 
@@ -225,7 +226,7 @@ one socket and 1.6 s on two; Q8 per token 41 s, AMX-INT8 2.8 s and 1.6 s ([numa-
 
 Kernels never create threads. A kernel describes its work as row ranges or segments and calls `parallel_rows` /
 `kernels_parallel_segments`, which run it either on the calling thread's worker team (`kernels_set_team`,
-`kernels_set_thread_team`) or, without teams, in an OpenMP parallel region (serially in a build without OpenMP).
+`kernels_set_thread_team`) or, without a team (the unit tests), serially on the calling thread.
 
 A team (`workers.c`) is a set of persistent threads created at load; the caller of `team_run` is worker 0 and does its own
 share. Workers wait on a generation counter (spin for a bounded time, then `sched_yield`), run the job, and set their done

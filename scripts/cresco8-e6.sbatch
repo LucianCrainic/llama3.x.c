@@ -50,7 +50,7 @@ e6_start() {
     if [[ $1 == -- ]]; then side=args; elif [[ $side == env ]]; then env_words+=("$1"); else args+=("$1"); fi
     shift
   done
-  numactl "--cpunodebind=$socket" env LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false \
+  numactl "--cpunodebind=$socket" env LLAMA_BACKEND=teams LLAMA_THREADS=56 \
     ${env_words[@]+"${env_words[@]}"} "$ROOT/build/release/$bin" "${args[@]}" > "$OUT/E6/$name.out" 2> "$OUT/E6/$name.err" &
   E6_PID=$!
 }
@@ -92,7 +92,7 @@ e6_kernels() {
   for workers in 1 56; do
     for k in 512 4096; do
       expect "amx-t$workers-k$k" ok "$OUT/E6" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams "LLAMA_THREADS=$workers" \
-        OMP_PROC_BIND=false LLAMA_KERNELS=amx "$ROOT/build/release/amx-bench" --kind both --k "$k" --m "$E6_MS,24" --reps 5000
+        LLAMA_KERNELS=amx "$ROOT/build/release/amx-bench" --kind both --k "$k" --m "$E6_MS,24" --reps 5000
     done
   done
 }
@@ -103,7 +103,7 @@ e6_attention() {
     for kv in 8 4; do
       for kernel in split group; do
         expect "attention-$kernel-$shape-kv$kv" ok "$OUT/E6" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 \
-          OMP_PROC_BIND=false LLAMA_KERNELS=avx512 "LLAMA_ATTN_DECODE=$kernel" "$ROOT/build/release/attention-bench" --node 2 \
+          LLAMA_KERNELS=avx512 "LLAMA_ATTN_DECODE=$kernel" "$ROOT/build/release/attention-bench" --node 2 \
           --mode decode --shape "$shape" --context "$E6_ATTN_CONTEXTS" --reps 1000 --kv-heads-local "$kv"
       done
     done
@@ -113,7 +113,7 @@ e6_attention() {
 # e6_launch NAME PRECISION SOCKETS CONTEXT REP STAGED TOKENIZER [x=LABEL]: one N = 1 decode run from a retained context.
 e6_launch() {
   local name=$1 precision=$2 sockets=$3 ctx=$4 rep=$5 staged=$6 tokenizer=$7 extra=${8:-x=e6} engine=runq label cpu= log=warn perf=0
-  local env_words=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm
+  local env_words=(LLAMA_BACKEND=teams LLAMA_THREADS=56 "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm
     "LLAMA_THP=$E6_THP" LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$E6_BATCH" "LLAMA_SOCKETS=$sockets" LLAMA_ATTN_DECODE=split)
   [[ $precision != fp32 ]] || engine=run
   [[ $sockets == 2 ]] || cpu=0

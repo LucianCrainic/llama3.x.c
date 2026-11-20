@@ -125,6 +125,11 @@ void check_retired_knobs(void) {
     if (value && *value)
       fail("%s is no longer supported: %s", retired[i][0], retired[i][1]);
   }
+  const char *backend = getenv("LLAMA_BACKEND"); /* teams is the only backend left; the name is still accepted */
+  if (backend && *backend && strcmp(backend, "teams"))
+    fail("LLAMA_BACKEND=%s is no longer supported: the OpenMP backend was removed (F2); every kernel runs on the worker "
+         "teams",
+         backend);
 }
 
 double monotonic_seconds(void) {

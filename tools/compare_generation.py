@@ -11,7 +11,7 @@ prompt + generated_a[:first_divergence]. A small margin means the reference was 
 taken from the one-token-at-a-time path (LLAMA_PREFILL_BATCH=--probe-batch, default 1), which is the decode path.
 
     compare_generation.py --engine build/release/run --checkpoint fp32-v3.bin --tokenizer tokenizer-v2.bin \\
-        --prompt-file prompt.txt --steps 128 --env-a LLAMA_BACKEND=omp --env-b LLAMA_BACKEND=teams \\
+        --prompt-file prompt.txt --steps 128 --env-a LLAMA_SOCKETS=1 --env-b LLAMA_SOCKETS=2 \\
         --probe build/release/probe-fp32 --output result.json
 """
 import argparse

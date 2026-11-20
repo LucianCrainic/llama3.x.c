@@ -1,6 +1,5 @@
 CC ?= cc
 MODE ?= release
-OPENMP ?= 0
 NATIVE ?= 0
 PCRE2 ?= 1
 BUILD_DIR ?= build/$(MODE)
@@ -23,9 +22,8 @@ LDFLAGS += -fsanitize=thread
 else
 $(error MODE must be release, debug, profile, sanitize, or tsan)
 endif
-ifeq ($(OPENMP),1)
-CFLAGS += $(if $(OMP_CFLAGS),$(OMP_CFLAGS),-fopenmp)
-LDFLAGS += $(if $(OMP_LDFLAGS),$(OMP_LDFLAGS),-fopenmp)
+ifneq ($(filter-out 0,$(OPENMP)),)
+$(error OPENMP is no longer supported: the OpenMP backend was removed (docs/audit-2026-11.md F2); every build runs on the worker teams)
 endif
 ifeq ($(NATIVE),1)
 CFLAGS += -march=native
@@ -37,8 +35,8 @@ endif
 COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/profile.c src/numa.c src/shards.c src/workers.c src/tp.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
 HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h
-# Regenerate the configuration stamp only when flags change; changing OPENMP or
-# CC must not silently reuse an executable from an earlier build.
+# Regenerate the configuration stamp only when flags change; changing CC or MODE
+# must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE
 all: $(BUILD_DIR)/run $(BUILD_DIR)/runq
 $(BUILD_DIR):

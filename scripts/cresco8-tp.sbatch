@@ -26,7 +26,7 @@ job_begin
 # On hbm14: S0 = cores 0-55, DDR 0, HBM 2; S1 = cores 56-111, DDR 1, HBM 3 (explicit map C/H/D = package/HBM/DDR).
 EXPLICIT='explicit:0/2/0,1/3/1'
 # Two sockets run with no job-wide CPU or memory binding: each team pins itself and each region binds itself.
-TP_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm)
+TP_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=56 "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm)
 
 # ---- B1: shard descriptors and packing ---------------------------------------------------------------------------
 # The synthetic reconstruction tests on the hardware, then each model sharded over both sockets from a copy staged on
@@ -212,22 +212,22 @@ B7_BATCH=${B7_BATCH:-64}
 B7_DECODE=128
 B7_CONTEXTS="512 8192 32768"
 
-# b7_config CONFIG PRECISION: sets B7_SOCKETS, B7_TPS (workers per socket, or total for the control), B7_BACKEND, B7_CPU,
-# B7_MEM, B7_PREC (the label's precision) and B7_ENV for a configuration name: 1s56, 2sT or ctl.
+# b7_config CONFIG PRECISION: sets B7_SOCKETS, B7_TPS (workers per socket, or total for the control), B7_CPU, B7_MEM,
+# B7_PREC (the label's precision) and B7_ENV for a configuration name: 1s56, 2sT or ctl.
 b7_config() {
   local config=$1
-  B7_MEM= B7_BACKEND=teams B7_PREC=$2
+  B7_MEM= B7_PREC=$2
   [[ $2 != w8a32 ]] || B7_ENV_EXTRA=(LLAMA_Q8_ACTIVATIONS=fp32)
   [[ $2 == w8a32 ]] || B7_ENV_EXTRA=()
   case $config in
     1s56 | 2s[0-9]*)
       B7_SOCKETS=${config:0:1} B7_TPS=${config:2} B7_CPU=
       [[ $B7_SOCKETS == 2 ]] || B7_CPU=0
-      B7_ENV=(LLAMA_BACKEND=teams "LLAMA_THREADS=$B7_TPS" OMP_PROC_BIND=false "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm
+      B7_ENV=(LLAMA_BACKEND=teams "LLAMA_THREADS=$B7_TPS" "LLAMA_TOPOLOGY=$EXPLICIT" LLAMA_PLACEMENT=hbm
         "LLAMA_THP=$B7_THP" LLAMA_PREFILL_GEMM=on "LLAMA_PREFILL_BATCH=$B7_BATCH" "LLAMA_SOCKETS=$B7_SOCKETS") ;;
-    ctl)
-      B7_SOCKETS=2 B7_TPS=112 B7_BACKEND=omp B7_CPU=0,1 B7_MEM=2,3
-      B7_ENV=(LLAMA_BACKEND=omp OMP_NUM_THREADS=112 OMP_PROC_BIND=close OMP_PLACES=cores "LLAMA_PREFILL_BATCH=$B7_BATCH") ;;
+    ctl) # B7 ran this on OpenMP; that backend is gone (F2), so the control is one team of 112 threads on both sockets
+      B7_SOCKETS=2 B7_TPS=112 B7_CPU=0,1 B7_MEM=2,3
+      B7_ENV=(LLAMA_BACKEND=teams LLAMA_THREADS=112 LLAMA_SOCKETS=1 "LLAMA_PREFILL_BATCH=$B7_BATCH") ;;
     *) die "unknown B7 configuration '$config'" ;;
   esac
   B7_ENV+=(${B7_ENV_EXTRA[@]+"${B7_ENV_EXTRA[@]}"})
@@ -247,8 +247,8 @@ b7_launch() {
   b7_config "$config" "$precision"
   [[ $rep != 1 ]] || perf=$PERF
   [[ " ${label_words[*]-} " != *" x="*"prof "* ]] || log=info
-  label=$(run_label "$name" "$B7_PREC" "$B7_BACKEND" hbm "$B7_SOCKETS" "$B7_TPS" "p=$ctx" ${label_words[@]+"${label_words[@]}"})
-  [[ $config != ctl ]] || label=$(run_label "$name" "$B7_PREC" omp file 2 112 "p=$ctx" x=ctl)
+  label=$(run_label "$name" "$B7_PREC" teams hbm "$B7_SOCKETS" "$B7_TPS" "p=$ctx" ${label_words[@]+"${label_words[@]}"})
+  [[ $config != ctl ]] || label=$(run_label "$name" "$B7_PREC" teams file 2 112 "p=$ctx" x=ctl)
   CPU_BIND=$B7_CPU MEM_BIND=$B7_MEM REP=$rep CONTEXT=$((ctx + 256)) GENERATION=$B7_DECODE WARM=$ctx LOG_LEVEL=$log \
     run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" 1 "$perf" "${B7_ENV[@]}" ${env_words[@]+"${env_words[@]}"}
 }
@@ -476,7 +476,7 @@ e5_check() {
 e5_bench_cell() {
   local name=$1 kernel=$2 shape=$3 kv=$4 layout=${5:-} layout_args=()
   [[ -z $layout ]] || layout_args=(--kv-layout "$layout")
-  expect "$name" ok "$OUT/E5" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false \
+  expect "$name" ok "$OUT/E5" -- numactl --cpunodebind=0 env LLAMA_BACKEND=teams LLAMA_THREADS=56 \
     LLAMA_KERNELS=avx512 "LLAMA_ATTN_DECODE=$kernel" "$ROOT/build/release/attention-bench" --node 2 --mode decode \
     --shape "$shape" --context "${E5_MICRO_CONTEXTS// /,}" --reps "$E5_MICRO_REPS" --kv-heads-local "$kv" \
     ${layout_args[@]+"${layout_args[@]}"}

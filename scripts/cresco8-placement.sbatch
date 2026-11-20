@@ -190,13 +190,11 @@ phase_A4() {
       engine=run
       [[ $precision == fp32 ]] || engine=runq
       staged=$(stage_model_on 0 "$name" "$precision" "$artifacts")
-      # 1. bitwise logits at every prompt position: file against hbm and ddr, on each backend.
-      for backend in omp teams; do
-        read -r -a benv <<< "$(backend_env "$backend" 56 | tr '\n' ' ')"
-        for placement in hbm ddr; do
-          a_bitwise "$dir" "$name" "$precision" "$staged" "$backend-file-vs-$placement" "${benv[@]}" \
-            LLAMA_PLACEMENT=file -- "${benv[@]}" LLAMA_PLACEMENT=$placement
-        done
+      # 1. bitwise logits at every prompt position: file against hbm and ddr (A4 also ran them on OpenMP, now removed).
+      read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
+      for placement in hbm ddr; do
+        a_bitwise "$dir" "$name" "$precision" "$staged" "teams-file-vs-$placement" "${benv[@]}" \
+          LLAMA_PLACEMENT=file -- "${benv[@]}" LLAMA_PLACEMENT=$placement
       done
       if [[ $precision == int8 ]]; then # W8A32 takes the same placement code through different kernels
         read -r -a benv <<< "$(backend_env teams 56 | tr '\n' ' ')"
@@ -209,7 +207,7 @@ phase_A4() {
         export CPU_BIND=0
         label=$(run_label "$name" "$precision" teams "$placement" 1 56 x=startup)
         GENERATION=8 CONTEXT=2048 REP=1 run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" 1 0 \
-          LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=$placement
+          LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_PLACEMENT=$placement
         unset CPU_BIND
         snapshot_memory "$dir/$name-$precision-$placement.meminfo-after"
         if dry_run; then continue; fi
@@ -275,7 +273,7 @@ phase_A5() {
         export CPU_BIND=0
         label=$(run_label "$name" "$precision" teams hbm 1 56 p=2048 c=32768 "x=kv$thp")
         CONTEXT=32768 GENERATION=128 REP=1 run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/prompt-2048.txt" 1 0 \
-          LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_THP=$thp
+          LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm LLAMA_THP=$thp
         unset CPU_BIND
         if dry_run; then continue; fi
         layers=$("$PYTHON" -c "import json,sys; print(json.load(open(sys.argv[1]))['model']['layers'])" "$OUT/$label-1.json" 2> /dev/null || echo 0)
@@ -301,7 +299,6 @@ a6_run() { # a6_run NAME PRECISION ENGINE SOURCE TOKENIZER REP LABELKEY PLACEMEN
   shift 9
   case $key in
     file) label=$(run_label "$name" "$precision" teams file 1 "$threads") ;;
-    omp-file) label=$(run_label "$name" "$precision" omp file 1 "$threads") ;;
     ddr) label=$(run_label "$name" "$precision" teams ddr 1 "$threads") ;;
     hbm) label=$(run_label "$name" "$precision" teams hbm 1 "$threads") ;;
     hbm-thp) label=$(run_label "$name" "$precision" teams hbm 1 "$threads" x=thp) ;;
@@ -350,38 +347,36 @@ phase_A6() {
       [[ $precision == fp32 ]] || engine=runq
       src0=$(stage_model_on 0 "$name" "$precision" "$artifacts")
       for ((rep = 1; rep <= REPEATS; rep++)); do
-        # Staged-file baselines (HBM node 2 holds the copy only for the duration of these two runs).
+        # Staged-file baseline (HBM node 2 holds the copy only for the duration of this run).
         src2=$(stage_model_on 2 "$name" "$precision" "$artifacts")
         export CPU_BIND=0 MEM_BIND=2
         a6_run "$name" "$precision" "$engine" "$src2" "$tokenizer" "$rep" file file 56 LLAMA_BACKEND=teams \
-          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=file
-        a6_run "$name" "$precision" "$engine" "$src2" "$tokenizer" "$rep" omp-file file 56 LLAMA_BACKEND=omp \
-          OMP_NUM_THREADS=56
+          LLAMA_THREADS=56 LLAMA_PLACEMENT=file
         unset CPU_BIND MEM_BIND
         unstage_model_on 2 "$name" "$precision"
         # Engine-owned placements: no job-wide memory policy.
         export CPU_BIND=0
         a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" ddr ddr 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 \
-          OMP_PROC_BIND=false LLAMA_PLACEMENT=ddr
+          LLAMA_PLACEMENT=ddr
         a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 \
-          OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+          LLAMA_PLACEMENT=hbm
         a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm-thp hbm 56 LLAMA_BACKEND=teams \
-          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_THP=on
+          LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm LLAMA_THP=on
         # Remote control: socket 0's threads read HBM node 3 (an explicit map points socket 0 at it).
         a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" remote hbm 56 LLAMA_BACKEND=teams \
-          LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1 \
+          LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm LLAMA_TOPOLOGY=explicit:0/3/0,1/2/1 \
           LLAMA_TOPOLOGY_ALLOW_FAR_HBM=1
         for threads in 14 28; do
           a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" hbm hbm "$threads" LLAMA_BACKEND=teams \
-            LLAMA_THREADS=$threads OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+            LLAMA_THREADS=$threads LLAMA_PLACEMENT=hbm
         done
         if [[ $precision == int8 ]]; then # W8A32 on the owned HBM placement only
           a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" w8a32 hbm 56 LLAMA_BACKEND=teams \
-            LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32
+            LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm LLAMA_Q8_ACTIVATIONS=fp32
         fi
         if [[ $precision == fp32 && $name == 8[bB] ]]; then # the long-context point
           CONTEXT=8448 PROMPT="$OUT/prompt-8192.txt" a6_run "$name" "$precision" "$engine" "$src0" "$tokenizer" "$rep" \
-            long hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 OMP_PROC_BIND=false LLAMA_PLACEMENT=hbm
+            long hbm 56 LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_PLACEMENT=hbm
         fi
         unset CPU_BIND
       done

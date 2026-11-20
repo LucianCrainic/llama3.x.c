@@ -28,9 +28,8 @@ make                     # build/release/run (FP32) and build/release/runq (Q8_0
 make test                # unit tests, emulated AVX-512/AMX tests and end-to-end tests on synthetic models
 ```
 
-`MODE=debug|profile|sanitize|tsan` select other builds, `NATIVE=1` adds `-march=native`, `OPENMP=1` enables the OpenMP
-backend (`LLAMA_BACKEND=omp`; the default backend, worker teams, needs no OpenMP). AMX code needs x86-64 and GCC 11 or
-later.
+`MODE=debug|profile|sanitize|tsan` select other builds and `NATIVE=1` adds `-march=native`. The engine schedules its
+kernels on its own worker teams (POSIX threads), so no OpenMP is needed. AMX code needs x86-64 and GCC 11 or later.
 
 ## Convert a model
 

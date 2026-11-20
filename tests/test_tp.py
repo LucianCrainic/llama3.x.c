@@ -433,7 +433,7 @@ class TensorParallelTests(unittest.TestCase):
                 self.assertIn('"status": "completed"', report.read_text())
 
     def test_two_sockets_imply_worker_teams(self):
-        """LLAMA_SOCKETS=2 with LLAMA_BACKEND unset runs on teams (the only backend two sockets have), bitwise as with it."""
+        """LLAMA_BACKEND unset and LLAMA_BACKEND=teams (still accepted) run the same teams: bitwise equal on two sockets."""
         env = environment(2)
         del env['LLAMA_BACKEND']
         model = self.fixtures['shared']/'fp32.bin'
@@ -446,7 +446,7 @@ class TensorParallelTests(unittest.TestCase):
         model = self.one_kv/'fp32.bin'
         cases = [
             (model, environment(2), 'n_kv_heads=1'),
-            (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_BACKEND': 'omp'}, 'requires LLAMA_BACKEND=teams'),
+            (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_BACKEND': 'omp'}, 'the OpenMP backend was removed'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_SOCKETS': '3'}, 'LLAMA_SOCKETS must be 1 or 2'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_TOPOLOGY': 'virtual:1x3'}, 'allowed CPUs in only 1'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_PLACEMENT': 'hbm'}, 'virtual'),
