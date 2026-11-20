@@ -28,6 +28,8 @@ CAMPAIGN_KNOBS |= {'E6_ATTN_CONTEXTS', 'E6_BATCH', 'E6_COLD_MIB', 'E6_CONTEXTS',
 # Knobs of phase E5's bench stage (E5 follow-ups).
 CAMPAIGN_KNOBS |= {'E5_ALTERNATE', 'E5_CONTEXTS', 'E5_KERNELS', 'E5_LAYOUTS', 'E5_MICRO_CONTEXTS', 'E5_MICRO_KV',
                    'E5_MICRO_REPS', 'E5_MICRO_SHAPES', 'E5_PROFILED', 'E5_SKIP_ENGINE', 'E5_SKIP_MICRO', 'E5_SOCKETS'}
+# Knobs of phase E5's K/V layout study (E5.4).
+CAMPAIGN_KNOBS |= {'E5_ATTN', 'E5_KV_CHECK', 'E5_SKIP_DECODE', 'E5_KV_LAYOUTS', 'E5_PREFILL_PROMPTS', 'E5_PREFILL_RUNGS'}
 
 
 def campaign_env():
@@ -59,8 +61,10 @@ class ToolSmokeTests(unittest.TestCase):
 
 
 def report(prefill, decode, ttft=0.5, status='completed', placement='file', regions=None, thp='off', kernels='avx512',
-           attention=None, attention_decode=None):
+           attention=None, attention_decode=None, kv_layout=None):
     build = {'kernels': kernels}
+    if kv_layout is not None:
+        build['kv_layout'] = kv_layout
     if attention is not None:
         build['attention'] = attention
     if attention_decode is not None:
@@ -365,6 +369,10 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertEqual(ct.attention_tag(report(1, 1, attention='tiled', attention_decode='split')), 'attn=tiled')
         self.assertEqual(ct.attention_tag(report(1, 1, attention='amx', attention_decode='group')),
                          'attn=amx decode-attn=group')
+        # E5.4: the K/V layout is written only when it is not the default rows
+        self.assertEqual(ct.attention_tag(report(1, 1, attention='split', attention_decode='split', kv_layout='rows')), '')
+        self.assertEqual(ct.attention_tag(report(1, 1, attention='tiled', attention_decode='group', kv_layout='head')),
+                         'attn=tiled decode-attn=group kv=head')
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root/'8b-fp32-teams-hbm-s1-t56-p512-kavx512-1.json').write_text(
@@ -464,6 +472,33 @@ class CompareEnginesTests(unittest.TestCase):
                                         env={**os.environ, 'LLAMA_PREFILL_BATCH': '64'}, timeout=600)
                 self.assertNotEqual(result.returncode, 0)  # 4300 positions: beyond the checkpoint's 4200
                 self.assertIn(b'requested context exceeds checkpoint context', result.stderr)
+
+    def test_tail_mode_compares_the_decode_path_after_a_batched_prefill(self):
+        """E5.4: `--tail K` compares the logits of the last K positions, each a per-token forward after the rest of the prompt
+        (batched with --batch-a/--batch-b), and the probe's `tail` mode is exactly the last K rows of the per-token run when
+        nothing is batched. The K/V layouts must agree bit for bit (--bitwise); a bad K is refused."""
+        tokens = [str(65 + (i * 7) % 20) for i in range(20)]
+        for engine in ('fp32', 'int8'):
+            probe, model = str(BUILD/f'probe-{engine}'), str(self.fixture/f'{engine}.bin')
+            every = subprocess.run([probe, model, *tokens], capture_output=True, timeout=120).stdout
+            tail = subprocess.run([probe, 'tail', model, '5', *tokens], capture_output=True, timeout=120)
+            self.assertEqual(tail.returncode, 0, tail.stderr)
+            self.assertEqual(tail.stdout, every[-5 * len(every) // 20:])
+            for batched in ([], ['--batch-a', '8', '--batch-b', '8']):
+                with self.subTest(engine=engine, batched=bool(batched)):
+                    result = subprocess.run([sys.executable, str(TOOLS/'compare_engines.py'), '--probe', probe, '--checkpoint',
+                                             model, '--tokens', ','.join(tokens), '--tail', '5', '--bitwise', '--env-a',
+                                             'LLAMA_KV_LAYOUT=rows', '--env-b', 'LLAMA_KV_LAYOUT=head', *batched],
+                                            capture_output=True, text=True, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    data = json.loads(result.stdout)
+                    self.assertTrue(data['passed'] and data['summary']['bitwise'])
+                    self.assertEqual((data['tail'], [c['position'] for c in data['comparisons']]), (5, list(range(15, 20))))
+        for bad in ('0', '21'):
+            result = subprocess.run([sys.executable, str(TOOLS/'compare_engines.py'), '--probe', str(BUILD/'probe-fp32'),
+                                     '--checkpoint', str(self.fixture/'fp32.bin'), '--tokens', ','.join(tokens), '--tail', bad],
+                                    capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(result.returncode, 0)
 
     def test_teams_backend_agrees_within_the_budget(self):
         result, data = self.compare('fp32', '--env-b', 'LLAMA_BACKEND=teams', '--env-b', 'LLAMA_THREADS=3')
@@ -620,6 +655,17 @@ class CompareGenerationTests(unittest.TestCase):
         self.assertTrue(data['prompt_identical'])
         self.assertEqual(data['env_b'], {'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3'})
         self.assertIn('identical', result.stderr)
+
+    def test_require_identical_turns_the_comparison_into_a_gate(self):
+        for generated_b, status in (('[70,71,72,73]', 0), ('[70,71,99,73]', 1)):
+            result, data = self.compare('--env-a', 'STUB_GENERATED=[70,71,72,73]', '--env-b', f'STUB_GENERATED={generated_b}',
+                                        '--require-identical', engine=self.stub, steps='4')
+            self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual(data['identical'], status == 0)
+        # without the flag a divergence is only recorded
+        result, data = self.compare('--env-a', 'STUB_GENERATED=[70,71,72,73]', '--env-b', 'STUB_GENERATED=[70,71,99,73]',
+                                    engine=self.stub, steps='4')
+        self.assertEqual((result.returncode, data['identical']), (0, False))
 
     def test_warm_context_is_part_of_the_recorded_prompt(self):
         result, data = self.compare('--warm-context', '2')
@@ -998,6 +1044,22 @@ class CheckPlacementTests(unittest.TestCase):
         code, out = self.run_tool(self.report(), *self.ARGS)
         self.assertEqual(code, 0, out)
         self.assertNotIn('FAIL', out)
+
+    def test_head_layout_slack_is_a_page_per_layer_and_kv_head(self):
+        """E5.4: with LLAMA_KV_LAYOUT=head the touched pages are a prefix of each head's span, so the resident figure may
+        exceed the reserved one by a page per layer and KV head (a page per layer for the rows layout)."""
+        over = 8192 + 2 * 3 * 4096  # reserved + 2 layers x 3 KV heads of slack
+        for layout, status in ((None, 1), ('rows', 1), ('head', 0)):
+            report = self.report(model=dict(configuration=dict(n_kv_heads=3)))
+            if layout:
+                report['build'] = dict(kv_layout=layout)
+            report['kv'].update(resident_bytes=over)
+            report['kv']['after_prompt'].update(resident_bytes=over)
+            code, out = self.run_tool(report, *self.ARGS)
+            self.assertEqual(code, status, (layout, out))
+        report = self.report(model=dict(configuration=dict(n_kv_heads=3)), build=dict(kv_layout='head'))
+        report['kv'].update(resident_bytes=over + 4096)
+        self.assertEqual(self.run_tool(report, *self.ARGS)[0], 1)  # beyond the slack it still fails
 
     def test_rejects_every_kind_of_wrong_placement(self):
         base = self.report()
@@ -1656,6 +1718,189 @@ class DecodeAttentionFollowupTests(unittest.TestCase):
             self.assertIn('E5', result.stderr + result.stdout, f'{knob}={value}')
             self.assertEqual([l for l in result.stdout.splitlines() if l.startswith(('RUN ', 'EXPECT bench-decode'))], [],
                              f'{knob}={value}')
+
+
+class KvLayoutCampaignTests(unittest.TestCase):
+    """E5.4: the K/V layout study of phase E5 (E5_KV_LAYOUTS, E5_ATTN, E5_PREFILL_PROMPTS, E5_PREFILL_RUNGS, E5_KV_CHECK) prints
+    its matrix without running anything; with none of these knobs the engine runs are the first E5 job's (no LLAMA_KV_LAYOUT)."""
+
+    ONE = 'm1b:/a/m1b:/hf/m1b'
+
+    def run_e5(self, stage='bench', expect_ok=True, models=ONE, **extra):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        with tempfile.TemporaryDirectory() as temp:
+            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': stage, 'REPEATS': '3', 'MODELS': models, **extra}
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
+                                    text=True, timeout=120)
+        if expect_ok:
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return result
+
+    def lines(self, *args, **extra):
+        return self.run_e5(*args, **extra).stdout.splitlines()
+
+    @staticmethod
+    def runs(out):
+        return [l for l in out if l.startswith('RUN ')]
+
+    @staticmethod
+    def label(line):
+        return line.split()[1]
+
+    def test_defaults_add_no_layout_and_no_prefill_cells(self):
+        runs = self.runs(self.lines())
+        self.assertEqual(len(runs), 2 * (3 * 3 + 3) * 2 * 2)  # precisions x (3 repeats x 3 contexts + 3) x sockets x kernels
+        self.assertFalse([l for l in runs if 'LLAMA_KV_LAYOUT' in l or 'LLAMA_ATTN=' in l or 'xkv' in l or 'warm=0 ' in l])
+        # empty knobs (as a submitter's `export E5_KV_LAYOUTS=`) are the defaults
+        self.assertEqual(self.runs(self.lines(E5_KV_LAYOUTS='', E5_ATTN='', E5_PREFILL_PROMPTS='')), runs)
+
+    def test_layout_variants_run_inside_each_repeat_in_alternating_order(self):
+        from summarize_campaign import parse_label
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_ATTN='tiled', E5_ALTERNATE='1', E5_SKIP_MICRO='1', E5_CONTEXTS='512 8192',
+                         E5_SOCKETS='1', PRECISIONS='fp32')
+        runs = self.runs(out)
+        prof = [l for l in runs if 'LLAMA_PROFILE=1' in l]
+        timed = [l for l in runs if 'LLAMA_PROFILE=1' not in l]
+        self.assertEqual(len(timed), 3 * 2 * 4)  # repeats x contexts x (kernel, layout) variants
+        self.assertEqual(len(prof), 1 * 2 * 4)
+        for line in runs:
+            self.assertIsNotNone(parse_label(self.label(line) + '-1'), line)
+            tag = self.label(line).rsplit('-x', 1)[1]
+            kernel, layout = ('group' if 'group' in tag else 'split'), ('head' if 'kvhead' in tag else 'rows')
+            self.assertTrue(tag.startswith('attn' + kernel + 'kv' + layout), tag)
+            for word in (f'LLAMA_ATTN_DECODE={kernel}', f'LLAMA_KV_LAYOUT={layout}', 'LLAMA_ATTN=tiled'):
+                self.assertEqual(line.count(word), 1, (word, line))
+            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 1)
+        # one cell: every variant once per repeat; odd repeats in order, even repeats reversed
+        cell = [(l.split()[2], self.label(l).rsplit('-x', 1)[1]) for l in timed if '-p512-' in l]
+        self.assertEqual(cell[:4], [('reps=1-1', 'attnsplitkvrows'), ('reps=1-1', 'attnsplitkvhead'),
+                                    ('reps=1-1', 'attngroupkvrows'), ('reps=1-1', 'attngroupkvhead')])
+        self.assertEqual([t for r, t in cell[4:8]], ['attngroupkvhead', 'attngroupkvrows', 'attnsplitkvhead', 'attnsplitkvrows'])
+        self.assertEqual({r for r, _ in cell[4:8]}, {'reps=2-2'})
+        # without E5_ALTERNATE every repeat has the same order, and E5_ATTN unset leaves the job-wide default
+        plain = self.runs(self.lines(E5_KV_LAYOUTS='head', E5_SKIP_MICRO='1', E5_CONTEXTS='512', E5_SOCKETS='1',
+                                     PRECISIONS='fp32', REPEATS='2', E5_PROFILED='0'))
+        self.assertEqual([self.label(l).rsplit('-x', 1)[1] for l in plain], ['attnsplitkvhead', 'attngroupkvhead'] * 2)
+        self.assertFalse([l for l in plain if 'LLAMA_ATTN=' in l])
+
+    def test_prefill_cells(self):
+        from summarize_campaign import parse_label
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_ALTERNATE='1', E5_CONTEXTS='512',
+                         E5_SOCKETS='1', E5_PROFILED='0', E5_SKIP_MICRO='1')
+        prefill = [l for l in self.runs(out) if 'warm=0 ' in l]
+        # FP32: avx512_fp32 and amx_bf16; W8A8: avx512_q8 and amx_int8; two prompts, two layouts, three repeats
+        self.assertEqual(len(prefill), 4 * 2 * 2 * 3)
+        for line in prefill:
+            info = parse_label(self.label(line) + '-1')
+            self.assertEqual((info['sockets'], info['threads'], info['placement']), ('1', '56', 'hbm'))
+            self.assertIn(info['prompt'], ('2048', '8192'))
+            for word in ('LLAMA_SOCKETS=1', 'LLAMA_ATTN=tiled', 'gen=32', 'cpu=0'):
+                self.assertIn(word, line)
+            self.assertNotIn('LLAMA_ATTN_DECODE', line)
+            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 1)
+            self.assertIn(f"ctx={int(info['prompt']) + 256} ", line)
+            self.assertEqual(self.label(line).rsplit('-x', 1)[1], 'kv' + line.split('LLAMA_KV_LAYOUT=')[1].split()[0])
+        rungs = {info['kernel'] for info in (parse_label(self.label(l) + '-1') for l in prefill)}
+        self.assertEqual(rungs, {'avx512_fp32', 'amx_bf16', 'avx512_q8', 'amx_int8'})
+        self.assertTrue(all('LLAMA_PRECISION=bf16' in l for l in prefill if 'kamx_bf16' in l))
+        self.assertTrue(all('LLAMA_KERNELS=amx' in l for l in prefill if 'kamx_' in l))
+        self.assertEqual({self.label(l).split('-m')[1].split('-')[0] for l in prefill if 'kavx512_fp32' in l}, {'128'})
+        # the layout order alternates between repeats, within a cell
+        cell = [(l.split()[2], self.label(l).rsplit('-x', 1)[1]) for l in prefill
+                if 'm1b-fp32' in l and 'kavx512_fp32' in l and '-p8192-' in l]
+        self.assertEqual(cell, [('reps=1-1', 'kvrows'), ('reps=1-1', 'kvhead'), ('reps=2-2', 'kvhead'), ('reps=2-2', 'kvrows'),
+                                ('reps=3-3', 'kvrows'), ('reps=3-3', 'kvhead')])
+        # rungs and the attention kernel are selectable
+        some = self.runs(self.lines(E5_KV_LAYOUTS='head', E5_PREFILL_PROMPTS='2048', E5_PREFILL_RUNGS='amx_bf16', E5_ATTN='split',
+                                    E5_SKIP_MICRO='1', E5_CONTEXTS='512', E5_SOCKETS='1', E5_PROFILED='0', PRECISIONS='fp32',
+                                    REPEATS='1'))
+        self.assertEqual([self.label(l) for l in some if 'warm=0 ' in l],
+                         ['m1b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16-xkvhead'])
+        self.assertTrue(all('LLAMA_ATTN=split' in l for l in some))
+
+    def test_bench_stage_writes_the_prompt_files_of_the_prefill_cells(self):
+        """Jobs 5876582 and 5876584: the prefill cells read prompt-N.txt, which only the check stage wrote. The bench stage
+        must ask for exactly the lengths of E5_PREFILL_PROMPTS (the dry run names them) and nothing without the cells."""
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_MICRO='1')
+        self.assertEqual([l for l in out if l.startswith('E5 prompts')], ['E5 prompts: 2048,8192'])
+        self.assertFalse([l for l in self.lines() if l.startswith('E5 prompts')])
+        # the same call the real stage makes: make_prompt writes prompt-N.txt for every length it is given
+        script = (ROOT/'scripts'/'cresco8-tp.sbatch').read_text()
+        self.assertIn('a_models "$dir" "${E5_PREFILL_PROMPTS// /,}"', script)
+
+    def test_skip_decode_leaves_only_the_prefill_cells(self):
+        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_DECODE='1', E5_SKIP_MICRO='1',
+                         E5_ALTERNATE='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')
+        runs = self.runs(out)
+        self.assertEqual(len(runs), 2 * 4 * 2 * 2 * 3)  # models x rungs (two per precision) x prompts x layouts x repeats
+        self.assertTrue(all('warm=0 ' in l and 'LLAMA_ATTN_DECODE' not in l and 'LLAMA_PROFILE' not in l for l in runs))
+        self.assertEqual(self.runs(self.lines(E5_SKIP_DECODE='1', E5_SKIP_MICRO='1')), [])
+        result = self.run_e5(expect_ok=False, E5_SKIP_DECODE='2')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_check_stage_gates_rows_against_head_bitwise(self):
+        out = self.lines('check', E5_KV_CHECK='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')
+        compares = [l for l in out if l.startswith('EXPECT compare-')]
+        gens = [l for l in out if l.startswith('EXPECT gen-')]
+        # per model and precision: two sockets x (two decode kernels x (short, tail) + prefill + AMX rung); and 2 x 2 generations
+        self.assertEqual(len(compares), 2 * 2 * 2 * (2 * 2 + 2))
+        self.assertEqual(len(gens), 2 * 2 * 2 * 2)
+        for line in compares:
+            self.assertIn('--bitwise', line)
+            self.assertNotIn('--max-abs', line)
+            self.assertEqual(line.count('--env-a LLAMA_KV_LAYOUT=rows'), 1)
+            self.assertEqual(line.count('--env-b LLAMA_KV_LAYOUT=head'), 1)
+            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 2)
+            if '-s2' in line.split()[1]:
+                self.assertEqual(line.count('LLAMA_TP_CHECK=1'), 2)
+            if 'tail8192' in line:
+                self.assertIn('--tail 8', line)
+                self.assertIn('--batch-a 64 --batch-b 64', line)
+                self.assertIn('-tokens-8192.txt', line)
+            if '-kv-short-' in line:
+                self.assertNotIn('--batch-a', line)  # the per-token path at every position of the short prompt
+                self.assertNotIn('-tokens-8192.txt', line)
+            if '-prefill8192-' in line:
+                self.assertIn('--last-only', line)
+                self.assertEqual(line.count('LLAMA_ATTN=tiled'), 2)
+            if 'amx' in line.split()[1]:
+                self.assertIn('LLAMA_KERNELS=amx', line)
+        self.assertEqual({l.split('LLAMA_ATTN_DECODE=')[1].split()[0] for l in compares if 'LLAMA_ATTN_DECODE=' in l},
+                         {'split', 'group'})
+        self.assertTrue(any('-amxbf16-' in l and 'LLAMA_PRECISION=bf16' in l for l in compares))
+        self.assertTrue(any('-amxint8-' in l for l in compares))
+        for line in gens:
+            for word in ('--steps 128', '--warm-context 8192', '--env-a LLAMA_KV_LAYOUT=rows', '--env-b LLAMA_KV_LAYOUT=head',
+                         '--env-a LLAMA_ATTN=tiled', '--env-b LLAMA_ATTN=tiled', '--probe-batch 64', '--require-identical'):
+                self.assertIn(word, line)
+        self.assertEqual({l.split('-s')[1][0] for l in (g.split()[1] for g in gens)}, {'1', '2'})
+        hf = [l for l in out if l.startswith('VALIDATE ')]
+        self.assertEqual(len(hf), 2 * 2)  # FP32 only, one socket and two sockets, per model
+        self.assertTrue(all('LLAMA_KV_LAYOUT=head' in l for l in hf))
+        self.assertEqual(self.runs(out), [])
+        self.assertEqual([l for l in self.lines('check', E5_KV_CHECK='1', HF_GATE='0') if l.startswith('VALIDATE ')], [])
+        # without E5_KV_CHECK the check stage is the split-against-group one, unchanged
+        default = self.lines('check')
+        self.assertTrue([l for l in default if l.startswith('EXPECT compare-')])
+        self.assertFalse([l for l in default if 'LLAMA_KV_LAYOUT' in l])
+
+    def test_bad_values_stop_before_any_launch(self):
+        for knob, value in (('E5_KV_LAYOUTS', 'columns'), ('E5_ATTN', 'amx'), ('E5_PREFILL_PROMPTS', '2048 x'),
+                            ('E5_PREFILL_RUNGS', 'per_token'), ('E5_KV_CHECK', '2')):
+            extra = {'E5_PREFILL_PROMPTS': '2048', 'E5_KV_LAYOUTS': 'head'}
+            extra[knob] = value
+            stage = 'bench'
+            if knob == 'E5_KV_CHECK':
+                extra, stage = {knob: value}, 'check'
+            result = self.run_e5(stage, expect_ok=False, **extra)
+            self.assertNotEqual(result.returncode, 0, f'{knob}={value}')
+            self.assertIn(knob, result.stderr + result.stdout, f'{knob}={value}')
+            self.assertEqual([l for l in result.stdout.splitlines() if l.startswith(('RUN ', 'EXPECT'))], [], f'{knob}={value}')
+        result = self.run_e5(expect_ok=False, E5_PREFILL_PROMPTS='2048')  # prefill cells compare layouts: they need some
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('E5_PREFILL_PROMPTS needs E5_KV_LAYOUTS', result.stderr + result.stdout)
 
 
 if __name__ == '__main__':

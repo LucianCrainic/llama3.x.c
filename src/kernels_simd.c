@@ -60,6 +60,7 @@ void kernels_set_thread_team(Team *team) {
 }
 
 static void attention_init_from_env(void);
+static void kv_layout_init_from_env(void);
 
 static int supported(KernelIsa which) {
   if (which == KERNELS_SCALAR)
@@ -159,8 +160,9 @@ void kernels_init(void) {
     fail("LLAMA_KERNELS must be auto, scalar, avx512 or amx");
   }
   attention_init_from_env();
-  LOG(LOG_DEBUG, "compute kernels: %s, attention %s, decode attention %s", kernels_name(), kernels_attention_name(),
-      kernels_attention_decode_name());
+  kv_layout_init_from_env();
+  LOG(LOG_DEBUG, "compute kernels: %s, attention %s, decode attention %s, K/V layout %s", kernels_name(),
+      kernels_attention_name(), kernels_attention_decode_name(), kernels_kv_layout_name());
 }
 
 const char *kernels_name(void) {
@@ -2097,10 +2099,10 @@ typedef struct {
   const float *q, *key_cache, *value_cache;
   float *partial;
   ChunkFn chunk;
-  int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
+  int n_heads, n_kv_heads, head_dim, kv_mul, pos_stride, dim, limit, workers;
   int pos0, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch */
   int chunks_wave, blocks, tasks, row_block;
-  size_t slot, head_stride, row_stride;
+  size_t slot, head_stride, row_stride, head_base; /* K/V layout: floats between positions / between KV heads' bases */
   atomic_int next_task; /* team-local queue over (kv group, chunk, row block) tasks */
   Team *team;           /* the barrier's team: workers cannot look it up (thread_team is the coordinator's) */
 } BatchJob;
@@ -2128,8 +2130,8 @@ static void batch_task(const BatchJob *j, int task) {
       continue;
     int t0 = (int)((long long)positions * c / chunks), t1 = (int)((long long)positions * (c + 1) / chunks);
     int h0 = g * j->kv_mul;
-    j->chunk(j->q + (size_t)row * j->dim + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_dim,
-             j->value_cache + (size_t)g * j->head_dim, j->kv_dim, j->head_dim, j->kv_mul, t0, t1, scores,
+    j->chunk(j->q + (size_t)row * j->dim + (size_t)h0 * j->head_dim, j->key_cache + (size_t)g * j->head_base,
+             j->value_cache + (size_t)g * j->head_base, j->pos_stride, j->head_dim, j->kv_mul, t0, t1, scores,
              (size_t)(t1 - t0), j->partial + (size_t)rr * j->row_stride + (size_t)h0 * j->head_stride + c * j->slot,
              j->head_stride);
   }
@@ -2184,11 +2186,24 @@ static void batch_team(const void *p, int worker, int workers) {
 
 static void attention_batch_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
-                                   ChunkFn chunk) {
-  BatchJob job = {.row_block = attention_row_block, .out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
-                  .chunk = chunk, .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim,
-                  .kv_mul = n_heads / n_kv_heads, .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim,
-                  .limit = work->max_chunks, .workers = work->workers, .pos0 = pos0,
+                                   size_t pos_stride, size_t head_base, ChunkFn chunk) {
+  BatchJob job = {.row_block = attention_row_block,
+                  .out = out,
+                  .q = q,
+                  .key_cache = key_cache,
+                  .value_cache = value_cache,
+                  .partial = work->partial,
+                  .chunk = chunk,
+                  .n_heads = n_heads,
+                  .n_kv_heads = n_kv_heads,
+                  .head_dim = head_dim,
+                  .kv_mul = n_heads / n_kv_heads,
+                  .pos_stride = (int)pos_stride,
+                  .head_base = head_base,
+                  .dim = n_heads * head_dim,
+                  .limit = work->max_chunks,
+                  .workers = work->workers,
+                  .pos0 = pos0,
                   .slot = (size_t)head_dim + 2};
   for (int row0 = 0; row0 < m;) {
     /* A wave holds as many rows of partials as the workspace allows; chunk counts only grow with the position, so the
@@ -2238,11 +2253,11 @@ static int batch_supported(int n_heads, int n_kv_heads, int head_dim, int seq_le
 
 static void attention_batch_split(float *out, const float *q, const float *key_cache, const float *value_cache,
                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                  int seq_len, int pos0, int m) {
+                                  int seq_len, int pos0, int m, size_t pos_stride, size_t head_base) {
 #if HAVE_AVX512
   if (isa == KERNELS_AVX512 && batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
-    attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
-                           attention_chunk_avx512);
+    attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m, pos_stride,
+                           head_base, attention_chunk_avx512);
     return;
   }
 #endif
@@ -2250,16 +2265,25 @@ static void attention_batch_split(float *out, const float *q, const float *key_c
   size_t dim = (size_t)n_heads * head_dim;
   for (int i = 0; i < m; i++)
     attention_decode_split(out + i * dim, q + i * dim, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim,
-                           seq_len, pos0 + i, (size_t)n_kv_heads * head_dim, head_dim);
+                           seq_len, pos0 + i, pos_stride, head_base);
+}
+
+void k_attention_batch_portable_layout(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
+                                       int pos0, int m, size_t pos_stride, size_t head_base) {
+  if (!batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m))
+    fail("portable batched attention needs head_dim <= 256, at most %d heads per KV head and m > 1", BATCH_MAX_GROUP);
+  if (pos_stride < (size_t)head_dim || pos_stride > INT_MAX)
+    fail("k_attention_batch_portable_layout: position stride %zu is not in [head_dim, INT_MAX]", pos_stride);
+  attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m, pos_stride,
+                         head_base, attention_chunk_portable);
 }
 
 void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
                                 AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
                                 int m) {
-  if (!batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m))
-    fail("portable batched attention needs head_dim <= 256, at most %d heads per KV head and m > 1", BATCH_MAX_GROUP);
-  attention_batch_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m,
-                         attention_chunk_portable);
+  k_attention_batch_portable_layout(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, seq_len, pos0,
+                                    m, (size_t)n_kv_heads * head_dim, head_dim);
 }
 
 // ----------------------------------------------------------------------------
@@ -2274,11 +2298,11 @@ typedef struct {
   float *out;
   const float *q, *key_cache, *value_cache;
   float *partial;
-  int n_heads, n_kv_heads, head_dim, kv_mul, kv_dim, dim, limit, workers;
+  int n_heads, n_kv_heads, head_dim, kv_mul, pos_stride, dim, limit, workers;
   int pos0, m, row0, rows; /* this wave: rows row0..row0+rows-1 of the microbatch of m rows */
   int rblock, chunks_wave, tasks;
   const TiledTask *order; /* the tasks of the wave, in the order they are claimed */
-  size_t slot, head_stride, row_stride;
+  size_t slot, head_stride, row_stride, head_base; /* K/V layout: floats between positions / between KV heads' bases */
   atomic_int next_task;
   Team *team;
 } TiledJob;
@@ -2311,8 +2335,8 @@ static void tiled_task(const TiledJob *j, const TiledTask *t) {
   int h0 = t->g * j->kv_mul, rr = first - j->row0;
   attention_tiled_avx512(j->q + (size_t)first * j->dim + (size_t)h0 * j->head_dim, (size_t)j->dim, last - first,
                          j->kv_mul, j->head_dim, j->pos0 + first + 1, t0, t1,
-                         j->key_cache + (size_t)t->g * j->head_dim, j->value_cache + (size_t)t->g * j->head_dim,
-                         j->kv_dim,
+                         j->key_cache + (size_t)t->g * j->head_base, j->value_cache + (size_t)t->g * j->head_base,
+                         j->pos_stride,
                          j->partial + (size_t)rr * j->row_stride + (size_t)h0 * j->head_stride + t->chunk * j->slot,
                          j->row_stride, j->head_stride);
 }
@@ -2401,12 +2425,26 @@ static TiledTask *tiled_tasks(TiledJob *j) {
 }
 
 static void attention_tiled_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
-                                   AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m) {
+                                   AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
+                                   size_t pos_stride, size_t head_base) {
   int kv_mul = n_heads / n_kv_heads, queries = attention_tiled_queries / kv_mul;
-  TiledJob job = {.out = out, .q = q, .key_cache = key_cache, .value_cache = value_cache, .partial = work->partial,
-                  .n_heads = n_heads, .n_kv_heads = n_kv_heads, .head_dim = head_dim, .kv_mul = kv_mul,
-                  .kv_dim = n_kv_heads * head_dim, .dim = n_heads * head_dim, .limit = work->max_chunks,
-                  .workers = work->workers, .pos0 = pos0, .m = m, .rblock = queries < 1 ? 1 : queries,
+  TiledJob job = {.out = out,
+                  .q = q,
+                  .key_cache = key_cache,
+                  .value_cache = value_cache,
+                  .partial = work->partial,
+                  .n_heads = n_heads,
+                  .n_kv_heads = n_kv_heads,
+                  .head_dim = head_dim,
+                  .kv_mul = kv_mul,
+                  .pos_stride = (int)pos_stride,
+                  .head_base = head_base,
+                  .dim = n_heads * head_dim,
+                  .limit = work->max_chunks,
+                  .workers = work->workers,
+                  .pos0 = pos0,
+                  .m = m,
+                  .rblock = queries < 1 ? 1 : queries,
                   .slot = (size_t)head_dim + 2};
   for (int row0 = 0; row0 < m;) {
     /* A wave holds as many rows of partials as the workspace allows. The slots per head follow the plan of the last
@@ -2466,7 +2504,7 @@ static void attention_tiled_fallback(const char *reason) {
 
 static void attention_batch_tiled(float *out, const float *q, const float *key_cache, const float *value_cache,
                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                  int seq_len, int pos0, int m) {
+                                  int seq_len, int pos0, int m, size_t pos_stride, size_t head_base) {
   if (m > 1) { /* a single row is the decode path, whatever the variant */
 #if HAVE_AVX512
     if (isa != KERNELS_AVX512)
@@ -2474,14 +2512,16 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
     else if (head_dim > 256 || n_heads / n_kv_heads > TILED_MAX_Q)
       attention_tiled_fallback("head_dim above 256 or more than 16 query heads per KV head is not supported");
     else if (batch_supported(n_heads, n_kv_heads, head_dim, seq_len, pos0, m)) {
-      attention_tiled_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m);
+      attention_tiled_driver(out, q, key_cache, value_cache, work, n_heads, n_kv_heads, head_dim, pos0, m, pos_stride,
+                             head_base);
       return;
     }
 #else
     attention_tiled_fallback("the AVX-512 kernels are not built");
 #endif
   }
-  attention_batch_split(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m);
+  attention_batch_split(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m,
+                        pos_stride, head_base);
 }
 
 // ----------------------------------------------------------------------------
@@ -2494,7 +2534,7 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
  * batched path since E4 (owner decision, 2026-11-19; split stays selectable with LLAMA_ATTN=split), split for decode. */
 typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
-                                 int seq_len, int pos0, int m);
+                                 int seq_len, int pos0, int m, size_t pos_stride, size_t head_base);
 typedef void (*AttentionDecodeFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                   float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
                                   int seq_len, int position, size_t pos_stride, size_t head_base);
@@ -2598,7 +2638,88 @@ void k_attention_layout(float *out, const float *q, const float *key_cache, cons
 void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                        AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m) {
   attention_batch_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0,
-                              m);
+                              m, (size_t)n_kv_heads * head_dim, head_dim);
+}
+
+void k_attention_batch_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                              AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
+                              int m, size_t pos_stride, size_t head_base) {
+  if (pos_stride < (size_t)head_dim || pos_stride > INT_MAX)
+    fail("k_attention_batch_layout: position stride %zu is not in [head_dim, INT_MAX]", pos_stride);
+  attention_batch_active->run(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0,
+                              m, pos_stride, head_base);
+}
+
+// ----------------------------------------------------------------------------
+// K/V cache layout (E5.4): LLAMA_KV_LAYOUT=rows|head
+
+/* rows (default): a layer's cache is [position][kv_head][head_dim]. head: [kv_head][position][head_dim], each head with
+ * room for seq_len positions, so the cache is the same size. The cache pointer of a layer is the same in both. */
+static int kv_layout_head;
+
+int kernels_kv_layout_head(void) {
+  return kv_layout_head;
+}
+
+const char *kernels_kv_layout_name(void) {
+  return kv_layout_head ? "head" : "rows";
+}
+
+int kernels_kv_layout_select(const char *name) {
+  if (!strcmp(name, "rows"))
+    kv_layout_head = 0;
+  else if (!strcmp(name, "head"))
+    kv_layout_head = 1;
+  else
+    return 0;
+  return 1;
+}
+
+static void kv_layout_init_from_env(void) {
+  const char *layout = getenv("LLAMA_KV_LAYOUT");
+  kv_layout_head = 0;
+  if (layout && *layout && strcmp(layout, "auto") && !kernels_kv_layout_select(layout))
+    fail("LLAMA_KV_LAYOUT must be rows or head");
+}
+
+void k_kv_strides(int n_kv_heads, int head_dim, int seq_len, size_t *pos_stride, size_t *head_base) {
+  *pos_stride = kv_layout_head ? (size_t)head_dim : (size_t)n_kv_heads * head_dim;
+  *head_base = kv_layout_head ? (size_t)seq_len * head_dim : (size_t)head_dim;
+}
+
+void k_kv_store(float *cache, const float *src, size_t src_ld, int pos0, int count, int n_kv_heads, int head_dim,
+                int seq_len) {
+  size_t kv_dim = (size_t)n_kv_heads * head_dim;
+  if (!kv_layout_head) {
+    for (int r = 0; r < count; r++)
+      memcpy(cache + (size_t)(pos0 + r) * kv_dim, src + (size_t)r * src_ld, kv_dim * sizeof(float));
+    return;
+  }
+  for (int r = 0; r < count; r++)
+    for (int g = 0; g < n_kv_heads; g++)
+      memcpy(cache + (size_t)g * seq_len * head_dim + (size_t)(pos0 + r) * head_dim,
+             src + (size_t)r * src_ld + (size_t)g * head_dim, (size_t)head_dim * sizeof(float));
+}
+
+void k_attention_kv(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position) {
+  if (!kv_layout_head) {
+    k_attention(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position);
+    return;
+  }
+  k_attention_layout(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, position,
+                     (size_t)head_dim, (size_t)seq_len * head_dim);
+}
+
+void k_attention_batch_kv(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
+                          AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
+                          int m) {
+  if (!kv_layout_head) {
+    k_attention_batch(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m);
+    return;
+  }
+  k_attention_batch_layout(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m,
+                           (size_t)head_dim, (size_t)seq_len * head_dim);
 }
 
 // ----------------------------------------------------------------------------

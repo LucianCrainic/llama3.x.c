@@ -1395,6 +1395,128 @@ static void test_attention_head_layout(int with_long) {
     attention_head_layout_case((AttnShape){2, 4, 128}, long_positions, sizeof(long_positions) / sizeof(*long_positions));
 }
 
+/* E5.4: batched prefill attention (split, split-portable, tiled) on the head-major K/V layout, through both the
+ * explicit strides (k_attention_batch_layout with padding between the heads) and the engine helpers
+ * (LLAMA_KV_LAYOUT=head: k_kv_store, k_attention_batch_kv). The result must equal the rows layout BIT FOR BIT on the
+ * same values, in one wave and in several, on the chunk plan of `workers` many workers when forced. K/V positions at
+ * and after the context, and the padding between the heads, are NaN, so a read of anything the rows layout would not
+ * read fails. */
+static void attention_batch_head_case(AttnShape shape, int m, int pos0) {
+  int heads = shape.kv_heads * shape.group, kv_heads = shape.kv_heads, hd = shape.hd;
+  int seq = pos0 + m, cap = seq + ATTN_GUARD_ROWS;
+  size_t dim = (size_t)heads * hd, kv_dim = (size_t)kv_heads * hd, pad_base = ((size_t)cap + 3) * hd;
+  float *q = zeroed(m * dim, sizeof(float)), *kc = zeroed((size_t)cap * kv_dim, sizeof(float));
+  float *vc = zeroed((size_t)cap * kv_dim, sizeof(float)), *att = zeroed((size_t)heads * cap, sizeof(float));
+  float *want = zeroed(m * dim, sizeof(float)), *got = zeroed(m * dim, sizeof(float));
+  float *kp = zeroed(pad_base * kv_heads, sizeof(float)), *vp = zeroed(pad_base * kv_heads, sizeof(float));
+  float *kh = zeroed((size_t)cap * kv_dim, sizeof(float)), *vh = zeroed((size_t)cap * kv_dim, sizeof(float));
+  fill(q, m * dim, 2), fill(kc, (size_t)seq * kv_dim, 2), fill(vc, (size_t)seq * kv_dim, 1);
+  poison(kc + (size_t)seq * kv_dim, (size_t)ATTN_GUARD_ROWS * kv_dim);
+  poison(vc + (size_t)seq * kv_dim, (size_t)ATTN_GUARD_ROWS * kv_dim);
+  /* explicit strides, head bases wider than the heads' rows */
+  poison(kp, pad_base * kv_heads), poison(vp, pad_base * kv_heads);
+  for (int t = 0; t < seq; t++)
+    for (int g = 0; g < kv_heads; g++) {
+      memcpy(kp + g * pad_base + (size_t)t * hd, kc + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+      memcpy(vp + g * pad_base + (size_t)t * hd, vc + (size_t)t * kv_dim + (size_t)g * hd, hd * sizeof(float));
+    }
+  /* the engine layout: seq_len positions per head, written by k_kv_store; positions past the context stay NaN */
+  poison(kh, (size_t)cap * kv_dim), poison(vh, (size_t)cap * kv_dim);
+  assert(kernels_kv_layout_select("head"));
+  k_kv_store(kh, kc, kv_dim, 0, seq, kv_heads, hd, cap);
+  k_kv_store(vh, vc, kv_dim, 0, seq, kv_heads, hd, cap);
+  size_t strides[2];
+  k_kv_strides(kv_heads, hd, cap, &strides[0], &strides[1]);
+  expect(strides[0] == (size_t)hd && strides[1] == (size_t)cap * hd, "k_kv_strides [%s]: head layout strides wrong\n",
+         current);
+  assert(kernels_kv_layout_select("rows"));
+  k_kv_strides(kv_heads, hd, cap, &strides[0], &strides[1]);
+  expect(strides[0] == kv_dim && strides[1] == (size_t)hd, "k_kv_strides [%s]: rows layout strides wrong\n", current);
+  AttentionWork work;
+  k_attention_init_rows(&work, heads, kv_heads, hd, cap, m, NULL);
+  if (attn_force_workers) {
+    k_attention_free(&work);
+    int by_threads = (attn_force_workers + kv_heads - 1) / kv_heads, by_length = (cap + 255) / 256;
+    work.workers = attn_force_workers;
+    work.max_chunks = by_threads > by_length ? by_threads : by_length;
+    work.capacity = (size_t)m * heads * work.max_chunks * (hd + 2);
+    work.partial = zeroed(work.capacity, sizeof(float));
+    work.external = 1;
+  }
+  size_t full = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
+  const char *names[3] = {"split", "split-portable", "tiled"};
+  char label[160];
+  for (int v = 0; v < 3; v++) {
+    if (v == 1 && m < 2)
+      continue;
+    assert(kernels_attention_select(v == 2 ? "tiled" : "split", NULL));
+    for (int pass = 0; pass < 3; pass++) {
+      if (pass && (m < 3 || (pass == 2 && m > 32)))
+        continue;
+      size_t rows_per_wave = pass == 1 ? (size_t)(m / 3 > 0 ? m / 3 : 1) : 1;
+      work.capacity = pass ? (rows_per_wave * one_row < full ? rows_per_wave * one_row : full) : full;
+      snprintf(label, sizeof(label), "attention head layout batch %s g=%d hd=%d m=%d pos0=%d pass=%d", names[v],
+               shape.group, hd, m, pos0, pass);
+      poison(want, m * dim), poison(att, (size_t)heads * cap), poison(work.partial, full);
+      if (v == 1)
+        k_attention_batch_portable(want, q, kc, vc, &work, heads, kv_heads, hd, cap, pos0, m);
+      else
+        k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, cap, pos0, m);
+      poison(got, m * dim), poison(att, (size_t)heads * cap), poison(work.partial, full);
+      if (v == 1)
+        k_attention_batch_portable_layout(got, q, kp, vp, &work, heads, kv_heads, hd, cap, pos0, m, (size_t)hd,
+                                          pad_base);
+      else
+        k_attention_batch_layout(got, q, kp, vp, att, &work, heads, kv_heads, hd, cap, pos0, m, (size_t)hd, pad_base);
+      expect(!memcmp(got, want, m * dim * sizeof(float)), "%s [%s]: head-major result differs from rows bit for bit\n",
+             label, current);
+      if (v != 1) { /* the engine entry point with the layout selected */
+        assert(kernels_kv_layout_select("head"));
+        poison(got, m * dim), poison(att, (size_t)heads * cap), poison(work.partial, full);
+        k_attention_batch_kv(got, q, kh, vh, att, &work, heads, kv_heads, hd, cap, pos0, m);
+        assert(kernels_kv_layout_select("rows"));
+        expect(!memcmp(got, want, m * dim * sizeof(float)),
+               "%s [%s]: k_attention_batch_kv (head) differs from rows bit for bit\n", label, current);
+      }
+    }
+    assert(kernels_attention_select("split", NULL));
+  }
+  work.capacity = full;
+  k_attention_free(&work);
+  if (attn_force_workers)
+    free(work.partial);
+  free(q), free(kc), free(vc), free(att), free(want), free(got), free(kp), free(vp), free(kh), free(vh);
+}
+
+static void test_attention_batch_head_layout(int with_forced) {
+  const AttnShape shapes[] = {{2, 1, 64}, {2, 4, 64}, {2, 4, 128}, {2, 8, 40}, {4, 2, 128}};
+  const int ms[] = {1, 2, 3, 7, 32, 64};
+  /* prompts ending at 31/32/33, 255/256/257 and 513 positions, and warm contexts */
+  const int ends[] = {31, 32, 33, 255, 256, 257, 513}, warm[] = {1, 33, 256, 300};
+  for (size_t s = 0; s < sizeof(shapes) / sizeof(*shapes); s++)
+    for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++) {
+      for (size_t e = 0; e < sizeof(ends) / sizeof(*ends); e++)
+        if (ends[e] - ms[mi] >= 0)
+          attention_batch_head_case(shapes[s], ms[mi], ends[e] - ms[mi]);
+      for (size_t w = 0; w < sizeof(warm) / sizeof(*warm); w++)
+        attention_batch_head_case(shapes[s], ms[mi], warm[w]);
+    }
+  if (with_forced) { /* the multi-chunk plans of many-worker sockets, every position near a chunk edge */
+    const int workers[] = {3, 6, 56};
+    for (size_t w = 0; w < sizeof(workers) / sizeof(*workers); w++) {
+      attn_force_workers = workers[w];
+      for (int pos0 = 0; pos0 <= 70; pos0 += (pos0 < 40 ? 1 : 3)) {
+        attention_batch_head_case((AttnShape){2, 4, 64}, 7, pos0);
+        attention_batch_head_case((AttnShape){2, 1, 40}, 9, pos0);
+      }
+      attention_batch_head_case((AttnShape){2, 2, 64}, 33, 100);
+      attention_batch_head_case((AttnShape){2, 8, 64}, 5, 250);
+    }
+    attn_force_workers = 0;
+  }
+  attention_batch_head_case((AttnShape){2, 4, 128}, 64, 1023);
+}
+
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
@@ -1485,6 +1607,7 @@ int main(int argc, char **argv) {
     test_attention_matrix();
     test_attention_decode_long();
     test_attention_head_layout(1);
+    test_attention_batch_head_layout(1);
     test_attention_forced_plans();
     test_attention_empty_partial();
     test_attention_tiled_knobs();
@@ -1541,6 +1664,7 @@ int main(int argc, char **argv) {
       test_attention_batch();
       test_attention_matrix();
       test_attention_head_layout(0);
+      test_attention_batch_head_layout(0);
       test_partial();
       test_packed4();
       test_row_parallel();

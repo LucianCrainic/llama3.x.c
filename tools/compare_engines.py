@@ -39,16 +39,23 @@ def parse_env(items):
     return env
 
 
-def run_probe(probe, checkpoint, tokens, env, batch=None, last_only=False):
+def run_probe(probe, checkpoint, tokens, env, batch=None, last_only=False, tail=None):
     """Raw logits at every position. batch=M runs the batched prefill path (C1) with LLAMA_PREFILL_BATCH=M; with
-    last_only the batched path returns just the final position's row, which keeps long prompts affordable."""
-    command = [str(probe)] + (['batch'] if batch else []) + [str(checkpoint), *map(str, tokens)]
-    if batch:
+    last_only the batched path returns just the final position's row, which keeps long prompts affordable. tail=K runs
+    the probe's `tail` mode: all but the last K tokens through the batched prefill (batch=M, per token without it), then
+    the last K per token, K rows of logits: the decode path on a long retained context."""
+    if tail:
+        command = [str(probe), 'tail', str(checkpoint), str(tail), *map(str, tokens)]
+        if batch:
+            env = {**env, 'LLAMA_PREFILL_BATCH': str(batch)}
+    else:
+        command = [str(probe)] + (['batch'] if batch else []) + [str(checkpoint), *map(str, tokens)]
+    if batch and not tail:
         env = {**env, 'LLAMA_PREFILL_BATCH': str(batch), 'LLAMA_PREFILL_LOGITS': 'last' if last_only else 'all'}
     result = subprocess.run(command, capture_output=True, env={**os.environ, **env})
     if result.returncode != 0:
         raise SystemExit(f'probe failed (exit {result.returncode}) under {env}: {result.stderr.decode(errors="replace")}')
-    rows = 1 if batch and last_only else len(tokens)
+    rows = tail if tail else 1 if batch and last_only else len(tokens)
     if not result.stdout or len(result.stdout) % (rows * 4):
         raise SystemExit(f'probe wrote {len(result.stdout)} bytes, not a multiple of {rows} float32 rows')
     return result.stdout
@@ -105,6 +112,9 @@ def main(argv=None):
     parser.add_argument('--rms-max', type=float, help='statistical gate: budget for the rms of the logit differences')
     parser.add_argument('--argmax-min', type=float,
                         help='statistical gate: minimum fraction of positions whose argmax agrees (default 1.0)')
+    parser.add_argument('--tail', type=int, metavar='K',
+                        help='compare the logits of the last K positions, each a per-token forward after the rest of the prompt '
+                             '(batched with --batch-a/--batch-b): the decode path on a long context')
     parser.add_argument('--bitwise', action='store_true', help='require bit-identical logits instead of the --max-abs budget')
     parser.add_argument('--output', help='write the JSON result here as well as to stdout')
     args = parser.parse_args(argv)
@@ -113,9 +123,11 @@ def main(argv=None):
     if not tokens:
         raise SystemExit('no tokens given')
     env_a, env_b = parse_env(args.env_a), parse_env(args.env_b)
-    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a, args.last_only)
-    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b, args.last_only)
-    compared = len(tokens)
+    if args.tail is not None and (args.last_only or not 0 < args.tail <= len(tokens)):
+        raise SystemExit('--tail K needs 0 < K <= the number of tokens and cannot be combined with --last-only')
+    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a, args.last_only, args.tail)
+    blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b, args.last_only, args.tail)
+    compared = args.tail or len(tokens)
     if args.last_only:
         row_bytes = len(blob_a) // (len(tokens) if not args.batch_a else 1)
         blob_a, compared = blob_a[-row_bytes:], 1  # a batched side already returns just the final row
@@ -126,7 +138,7 @@ def main(argv=None):
     if statistical and args.bitwise:
         raise SystemExit('--bitwise cannot be combined with --rms-max or --argmax-min')
     for index, row in enumerate(positions(blob_a, blob_b, compared)):
-        position = len(tokens) - 1 if args.last_only else index
+        position = len(tokens) - 1 if args.last_only else len(tokens) - compared + index
         row.update(position=position, token=tokens[position])
         row['passed'] = row['finite'] and (statistical or row['argmax_match']) and (
             row['bitwise'] if args.bitwise else row['max_abs'] <= args.max_abs)
@@ -142,6 +154,7 @@ def main(argv=None):
             args.rms_max is None or summary['rms'] <= args.rms_max)
     result = dict(passed=passed, probe=str(args.probe), checkpoint=str(args.checkpoint),
                   env_a=env_a, env_b=env_b, batch_a=args.batch_a, batch_b=args.batch_b, tokens=len(tokens),
+                  tail=args.tail,
                   budget=dict(max_abs=0.0 if args.bitwise else args.max_abs, argmax_agreement=argmax_min,
                               bitwise=args.bitwise, rms_max=args.rms_max, statistical=statistical),
                   summary=summary, comparisons=rows)
