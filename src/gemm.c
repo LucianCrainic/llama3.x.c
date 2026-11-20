@@ -268,7 +268,8 @@ static int cpu_has_amx(void) {
 #endif
 
 /* NULL when AMX can be used, else why not. Requests the kernel's tile-data permission on the first call; that must
- * happen before any worker thread executes a tile instruction, and kernels_init() is that point. */
+ * happen before any thread executes a tile instruction: kernels_init() for LLAMA_KERNELS=amx, kernels_select_amx_auto()
+ * under auto (the permission is process-wide, so workers started before it are covered). */
 const char *gemm_amx_unavailable(void) {
 #if !GEMM_AMX
   return "this build has no AMX support (it needs x86-64 and a compiler with the AMX intrinsics, GCC 11 or later)";

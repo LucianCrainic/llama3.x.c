@@ -55,8 +55,9 @@ void prefill_configure(Model *model, int recommended) {
     if (model->max_batch < 2)
       fail("LLAMA_PRECISION=bf16 applies to batched prefill: set LLAMA_PREFILL_BATCH to 2 or more");
     model->prefill_gemm = 1;
+    kernels_select_amx_auto(); /* BF16 was asked for: under LLAMA_KERNELS=auto it runs on AMX-BF16 where AMX can run */
     if (!kernels_amx_active())
-      LOG(LOG_WARN, "LLAMA_PRECISION=bf16 without LLAMA_KERNELS=amx runs the portable BF16 reference GEMM (slow)");
+      LOG(LOG_WARN, "LLAMA_PRECISION=bf16 without AMX runs the portable BF16 reference GEMM (slow)");
   }
   model->prefill_logits = logits && !strcmp(logits, "all") ? LOGITS_ALL : LOGITS_LAST;
   LOG(LOG_DEBUG, "prefill: maximum batch=%d, logits=%s, gemm=%s, precision=%s", model->max_batch,

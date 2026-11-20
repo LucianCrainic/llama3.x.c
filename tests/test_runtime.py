@@ -74,9 +74,11 @@ class RuntimeTests(unittest.TestCase):
         _, data = self.execute('run')
         for key in v2:
             self.assertIn(key, data)
+        # Batched prefill is the default where the GEMM runs (AVX-512): 128 rows, capped at the fixture's context of 32.
+        scalar = data['build']['kernels'] == 'scalar'
         self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
-            'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None,
-            'attn_row_block': 4})
+            'precision_mode': 'fp32', 'prefill_batch': 1 if scalar else 32, 'prefill_logits': 'last',
+            'kernels_prefill': None if scalar else 'avx512', 'attn_row_block': 4})
         self.assertIsNone(data['teams'])
         self.assertEqual(data['regions'], [])
         self.assertIsNone(data['phase_seconds'])
@@ -403,7 +405,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('LLAMA_PREFILL_GEMM', data['error'])
 
     def test_amx_is_explicit_and_fails_clearly_when_unavailable(self):
-        """C4: `auto` never picks amx; an explicit request is honoured or fails with the reason (no silent fallback)."""
+        """C4: `auto` never picks amx for an FP32 checkpoint (nor asks for the tile permission); an explicit request is
+        honoured or fails with the reason (no silent fallback). Q8 W8A8 and the explicit BF16 mode take AMX under auto
+        (D2 §7; test_tp.py covers them on the emulated tiles)."""
         _, data = self.execute('run', env={'LLAMA_KERNELS': 'auto'})
         self.assertNotEqual(data['build']['kernels'], 'amx')
         self.assertEqual(data['build']['amx_permission'], 'not requested')
@@ -468,7 +472,7 @@ class RuntimeTests(unittest.TestCase):
         for engine, env, text in (
                 ('run', {'LLAMA_PRECISION': 'half'}, 'LLAMA_PRECISION must be fp32 or bf16'),
                 ('runq', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4'}, 'applies to FP32 checkpoints'),
-                ('run', {'LLAMA_PRECISION': 'bf16'}, 'set LLAMA_PREFILL_BATCH to 2 or more'),
+                ('run', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '1'}, 'set LLAMA_PREFILL_BATCH to 2 or more'),
                 ('run', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4', 'LLAMA_PREFILL_GEMM': 'off'},
                  'LLAMA_PREFILL_GEMM=off')):
             with self.subTest(engine=engine, env=env):

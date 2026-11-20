@@ -35,8 +35,9 @@ const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after
  * two segments. Returns after every share has run. */
 int kernels_avx512_active(void);
 int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
-/* LLAMA_KERNELS unset or auto and AMX usable: selects it (the Q8 engine does, for W8A8 batched prefill, D2 §7). Returns
- * kernels_amx_active(). */
+/* LLAMA_KERNELS unset or auto, and AMX usable (this requests the tile permission): selects it. Called for
+ * batched prefill in W8A8 (runq, D2 §7) and in the explicit BF16 mode (prefill_configure); an FP32 checkpoint without
+ * LLAMA_PRECISION=bf16 never asks, so its permission stays "not requested" (C4). Returns kernels_amx_active(). */
 int kernels_select_amx_auto(void);
 /* Attention variants (E1). kernels_init reads LLAMA_ATTN (batched, prefill: split|tiled|amx) and LLAMA_ATTN_DECODE
  * (single row: split|group) once. The defaults are tiled for the batched path (since E4; it runs split where AVX-512

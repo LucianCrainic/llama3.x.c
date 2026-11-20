@@ -35,7 +35,7 @@ exists for tests and measurements only and is never a deployment setting.
 | Persistent worker teams (`LLAMA_BACKEND=teams`) | Default with two sockets; opt-in on one, used by every campaign since F2 | [F2](plans/00-foundations/F2-worker-teams.md): decode +4% to +11% against OpenMP |
 | Batched prefill (`LLAMA_PREFILL_BATCH=M`) | Default where the batched GEMM runs (AVX-512, AMX): section 2.1 | [batched-prefill.md](batched-prefill.md): 8B 2048-token TTFT 121 s to 10.5 s |
 | AMX-INT8 prefill for Q8_0 (`LLAMA_KERNELS=amx`, `runq`) | Default for W8A8 batched prefill where AMX can run | [numa-tp-prefill-results.md](numa-tp-prefill-results.md) §7: 3.4x AVX-512 Q8 |
-| AMX-BF16 prefill for FP32 (`LLAMA_PRECISION=bf16` + `LLAMA_KERNELS=amx`) | Opt-in by user decision (BF16 never silent) | same, 3.6x the AVX-512 FP32 GEMM |
+| AMX-BF16 prefill for FP32 (`LLAMA_PRECISION=bf16`, on AMX under `auto`) | Opt-in by user decision (BF16 never silent) | same, 3.6x the AVX-512 FP32 GEMM |
 | Engine-owned, verified placement (`LLAMA_PLACEMENT=hbm\|ddr`) | Opt-in on one socket; two sockets always own their shards, in HBM by default on an HBM node | [numa-placement.md](numa-placement.md) |
 | Two-socket tensor parallelism (`LLAMA_SOCKETS=2`) | Default on a node whose two sockets each have an HBM node | [tensor-parallel.md](tensor-parallel.md): 8B decode 1.87-1.99x one socket |
 | Fused tiled prefill attention (`LLAMA_ATTN=tiled`) | Default for batched prefill | [attention-results.md](attention-results.md): 1.55x TTFT at 8B/8192 |
@@ -62,7 +62,7 @@ set on 20 November 2026. Each rule applies only while its own knob is unset, and
 | Backend | `teams` with two sockets, `omp` with one |
 | Placement | `hbm` with two sockets on such a node (each socket's shards in its own HBM, verified), `file` otherwise |
 | Prefill batch | where the batched GEMM runs (AVX-512 or AMX, or `LLAMA_PREFILL_GEMM=on`): 128 rows for FP32 on one socket, 64 on two, 256 for W8A8 and AMX-BF16; 1 on the scalar kernels, with `LLAMA_PREFILL_GEMM=off`, and for W8A32 |
-| Kernels | `auto`: AVX-512 where available, scalar otherwise; `runq` W8A8 with batched prefill also takes AMX-INT8 where AMX can run (group size a multiple of 64). An FP32 checkpoint never gets AMX by default (BF16 stays a user decision) |
+| Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
 
 To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
 `LLAMA_ATTN=split` for runs before E4). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`).

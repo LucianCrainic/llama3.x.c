@@ -26,8 +26,8 @@ the machine (sockets, backend, placement, prefill batch, AMX) are resolved as in
 
 | Variable | Values (default first) | Meaning |
 | --- | --- | --- |
-| `LLAMA_KERNELS` | `auto`, `scalar`, `avx512`, `amx` | instruction set; `auto` picks AVX-512 when available, and AMX-INT8 for `runq` W8A8 batched prefill where AMX can run (never AMX for an FP32 checkpoint); `amx` keeps AVX-512 for everything but the prefill GEMMs |
-| `LLAMA_PRECISION` (`run` only) | `fp32`, `bf16` | `bf16` runs batched prefill on BF16-packed weights (needs a batch of 2 or more); decode stays FP32 |
+| `LLAMA_KERNELS` | `auto`, `scalar`, `avx512`, `amx` | instruction set; `auto` picks AVX-512 when available, and AMX for batched prefill where it can run: AMX-INT8 for `runq` W8A8, AMX-BF16 with `LLAMA_PRECISION=bf16` (never for plain FP32); `amx` keeps AVX-512 for everything but the prefill GEMMs |
+| `LLAMA_PRECISION` (`run` only) | `fp32`, `bf16` | `bf16` runs batched prefill on BF16-packed weights, on AMX where it can run (needs a batch of 2 or more, the default on AVX-512); decode stays FP32 |
 | `LLAMA_Q8_ACTIVATIONS` (`runq` only) | `int8`, `fp32` | W8A8 (Q8_0 rule) or W8A32; W8A32 never uses the batched GEMM |
 | `LLAMA_ATTN` | `tiled`, `split` | batched prefill attention (`tiled` falls back to `split` without AVX-512) |
 | `LLAMA_ATTN_DECODE` | `split`, `group` | decode attention |

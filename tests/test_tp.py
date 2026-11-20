@@ -267,6 +267,24 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIsNone(data['runtime']['kernels_prefill'])
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
 
+    def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
+        """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the
+        explicit BF16 mode takes AMX-BF16. The emulated-tile binaries have no AVX-512, so `auto` starts from the scalar
+        kernels there and the GEMM and batch are named (on AVX-512 they are the default)."""
+        auto = {'LLAMA_KERNELS': 'auto', 'LLAMA_PREFILL_GEMM': 'on', 'LLAMA_PREFILL_BATCH': '4'}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets):
+                data = self.report('runq', 'int8.bin', sockets, fixture='wide', binary='runq-amx-emul', full=True, **auto)
+                self.assertEqual((data['runtime']['kernels_prefill'], data['build']['kernels']), ('amx-int8', 'amx'))
+                data = self.report('runq', 'int8.bin', sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                                   LLAMA_Q8_ACTIVATIONS='fp32', **auto)
+                self.assertEqual((data['runtime']['kernels_prefill'], data['build']['kernels']), (None, 'scalar'))
+                data = self.report('run', 'fp32.bin', sockets, binary='run-amx-emul', full=True, **auto)
+                self.assertEqual(data['build']['kernels'], 'scalar')
+                data = self.report('run', 'fp32.bin', sockets, binary='run-amx-emul', full=True, LLAMA_PRECISION='bf16',
+                                   **auto)
+                self.assertEqual((data['runtime']['kernels_prefill'], data['build']['kernels']), ('amx-bf16', 'amx'))
+
     def test_fp32_two_socket_batched_prefill_thread_counts_and_last_logits(self):
         knobs = {'LLAMA_PREFILL_GEMM': 'on'}
         tokens = [65 + (i * 5) % 19 for i in range(33)]

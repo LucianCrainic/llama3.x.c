@@ -150,8 +150,7 @@ void kernels_init(void) {
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
     kernels_select(supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR);
-    /* Asked now, so the tile-data permission is requested before any worker exists (gemm_amx_unavailable). */
-    amx_auto = supported(KERNELS_AVX512) && supported(KERNELS_AMX);
+    amx_auto = 1; /* AMX itself (which implies AVX-512) is asked for only when an engine wants it (C4) */
   } else if (!strcmp(request, "scalar")) {
     kernels_select(KERNELS_SCALAR);
   } else if (!strcmp(request, "avx512")) {
@@ -169,10 +168,10 @@ void kernels_init(void) {
 }
 
 int kernels_select_amx_auto(void) {
-  if (amx_auto && !gemm_amx_active()) {
-    kernels_select(KERNELS_AMX);
-    LOG(LOG_INFO, "LLAMA_KERNELS=auto: AMX-INT8 runs the batched Q8 prefill (LLAMA_KERNELS=avx512 keeps VNNI)");
-  }
+  /* The tile-data permission is requested here, after the workers exist; Linux grants it to the whole process, and no
+   * thread has executed a tile instruction yet. */
+  if (amx_auto && !gemm_amx_active() && kernels_select(KERNELS_AMX))
+    LOG(LOG_INFO, "LLAMA_KERNELS=auto: AMX runs the batched prefill GEMMs (LLAMA_KERNELS=avx512 keeps AVX-512)");
   return gemm_amx_active();
 }
 
