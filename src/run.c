@@ -453,7 +453,8 @@ void engine_load_context(Model *model, const char *path, int context) {
   model->config = t->config;
   double start = monotonic_seconds();
   model->prefill_bf16 = prefill_precision(0);
-  prefill_configure(model);
+  /* D2 §7: 128 rows per pass on one socket, 64 on two, 256 for the AMX-BF16 rung. */
+  prefill_configure(model, model->prefill_bf16 ? 256 : tp_sockets_requested() == 2 ? 64 : 128);
   if (tp_sockets_requested() == 2) {
     /* D1: with the GEMM on, microbatches run through the batched two-socket forward, else per token as before. In BF16
      * mode every microbatch does, even a single row, so a prompt's precision does not depend on how it was split. */

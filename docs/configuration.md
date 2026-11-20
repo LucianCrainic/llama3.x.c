@@ -2,7 +2,8 @@
 
 Command-line options select the request; environment variables select how the engine executes it. Every variable is
 validated at load (a bad value fails with a message), and every execution choice is recorded in the `--json` report. With
-no variable set, the engine runs the default path of [architecture.md](architecture.md) §2.
+no variable set, the engine runs the default path of [architecture.md](architecture.md) §2; the defaults that depend on
+the machine (sockets, backend, placement, prefill batch, AMX) are resolved as in its §2.1.
 
 ## Command line (`run` and `runq`)
 
@@ -25,7 +26,7 @@ no variable set, the engine runs the default path of [architecture.md](architect
 
 | Variable | Values (default first) | Meaning |
 | --- | --- | --- |
-| `LLAMA_KERNELS` | `auto`, `scalar`, `avx512`, `amx` | instruction set; `auto` picks AVX-512 when available, never AMX; `amx` keeps AVX-512 for everything but the prefill GEMMs |
+| `LLAMA_KERNELS` | `auto`, `scalar`, `avx512`, `amx` | instruction set; `auto` picks AVX-512 when available, and AMX-INT8 for `runq` W8A8 batched prefill where AMX can run (never AMX for an FP32 checkpoint); `amx` keeps AVX-512 for everything but the prefill GEMMs |
 | `LLAMA_PRECISION` (`run` only) | `fp32`, `bf16` | `bf16` runs batched prefill on BF16-packed weights (needs a batch of 2 or more); decode stays FP32 |
 | `LLAMA_Q8_ACTIVATIONS` (`runq` only) | `int8`, `fp32` | W8A8 (Q8_0 rule) or W8A32; W8A32 never uses the batched GEMM |
 | `LLAMA_ATTN` | `tiled`, `split` | batched prefill attention (`tiled` falls back to `split` without AVX-512) |
@@ -36,7 +37,7 @@ no variable set, the engine runs the default path of [architecture.md](architect
 
 | Variable | Values | Meaning |
 | --- | --- | --- |
-| `LLAMA_PREFILL_BATCH` | `1` or M | prompt tokens per forward pass (capped at the context). D2 recommends 128 for FP32 on one socket, 64 on two, 256 for Q8 and the AMX rungs |
+| `LLAMA_PREFILL_BATCH` | M | prompt tokens per forward pass (capped at the context). Default where the batched GEMM runs: 128 for FP32 on one socket, 64 on two, 256 for W8A8 and BF16; otherwise (scalar kernels, `LLAMA_PREFILL_GEMM=off`, W8A32) 1, token by token |
 | `LLAMA_PREFILL_GEMM` | `auto`, `on`, `off` | batched GEMM (`auto`: on where AVX-512 or AMX runs) or the per-row reference |
 | `LLAMA_PREFILL_LOGITS` | `last`, `all` | logits of the last prompt row only, or every row (diagnostic) |
 
@@ -44,12 +45,12 @@ no variable set, the engine runs the default path of [architecture.md](architect
 
 | Variable | Values | Meaning |
 | --- | --- | --- |
-| `LLAMA_BACKEND` | `omp`, `teams` | OpenMP regions, or persistent pinned worker teams |
+| `LLAMA_BACKEND` | `omp` (one socket), `teams` (two) | OpenMP regions, or persistent pinned worker teams. A build without `OPENMP=1` (the `make` default) runs `omp` serially: set `teams` on one socket |
 | `LLAMA_THREADS` | N | team size (default: every allowed CPU for one team; each socket's allowed physical cores with two sockets) |
 | `LLAMA_TOPOLOGY` | `auto`, `virtual:SxT`, `explicit:C0/H0/D0,C1/H1/D1` | socket/NUMA map: discovered, S fake unpinned sockets of T threads (tests), or explicit package/HBM/DDR nodes |
-| `LLAMA_SOCKETS` | `1`, `2` | tensor parallelism over two sockets (needs `teams`) |
+| `LLAMA_SOCKETS` | `2` on a dual-socket HBM node, else `1` | tensor parallelism over two sockets (runs on `teams`; `omp` is an error). Unset, 2 is chosen only on a discovered topology whose two sockets each have an allowed HBM node, with no `LLAMA_BACKEND=omp`, `LLAMA_TOPOLOGY` or `LLAMA_PLACEMENT=file\|ddr` |
 | `LLAMA_TEAM_FANOUT` | `8`, `0`, N <= 64 | group size of the dispatch tree (0 = flat) |
-| `LLAMA_PLACEMENT` | `file`, `ddr`, `hbm` | where one socket's weights live. Two sockets always copy their shards into owned regions: `hbm`/`ddr` bind them to each socket's node, `file` leaves them unbound (first touch by the socket's own team) |
+| `LLAMA_PLACEMENT` | `file` (one socket), `hbm` (two sockets on an HBM node), `ddr` | where the weights live. Two sockets always copy their shards into owned regions: `hbm`/`ddr` bind them to each socket's node, `file` leaves them unbound (first touch by the socket's own team, which lands in DDR) |
 | `LLAMA_PLACEMENT_STRICT` | `1` for `ddr`/`hbm`, else `0` | fail when a page is found on the wrong node or placement cannot be verified |
 | `LLAMA_HBM_BUDGET_GIB` | `56` | per-socket HBM budget checked before reserving |
 | `LLAMA_THP` | `off`, `on` | transparent huge pages for owned regions |

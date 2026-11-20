@@ -511,7 +511,10 @@ void engine_load_context(Model *model, const char *path, int context) {
   t->config.seq_len = context ? context : (t->config.seq_len < 4096 ? t->config.seq_len : 4096);
   model->config = t->config;
   double start = monotonic_seconds();
-  prefill_configure(model);
+  /* D2 §7: W8A8 prefill takes 256 rows per pass, on AMX-INT8 where it can run; W8A32 never batches. */
+  prefill_configure(model, fp32_activations ? 1 : 256);
+  if (!fp32_activations && model->prefill_gemm && GS % 64 == 0)
+    kernels_select_amx_auto();
   if (tp_sockets_requested() == 2) {
     /* D1: W8A8 microbatches run through the batched two-socket forward (the VNNI or portable Q8 GEMM; the AMX-INT8 rung
      * needs packed shards, which come with the BF16 ones). W8A32 stays per token, as on one socket. */

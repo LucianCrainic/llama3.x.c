@@ -79,16 +79,40 @@ struct Tp {
   int token, pos, loader_fd;
 };
 
+int tp_hbm_pair(void) {
+  const Topology *topology;
+  char err[512];
+  return !numa_topology_try(&topology, err, sizeof(err)) && topology->classification != CLASS_VIRTUAL &&
+         !numa_check_placement(topology, SOCKETS, "hbm", err, sizeof(err));
+}
+
+static int knob_set(const char *name) {
+  const char *value = getenv(name);
+  return value && *value;
+}
+
 int tp_sockets_requested(void) {
-  const char *value = getenv("LLAMA_SOCKETS");
-  if (!value || !*value || !strcmp(value, "1"))
-    return 1;
-  if (strcmp(value, "2"))
-    fail("LLAMA_SOCKETS must be 1 or 2");
-  const char *backend = getenv("LLAMA_BACKEND");
-  if (!backend || strcmp(backend, "teams"))
-    fail("LLAMA_SOCKETS=2 requires LLAMA_BACKEND=teams");
-  return 2;
+  static int sockets;
+  if (sockets)
+    return sockets;
+  const char *value = getenv("LLAMA_SOCKETS"), *backend = getenv("LLAMA_BACKEND"), *topology = getenv("LLAMA_TOPOLOGY"),
+             *placement = getenv("LLAMA_PLACEMENT");
+  int omp = knob_set("LLAMA_BACKEND") && !strcmp(backend, "omp");
+  if (knob_set("LLAMA_SOCKETS")) {
+    if (strcmp(value, "1") && strcmp(value, "2"))
+      fail("LLAMA_SOCKETS must be 1 or 2");
+    if (!strcmp(value, "2") && omp)
+      fail("LLAMA_SOCKETS=2 requires LLAMA_BACKEND=teams");
+    return sockets = value[0] - '0';
+  }
+  /* D2 §7: unset, both sockets of a node whose sockets each have an allowed HBM node, unless the other knobs ask for a
+   * one-socket configuration (OpenMP, a given topology, file or DDR placement). */
+  int auto_two = !omp && !(knob_set("LLAMA_TOPOLOGY") && strcmp(topology, "auto")) &&
+                 !(knob_set("LLAMA_PLACEMENT") && strcmp(placement, "hbm")) && tp_hbm_pair();
+  if (auto_two)
+    LOG(LOG_INFO, "LLAMA_SOCKETS unset: both sockets have an HBM node, so the model runs on both (LLAMA_SOCKETS=1 keeps "
+                  "one)");
+  return sockets = auto_two ? 2 : 1;
 }
 
 int tp_check_topology(const char *placement) {

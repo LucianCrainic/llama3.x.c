@@ -18,8 +18,8 @@ ABS, REL = 2e-6, 2e-5   # the fixture tolerance of test_runtime.py
 
 def environment(sockets, threads=3, **extra):
     env = {**os.environ, 'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(threads), 'LLAMA_TP_CHECK': '1', **extra}
-    env.pop('LLAMA_SOCKETS', None)
     env.pop('LLAMA_TOPOLOGY', None)
+    env['LLAMA_SOCKETS'] = '1'  # explicit: unset means two sockets on a dual-socket HBM node
     if sockets == 2:
         env.update(LLAMA_SOCKETS='2', LLAMA_TOPOLOGY=f'virtual:2x{threads}')
     return env
@@ -412,6 +412,16 @@ class TensorParallelTests(unittest.TestCase):
             else:
                 self.assertEqual(result.stdout, expected)
                 self.assertIn('"status": "completed"', report.read_text())
+
+    def test_two_sockets_imply_worker_teams(self):
+        """LLAMA_SOCKETS=2 with LLAMA_BACKEND unset runs on teams (the only backend two sockets have), bitwise as with it."""
+        env = environment(2)
+        del env['LLAMA_BACKEND']
+        model = self.fixtures['shared']/'fp32.bin'
+        implied = subprocess.run([str(BUILD/'probe-fp32'), str(model), *map(str, TOKENS)], capture_output=True,
+                                 timeout=60, env=env)
+        self.assertEqual(implied.returncode, 0, implied.stderr.decode())
+        self.assertEqual(implied.stdout, self.probe('fp32', 'shared', None, 2))
 
     def test_incompatible_configurations_are_rejected(self):
         model = self.one_kv/'fp32.bin'

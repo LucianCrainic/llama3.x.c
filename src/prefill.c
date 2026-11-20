@@ -23,9 +23,15 @@ int prefill_precision(int quantized) {
   return bf16;
 }
 
-void prefill_configure(Model *model) {
+void prefill_configure(Model *model, int recommended) {
   const char *batch = getenv("LLAMA_PREFILL_BATCH");
-  long count = 1;
+  const char *gemm = getenv("LLAMA_PREFILL_GEMM");
+  if (gemm && *gemm && strcmp(gemm, "auto") && strcmp(gemm, "on") && strcmp(gemm, "off"))
+    fail("LLAMA_PREFILL_GEMM must be auto, on or off");
+  int gemm_on = gemm && !strcmp(gemm, "on")    ? 1
+                : gemm && !strcmp(gemm, "off") ? 0
+                                               : kernels_avx512_active() || kernels_amx_active();
+  long count = gemm_on ? recommended : 1;
   if (batch && *batch) {
     /* Require decimal digits only (strtol alone also accepts whitespace/signs). */
     if (strspn(batch, "0123456789") != strlen(batch))
@@ -41,14 +47,8 @@ void prefill_configure(Model *model) {
     fail("LLAMA_PREFILL_LOGITS must be last or all");
   /* LLAMA_PREFILL_GEMM: auto = the GEMM where the AVX-512 kernels or AMX run, on = always (the scalar GEMM sums like
    * the GEMV), off = the per-row reference. The Q8 engine has a W8A8 GEMM (C6); W8A32 always runs per row. */
-  const char *gemm = getenv("LLAMA_PREFILL_GEMM");
-  if (gemm && *gemm && strcmp(gemm, "auto") && strcmp(gemm, "on") && strcmp(gemm, "off"))
-    fail("LLAMA_PREFILL_GEMM must be auto, on or off");
   model->max_batch = count < model->config.seq_len ? (int)count : model->config.seq_len;
-  model->prefill_gemm = (gemm && !strcmp(gemm, "on")    ? 1
-                         : gemm && !strcmp(gemm, "off") ? 0
-                                                        : kernels_avx512_active() || kernels_amx_active()) &&
-                        model->max_batch > 1;
+  model->prefill_gemm = gemm_on && model->max_batch > 1;
   if (model->prefill_bf16) {
     if (gemm && !strcmp(gemm, "off"))
       fail("LLAMA_PRECISION=bf16 needs the batched GEMM, but LLAMA_PREFILL_GEMM=off disables it");

@@ -78,6 +78,8 @@ static int supported(KernelIsa which) {
 #endif
 }
 
+static int amx_auto; /* LLAMA_KERNELS=auto on a machine where AMX can run: kernels_select_amx_auto may take it */
+
 int kernels_select(KernelIsa which) {
   if (!supported(which))
     return 0;
@@ -148,6 +150,8 @@ void kernels_init(void) {
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
     kernels_select(supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR);
+    /* Asked now, so the tile-data permission is requested before any worker exists (gemm_amx_unavailable). */
+    amx_auto = supported(KERNELS_AVX512) && supported(KERNELS_AMX);
   } else if (!strcmp(request, "scalar")) {
     kernels_select(KERNELS_SCALAR);
   } else if (!strcmp(request, "avx512")) {
@@ -162,6 +166,14 @@ void kernels_init(void) {
   attention_init_from_env();
   LOG(LOG_DEBUG, "compute kernels: %s, attention %s, decode attention %s", kernels_name(), kernels_attention_name(),
       kernels_attention_decode_name());
+}
+
+int kernels_select_amx_auto(void) {
+  if (amx_auto && !gemm_amx_active()) {
+    kernels_select(KERNELS_AMX);
+    LOG(LOG_INFO, "LLAMA_KERNELS=auto: AMX-INT8 runs the batched Q8 prefill (LLAMA_KERNELS=avx512 keeps VNNI)");
+  }
+  return gemm_amx_active();
 }
 
 const char *kernels_name(void) {
@@ -2438,17 +2450,18 @@ const char *kernels_backend_name(void) {
 }
 
 void kernels_backend_init(void) {
-  int sockets = tp_sockets_requested(); /* LLAMA_SOCKETS=2 without LLAMA_BACKEND=teams fails here */
+  int sockets = tp_sockets_requested(); /* LLAMA_SOCKETS=2 with LLAMA_BACKEND=omp fails here */
   /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
    * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
   const Topology *topology_result;
   char topology_error[512];
   numa_topology_try(&topology_result, topology_error, sizeof(topology_error));
   const char *backend = getenv("LLAMA_BACKEND");
-  if (!backend || !*backend || !strcmp(backend, "omp"))
-    return;
-  if (strcmp(backend, "teams"))
+  if (backend && *backend && strcmp(backend, "omp") && strcmp(backend, "teams"))
     fail("LLAMA_BACKEND must be omp or teams");
+  /* Unset: OpenMP, except on two sockets, which run on teams only. */
+  if (backend && *backend ? !strcmp(backend, "omp") : sockets == 1)
+    return;
   if (backend_started)
     return;
 #ifdef _OPENMP

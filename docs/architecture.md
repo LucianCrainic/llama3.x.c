@@ -31,13 +31,13 @@ exists for tests and measurements only and is never a deployment setting.
 | --- | --- | --- |
 | Scalar reference kernels (original llama2.c operation order) | Default where AVX-512 is absent | `tests/kernels.c` (double-precision references) |
 | AVX-512 GEMV / attention / norm kernels | Default on AVX-512 + VNNI CPUs | [kernels.md](kernels.md) |
-| OpenMP scheduling (`LLAMA_BACKEND=omp`) | Default | Kept as the reference backend; see section 8 |
-| Persistent worker teams (`LLAMA_BACKEND=teams`) | Opt-in; **required** by two sockets and used by every campaign since F2 | [F2](plans/00-foundations/F2-worker-teams.md): decode +4% to +11% against OpenMP |
-| Batched prefill (`LLAMA_PREFILL_BATCH=M`) | Opt-in (D2 recommends it as default) | [batched-prefill.md](batched-prefill.md): 8B 2048-token TTFT 121 s to 10.5 s |
-| AMX-INT8 prefill for Q8_0 (`LLAMA_KERNELS=amx`, `runq`) | Opt-in (D2 recommends default when AMX exists) | [numa-tp-prefill-results.md](numa-tp-prefill-results.md) §7: 3.4x AVX-512 Q8 |
+| OpenMP scheduling (`LLAMA_BACKEND=omp`) | Default on one socket; serial in a build without `OPENMP=1` (the `make` default) | Kept as the reference backend; see section 8 |
+| Persistent worker teams (`LLAMA_BACKEND=teams`) | Default with two sockets; opt-in on one, used by every campaign since F2 | [F2](plans/00-foundations/F2-worker-teams.md): decode +4% to +11% against OpenMP |
+| Batched prefill (`LLAMA_PREFILL_BATCH=M`) | Default where the batched GEMM runs (AVX-512, AMX): section 2.1 | [batched-prefill.md](batched-prefill.md): 8B 2048-token TTFT 121 s to 10.5 s |
+| AMX-INT8 prefill for Q8_0 (`LLAMA_KERNELS=amx`, `runq`) | Default for W8A8 batched prefill where AMX can run | [numa-tp-prefill-results.md](numa-tp-prefill-results.md) §7: 3.4x AVX-512 Q8 |
 | AMX-BF16 prefill for FP32 (`LLAMA_PRECISION=bf16` + `LLAMA_KERNELS=amx`) | Opt-in by user decision (BF16 never silent) | same, 3.6x the AVX-512 FP32 GEMM |
-| Engine-owned, verified placement (`LLAMA_PLACEMENT=hbm\|ddr`) | Opt-in; two sockets always own their shards and bind them with `hbm`/`ddr` | [numa-placement.md](numa-placement.md) |
-| Two-socket tensor parallelism (`LLAMA_SOCKETS=2`) | Opt-in (D2 recommends default on dual-socket HBM nodes) | [tensor-parallel.md](tensor-parallel.md): 8B decode 1.87-1.99x one socket |
+| Engine-owned, verified placement (`LLAMA_PLACEMENT=hbm\|ddr`) | Opt-in on one socket; two sockets always own their shards, in HBM by default on an HBM node | [numa-placement.md](numa-placement.md) |
+| Two-socket tensor parallelism (`LLAMA_SOCKETS=2`) | Default on a node whose two sockets each have an HBM node | [tensor-parallel.md](tensor-parallel.md): 8B decode 1.87-1.99x one socket |
 | Fused tiled prefill attention (`LLAMA_ATTN=tiled`) | Default for batched prefill | [attention-results.md](attention-results.md): 1.55x TTFT at 8B/8192 |
 | Split-K prefill attention (`LLAMA_ATTN=split`) | Opt-in (reproduces runs before E4) | same |
 | Split-K decode attention (`LLAMA_ATTN_DECODE=split`) | Default | [decode-attention-results.md](decode-attention-results.md) |
@@ -50,6 +50,22 @@ exists for tests and measurements only and is never a deployment setting.
 
 Removed after measurement (setting their knobs is an error, see [audit-2026-11.md](audit-2026-11.md)): the packed4 FP32 decode
 layout, the unfused and two-barrier decode reductions, the counter team join, and the reduction trace.
+
+### 2.1 How the defaults are resolved
+
+The defaults follow the decisions of the final campaign ([numa-tp-prefill-results.md](numa-tp-prefill-results.md) §7),
+set on 20 November 2026. Each rule applies only while its own knob is unset, and the report records what was chosen.
+
+| Choice | Rule when unset |
+| --- | --- |
+| Sockets | 2 when the discovered topology has two sockets with allowed CPUs, each with an HBM node in the job's allowed memory (Flat mode on a Xeon Max), and none of `LLAMA_BACKEND=omp`, `LLAMA_TOPOLOGY`, `LLAMA_PLACEMENT=file\|ddr` is set; else 1. A job bound to one socket (`numactl --cpunodebind`, a one-socket allocation) therefore keeps one |
+| Backend | `teams` with two sockets, `omp` with one |
+| Placement | `hbm` with two sockets on such a node (each socket's shards in its own HBM, verified), `file` otherwise |
+| Prefill batch | where the batched GEMM runs (AVX-512 or AMX, or `LLAMA_PREFILL_GEMM=on`): 128 rows for FP32 on one socket, 64 on two, 256 for W8A8 and AMX-BF16; 1 on the scalar kernels, with `LLAMA_PREFILL_GEMM=off`, and for W8A32 |
+| Kernels | `auto`: AVX-512 where available, scalar otherwise; `runq` W8A8 with batched prefill also takes AMX-INT8 where AMX can run (group size a multiple of 64). An FP32 checkpoint never gets AMX by default (BF16 stays a user decision) |
+
+To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
+`LLAMA_ATTN=split` for runs before E4). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`).
 
 ## 3. Source map
 
@@ -82,7 +98,8 @@ src/profile.c      LLAMA_PROFILE phase timers
 `engine_load_context` (in `run.c` / `runq.c`):
 
 1. `kernels_init` reads the ISA and attention knobs and refuses retired knobs; `kernels_backend_init` discovers the
-   topology and, for `teams`, starts the pinned worker pool (one team, or one per socket).
+   topology, resolves the socket count (section 2.1) and, for `teams`, starts the pinned worker pool (one team, or one
+   per socket). `prefill_configure` then sets the prefill batch, and `runq` takes AMX-INT8 for it where it can.
 2. `checkpoint_map` validates the header and maps the file read-only; `manifest_build` records the byte offset of every
    tensor. Every later view of a weight (mapped, owned, sharded, packed) is derived from this manifest.
 3. One socket: `weights_open` either keeps the mapping (`file`) or copies the tensors into engine-owned regions bound to a

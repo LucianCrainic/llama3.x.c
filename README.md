@@ -53,12 +53,15 @@ python3 tools/tokenizer.py --hf /path/to/snapshot -o checkpoints/tokenizer.bin
 build/release/run checkpoints/llama-fp32.bin -z checkpoints/tokenizer.bin --chat-template -i 'Explain what a CPU does.' -t 0
 ```
 
-On a dual-socket HBM node, the configuration the measurements recommend (Q8_0 with AMX prefill, both sockets, weights in
-HBM):
+The defaults follow the measurements: on a dual-socket Xeon Max node in Flat mode, a plain run uses both sockets with the
+weights in HBM, batched prefill, and (for Q8_0) AMX-INT8 prefill, and the `--json` report records each choice:
 
 ```bash
-LLAMA_BACKEND=teams LLAMA_SOCKETS=2 LLAMA_PLACEMENT=hbm LLAMA_PREFILL_BATCH=256 LLAMA_KERNELS=amx build/release/runq checkpoints/llama-int8.bin -z checkpoints/tokenizer.bin --chat-template -i 'Explain what a CPU does.' -t 0 --json report.json
+build/release/runq checkpoints/llama-int8.bin -z checkpoints/tokenizer.bin --chat-template -i 'Explain what a CPU does.' -t 0 --json report.json
 ```
+
+On one socket, add `LLAMA_BACKEND=teams` (or build with `make OPENMP=1`): the default build has no OpenMP, so its default
+backend runs on one thread.
 
 Every option and environment variable is listed in [docs/configuration.md](docs/configuration.md).
 

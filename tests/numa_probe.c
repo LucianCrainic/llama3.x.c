@@ -1,9 +1,13 @@
 /* Dump the discovered topology as JSON; used by tests (sysfs fixtures) and by the cluster check (real machine).
  *   numa_probe                          real /sys, real affinity and allowed nodes, LLAMA_TOPOLOGY
  *   numa_probe --sysfs ROOT [--topology SPEC] [--cpus LIST] [--mems LIST]
- *   either form: [--sockets N] [--placement file|ddr|hbm] checks that the layout can run */
+ *   either form: [--sockets N] [--placement file|ddr|hbm] checks that the layout can run
+ *   numa_probe --defaults 1             the engine's socket count and placement for this environment (LLAMA_SYSFS_ROOT
+ *                                       stands in for /sys), as {"sockets": N, "placement": "..."} */
+#include "loader.h"
 #include "numa.h"
 #include "runtime.h"
+#include "tp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +49,7 @@ static void print_topology(const Topology *t) {
 int main(int argc, char **argv) {
   NumaInputs in = {0};
   const char *placement = NULL;
-  int sockets = 0;
+  int sockets = 0, defaults = 0;
   for (int i = 1; i < argc; i += 2) {
     if (i + 1 >= argc) {
       fprintf(stderr, "usage: numa_probe [--sysfs ROOT] [--topology SPEC] [--cpus LIST] [--mems LIST] [--sockets N] "
@@ -64,10 +68,17 @@ int main(int argc, char **argv) {
       sockets = atoi(argv[i + 1]);
     else if (!strcmp(argv[i], "--placement"))
       placement = argv[i + 1];
+    else if (!strcmp(argv[i], "--defaults"))
+      defaults = atoi(argv[i + 1]);
     else {
       fprintf(stderr, "unknown argument '%s'\n", argv[i]);
       return 2;
     }
+  }
+  if (defaults) {
+    int n = tp_sockets_requested();
+    printf("{\"sockets\": %d, \"placement\": \"%s\"}\n", n, placement_mode());
+    return 0;
   }
   char err[512];
   Topology local;

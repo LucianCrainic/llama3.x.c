@@ -35,6 +35,9 @@ const char *kernels_backend_name(void); /* "omp" or "teams"; stays "teams" after
  * two segments. Returns after every share has run. */
 int kernels_avx512_active(void);
 int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
+/* LLAMA_KERNELS unset or auto and AMX usable: selects it (the Q8 engine does, for W8A8 batched prefill, D2 §7). Returns
+ * kernels_amx_active(). */
+int kernels_select_amx_auto(void);
 /* Attention variants (E1). kernels_init reads LLAMA_ATTN (batched, prefill: split|tiled|amx) and LLAMA_ATTN_DECODE
  * (single row: split|group) once. The defaults are tiled for the batched path (since E4; it runs split where AVX-512
  * is not active) and split, the split-K kernel, for decode. A variant that is not built yet is refused

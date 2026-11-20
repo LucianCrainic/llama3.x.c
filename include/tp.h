@@ -5,9 +5,9 @@
 #include "shards.h"
 
 /* Two-socket tensor-parallel forward pass (B5, B6): one model instance split into two socket-owned shards, each run
- * by its own worker team, with two cross-socket reductions per layer (B4). Selected by LLAMA_SOCKETS=2, which needs
- * LLAMA_BACKEND=teams and a topology with two sockets (real, or LLAMA_TOPOLOGY=virtual:2xT where the teams are
- * unpinned and the regions portable). Default is 1: nothing in this module runs.
+ * by its own worker team, with two cross-socket reductions per layer (B4). Selected by LLAMA_SOCKETS=2, or by default
+ * on a dual-socket HBM node (tp_sockets_requested); it runs on worker teams and a topology with two sockets (real, or
+ * LLAMA_TOPOLOGY=virtual:2xT where the teams are unpinned and the regions portable).
  *
  * The caller is the coordinator of socket 0 (worker 0 of team 0); a thread of this module is the coordinator of
  * socket 1 (worker 0 of team 1). Each coordinator drives its team with the ordinary kernels (kernels_set_thread_team),
@@ -21,8 +21,12 @@ typedef struct Tp Tp;
  * stay: decode reads them. */
 typedef enum { TP_PACK_NONE, TP_PACK_BF16, TP_PACK_INT8 } TpPack;
 
-/* LLAMA_SOCKETS validated: 1 when unset; 2 requires LLAMA_BACKEND=teams. */
+/* LLAMA_SOCKETS validated (2 with LLAMA_BACKEND=omp is an error). Unset, it is 2 on a discovered topology whose two
+ * sockets each have an allowed HBM node, unless LLAMA_BACKEND=omp, LLAMA_TOPOLOGY or LLAMA_PLACEMENT=file|ddr is set;
+ * else 1. Resolved once per process, at the first call (kernels_backend_init, before any worker is pinned). */
 int tp_sockets_requested(void);
+/* Both sockets of the discovered or explicit topology have an HBM node in this job's allowed memory set. */
+int tp_hbm_pair(void);
 /* The sockets of the topology the pool must be built for (kernels_backend_init), or fails with the reason. */
 int tp_check_topology(const char *placement);
 

@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "tp.h"
 #include "workers.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -13,15 +14,15 @@ static const char *active_mode = "file";
 
 const char *placement_mode(void) {
   const char *mode = getenv("LLAMA_PLACEMENT");
-  if (!mode || !*mode)
-    return "file";
+  if (!mode || !*mode) /* two sockets own their shards: on an HBM node they go to HBM, as D2 measured them */
+    return tp_sockets_requested() == 2 && tp_hbm_pair() ? "hbm" : "file";
   if (!strcmp(mode, "file") || !strcmp(mode, "ddr") || !strcmp(mode, "hbm"))
     return mode[0] == 'f' ? "file" : mode[0] == 'd' ? "ddr" : "hbm";
   fail("LLAMA_PLACEMENT must be file, ddr or hbm");
 }
 
 const char *placement_active(void) {
-  return active_mode;
+  return tp_sockets_requested() == 2 ? placement_mode() : active_mode; /* tp_create places the shards itself */
 }
 
 size_t placement_hbm_budget(void) {
