@@ -919,6 +919,9 @@ PY
 }
 
 # ---- E0: measure attention before changing it ---------------------------------------------------------------------------
+# Since F5 the engine refuses the sweep knobs this phase and E2 set (LLAMA_ATTN_ROW_BLOCK, LLAMA_ATTN_TILED_QUERIES,
+# LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_WORKSPACE_MIB): those cells fail at load. Rerun the sweeps from a commit before F5;
+# the other cells still run.
 # tests/attention_bench.c on socket 0 with K/V in a region on its HBM node (2): the prefill matrix (H1, H2, H4), the row-block
 # sweep (H3), the half-KV-head shapes (H6), decode (H5), hardware counters, one profiled engine run that shows whether the
 # bench represents the engine, and the bitwise gate of the LLAMA_ATTN_ROW_BLOCK knob. Everything but the last two needs no
@@ -1392,8 +1395,8 @@ phase_E2() {
 # models. Submit check first (SKIP_TEST=1 on the bench job once the check passed), one job per stage; the E3 variant `amx` is
 # opted in with E4_AMX=1 (LLAMA_ATTN=amx exists only after E3; before that it fails with an E3 message). Knobs:
 #   E4_ATTN        attention variants of the matrix (default "split tiled"); `amx` in the list counts for the BF16 rung only
-#   E4_AMX         1 adds LLAMA_ATTN=amx, on the AMX-BF16 rung only (default 0)
-#   E4_TILED_ENV   environment words that go with LLAMA_ATTN=tiled everywhere, e.g. "LLAMA_ATTN_TILED_QUERIES=8" (E2's knob choice)
+#   E4_AMX         1 adds LLAMA_ATTN=amx, on the AMX-BF16 rung only (default 0); refused since F5 (the placeholder is gone)
+#   E4_TILED_ENV   environment words that go with LLAMA_ATTN=tiled everywhere (the tiled knobs E2 chose from were removed in F5)
 #   E4_RUNGS       RUNG:M cells (default "avx512_fp32:64 avx512_fp32:128 amx_bf16:256 amx_int8:256"); FP32 and BF16 read the fp32
 #                  checkpoint, AMX-INT8 the int8 one
 # check (E4/compare-*.json, gen-*.json; summary.md from tools/summarize_e4.py checks, generation-summary.md): for every variant

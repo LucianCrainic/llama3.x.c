@@ -388,29 +388,15 @@ class TensorParallelTests(unittest.TestCase):
         """A script that still sets a knob of a removed experimental path must not measure the default under the old label."""
         model = self.fixtures['shared']/'fp32.bin'
         for name, value in (('LLAMA_FP32_LAYOUT', 'packed4'), ('LLAMA_TP_FUSED', '0'), ('LLAMA_TP_REDUCE', 'barrier'),
-                            ('LLAMA_TP_TRACE', '/dev/null'), ('LLAMA_TEAM_JOIN', 'counter')):
+                            ('LLAMA_TP_TRACE', '/dev/null'), ('LLAMA_TEAM_JOIN', 'counter'),
+                            ('LLAMA_GEMV_SCHED', 'dynamic'), ('LLAMA_ATTN_ROW_BLOCK', '4'),
+                            ('LLAMA_ATTN_TILED_QUERIES', '16'), ('LLAMA_ATTN_TILED_ORDER', 'longest'),
+                            ('LLAMA_ATTN_WORKSPACE_MIB', '1'), ('LLAMA_GEMM_KC', '512')):
             with self.subTest(name=name):
                 result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
                                         env=environment(2, 3, **{name: value}))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(name.encode() + b' is no longer supported', result.stderr)
-
-    def test_gemv_scheduling_agrees_and_is_validated(self):
-        """Dynamic and hybrid row claiming against the static split, FP32 and Q8, on one and on two sockets, within the
-        fixture budget (an AVX-512 four-row group sums in a different order than a short tail group)."""
-        for precision, vocab in (('fp32', TP_CONFIG[5]), ('int8', TP_CONFIG[5])):
-            for sockets in (1, 2):
-                for threads in (3, 7):
-                    static = self.logits(precision, 'shared', None, sockets, threads, LLAMA_GEMV_SCHED='static')
-                    for mode in ('dynamic', 'hybrid', 'auto'):
-                        with self.subTest(precision=precision, sockets=sockets, threads=threads, mode=mode):
-                            self.assert_agree(static, self.logits(precision, 'shared', None, sockets, threads,
-                                                                  LLAMA_GEMV_SCHED=mode), vocab)
-        model = self.fixtures['shared']/'fp32.bin'
-        result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
-                                env=environment(1, 3, LLAMA_GEMV_SCHED='guided'))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b'LLAMA_GEMV_SCHED must be static, dynamic, hybrid or auto', result.stderr)
 
     def test_greedy_generation_is_identical(self):
         one = self.probe('fp32', 'unshared', 'generate', 1)

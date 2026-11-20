@@ -163,7 +163,6 @@ static void write_v2_sections(FILE *f) {
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fputs(",\n    \"kernels_prefill\": ", f);
   string(f, metrics.runtime_ready && model.prefill_gemm ? model.prefill_kernel : NULL);
-  fprintf(f, ",\n    \"attn_row_block\": %d", k_attention_row_block());
   fputs("\n  }", f);
 
   const Topology *topology;

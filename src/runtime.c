@@ -119,6 +119,12 @@ void check_retired_knobs(void) {
       {"LLAMA_TP_TRACE", "the reduction trace was a B7 diagnostic"},
       {"LLAMA_TEAM_JOIN", "teams always join with per-member flags"},
       {"LLAMA_BF16_DROP_FP32", "decode always reads the FP32 weights"},
+      {"LLAMA_GEMV_SCHED", "the sweep is finished: FP32 GEMV runs hybrid on large jobs and static otherwise, Q8 static (F5)"},
+      {"LLAMA_ATTN_ROW_BLOCK", "the sweep is finished: the split batched attention uses 4 rows per task (F5)"},
+      {"LLAMA_ATTN_TILED_QUERIES", "the sweep is finished: the tiled attention uses 16 query vectors per task (F5)"},
+      {"LLAMA_ATTN_TILED_ORDER", "the sweep is finished: the tiled attention claims tasks in plan order (F5)"},
+      {"LLAMA_ATTN_WORKSPACE_MIB", "the batched attention workspace is fixed at 32 MiB (F5)"},
+      {"LLAMA_GEMM_KC", "the sweep is finished: the AVX-512 GEMM uses its default K block (F5)"},
   };
   for (size_t i = 0; i < sizeof(retired) / sizeof(retired[0]); i++) {
     const char *value = getenv(retired[i][0]);

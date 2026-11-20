@@ -45,11 +45,12 @@ exists for tests and measurements only and is never a deployment setting.
 | Transparent huge pages for owned regions (`LLAMA_THP=on`) | Opt-in; measured neutral | [numa-placement.md](numa-placement.md) |
 | Profile (`LLAMA_PROFILE=1`), JSON report (`--json`), `LLAMA_TP_CHECK=1` | Diagnostic | section 9 |
 | Head-major K/V cache (`LLAMA_KV_LAYOUT=head`) | Default since E5.4 (owner decision 2026-11-20); `rows` is opt-in and bitwise equal | [decode-attention-results.md](decode-attention-results.md) §8, §9: 1B decode at 32768 one socket 1.34x FP32, 1.65x W8A8 |
-| AMX flash attention (E3) | Not implemented (postponed) | [E-followups](plans/E-followups/README.md) |
+| AMX flash attention (E3) | Not implemented (postponed; the `LLAMA_ATTN=amx` placeholder was removed in F5) | [E-followups](plans/E-followups/README.md) |
 
 Removed after measurement (setting their knobs is an error, see [audit-2026-11.md](audit-2026-11.md)): the packed4 FP32 decode
-layout, the unfused and two-barrier decode reductions, the counter team join, the reduction trace, and the OpenMP backend
-(`LLAMA_BACKEND=omp`, `make OPENMP=1`).
+layout, the unfused and two-barrier decode reductions, the counter team join, the reduction trace, the OpenMP backend
+(`LLAMA_BACKEND=omp`, `make OPENMP=1`), and the knobs of finished sweeps (GEMV schedule, attention row block, tiled queries
+and order, attention workspace, GEMM K block; F5).
 
 ### 2.1 How the defaults are resolved
 
@@ -183,7 +184,7 @@ below follows from those three numbers.
    sequential streams; four rows share every load of `x` and run independent FMA chains (`dots_f32_avx512`). Q8 kernels,
    which do more work per byte, add software prefetch at a measured distance (`q8_ahead`). QKV and W1/W3 run as one fused
    job, so `x` is read once and there is one dispatch instead of three.
-5. **Absorb stragglers on big matrices.** `LLAMA_GEMV_SCHED=auto` (default): for FP32 jobs of at least 96 MiB each member
+5. **Absorb stragglers on big matrices.** For FP32 jobs of at least 96 MiB (the hybrid split) each member
    first streams a contiguous three quarters share and then claims small chunks of the rest, so a member slowed by a busy
    memory channel does not hold the whole team (+14% on 8B FP32 two sockets). Smaller jobs and Q8 stay static, where
    claiming measured 4-25% slower.
@@ -212,7 +213,7 @@ bandwidth-bound to compute-bound. The precision ladder (user decision: each rung
 
 | Rung | Kernel | Selected by |
 | --- | --- | --- |
-| AVX-512 FP32 GEMM | `k_gemm_f32`: register-blocked microkernel, K blocks of `LLAMA_GEMM_KC` (1024) | `LLAMA_PREFILL_BATCH>1` on AVX-512 (`LLAMA_PREFILL_GEMM=auto`) |
+| AVX-512 FP32 GEMM | `k_gemm_f32`: register-blocked microkernel, K blocks of 1024 | `LLAMA_PREFILL_BATCH>1` on AVX-512 (`LLAMA_PREFILL_GEMM=auto`) |
 | AMX-BF16 | `k_gemm_bf16`: activations converted to BF16 (round to nearest even) into an aligned panel; weights pre-packed in VNNI pairs; FP32 sums | `LLAMA_PRECISION=bf16 LLAMA_KERNELS=amx` (`run`) |
 | AVX-512 VNNI Q8 | `k_gemm_q8` tiled VNNI, per-group int32 dots scaled into FP32 | `runq`, W8A8, `gs % 64 == 0` |
 | AMX-INT8 | `k_gemm_q8` on weights packed in VNNI quads: exact int32 group dots on tiles, same Q8_0 semantics | `runq`, W8A8, `LLAMA_KERNELS=amx` |

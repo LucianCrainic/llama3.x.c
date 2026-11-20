@@ -32,7 +32,6 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_ATTN` | `tiled`, `split` | batched prefill attention (`tiled` falls back to `split` without AVX-512) |
 | `LLAMA_ATTN_DECODE` | `split`, `group` | decode attention |
 | `LLAMA_KV_LAYOUT` | `head`, `rows` | K/V cache layout: `head` is `[kv_head][position][head_dim]` per layer (default since E5.4), `rows` is `[position][kv_head][head_dim]`; results are bitwise equal, `head` is faster at long contexts |
-| `LLAMA_GEMV_SCHED` | `auto`, `static`, `dynamic`, `hybrid` | how a team splits GEMV rows |
 
 ### Prefill
 
@@ -65,9 +64,7 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_PROFILE=1` | per-phase times (and per socket, with the exchange split) at log level `info` and in the report |
 | `LLAMA_TP_CHECK=1` | compare both sockets' residual copies after every layer (bitwise) |
 | `LLAMA_TOKENS_OUT=FILE` | write prompt and generated token ids as JSON (generate mode) |
-| `LLAMA_GEMM_KC`, `LLAMA_ATTN_WORKSPACE_MIB` | FP32 GEMM K block (1024), batched-attention workspace (32 MiB) |
-| `LLAMA_ATTN_ROW_BLOCK`, `LLAMA_ATTN_TILED_QUERIES`, `LLAMA_ATTN_TILED_ORDER` | attention sweep knobs of E0/E2 (defaults 4, 16, `natural`) |
-| `LLAMA_LOADER_CHUNK`, `LLAMA_LOADER_MAX_READ` | `pread` sizes of the owned loader |
+| `LLAMA_LOADER_CHUNK`, `LLAMA_LOADER_MAX_READ` | test-only: `pread` sizes of the owned loader, so the tests reach the multi-chunk and short-read paths on small fixtures |
 | `LLAMA_TOPOLOGY_ALLOW_FAR_HBM=1` | accept an explicit map that points a socket at the other socket's HBM (A6 remote control only) |
 | `LLAMA_SYSFS_ROOT`, `LLAMA_NUMA_FAULT` | test-only: fake sysfs tree, injected syscall errors |
 
@@ -82,3 +79,7 @@ script cannot silently measure the default path under an old label. See [audit-2
 | `LLAMA_TP_FUSED`, `LLAMA_TP_REDUCE`, `LLAMA_TEAM_JOIN` | slower synchronization variants, superseded by the fused flag reduction and flag join (B7) |
 | `LLAMA_TP_TRACE` | per-worker reduction trace of the finished B7 investigation |
 | `LLAMA_BF16_DROP_FP32` | reserved for a BF16 decode that does not exist |
+| `LLAMA_BACKEND` other than `teams` | the OpenMP backend; worker teams were faster or equal (F2) |
+| `LLAMA_GEMV_SCHED` | finished sweep: FP32 GEMV is hybrid on jobs of 96 MiB or more and static below, Q8 is static (F5) |
+| `LLAMA_ATTN_ROW_BLOCK`, `LLAMA_ATTN_TILED_QUERIES`, `LLAMA_ATTN_TILED_ORDER` | finished E0/E2 sweeps: 4 rows per split task, 16 query vectors per tiled task, plan order (F5) |
+| `LLAMA_ATTN_WORKSPACE_MIB`, `LLAMA_GEMM_KC` | fixed at 32 MiB and the 1024 K block (F5) |

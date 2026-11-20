@@ -39,7 +39,7 @@ void k_gemm_f32_portable(const float *a, int lda, int m, int k, const GemmSegmen
 /* Runs the SIMD microkernel (real AVX-512 on x86, an emulation in the GEMM_EMULATE_AVX512 test build) regardless of
  * the selected instruction set; returns 0 when none is compiled in. The caller must know the CPU can run it. */
 int k_gemm_f32_simd_test(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc);
-/* The K block the active instruction set uses (LLAMA_GEMM_KC overrides the AVX-512 default of 1024). */
+/* The K block the active instruction set uses (1024 on AVX-512, 0 = one block otherwise). */
 int k_gemm_kc(void);
 
 /* ---- AMX (C4) ------------------------------------------------------------------------------------------------------

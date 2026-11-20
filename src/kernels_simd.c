@@ -31,16 +31,12 @@
 
 static KernelIsa isa = KERNELS_SCALAR;
 static int initialized;
-/* Rows of one (kv group, chunk) task of the batched attention (E0 diagnostic, LLAMA_ATTN_ROW_BLOCK, read once by
- * kernels_init). Rows of a block are computed one after the other, each exactly as without the block, so the result is
- * bitwise independent of it. */
-enum { BATCH_MAX_ROW_BLOCK = 16 };
-static int attention_row_block = 4;
-/* E2 tiled attention: query vectors per task (rows of a block x heads of the group, 1..16, LLAMA_ATTN_TILED_QUERIES) and
- * whether the tasks of a wave are claimed in plan order (default, LLAMA_ATTN_TILED_ORDER=natural) or longest first
- * (longest; E2 bench: natural was faster at 2048 and 8192 tokens). Neither changes how a
- * row is computed once its block is fixed; the block size sets the chunk plan, the order only the schedule. */
-static int attention_tiled_queries = 16, attention_tiled_longest_first = 0;
+/* Rows of one (kv group, chunk) task of the split batched attention. Rows of a block are computed one after the other,
+ * each exactly as without the block, so the result is bitwise independent of it (E0 swept 1..16; 4 kept, F5). */
+enum { BATCH_ROW_BLOCK = 4 };
+/* Tiled attention: query vectors per task (rows of a block x heads of the group). E2 swept 1..16 and the claim order
+ * (plan order against longest first); 16 in plan order was kept, the knobs were removed (F5). */
+enum { TILED_QUERIES = 16 };
 /* With a team set, kernels run on it; without one (unit tests) they run serially on the calling thread. */
 static Team *default_team;
 /* A coordinator thread that drives one socket's team (B2) binds its kernels to that team without touching the
@@ -93,58 +89,25 @@ int kernels_select(KernelIsa which) {
  * shared counter, so the fast ones take over what the slow one has not reached, but no member streams a long contiguous
  * run any more. Hybrid: each member first takes a contiguous share of three quarters of the rows, then all claim the
  * rest in small chunks. A claim starts on a multiple of BLOCK rows, so every row sits in the same four-row group
- * whatever the team size or the timing. LLAMA_GEMV_SCHED=static|dynamic|hybrid|auto selects it for the FP32 and the
- * Q8 kernels together. Auto (default) is hybrid for large FP32 jobs and static otherwise, and static for Q8, whose
- * kernels prefetch along long contiguous runs and lose 6-25% to any claiming (measured on Xeon Max 9480, docs/plans). */
-typedef enum { SCHED_STATIC, SCHED_DYNAMIC, SCHED_HYBRID, SCHED_AUTO } GemvSched;
-static GemvSched gemv_sched_f32 = SCHED_AUTO, gemv_sched_q8 = SCHED_STATIC;
-/* auto, FP32: hybrid for a job that streams at least this many weight bytes (the 8B shards: 117-235 MiB; measured +14% on
- * two sockets), static below it (1B: at most 64 MiB, where the claims cost 4-6%; Wo shards: 33 MiB). */
+ * whatever the team size or the timing. FP32 runs hybrid for large jobs and static otherwise; Q8 always runs static, as
+ * its kernels prefetch along long contiguous runs and lose 6-25% to any claiming (measured on Xeon Max 9480, docs/plans).
+ * Dynamic, and the LLAMA_GEMV_SCHED knob that forced one policy everywhere, were removed after the sweep (F5). */
+typedef enum { SCHED_STATIC, SCHED_HYBRID } GemvSched;
+/* FP32: hybrid for a job that streams at least this many weight bytes (the 8B shards: 117-235 MiB; measured +14% on two
+ * sockets), static below it (1B: at most 64 MiB, where the claims cost 4-6%; Wo shards: 33 MiB). */
 enum { AUTO_HYBRID_BYTES = 96 << 20 };
+static int gemv_force_hybrid; /* test hook: run every FP32 team GEMV hybrid, so small fixtures reach the claiming path */
+
+void k_gemv_force_hybrid(int on) {
+  gemv_force_hybrid = on != 0;
+}
 
 static GemvSched effective_f32(size_t bytes) {
-  return gemv_sched_f32 == SCHED_AUTO ? (bytes >= AUTO_HYBRID_BYTES ? SCHED_HYBRID : SCHED_STATIC) : gemv_sched_f32;
+  return gemv_force_hybrid || bytes >= AUTO_HYBRID_BYTES ? SCHED_HYBRID : SCHED_STATIC;
 }
 
 void kernels_init(void) {
   check_retired_knobs();
-  const char *sched = getenv("LLAMA_GEMV_SCHED");
-  gemv_sched_f32 = SCHED_AUTO;
-  gemv_sched_q8 = SCHED_STATIC;
-  if (sched && *sched && strcmp(sched, "auto")) {
-    GemvSched which = !strcmp(sched, "static") ? SCHED_STATIC
-                      : !strcmp(sched, "dynamic") ? SCHED_DYNAMIC
-                      : !strcmp(sched, "hybrid") ? SCHED_HYBRID
-                                                 : (GemvSched)-1;
-    if ((int)which < 0)
-      fail("LLAMA_GEMV_SCHED must be static, dynamic, hybrid or auto");
-    gemv_sched_f32 = gemv_sched_q8 = which;
-  }
-  if (gemv_sched_q8 == SCHED_AUTO)
-    gemv_sched_q8 = SCHED_STATIC;
-  const char *rows = getenv("LLAMA_ATTN_ROW_BLOCK"); /* diagnostic: rows per batched-attention task, 1..16, default 4 */
-  attention_row_block = 4;
-  if (rows && *rows) {
-    char *end;
-    long value = strtol(rows, &end, 10);
-    if (*end || value < 1 || value > BATCH_MAX_ROW_BLOCK)
-      fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
-    attention_row_block = (int)value;
-  }
-  const char *queries = getenv("LLAMA_ATTN_TILED_QUERIES"), *order = getenv("LLAMA_ATTN_TILED_ORDER");
-  attention_tiled_queries = 16, attention_tiled_longest_first = 0;
-  if (queries && *queries) {
-    char *end;
-    long value = strtol(queries, &end, 10);
-    if (*end || value < 1 || value > 16)
-      fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
-    attention_tiled_queries = (int)value;
-  }
-  if (order && *order) {
-    if (strcmp(order, "longest") && strcmp(order, "natural"))
-      fail("LLAMA_ATTN_TILED_ORDER must be longest or natural");
-    attention_tiled_longest_first = !strcmp(order, "longest");
-  }
   const char *request = getenv("LLAMA_KERNELS");
   if (!request || !*request || !strcmp(request, "auto")) {
     kernels_select(supported(KERNELS_AVX512) ? KERNELS_AVX512 : KERNELS_SCALAR);
@@ -181,13 +144,6 @@ const char *kernels_name(void) {
 }
 
 enum { BLOCK = 4 }; // rows per GEMV kernel call
-
-/* Rows per claim: about four claims per member, a multiple of BLOCK, between 8 and 32 (a claim is a 128-512 KiB stream
- * of a large matrix, long enough that the shared counter is touched rarely). */
-static int claim_rows(int total_rows, int workers) {
-  int rows = total_rows / (workers * 4) / BLOCK * BLOCK;
-  return rows < 8 ? 8 : rows > 32 ? 32 : rows;
-}
 
 int kernels_avx512_active(void) {
   return isa == KERNELS_AVX512;
@@ -1139,7 +1095,7 @@ typedef struct {
   int n, kind, count;
   F32Segment segment[3];
   size_t ld; /* weight row stride in floats; 0 = n */
-  atomic_int next; /* dynamic scheduling: the next unclaimed row (zero before the team starts) */
+  atomic_int next; /* hybrid scheduling: the next unclaimed row (zero before the team starts) */
   RowsDoneFn done; /* worker entry points only (one segment): called after each range of rows is stored */
   void *done_ctx;
 } F32Job;
@@ -1187,23 +1143,18 @@ static void f32_team_static(const F32Job *job, int worker, int workers) {
   }
 }
 
-/* Dynamic and hybrid splits over the concatenated rows of all segments; `next` is shared by the members of one job.
+/* The hybrid split over the concatenated rows of all segments; `next` is shared by the members of one job.
  * `range(job, r0, r1)` runs rows [r0, r1) of that concatenation. */
 typedef void (*RangeFn)(const void *job, int r0, int r1);
 
-static void claim_rows_run(RangeFn range, const void *job, int rows, atomic_int *next, int worker, int workers,
-                           GemvSched sched) {
-  int first = 0, chunk = claim_rows(rows, workers);
-  if (sched == SCHED_HYBRID) {
-    int pool = rows * 3 / 4 / BLOCK * BLOCK; /* the contiguous shares */
-    int r0 = (int)((long long)pool * worker / workers) / BLOCK * BLOCK;
-    int r1 = worker + 1 == workers ? pool : (int)((long long)pool * (worker + 1) / workers) / BLOCK * BLOCK;
-    if (r1 > r0)
-      range(job, r0, r1);
-    first = pool;
-    chunk = (rows - pool) / (workers * 2) / BLOCK * BLOCK;
-    chunk = chunk < BLOCK ? BLOCK : chunk > 16 ? 16 : chunk;
-  }
+static void hybrid_rows_run(RangeFn range, const void *job, int rows, atomic_int *next, int worker, int workers) {
+  int pool = rows * 3 / 4 / BLOCK * BLOCK; /* the contiguous shares */
+  int r0 = (int)((long long)pool * worker / workers) / BLOCK * BLOCK;
+  int r1 = worker + 1 == workers ? pool : (int)((long long)pool * (worker + 1) / workers) / BLOCK * BLOCK;
+  if (r1 > r0)
+    range(job, r0, r1);
+  int first = pool, chunk = (rows - pool) / (workers * 2) / BLOCK * BLOCK;
+  chunk = chunk < BLOCK ? BLOCK : chunk > 16 ? 16 : chunk;
   for (;;) {
     int r0 = first + atomic_fetch_add_explicit(next, chunk, memory_order_relaxed);
     if (r0 >= rows)
@@ -1224,15 +1175,14 @@ static size_t job_bytes_f32(const F32Job *job) {
   return (size_t)job_rows_f32(job) * row * sizeof(float) * (job->kind == SWIGLU ? 2 : 1);
 }
 
-static void f32_team_claim(const F32Job *job, atomic_int *next, int worker, int workers, GemvSched sched) {
-  claim_rows_run(f32_rows, job, job_rows_f32(job), next, worker, workers, sched);
+static void f32_team_claim(const F32Job *job, atomic_int *next, int worker, int workers) {
+  hybrid_rows_run(f32_rows, job, job_rows_f32(job), next, worker, workers);
 }
 
 static void f32_team(const void *p, int worker, int workers) {
   F32Job *job = (F32Job *)p; /* the caller's job object is writable: only `next` changes */
-  GemvSched sched = effective_f32(job_bytes_f32(job));
-  if (sched != SCHED_STATIC && workers > 1)
-    f32_team_claim(job, &job->next, worker, workers, sched);
+  if (effective_f32(job_bytes_f32(job)) == SCHED_HYBRID && workers > 1)
+    f32_team_claim(job, &job->next, worker, workers);
   else
     f32_team_static(job, worker, workers);
 }
@@ -1317,7 +1267,6 @@ typedef struct {
   int n, gs, kind, count;
   Q8Segment segment[3];
   size_t ld; /* weight row stride in values (a multiple of gs); 0 = n */
-  atomic_int next;
   RowsDoneFn done;
   void *done_ctx;
 } Q8Job;
@@ -1364,19 +1313,8 @@ static void q8_team_static(const Q8Job *job, int worker, int workers) {
   }
 }
 
-static void q8_team_claim(const Q8Job *job, atomic_int *next, int worker, int workers, GemvSched sched) {
-  int rows = 0;
-  for (int s = 0; s < job->count; s++)
-    rows += job->segment[s].d;
-  claim_rows_run(q8_rows, job, rows, next, worker, workers, sched);
-}
-
 static void q8_team(const void *p, int worker, int workers) {
-  Q8Job *job = (Q8Job *)p;
-  if (gemv_sched_q8 != SCHED_STATIC && workers > 1)
-    q8_team_claim(job, &job->next, worker, workers, gemv_sched_q8);
-  else
-    q8_team_static(job, worker, workers);
+  q8_team_static((const Q8Job *)p, worker, workers);
 }
 
 static void q8_run(Q8Job *job) {
@@ -1391,20 +1329,20 @@ static void q8_run(Q8Job *job) {
 }
 
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs) {
-  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, NULL, NULL};
   q8_run(&job);
 }
 
@@ -1432,9 +1370,8 @@ void k_matmul_ld_worker(float *out, const float *x, const float *w, size_t ld, i
   if (ld < (size_t)n)
     fail("k_matmul_ld_worker: row stride %zu is shorter than the %d inputs", ld, n);
   F32Job job = {x, n, kind, 1, {{out, w, NULL, d}}, ld, 0, done, done_ctx};
-  GemvSched sched = effective_f32(job_bytes_f32(&job));
-  if (sched != SCHED_STATIC && claim && workers > 1)
-    f32_team_claim(&job, claim, worker, workers, sched);
+  if (effective_f32(job_bytes_f32(&job)) == SCHED_HYBRID && claim && workers > 1)
+    f32_team_claim(&job, claim, worker, workers);
   else
     f32_team_static(&job, worker, workers);
 }
@@ -1448,7 +1385,7 @@ void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, 
   check_epilogue(kind, "k_matmul_q8_ld");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
@@ -1456,17 +1393,15 @@ void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size
   check_epilogue(kind, "k_matmul_q8_ld_worker");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld_worker: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, 0, done, done_ctx};
-  if (gemv_sched_q8 != SCHED_STATIC && claim && workers > 1)
-    q8_team_claim(&job, claim, worker, workers, gemv_sched_q8);
-  else
-    q8_team_static(&job, worker, workers);
+  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, done, done_ctx};
+  (void)claim; /* Q8 always splits statically (see GemvSched) */
+  q8_team_static(&job, worker, workers);
 }
 void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
                            int d, int gs) {
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_swiglu_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, NULL, NULL};
   q8_run(&job);
 }
 
@@ -1538,9 +1473,16 @@ static size_t attention_row_floats(int n_heads, int head_dim, int max_chunks) {
   return checked_mul(checked_mul((size_t)n_heads, (size_t)max_chunks), (size_t)head_dim + 2);
 }
 
+/* The batched attention's partials workspace: 32 MiB (the LLAMA_ATTN_WORKSPACE_MIB knob was removed, F5). Tests lower it
+ * with k_attention_set_workspace_mib to run several waves on small shapes; 0 means one row per wave. */
+static long attention_workspace_mib = 32;
+
+void k_attention_set_workspace_mib(long mib) {
+  attention_workspace_mib = mib < 0 ? 32 : mib;
+}
+
 static size_t attention_budget_floats(void) {
-  const char *value = getenv("LLAMA_ATTN_WORKSPACE_MIB");
-  long mib = value && *value ? atol(value) : 32;
+  long mib = attention_workspace_mib;
   return mib > 0 ? (size_t)mib * (1u << 20) / sizeof(float) : 1;
 }
 
@@ -1868,23 +1810,6 @@ static void attention_chunk_portable(const float *q, const float *kc, const floa
 
 enum { BATCH_MAX_GROUP = 16, BATCH_MAX_CHUNK = 256 };
 
-void k_attention_set_tiled(int queries, int longest_first) {
-  if (queries < 1 || queries > 16)
-    fail("LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16");
-  attention_tiled_queries = queries;
-  attention_tiled_longest_first = longest_first != 0;
-}
-
-void k_attention_set_row_block(int rows) {
-  if (rows < 1 || rows > BATCH_MAX_ROW_BLOCK)
-    fail("LLAMA_ATTN_ROW_BLOCK must be an integer in 1..%d", BATCH_MAX_ROW_BLOCK);
-  attention_row_block = rows;
-}
-
-int k_attention_row_block(void) {
-  return attention_row_block;
-}
-
 typedef struct {
   float *out;
   const float *q, *key_cache, *value_cache;
@@ -1978,7 +1903,7 @@ static void batch_team(const void *p, int worker, int workers) {
 static void attention_batch_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
                                    size_t pos_stride, size_t head_base, ChunkFn chunk) {
-  BatchJob job = {.row_block = attention_row_block,
+  BatchJob job = {.row_block = BATCH_ROW_BLOCK,
                   .out = out,
                   .q = q,
                   .key_cache = key_cache,
@@ -2071,7 +1996,7 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
 
 #if HAVE_AVX512
 typedef struct {
-  int g, block, chunk, cost;
+  int g, block, chunk;
 } TiledTask;
 
 typedef struct {
@@ -2161,19 +2086,7 @@ static void tiled_team(const void *p, int worker, int workers) {
     tiled_merge(j, item);
 }
 
-/* The tasks of a wave in the order they are claimed: the most positions first (the late row blocks, whose chunks are the
- * longest), then late blocks, early chunks, low groups. Slots are disjoint, so the order never changes a result. */
-static int tiled_compare(const void *a, const void *b) {
-  const TiledTask *x = a, *y = b;
-  if (x->cost != y->cost)
-    return x->cost > y->cost ? -1 : 1;
-  if (x->block != y->block)
-    return x->block > y->block ? -1 : 1;
-  if (x->chunk != y->chunk)
-    return x->chunk < y->chunk ? -1 : 1;
-  return x->g - y->g;
-}
-
+/* The tasks of a wave, claimed in plan order (E2: faster than longest first at 2048 and 8192 tokens). */
 static TiledTask *tiled_tasks(TiledJob *j) {
   int block0 = j->row0 / j->rblock, block1 = (j->row0 + j->rows - 1) / j->rblock, count = 0;
   TiledTask *list = NULL;
@@ -2187,27 +2100,22 @@ static TiledTask *tiled_tasks(TiledJob *j) {
     for (int block = block0; block <= block1; block++) {
       int length, chunks;
       tiled_plan(j, block, &length, &chunks);
-      int end = j->pos0 + ((block + 1) * j->rblock < j->m ? (block + 1) * j->rblock : j->m);
       for (int g = 0; g < j->n_kv_heads; g++)
         for (int c = 0; c < chunks; c++) {
-          if (pass) {
-            int span = (c + 1) * length < end ? length : end - c * length;
-            list[count] = (TiledTask){.g = g, .block = block, .chunk = c, .cost = span};
-          }
+          if (pass)
+            list[count] = (TiledTask){.g = g, .block = block, .chunk = c};
           count++;
         }
     }
   }
   j->tasks = count;
-  if (attention_tiled_longest_first)
-    qsort(list, (size_t)count, sizeof(*list), tiled_compare);
   return list;
 }
 
 static void attention_tiled_driver(float *out, const float *q, const float *key_cache, const float *value_cache,
                                    AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int pos0, int m,
                                    size_t pos_stride, size_t head_base) {
-  int kv_mul = n_heads / n_kv_heads, queries = attention_tiled_queries / kv_mul;
+  int kv_mul = n_heads / n_kv_heads, queries = TILED_QUERIES / kv_mul;
   TiledJob job = {.out = out,
                   .q = q,
                   .key_cache = key_cache,
@@ -2298,8 +2206,7 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
 
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
  * (batched, prefill) and LLAMA_ATTN_DECODE (single row). A later variant is one new table entry plus its function;
- * run.c, runq.c and tp.c need no change. An entry without a function is a known name that is not built yet: it is
- * refused with a message rather than silently running the default. The first entry is the default: tiled for the
+ * run.c, runq.c and tp.c need no change. The first entry is the default: tiled for the
  * batched path since E4 (owner decision, 2026-11-19; split stays selectable with LLAMA_ATTN=split), split for decode. */
 typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,
@@ -2310,22 +2217,19 @@ typedef void (*AttentionDecodeFn)(float *out, const float *q, const float *key_c
 typedef struct {
   const char *name;
   AttentionBatchFn run;
-  const char *phase; /* where the variant lands, for the refusal message */
 } AttentionBatchEntry;
 typedef struct {
   const char *name;
   AttentionDecodeFn run;
-  const char *phase;
 } AttentionDecodeEntry;
 
 static const AttentionBatchEntry attention_batch_table[] = {
-    {"tiled", attention_batch_tiled, NULL},
-    {"split", attention_batch_split, NULL},
-    {"amx", NULL, "E3"},
+    {"tiled", attention_batch_tiled},
+    {"split", attention_batch_split},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
-    {"split", attention_decode_split, NULL},
-    {"group", attention_decode_group, NULL},
+    {"split", attention_decode_split},
+    {"group", attention_decode_group},
 };
 static const AttentionBatchEntry *attention_batch_active = &attention_batch_table[0];
 static const AttentionDecodeEntry *attention_decode_active = &attention_decode_table[0];
@@ -2339,7 +2243,7 @@ int kernels_attention_select(const char *batch, const char *decode) {
   for (size_t i = 0; decode && i < sizeof(attention_decode_table) / sizeof(*attention_decode_table); i++)
     if (!strcmp(decode, attention_decode_table[i].name))
       d = &attention_decode_table[i];
-  if ((batch && !(b && b->run)) || (decode && !(d && d->run)))
+  if ((batch && !b) || (decode && !d))
     return 0;
   if (b) {
     attention_batch_active = b;
@@ -2370,9 +2274,7 @@ static void attention_init_from_env(void) {
       if (!strcmp(batch, attention_batch_table[i].name))
         found = &attention_batch_table[i];
     if (!found)
-      fail("LLAMA_ATTN must be split, tiled or amx");
-    if (!found->run)
-      fail("LLAMA_ATTN=%s is not implemented yet (%s)", found->name, found->phase);
+      fail("LLAMA_ATTN must be tiled or split");
     attention_batch_active = found;
     attention_batch_requested = 1;
   }
@@ -2383,8 +2285,6 @@ static void attention_init_from_env(void) {
         found = &attention_decode_table[i];
     if (!found)
       fail("LLAMA_ATTN_DECODE must be split or group");
-    if (!found->run)
-      fail("LLAMA_ATTN_DECODE=%s is not implemented yet (%s)", found->name, found->phase);
     attention_decode_active = found;
   }
 }

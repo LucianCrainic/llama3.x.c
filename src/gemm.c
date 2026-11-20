@@ -628,9 +628,7 @@ void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const flo
 int k_gemm_kc(void) {
 #if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
   if (kernels_avx512_active()) {
-    const char *value = getenv("LLAMA_GEMM_KC");
-    int kc = value && *value ? atoi(value) : DEFAULT_KC;
-    return kc >= 16 ? kc : DEFAULT_KC;
+    return DEFAULT_KC; /* the LLAMA_GEMM_KC sweep knob was removed (F5) */
   }
 #endif
   return 0; /* one block: ascending k, as the scalar GEMV sums */

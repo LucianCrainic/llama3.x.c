@@ -88,8 +88,8 @@ typedef enum { K_STORE, K_ADD, K_PARTIAL, K_SWIGLU } KernelEpilogue;
 void k_matmul_ld(float *out, const float *x, const float *w, size_t ld, int n, int d, int kind);
 /* The share of k_matmul_ld / k_matmul_q8_ld of member `worker` of `workers`, for a caller that is already inside a team
  * job (every member calls it; the union is the team-level result, bitwise). Teams backend only. `claim` is a counter
- * shared by the members of this one job and zero before the team starts; with LLAMA_GEMV_SCHED=dynamic the members
- * claim rows from it (NULL means a static split). */
+ * shared by the members of this one job and zero before the team starts; a large FP32 job claims the last quarter of
+ * its rows from it (the hybrid split). NULL means a static split; Q8 always splits statically and ignores it. */
 /* `done`, when not NULL, is called as done(done_ctx, r0, r1) by the member that computed output rows [r0, r1), after
  * those rows are stored, once per contiguous range it computed (a static split: once; claiming: once per claim). A
  * following step can use it to start on rows whose producers are finished without waiting for the whole team. */
@@ -138,7 +138,7 @@ void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
 void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory);
 /* The same for batched prefill of up to `rows` rows per call: room for as many rows of split-K partials as the budget
- * LLAMA_ATTN_WORKSPACE_MIB (default 32) allows, never less than one row. Longer batches run in waves of that many rows. */
+ * (32 MiB) allows, never less than one row. Longer batches run in waves of that many rows. */
 size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows);
 void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
                            float *memory);
@@ -159,14 +159,12 @@ void k_attention_batch_portable(float *out, const float *q, const float *key_cac
  * count, for the report and for choosing contexts where a team has too little work. */
 int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int position);
 void k_attention_free(AttentionWork *work);
-/* Rows per batched-attention task (LLAMA_ATTN_ROW_BLOCK, 1..16, default 4; kernels_init reads it). Diagnostic only: the
- * rows of a block are computed independently, so the results are bitwise the same for every value. */
-void k_attention_set_row_block(int rows);
-int k_attention_row_block(void);
-/* Tiled attention (LLAMA_ATTN=tiled): query vectors per task, 1..16 (default 16; a block is that many divided by the heads
- * of a KV group, rows), and whether a wave's tasks are claimed longest first or in plan order (default). Diagnostic knobs
- * for the sweep: the order never changes a result bit; the block size changes the chunk plan, so results move by rounding. */
-void k_attention_set_tiled(int queries, int longest_first);
+/* Test hook: run every FP32 team GEMV with the hybrid split (contiguous shares, then claimed chunks), which the engine
+ * uses only for jobs of 96 MiB and more, so the unit tests reach it on small matrices. Results are bitwise unchanged. */
+void k_gemv_force_hybrid(int on);
+/* Test hook: the batched-attention workspace in MiB (32 by default; 0 = one row per wave), so tests run several waves on
+ * small shapes. Takes effect for workspaces sized after the call. A negative value restores the default. */
+void k_attention_set_workspace_mib(long mib);
 /* Opt-in timing of the attention tasks for tests/attention_bench.c: while a hook is set, every (kv group, chunk[, row
  * block]) task reports who ran it, what it read and when (monotonic_seconds). The hook runs on the worker threads; set and
  * clear it between kernel calls. With no hook (the default) the kernels are unchanged. */

@@ -78,7 +78,7 @@ class RuntimeTests(unittest.TestCase):
         scalar = data['build']['kernels'] == 'scalar'
         self.assertEqual(data['runtime'], {'backend': 'teams', 'sockets': 1, 'placement': 'file', 'thp': 'off',
             'precision_mode': 'fp32', 'prefill_batch': 1 if scalar else 32, 'prefill_logits': 'last',
-            'kernels_prefill': None if scalar else 'avx512', 'attn_row_block': 4})
+            'kernels_prefill': None if scalar else 'avx512'})
         self.assertEqual(len(data['teams']), 1)  # one team on the allowed CPUs
         self.assertNotIn('openmp', data['build'])
         self.assertEqual(data['regions'], [])
@@ -461,11 +461,10 @@ class RuntimeTests(unittest.TestCase):
         # E5: group is built; it is recorded, and runs split where AVX-512 is not active
         _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'group'))
-        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN=amx is not implemented yet (E3)'),
-                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be split, tiled or amx'),
-                                     ('LLAMA_ATTN_TILED_QUERIES', '0', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
-                                     ('LLAMA_ATTN_TILED_QUERIES', '17', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
-                                     ('LLAMA_ATTN_TILED_ORDER', 'random', 'LLAMA_ATTN_TILED_ORDER must be longest or natural'),
+        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN must be tiled or split'),
+                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled or split'),
+                                     ('LLAMA_ATTN_TILED_QUERIES', '8', 'LLAMA_ATTN_TILED_QUERIES is no longer supported'),
+                                     ('LLAMA_ATTN_TILED_ORDER', 'natural', 'LLAMA_ATTN_TILED_ORDER is no longer supported'),
                                      ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):
             result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
                                      '-i', 'A', '-t', '0'], capture_output=True, text=True,
