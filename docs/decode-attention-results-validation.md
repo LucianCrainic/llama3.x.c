@@ -121,3 +121,77 @@ section 8 come from the 96 reports (`throughput_tokens_per_second.decode`, `prof
 6. **Profiled runs** are three per kernel and cell, with `LLAMA_PROFILE=1` and log level `info`; the profile adds timing calls
    to every phase, so the phase times are not the unprofiled step times (the profiled token rates agree with the timed ones
    within about 1%).
+
+## E5.4: head-major K/V layout in the engine (2026-11-19/20)
+
+**Status: run.** Results: [decode-attention-results.md](decode-attention-results.md) section 9. The decision rules (9.1) were
+committed in a35b3b4 before any job was submitted. Branch `feature/kv-head-layout` (not merged).
+
+### Provenance
+
+| Item | Check job | 1B bench job | 8B bench job | V4 job |
+| --- | --- | --- | --- | --- |
+| Slurm job ID | 5876167 | 5876582 | 5876584 | 5876592 |
+| State | COMPLETED, exit 0, 2 h 54 min | **FAILED**, exit 1, 1 h 14 min (decode reports complete, 48 prefill cells failed) | **FAILED**, exit 1, 5 h 16 min (same) | COMPLETED, exit 0, 26 min 31 s |
+| Node (Flat mode, exclusive) | cresco8-hbm14 | cresco8-hbm13 | cresco8-hbm14 | cresco8-hbm13 |
+| Commit | a35b3b4 | a35b3b4 | a35b3b4 | 2dd52c5 (only the campaign script and its test differ from a35b3b4) |
+| Results directory (under the results store) | `kvlayout-check-20261119-1` | `kvlayout-bench-20261119-1b` | `kvlayout-bench-20261119-8b-2` | `kvlayout-v4-20261119-1` |
+| Settings | `STAGE=check PHASE=E5 E5_KV_CHECK=1 SKIP_PRELUDE_HF=1` (common `make test` ran) | `STAGE=bench PHASE=E5 REPEATS=3 SKIP_TEST=1 SKIP_PRELUDE_HF=1 E5_KV_LAYOUTS="rows head" E5_ATTN=tiled E5_ALTERNATE=1 E5_PROFILED=1 E5_SKIP_MICRO=1 E5_PREFILL_PROMPTS="2048 8192"`, MODELS = 1B | same, MODELS = 8B | same layouts and prompts with `E5_SKIP_DECODE=1 E5_PROFILED=0`, MODELS = 1B and 8B |
+| Result | 69 of 69 PASS | 192 decode reports completed; 48 prefill runs failed | 192 decode reports completed; 48 prefill runs failed | 96 prefill reports completed |
+
+Failed jobs and cells, recorded as they happened:
+
+- **5876582 and 5876584, V4 cells.** The 48 runs per job named `run-*-xkv{rows,head}-*` stopped with `[ERROR] cannot open prompt
+  file '<OUT>/prompt-2048.txt'` (and 8192): the bench stage never wrote the prompt files (only the check stage did). Both jobs
+  therefore ended with exit 1. Their decode data is valid and is what section 9.4 uses; their prefill reports are `status: error`
+  and are not used. The V4 figures come from job 5876592 (commit 2dd52c5), which includes the fix (the bench stage writes the prompt
+  files of `E5_PREFILL_PROMPTS`) and a dry-run test for it.
+- **5876583** (the first 8B submission, hbm14, 3 s): `mv: cannot stat 'build/release/config.tmp'`. It started `make` in the staged
+  tree `repo-a35b3b4` at the same moment as the 1B job; the Makefile's `config` rule races when two jobs build in one tree. It
+  produced no data and left an empty results directory (`kvlayout-bench-20261119-8b`); 5876584 was submitted after the 1B job's
+  build, as a no-op build, with a new directory. For parallel submissions from one tree: build once first, or skip the build when
+  it is current.
+
+The bench jobs ran with `LLAMA_ATTN=tiled` (`build.attention` of every decode and prefill report). The comparisons of the gates
+are inside each job. The 1B and 8B decode figures come from two different nodes (hbm13 and hbm14); no gate compares across them.
+
+### Gates
+
+| Gate | Criterion | Observed | Result |
+| --- | --- | --- | --- |
+| C1 | `make test` on hardware | 0 failures in every C suite, 87 Python tests OK (job 5876167 `test.log`) | pass |
+| C2 logits | rows against head, `--bitwise`, 1B/8B, FP32/W8A8, 1 and 2 sockets, decode `split` and `group`, tiled prefill, warm 8192 + short prompt, AMX rungs | 48 of 48 bitwise, max abs 0, argmax 100% | pass |
+| C2 tokens | 128 greedy tokens from a warm 8192-token context identical | 16 of 16 | pass |
+| C2 Hugging Face | FP32 with `LLAMA_KV_LAYOUT=head`, 1B/8B, one and two sockets | 4 of 4 exit 0 | pass |
+| V1 | 1B 32768 one socket, (head, group) over (rows, split) at least 1.3x beyond variability | FP32 1.343x, W8A8 1.646x, ranges apart | pass |
+| V2 | 1B W8A8 two-socket gain at 32768, head, best kernel, at least 1.5x | 1.869x (`split`), 1.860x (`group`) | pass |
+| V3 | 512 not slower, 16 comparisons | 15 pass; 8B FP32 one socket `group`: head 15.60 [15.59-15.61] below rows minimum 15.61 | **fail** (1 of 16) |
+| V4 | prefill TTFT not slower beyond variability, 8B `avx512_fp32` and `amx_bf16`, 2048 and 8192 | 0.997x, 0.976x, 0.991x, 0.921x | pass |
+| Reported | other V4 cells | 3 of 12 slower beyond variability at 2048 tokens (1B AMX-BF16 1.016x, 1B AMX-INT8 1.022x, 8B AVX-512 Q8 1.004x) | recorded |
+
+Local checks (macOS arm64, commit c0ca9b2 content; the final tree differs only by the later campaign-script and test commits):
+`make test` exit 0 (run twice, the second on the final C and Python tree); `MODE=sanitize` `test-kernels` and `test-kernels-emul`
+0 failures (run before the whitespace-only clang-format pass; the two binaries were rebuilt afterwards, not rerun); `MODE=tsan`
+`test-kernels-emul` with `LLAMA_TEST_TEAMS=1,3` 0 failures and no ThreadSanitizer report. Mutation checks: breaking the head-major
+store index (`k_kv_store`) failed the engine bitwise test (`test_tp.py`) and the kernel test; breaking the head base of
+`k_attention_batch_kv` aborted `test-kernels-emul` on the NaN-poisoned padding. Both reverted. DRY_RUN output of B5/B6/B7, E5
+(bench and check, default and with `E5_ALTERNATE=1 E5_PROFILED=2`), D2 and E4 is byte-identical to `develop` after the
+change (compared with ROOT normalized).
+
+### Gaps
+
+1. **One profiled run per variant and cell**; attention times and bandwidths are single-run and **derived** (bytes from the
+   shapes, mean context = warm context + 150).
+2. **V3 fails in one cell by the rule as written** (a 0.01 tok/s difference); the cell is the known 8B FP32 one-socket `group`
+   512 effect (weight-phase cost, section 8.3), which the layout does not touch.
+3. **Three repeats per variant**; ranges of three values are a coarse variability measure (the 1B W8A8 two-socket 512 `split`
+   rows range is 390-470 tok/s).
+4. **AMX-level unit tests** ran on the hardware only inside `make test` (not locally: this host has no AMX).
+5. **The V4 cells ran in a separate short job** (hbm13) from the decode cells of the 1B (hbm13) and 8B (hbm14) jobs; the layouts
+   are compared inside each job.
+6. **No placement report check** was part of the gates; `tools/check_placement.py` was changed to allow the one partly touched page
+   per (layer, KV head) that the head layout leaves, and is tested, but no cluster report was run through it.
+7. **First-touch effect**: with `head` the projection outputs go through a row buffer and the per-head store runs on the calling
+   thread, so on the owned-placement paths the K/V pages are first written by that thread; the K/V store phase costs under
+   0.04 ms per step and placement was verified in the reports (pages verified on the HBM node, no page elsewhere) but this was not
+   compared against rows.

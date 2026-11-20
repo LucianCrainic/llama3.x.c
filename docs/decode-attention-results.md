@@ -471,3 +471,260 @@ that job ran on another day (the comparison of the gates is inside each job).
 all pass. If only some pass, the section states which, and the layout stays opt-in. Whatever the outcome, this work does not
 change the default of `LLAMA_KV_LAYOUT` and does not merge: the decision table of [numa-tp-prefill-results.md](numa-tp-prefill-results.md)
 and the plan files are updated by the owner.
+
+### 9.2 What ran
+
+All jobs ran on Flat-mode nodes of the HBM partition, exclusive, gcc `-O3 -fopenmp`. Every rows against head comparison is inside
+one job on one node. Rules of 9.1 were committed before the first job (commit a35b3b4 holds them and was the build of the check
+job and the two bench jobs; 2dd52c5, which only changes the campaign script and its test, was the build of the V4 job).
+
+- **Check job 5876167** (hbm14, 2 h 54 min, exit 0): common `make test`, then `E5_KV_CHECK=1`.
+- **Bench jobs** 5876582 (1B, hbm13, 1 h 14 min) and 5876584 (8B, hbm14, 5 h 16 min), run in parallel, `E5_KV_LAYOUTS="rows head"
+  E5_ATTN=tiled E5_ALTERNATE=1 E5_PROFILED=1 E5_SKIP_MICRO=1 E5_PREFILL_PROMPTS="2048 8192" REPEATS=3`. Each produced all 192
+  decode reports (2 precisions x 3 contexts x 2 socket counts x 4 variants x (3 timed + 1 profiled)), every one `completed`.
+  **Both jobs exited 1 because their 48 prefill (V4) cells failed**: the bench stage did not write `prompt-2048.txt` and
+  `prompt-8192.txt` (only the check stage did), so each of those runs stopped with `cannot open prompt file`. The decode
+  reports are unaffected. A first 8B submission, job 5876583, failed after 3 s: it built in the shared staged tree at the same
+  time as the 1B job and `make` lost the `config.tmp` race (`mv: cannot stat`); it ran nothing and left an empty results
+  directory, so 5876584 used a new one.
+- **V4 job 5876592** (hbm13, 26 min 31 s, exit 0, commit 2dd52c5): the fix (the bench stage writes the prompt files of
+  `E5_PREFILL_PROMPTS`; new knob `E5_SKIP_DECODE=1` leaves out the decode runs; a dry-run test covers it) and one job holding
+  the prefill cells of 1B and 8B, both layouts, three repeats alternating the layout order: 96 reports, all `completed`. The
+  V4 figures below come from this job, not from the failed cells.
+
+### 9.3 Correctness gates
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| C1 `make test` on the hardware | **PASS** (all C suites 0 failures at the scalar, AVX-512 and AMX levels; 87 Python tests OK, 1 skipped) | check job `test.log`, `phase-results.txt` |
+| C2 logits, rows against head, `--bitwise` | **PASS**, 48 of 48: max \|dlogit\| = 0 and argmax 100% at every compared position. Per model and precision and socket count: the short prompt per token for `split` and `group` (86 positions), the decode path after a warm 8192-token context (8 positions, tiled prefill) for both kernels, the last row after the tiled prefill of 8192 tokens, and the AMX rung (AMX-BF16 on FP32, AMX-INT8 on W8A8) | `E5/compare-*-kv-*.json` |
+| C2 generation, 128 greedy tokens from a warm 8192-token context, both decode kernels | **PASS**, 16 of 16 identical (sequences and prompts) | `E5/gen-*-rows-vs-head.json` |
+| C2 Hugging Face, FP32 head layout, 1B and 8B, one and two sockets | **PASS**, 4 of 4 (exit 0; largest max \|dlogit\| seen 6.7e-5, 8B two sockets) | `correctness-*-fp32-head*.json` |
+
+### 9.4 Decode throughput, rows against head
+(tables are produced from the reports of the 1B and 8B bench jobs)
+
+#### Decode tok/s (head against rows, per kernel)
+
+Median [min-max] of three repeats, tok/s. Ratio = median head / median rows. "Beyond" = ranges do not overlap.
+
+| Model | Precision | Sockets | Context | Kernel | rows | head | head / rows | Beyond variability |
+| --- | --- | ---: | ---: | --- | --- | --- | ---: | --- |
+| 1B | FP32 | 1 | 512 | split | 91.37 [90.25-96.17] | 92.30 [91.38-97.42] | 1.010 | overlap |
+| 1B | FP32 | 1 | 512 | group | 91.15 [90.88-95.66] | 93.93 [91.88-94.67] | 1.031 | overlap |
+| 1B | FP32 | 1 | 8192 | split | 70.27 [69.94-70.29] | 79.99 [79.29-80.44] | 1.138 | faster |
+| 1B | FP32 | 1 | 8192 | group | 70.88 [70.82-71.25] | 84.29 [84.09-84.34] | 1.189 | faster |
+| 1B | FP32 | 1 | 32768 | split | 44.84 [44.73-44.88] | 53.49 [53.36-53.69] | 1.193 | faster |
+| 1B | FP32 | 1 | 32768 | group | 47.66 [47.63-47.81] | 60.23 [59.79-60.98] | 1.264 | faster |
+| 1B | FP32 | 2 | 512 | split | 169.72 [169.09-172.49] | 172.49 [169.37-178.22] | 1.016 | overlap |
+| 1B | FP32 | 2 | 512 | group | 170.57 [169.27-170.76] | 173.16 [170.95-174.68] | 1.015 | faster |
+| 1B | FP32 | 2 | 8192 | split | 129.27 [129.22-129.94] | 146.80 [146.69-147.35] | 1.136 | faster |
+| 1B | FP32 | 2 | 8192 | group | 140.62 [140.58-141.16] | 150.81 [150.75-152.76] | 1.072 | faster |
+| 1B | FP32 | 2 | 32768 | split | 70.66 [70.60-71.10] | 102.55 [101.34-102.97] | 1.451 | faster |
+| 1B | FP32 | 2 | 32768 | group | 85.30 [53.28-85.81] | 114.61 [114.52-114.95] | 1.344 | faster |
+| 1B | W8A8 | 1 | 512 | split | 260.31 [247.27-260.72] | 275.95 [258.42-278.12] | 1.060 | overlap |
+| 1B | W8A8 | 1 | 512 | group | 262.42 [258.10-268.85] | 282.23 [261.23-296.04] | 1.075 | overlap |
+| 1B | W8A8 | 1 | 8192 | split | 120.51 [120.26-123.22] | 181.04 [180.44-181.39] | 1.502 | faster |
+| 1B | W8A8 | 1 | 8192 | group | 126.86 [122.87-128.80] | 203.94 [200.78-205.23] | 1.608 | faster |
+| 1B | W8A8 | 1 | 32768 | split | 62.52 [62.36-62.66] | 85.07 [84.88-85.31] | 1.361 | faster |
+| 1B | W8A8 | 1 | 32768 | group | 68.96 [68.15-69.03] | 102.89 [102.35-103.39] | 1.492 | faster |
+| 1B | W8A8 | 2 | 512 | split | 461.34 [389.95-470.33] | 449.20 [412.06-450.58] | 0.974 | overlap |
+| 1B | W8A8 | 2 | 512 | group | 468.96 [408.03-479.29] | 453.78 [411.30-490.68] | 0.968 | overlap |
+| 1B | W8A8 | 2 | 8192 | split | 205.08 [198.90-206.40] | 327.63 [326.79-336.93] | 1.598 | faster |
+| 1B | W8A8 | 2 | 8192 | group | 259.71 [258.56-262.10] | 337.07 [327.33-352.04] | 1.298 | faster |
+| 1B | W8A8 | 2 | 32768 | split | 78.14 [77.83-78.23] | 158.98 [158.91-159.87] | 2.034 | faster |
+| 1B | W8A8 | 2 | 32768 | group | 100.81 [100.68-101.03] | 191.41 [188.78-191.64] | 1.899 | faster |
+| 8B | FP32 | 1 | 512 | split | 16.45 [16.39-16.46] | 16.60 [16.60-16.65] | 1.010 | faster |
+| 8B | FP32 | 1 | 512 | group | 15.65 [15.61-15.69] | 15.60 [15.59-15.61] | 0.997 | overlap |
+| 8B | FP32 | 1 | 8192 | split | 13.25 [13.25-13.34] | 14.84 [14.80-14.92] | 1.120 | faster |
+| 8B | FP32 | 1 | 8192 | group | 13.69 [13.68-13.72] | 15.23 [14.92-15.25] | 1.112 | faster |
+| 8B | FP32 | 1 | 32768 | split | 9.62 [9.45-9.62] | 11.41 [11.36-11.45] | 1.186 | faster |
+| 8B | FP32 | 1 | 32768 | group | 10.91 [10.90-10.91] | 12.25 [12.25-12.26] | 1.123 | faster |
+| 8B | FP32 | 2 | 512 | split | 30.49 [30.45-30.53] | 30.86 [30.86-30.94] | 1.012 | faster |
+| 8B | FP32 | 2 | 512 | group | 30.71 [30.70-30.75] | 30.94 [30.90-30.97] | 1.008 | faster |
+| 8B | FP32 | 2 | 8192 | split | 25.41 [25.37-25.53] | 28.46 [28.45-28.54] | 1.120 | faster |
+| 8B | FP32 | 2 | 8192 | group | 27.17 [27.12-27.17] | 29.21 [29.12-29.28] | 1.075 | faster |
+| 8B | FP32 | 2 | 32768 | split | 19.16 [19.04-19.20] | 22.11 [22.03-22.14] | 1.154 | faster |
+| 8B | FP32 | 2 | 32768 | group | 20.29 [20.18-20.39] | 23.77 [23.72-23.88] | 1.171 | faster |
+| 8B | W8A8 | 1 | 512 | split | 49.33 [49.28-49.41] | 50.02 [38.67-50.34] | 1.014 | overlap |
+| 8B | W8A8 | 1 | 512 | group | 49.38 [49.10-49.46] | 49.68 [49.64-49.70] | 1.006 | faster |
+| 8B | W8A8 | 1 | 8192 | split | 28.79 [28.61-28.88] | 37.11 [37.11-37.26] | 1.289 | faster |
+| 8B | W8A8 | 1 | 8192 | group | 30.62 [30.57-30.65] | 39.98 [39.86-39.98] | 1.306 | faster |
+| 8B | W8A8 | 1 | 32768 | split | 15.78 [15.77-15.78] | 21.41 [21.40-21.43] | 1.357 | faster |
+| 8B | W8A8 | 1 | 32768 | group | 19.83 [19.78-19.84] | 24.22 [24.02-24.31] | 1.221 | faster |
+| 8B | W8A8 | 2 | 512 | split | 90.11 [89.98-90.27] | 91.60 [91.47-93.38] | 1.017 | faster |
+| 8B | W8A8 | 2 | 512 | group | 91.22 [90.68-91.46] | 92.94 [92.74-93.67] | 1.019 | faster |
+| 8B | W8A8 | 2 | 8192 | split | 50.56 [50.18-51.09] | 66.66 [66.20-66.95] | 1.318 | faster |
+| 8B | W8A8 | 2 | 8192 | group | 58.64 [58.63-58.86] | 72.21 [71.88-72.23] | 1.231 | faster |
+| 8B | W8A8 | 2 | 32768 | split | 29.29 [29.20-29.55] | 39.09 [38.94-39.19] | 1.335 | faster |
+| 8B | W8A8 | 2 | 32768 | group | 33.71 [33.47-33.78] | 44.74 [44.40-44.84] | 1.327 | faster |
+
+#### V1 (1B, 32768, one socket): (head, group) against (rows, split)
+
+| Precision | rows+split | head+group | ratio of medians | ranges apart | verdict |
+| --- | --- | --- | ---: | --- | --- |
+| FP32 | 44.84 [44.73-44.88] | 60.23 [59.79-60.98] | 1.343 | yes | PASS |
+| W8A8 | 62.52 [62.36-62.66] | 102.89 [102.35-103.39] | 1.646 | yes | PASS |
+
+#### V2 (1B W8A8, 32768): two-socket gain with the head layout
+
+| Kernel | one socket | two sockets | s2 / s1 |
+| --- | --- | --- | ---: |
+| split | 85.07 [84.88-85.31] | 158.98 [158.91-159.87] | 1.869 |
+| group | 102.89 [102.35-103.39] | 191.41 [188.78-191.64] | 1.860 |
+
+Best kernel gain 1.869: PASS (rows layout for comparison: split 1.250, group 1.462).
+
+#### Two-socket gain s2 / s1 (medians, derived)
+
+| Model | Precision | Context | rows split | rows group | head split | head group |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1B | FP32 | 512 | 1.86 | 1.87 | 1.87 | 1.84 |
+| 1B | FP32 | 8192 | 1.84 | 1.98 | 1.84 | 1.79 |
+| 1B | FP32 | 32768 | 1.58 | 1.79 | 1.92 | 1.90 |
+| 1B | W8A8 | 512 | 1.77 | 1.79 | 1.63 | 1.61 |
+| 1B | W8A8 | 8192 | 1.70 | 2.05 | 1.81 | 1.65 |
+| 1B | W8A8 | 32768 | 1.25 | 1.46 | 1.87 | 1.86 |
+| 8B | FP32 | 512 | 1.85 | 1.96 | 1.86 | 1.98 |
+| 8B | FP32 | 8192 | 1.92 | 1.98 | 1.92 | 1.92 |
+| 8B | FP32 | 32768 | 1.99 | 1.86 | 1.94 | 1.94 |
+| 8B | W8A8 | 512 | 1.83 | 1.85 | 1.83 | 1.87 |
+| 8B | W8A8 | 8192 | 1.76 | 1.91 | 1.80 | 1.81 |
+| 8B | W8A8 | 32768 | 1.86 | 1.70 | 1.83 | 1.85 |
+
+#### V3: 512 not slower (median head >= min rows)
+
+| Model | Precision | Sockets | Kernel | rows | head | median head >= min rows | verdict |
+| --- | --- | ---: | --- | --- | --- | --- | --- |
+| 1B | FP32 | 1 | split | 91.37 [90.25-96.17] | 92.30 [91.38-97.42] | 92.30 vs 90.25 | PASS |
+| 1B | FP32 | 1 | group | 91.15 [90.88-95.66] | 93.93 [91.88-94.67] | 93.93 vs 90.88 | PASS |
+| 1B | FP32 | 2 | split | 169.72 [169.09-172.49] | 172.49 [169.37-178.22] | 172.49 vs 169.09 | PASS |
+| 1B | FP32 | 2 | group | 170.57 [169.27-170.76] | 173.16 [170.95-174.68] | 173.16 vs 169.27 | PASS |
+| 1B | W8A8 | 1 | split | 260.31 [247.27-260.72] | 275.95 [258.42-278.12] | 275.95 vs 247.27 | PASS |
+| 1B | W8A8 | 1 | group | 262.42 [258.10-268.85] | 282.23 [261.23-296.04] | 282.23 vs 258.10 | PASS |
+| 1B | W8A8 | 2 | split | 461.34 [389.95-470.33] | 449.20 [412.06-450.58] | 449.20 vs 389.95 | PASS |
+| 1B | W8A8 | 2 | group | 468.96 [408.03-479.29] | 453.78 [411.30-490.68] | 453.78 vs 408.03 | PASS |
+| 8B | FP32 | 1 | split | 16.45 [16.39-16.46] | 16.60 [16.60-16.65] | 16.60 vs 16.39 | PASS |
+| 8B | FP32 | 1 | group | 15.65 [15.61-15.69] | 15.60 [15.59-15.61] | 15.60 vs 15.61 | FAIL |
+| 8B | FP32 | 2 | split | 30.49 [30.45-30.53] | 30.86 [30.86-30.94] | 30.86 vs 30.45 | PASS |
+| 8B | FP32 | 2 | group | 30.71 [30.70-30.75] | 30.94 [30.90-30.97] | 30.94 vs 30.70 | PASS |
+| 8B | W8A8 | 1 | split | 49.33 [49.28-49.41] | 50.02 [38.67-50.34] | 50.02 vs 49.28 | PASS |
+| 8B | W8A8 | 1 | group | 49.38 [49.10-49.46] | 49.68 [49.64-49.70] | 49.68 vs 49.10 | PASS |
+| 8B | W8A8 | 2 | split | 90.11 [89.98-90.27] | 91.60 [91.47-93.38] | 91.60 vs 89.98 | PASS |
+| 8B | W8A8 | 2 | group | 91.22 [90.68-91.46] | 92.94 [92.74-93.67] | 92.94 vs 90.68 | PASS |
+
+V3: FAIL [('8b', 'fp32', 1, 'group')]
+
+#### Attention phase and derived K/V bandwidth (one profiled run per variant)
+
+Attention ms per decode step, K/V store ms per step, and bandwidth = 2 x local KV heads x head_dim x 4 bytes x mean context x layers / attention time (derived; mean context = warm context + 86 + 64). % of 552 GB/s per socket.
+
+| Model | Precision | Sockets | Context | Kernel | rows attn ms | head attn ms | attn rows / head | rows GB/s | head GB/s | head % of 552 | head kv_store ms |
+| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1B | FP32 | 1 | 8192 | split | 4.40 | 2.43 | 1.81 | 124 | 225 | 41% | 0.007 |
+| 1B | FP32 | 1 | 8192 | group | 4.02 | 1.97 | 2.04 | 136 | 278 | 50% | 0.007 |
+| 1B | FP32 | 1 | 32768 | split | 12.11 | 8.48 | 1.43 | 178 | 254 | 46% | 0.008 |
+| 1B | FP32 | 1 | 32768 | group | 10.99 | 6.47 | 1.70 | 196 | 333 | 60% | 0.008 |
+| 1B | FP32 | 2 | 8192 | split | 2.59 | 1.48 | 1.75 | 106 | 185 | 33% | 0.004 |
+| 1B | FP32 | 2 | 8192 | group | 1.63 | 1.28 | 1.27 | 168 | 214 | 39% | 0.004 |
+| 1B | FP32 | 2 | 32768 | split | 9.23 | 4.43 | 2.08 | 117 | 243 | 44% | 0.004 |
+| 1B | FP32 | 2 | 32768 | group | 6.66 | 3.50 | 1.91 | 162 | 309 | 56% | 0.005 |
+| 1B | W8A8 | 1 | 8192 | split | 4.86 | 2.39 | 2.04 | 112 | 229 | 41% | 0.006 |
+| 1B | W8A8 | 1 | 8192 | group | 4.38 | 1.85 | 2.37 | 125 | 295 | 54% | 0.006 |
+| 1B | W8A8 | 1 | 32768 | split | 12.41 | 8.35 | 1.49 | 174 | 258 | 47% | 0.007 |
+| 1B | W8A8 | 1 | 32768 | group | 10.92 | 6.41 | 1.70 | 198 | 337 | 61% | 0.008 |
+| 1B | W8A8 | 2 | 8192 | split | 2.81 | 1.24 | 2.26 | 97 | 220 | 40% | 0.004 |
+| 1B | W8A8 | 2 | 8192 | group | 1.81 | 1.18 | 1.53 | 151 | 232 | 42% | 0.004 |
+| 1B | W8A8 | 2 | 32768 | split | 10.43 | 4.43 | 2.35 | 103 | 244 | 44% | 0.005 |
+| 1B | W8A8 | 2 | 32768 | group | 7.60 | 3.34 | 2.28 | 142 | 323 | 59% | 0.004 |
+| 8B | FP32 | 1 | 8192 | split | 15.77 | 8.53 | 1.85 | 139 | 256 | 46% | 0.032 |
+| 8B | FP32 | 1 | 8192 | group | 15.86 | 6.64 | 2.39 | 138 | 330 | 60% | 0.032 |
+| 8B | FP32 | 1 | 32768 | split | 44.10 | 27.94 | 1.58 | 196 | 309 | 56% | 0.034 |
+| 8B | FP32 | 1 | 32768 | group | 30.87 | 22.44 | 1.38 | 280 | 385 | 70% | 0.034 |
+| 8B | FP32 | 2 | 8192 | split | 10.05 | 5.22 | 1.93 | 109 | 209 | 38% | 0.014 |
+| 8B | FP32 | 2 | 8192 | group | 7.31 | 4.17 | 1.75 | 150 | 262 | 48% | 0.014 |
+| 8B | FP32 | 2 | 32768 | split | 22.62 | 15.45 | 1.46 | 191 | 279 | 51% | 0.015 |
+| 8B | FP32 | 2 | 32768 | group | 19.46 | 12.23 | 1.59 | 222 | 353 | 64% | 0.016 |
+| 8B | W8A8 | 1 | 8192 | split | 16.09 | 8.20 | 1.96 | 136 | 267 | 48% | 0.031 |
+| 8B | W8A8 | 1 | 8192 | group | 15.09 | 6.54 | 2.31 | 145 | 334 | 61% | 0.032 |
+| 8B | W8A8 | 1 | 32768 | split | 44.12 | 27.87 | 1.58 | 196 | 310 | 56% | 0.033 |
+| 8B | W8A8 | 1 | 32768 | group | 31.24 | 22.51 | 1.39 | 276 | 383 | 69% | 0.034 |
+| 8B | W8A8 | 2 | 8192 | split | 9.48 | 4.89 | 1.94 | 115 | 223 | 40% | 0.015 |
+| 8B | W8A8 | 2 | 8192 | group | 7.44 | 4.06 | 1.84 | 147 | 270 | 49% | 0.012 |
+| 8B | W8A8 | 2 | 32768 | split | 23.50 | 15.28 | 1.54 | 184 | 282 | 51% | 0.020 |
+| 8B | W8A8 | 2 | 32768 | group | 19.40 | 12.24 | 1.58 | 222 | 352 | 64% | 0.016 |
+
+#### V4: time to first token, one socket, tiled prefill (seconds, median [min-max] of three)
+
+| Model | Rung | Prompt | rows | head | head / rows | verdict |
+| --- | --- | ---: | --- | --- | ---: | --- |
+| 1B | avx512_fp32 | 2048 | 1.66 [1.63-2.23] | 1.64 [1.60-1.66] | 0.987 | overlap: pass |
+| 1B | avx512_fp32 | 8192 | 8.48 [8.47-8.50] | 8.23 [8.18-8.25] | 0.970 | faster beyond variability |
+| 1B | amx_bf16 | 2048 | 0.50 [0.50-0.51] | 0.51 [0.51-0.51] | 1.016 | head slower beyond variability: FAIL |
+| 1B | amx_bf16 | 8192 | 3.76 [3.76-3.79] | 3.50 [3.49-3.50] | 0.929 | faster beyond variability |
+| 1B | avx512_q8 | 2048 | 1.53 [1.46-1.54] | 1.49 [1.48-1.55] | 0.974 | overlap: pass |
+| 1B | avx512_q8 | 8192 | 7.79 [7.79-7.83] | 7.49 [7.47-7.51] | 0.962 | faster beyond variability |
+| 1B | amx_int8 | 2048 | 0.57 [0.56-0.58] | 0.58 [0.58-0.58] | 1.022 | head slower beyond variability: FAIL |
+| 1B | amx_int8 | 8192 | 4.03 [4.01-4.04] | 3.77 [3.72-3.77] | 0.935 | faster beyond variability |
+| 8B | avx512_fp32 | 2048 | 10.00 [9.92-10.01] | 9.97 [9.97-9.99] | 0.997 | overlap: pass (gate) |
+| 8B | avx512_fp32 | 8192 | 47.04 [47.02-47.48] | 45.91 [45.89-45.95] | 0.976 | faster beyond variability (gate) |
+| 8B | amx_bf16 | 2048 | 2.43 [2.43-2.44] | 2.41 [2.40-2.42] | 0.991 | faster beyond variability (gate) |
+| 8B | amx_bf16 | 8192 | 16.19 [16.12-16.22] | 14.90 [14.90-14.95] | 0.921 | faster beyond variability (gate) |
+| 8B | avx512_q8 | 2048 | 8.90 [8.79-8.91] | 8.93 [8.93-8.96] | 1.004 | head slower beyond variability: FAIL |
+| 8B | avx512_q8 | 8192 | 42.78 [42.73-42.81] | 42.80 [42.78-42.81] | 1.000 | overlap: pass |
+| 8B | amx_int8 | 2048 | 2.37 [2.34-2.44] | 2.34 [2.32-2.35] | 0.986 | overlap: pass |
+| 8B | amx_int8 | 8192 | 16.30 [16.25-16.34] | 14.93 [14.90-14.97] | 0.916 | faster beyond variability |
+
+V4 (8B avx512_fp32 and amx_bf16, both prompts): PASS
+
+
+
+### 9.5 Gate verdicts
+
+| Gate | Criterion | Measured | Verdict |
+| --- | --- | --- | --- |
+| C1 | `make test` on hardware | pass | **PASS** |
+| C2 | bitwise, generated tokens identical, HF | 48 of 48, 16 of 16, 4 of 4 | **PASS** |
+| V1 | 1B 32768 one socket, (head, group) over (rows, split) at least 1.3x beyond variability | FP32 1.343x (ranges apart), W8A8 1.646x (ranges apart) | **PASS** |
+| V2 | 1B W8A8 two-socket gain at 32768, head, best kernel, at least 1.5x | 1.869x (`split`), 1.860x (`group`); with rows 1.250x and 1.462x | **PASS** |
+| V3 | 512 not slower: median head at least the minimum of rows, 16 comparisons | 15 of 16 pass; **8B FP32 one socket `group`: head 15.60 [15.59-15.61] against rows 15.65 [15.61-15.69], median below the rows minimum by 0.01 tok/s (0.06%)** | **FAIL** (one comparison) |
+| V4 | prefill TTFT not slower beyond variability, 8B `avx512_fp32` and `amx_bf16` at 2048 and 8192 | 4 of 4 not slower (0.997x, 0.976x, 0.991x, 0.921x of the rows time) | **PASS** |
+
+V3 fails by the rule as written. The failing cell is the one that has failed every 512 comparison since the first E5 job:
+8B FP32 one socket with `group` is 4.9% below `split` at 512 in the rows layout (15.65 against 16.45) and stays there with
+the head layout (15.60); the head layout does not change that kernel effect, and `split` with head is above rows in that
+cell (16.60 against 16.45). The difference between head and rows for `group` there is smaller than the rows spread. It is
+reported as a failed comparison, not as a pass.
+
+The 12 V4 cells outside the gate (1B on all four rungs, 8B on the two Q8 rungs) are faster with head beyond variability in 5
+of 12 cells (all at 8192 tokens, 3-8% shorter), overlap in 4 of 12 and **slower beyond variability in 3 of 12 cells by the rule of 9.1: 1B
+AMX-BF16 at 2048 (1.016x, 0.50 against 0.51 s), 1B AMX-INT8 at 2048 (1.022x, 0.57 against 0.58 s) and 8B AVX-512 Q8 at 2048
+(1.004x, 8.90 against 8.93 s)**. They are reported and not gated.
+
+### 9.6 Findings
+
+- **Decode.** Head-major is faster than rows with the same kernel beyond variability in all 32 comparisons at 8192 and 32768
+  (model x precision x sockets x context x kernel): 1B 1.07-1.61x at 8192 and 1.19-2.03x at 32768, 8B 1.08-1.32x at 8192 and
+  1.12-1.36x at 32768. The gain is largest for W8A8 on 1B and two sockets (2.03x with `split`, 1.90x with `group` at 32768), where the K/V
+  access dominated the step. At 512 tokens the ratios are 0.97-1.08: 7 of 16 comparisons are faster beyond variability (mostly 8B), 9
+  overlap, none is slower beyond variability; the V3 failure is the one cell where the median is below the rows minimum.
+- **Original E5 target.** (head, group) reaches 1.34x (FP32) and 1.65x (W8A8) of the engine as shipped on 1B at 32768 one socket
+  (E5 `group` alone: 1.08x and 1.10x), and the two-socket W8A8 gain at 32768 rises from 1.25x (rows, `split`) to 1.87x.
+  Both E5 value gates that `group` alone missed are met by the layout.
+- **Attention phase.** In the profiled runs the attention time per step falls by 1.3-2.4x (table in 9.4); the derived K/V
+  bandwidth of `group` on one socket rises from 125-280 GB/s (rows) to 278-385 GB/s (head), 50-70% of the 552 GB/s per
+  socket at 8192 and 32768. The K/V store phase costs 0.004-0.034 ms per step (under 0.1% of a step), i.e. the per-head
+  store of one row is not a cost. These bandwidths are **derived** from one profiled run per cell.
+- **Prefill.** Time to first token is equal or lower with head at 8192 tokens in every cell (0.92-1.00x); at 2048 tokens it is
+  equal within 2% (three cells 0.4-2.2% slower beyond variability, listed in 9.5). The batched K/V store through a row buffer
+  does not show up.
+
+### 9.7 Conclusion
+
+C1, C2, V1, V2 and V4 pass; V3 fails in one of 16 comparisons (8B FP32, one socket, `group`, 512 tokens, a 0.06% difference
+that is the previously known `group` effect at that cell). By the rule of 9.1 the layout is therefore **not recommended for
+adoption as the default**, although the evidence is strongly in its favour everywhere else: it is bitwise identical to rows
+on every path tested, it meets both original E5 value targets, and it never hurts beyond the spread except in the V3 cell and
+three 2048-token prefill cells of 0.4-2.2%. It stays opt-in (`LLAMA_KV_LAYOUT=head`); the decision to make it the default
+(possibly together with `LLAMA_ATTN_DECODE=group` for contexts of 8192 and above) and to waive or keep the V3 cell is the
+owner's. Nothing was merged and no default was changed.
