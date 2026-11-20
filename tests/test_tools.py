@@ -479,8 +479,11 @@ class CompareEnginesTests(unittest.TestCase):
         tokens = [str(65 + (i * 7) % 20) for i in range(20)]
         for engine in ('fp32', 'int8'):
             probe, model = str(BUILD/f'probe-{engine}'), str(self.fixture/f'{engine}.bin')
-            every = subprocess.run([probe, model, *tokens], capture_output=True, timeout=120).stdout
-            tail = subprocess.run([probe, 'tail', model, '5', *tokens], capture_output=True, timeout=120)
+            # Nothing batched: since F4 the prefix of `tail` is batched by default where the GEMM runs, and the tiled
+            # prefill attention is not bitwise the per-token path (FP32 on a real AVX-512 host differs in the last bits).
+            unbatched = {**os.environ, 'LLAMA_PREFILL_BATCH': '1'}
+            every = subprocess.run([probe, model, *tokens], capture_output=True, timeout=120, env=unbatched).stdout
+            tail = subprocess.run([probe, 'tail', model, '5', *tokens], capture_output=True, timeout=120, env=unbatched)
             self.assertEqual(tail.returncode, 0, tail.stderr)
             self.assertEqual(tail.stdout, every[-5 * len(every) // 20:])
             for batched in ([], ['--batch-a', '8', '--batch-b', '8']):
