@@ -32,9 +32,9 @@ ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
 LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
-COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/profile.c src/numa.c src/shards.c src/workers.c src/tp.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
+COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/gemv.c src/attention.c src/profile.c src/numa.c src/shards.c src/workers.c src/tp.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
-HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h
+HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h include/testing.h src/kernels_internal.h
 # Regenerate the configuration stamp only when flags change; changing CC or MODE
 # must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE
@@ -54,7 +54,7 @@ $(BUILD_DIR)/test-int8: tests/unit.c src/runq.c $(COMMON) $(HEADERS) $(BUILD_DIR
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-kernels: tests/kernels.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-# test-kernels with src/kernels_simd.c's AVX-512 kernels (attention included) on the scalar model of the intrinsics.
+# test-kernels with the AVX-512 kernels (src/kernels_simd.c, gemv.c, attention.c) on the scalar model of the intrinsics.
 $(BUILD_DIR)/test-kernels-emul: tests/kernels.c tests/avx512_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) -DKERNELS_EMULATE_AVX512 -ffp-contract=off $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-gemm: tests/gemm.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
@@ -156,7 +156,7 @@ $(BUILD_DIR)/probe-fp32-amx-emul: tests/probe.c src/run.c tests/amx_emul.h $(COM
 	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/probe.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/probe-int8-amx-emul: tests/probe.c src/runq.c tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) -DGEMM_EMULATE_AMX $(CFLAGS) tests/probe.c src/runq.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-# The probes with src/kernels_simd.c's AVX-512 kernels (batched attention included) on the scalar intrinsic model, so
+# The probes with the AVX-512 kernels (src/kernels_simd.c, gemv.c, attention.c) on the scalar intrinsic model, so
 # LLAMA_KERNELS=avx512 LLAMA_ATTN=tiled runs inside the engine on any host (real rounding and speed need AVX-512).
 $(BUILD_DIR)/probe-fp32-avx512-emul: tests/probe.c src/run.c tests/avx512_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) -DKERNELS_EMULATE_AVX512 -ffp-contract=off $(CFLAGS) tests/probe.c src/run.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@

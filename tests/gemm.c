@@ -5,6 +5,7 @@
 #include "gemm.h"
 #include "kernels.h"
 #include "workers.h"
+#include "testing.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>

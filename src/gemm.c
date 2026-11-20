@@ -7,6 +7,7 @@
  * microkernels and the VNNI packing helpers. The `amx` target attribute is used only in this file. */
 #include "gemm.h"
 #include "kernels.h"
+#include "testing.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -37,7 +38,7 @@ typedef struct {
   Micro micro;
 } GemmJob;
 
-/* Same expression as silu_gate in kernels_simd.c, so the SWIGLU epilogue rounds like the GEMV's. */
+/* Same expression as silu_gate in gemv.c, so the SWIGLU epilogue rounds like the GEMV's. */
 static float silu_gate(float value, float gate) {
   value *= (1.0f / (1.0f + expf(-value)));
   return value * gate;

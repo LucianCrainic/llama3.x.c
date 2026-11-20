@@ -19,6 +19,7 @@
 #include "kernels.h"
 #include "numa.h"
 #include "workers.h"
+#include "testing.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>

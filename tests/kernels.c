@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "numa.h"
 #include "workers.h"
+#include "testing.h"
 #include <assert.h>
 #include <float.h>
 #include <math.h>

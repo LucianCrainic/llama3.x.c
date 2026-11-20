@@ -41,19 +41,16 @@ int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
 int kernels_select_amx_auto(void);
 /* Attention variants (E1). kernels_init reads LLAMA_ATTN (batched, prefill: split|tiled|amx) and LLAMA_ATTN_DECODE
  * (single row: split|group) once. The defaults are tiled for the batched path (since E4; it runs split where AVX-512
- * is not active) and split, the split-K kernel, for decode. A variant that is not built yet is refused
- * with a message. The names are recorded in the run report. kernels_attention_select picks them directly (NULL leaves
- * one unchanged) and returns 0 for an unknown or unimplemented name; tests use it to run every variant. */
+ * is not active) and split, the split-K kernel, for decode. The names are recorded in the run report. Tests pick a
+ * variant with kernels_attention_select (testing.h). */
 const char *kernels_attention_name(void);
 const char *kernels_attention_decode_name(void);
-int kernels_attention_select(const char *batch, const char *decode);
 /* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default head since E5.4). rows: a layer's cache is
  * [position][kv_head][head_dim]; head: [kv_head][position][head_dim] with room for seq_len positions per head (the same
  * bytes). Engines address the cache through the helpers at the end of this header; the results are bitwise the same in
- * both layouts. kernels_kv_layout_select picks one directly (returns 0 for an unknown name); tests use it. */
+ * both layouts. Tests pick one with kernels_kv_layout_select (testing.h). */
 int kernels_kv_layout_head(void);
 const char *kernels_kv_layout_name(void);
-int kernels_kv_layout_select(const char *name);
 typedef void (*SegmentFn)(const void *job, int segment, int first, int last);
 void kernels_parallel_segments(int count, const int *chunks, SegmentFn fn, const void *job);
 
@@ -148,40 +145,13 @@ void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int
  * att is the per-row scratch of the fallback path. */
 void k_attention_batch(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                        AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0, int m);
-/* Test hook: the merge of `chunks` split-K partials [value sum (head_dim), maximum, sum] into one normalized row. A
- * partial with maximum -FLT_MAX and sum 0 (a row with no position in that chunk, tiled attention) is skipped. */
-void k_attention_merge_partials(const float *base, size_t slot, int chunks, int head_dim, float *o);
-/* Test hook: the same driver with a portable chunk kernel, on any host. */
-void k_attention_batch_portable(float *out, const float *q, const float *key_cache, const float *value_cache,
-                                AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
-                                int m);
 /* Position chunks the split-K attention uses for `position` with this work's team size and the given (local) KV head
  * count, for the report and for choosing contexts where a team has too little work. */
 int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int position);
 void k_attention_free(AttentionWork *work);
-/* Test hook: run every FP32 team GEMV with the hybrid split (contiguous shares, then claimed chunks), which the engine
- * uses only for jobs of 96 MiB and more, so the unit tests reach it on small matrices. Results are bitwise unchanged. */
-void k_gemv_force_hybrid(int on);
-/* Test hook: the batched-attention workspace in MiB (32 by default; 0 = one row per wave), so tests run several waves on
- * small shapes. Takes effect for workspaces sized after the call. A negative value restores the default. */
-void k_attention_set_workspace_mib(long mib);
-/* Opt-in timing of the attention tasks for tests/attention_bench.c: while a hook is set, every (kv group, chunk[, row
- * block]) task reports who ran it, what it read and when (monotonic_seconds). The hook runs on the worker threads; set and
- * clear it between kernel calls. With no hook (the default) the kernels are unchanged. */
-typedef struct {
-  int worker;        /* team member (0 when serial) */
-  int wave;          /* first row of the wave inside the microbatch (0 for decode) */
-  int task;          /* index in the wave */
-  int rows;          /* rows of the block that take part */
-  int span;          /* K/V positions the block streams: min(t0)..max(t1) over its rows */
-  long positions;    /* positions scored, summed over the rows */
-  double begin, end; /* monotonic_seconds around the task */
-} AttentionTaskInfo;
-typedef void (*AttentionTaskHook)(void *ctx, const AttentionTaskInfo *info);
-void k_attention_set_task_hook(AttentionTaskHook hook, void *ctx);
 void k_attention(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                  AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int position);
-/* k_attention on a caller-chosen K/V layout (E5.2 layout probe; no engine path uses it). Position t of KV head g starts at
+/* k_attention on a caller-chosen K/V layout (k_attention_kv uses it for the head-major cache). Position t of KV head g starts at
  * cache + t * pos_stride + g * head_base floats. k_attention is pos_stride = n_kv_heads * head_dim, head_base = head_dim
  * (rows [position][kv_head][head_dim]); the head-major layout [kv_head][position][head_dim] is pos_stride = head_dim,
  * head_base = seq_len * head_dim. The same decode kernel (LLAMA_ATTN_DECODE) runs, and the result is bitwise the one the
@@ -195,9 +165,6 @@ void k_attention_layout(float *out, const float *q, const float *key_cache, cons
 void k_attention_batch_layout(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,
                               AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int pos0,
                               int m, size_t pos_stride, size_t head_base);
-void k_attention_batch_portable_layout(float *out, const float *q, const float *key_cache, const float *value_cache,
-                                       AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
-                                       int pos0, int m, size_t pos_stride, size_t head_base);
 
 /* Engine-facing K/V cache helpers (LLAMA_KV_LAYOUT). `cache` is one layer's K or V cache of the (local) KV heads.
  * k_kv_strides gives the pos_stride / head_base of the active layout. k_kv_store copies `count` rows of

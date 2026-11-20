@@ -83,7 +83,10 @@ src/shards.c       tensor manifest (file offset of every tensor) and the per-soc
 src/loader.c       weight placement (file|ddr|hbm), run-state arena, packed-weight store, HBM budget
 src/numa.c         topology discovery from sysfs, bound regions (mmap+mbind), page verification (move_pages)
 src/workers.c      persistent pinned worker teams, barriers, the cross-socket exchange
-src/kernels_simd.c ISA selection, GEMV/attention/norm/RoPE kernels (scalar + AVX-512), scheduling
+src/kernels_simd.c ISA selection, team setters, row segments, norm/RoPE kernels (scalar + AVX-512)
+src/gemv.c         GEMV and Q8 matmul drivers and kernels, row scheduling (static/hybrid), quantization
+src/attention.c    attention kernels and dispatch (split, group, tiled), K/V cache layout
+src/kernels_internal.h  private to the three kernel files: ISA macros, current team, row partitioning
 src/kernels.c      scalar reference rmsnorm/softmax/RoPE used by tests and the scalar path
 src/gemm.c         batched GEMMs: FP32 (AVX-512), BF16 and INT8 on AMX tiles, Q8 VNNI, packing
 src/tokenizer.c    Llama 3 BPE tokenizer (PCRE2 pre-tokenization when built with PCRE2=1), chat template
@@ -91,7 +94,8 @@ src/sampler.c      temperature / top-p sampling
 src/profile.c      LLAMA_PROFILE phase timers
 ```
 
-`include/*.h` holds one header per module; each header documents its contract.
+`include/*.h` holds one header per module; each header documents its contract. `include/testing.h` declares the
+hooks only tests and benches call (portable references, forced schedules, attention task hook).
 
 ## 4. Execution paths
 
