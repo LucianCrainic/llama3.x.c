@@ -46,7 +46,7 @@ def attention_tag(report):
     keep their columns unchanged."""
     parts = [f'{label}={value}' for label, key in (('attn', 'attention'), ('decode-attn', 'attention_decode'))
              for value in [dig(report, 'build', key)] if value not in (None, 'split')]
-    if dig(report, 'build', 'kv_layout') not in (None, 'rows'):  # E5.4: LLAMA_KV_LAYOUT=head; rows is the default
+    if dig(report, 'build', 'kv_layout') not in (None, 'rows'):  # E5.4: LLAMA_KV_LAYOUT=head (the engine default since E5.4; campaigns pin rows)
         parts.append(f"kv={dig(report, 'build', 'kv_layout')}")
     return ' '.join(parts)
 

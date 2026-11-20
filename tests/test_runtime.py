@@ -464,16 +464,16 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(message, result.stderr)
 
     def test_kv_layout_is_reported_validated_and_bitwise_neutral(self):
-        """E5.4: LLAMA_KV_LAYOUT=rows|head (default rows) is recorded in build.kv_layout and refuses other values. The
+        """E5.4: LLAMA_KV_LAYOUT=rows|head (default head) is recorded in build.kv_layout and refuses other values. The
         head-major cache gives the same text and the same generated ids as rows, for FP32 and W8A8, with the batched prefill
         on (the GEMM writes the projections, RoPE, then the per-head store), both prefill kernels and both decode kernels
         (on scalar kernels the variants run split; the AVX-512 kernels run in test_tp.py's probes)."""
         for engine in ('run', 'runq'):
             _, data = self.execute(engine)
-            self.assertEqual(data['build']['kv_layout'], 'rows')
-            for value in ('auto', 'rows', 'head'):
+            self.assertEqual(data['build']['kv_layout'], 'head')
+            for value in ('', 'auto', 'rows', 'head'):
                 _, data = self.execute(engine, env={'LLAMA_KV_LAYOUT': value})
-                self.assertEqual(data['build']['kv_layout'], 'head' if value == 'head' else 'rows')
+                self.assertEqual(data['build']['kv_layout'], 'rows' if value == 'rows' else 'head')
             out = self.root/'kv-tokens.json'
             def run(layout, **extra):
                 out.unlink(missing_ok=True)

@@ -11,9 +11,9 @@
  * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_DECODE (split|group; decode mode),
  * LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
  * LLAMA_ATTN_WORKSPACE_MIB.
- * --kv-layout (decode only) picks the K/V layout the kernels read: rows (default, the engine's [position][kv_head][head_dim],
- * k_attention) or head ([kv_head][position][head_dim], k_attention_layout with a position stride of head_dim; the E5.2
- * layout probe, no engine path stores K/V like this). Same values, same kernels, same bytes.
+ * --kv-layout (decode only) picks the K/V layout the kernels read: rows (default here; the engine's layout before E5.4,
+ * [position][kv_head][head_dim], k_attention) or head ([kv_head][position][head_dim], k_attention_layout with a position
+ * stride of head_dim; the E5.2 layout probe, the engine's default since E5.4). Same values, same kernels, same bytes.
  * One extra pass per cell runs with the kernels' task hook on (k_attention_set_task_hook) to measure how the workers are
  * used: the timed repetitions run without it. --portable runs the batched driver with the scalar chunk kernel
  * (k_attention_batch_portable), the only way to see tasks on a host without AVX-512. */

@@ -551,9 +551,9 @@ class TensorParallelTests(unittest.TestCase):
                          LLAMA_PREFILL_LOGITS='all')
 
     def test_kv_head_layout_is_reported_and_validated(self):
-        """E5.4: the active layout is in the report (build.kv_layout, default rows) and a bad value is refused."""
+        """E5.4: the active layout is in the report (build.kv_layout, default head) and a bad value is refused."""
         for sockets in (1, 2):
-            for layout, expected in ((None, 'rows'), ('auto', 'rows'), ('rows', 'rows'), ('head', 'head')):
+            for layout, expected in ((None, 'head'), ('auto', 'head'), ('', 'head'), ('rows', 'rows'), ('head', 'head')):
                 extra = {} if layout is None else {'LLAMA_KV_LAYOUT': layout}
                 with self.subTest(sockets=sockets, layout=layout):
                     data = self.report('run', 'fp32.bin', sockets=sockets, full=True, **extra)

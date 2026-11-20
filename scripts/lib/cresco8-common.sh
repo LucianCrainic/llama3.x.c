@@ -63,6 +63,10 @@ job_begin() {
   # wants tiled names it per run (E2, E4), which overrides this; a submitter may export LLAMA_ATTN to change it job-wide.
   # `make test` runs without it, so the tests see the engine's own default.
   export LLAMA_ATTN=${LLAMA_ATTN:-split}
+  # Likewise the K/V cache defaults to head-major since E5.4 (bitwise equal to rows); campaigns keep rows, the layout
+  # every earlier campaign measured, so their throughput stays comparable. A phase that names a layout per run (E5's
+  # E5_KV_LAYOUTS) overrides this; a submitter may export LLAMA_KV_LAYOUT=head to change it job-wide.
+  export LLAMA_KV_LAYOUT=${LLAMA_KV_LAYOUT:-rows}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -74,6 +78,7 @@ record_environment() {
     printf "%s %s\n" "$ROOT" "$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD)"
     printf 'STAGE=%s REPEATS=%s PRECISIONS=%s PHASE=%s MODELS=%s\n' "$STAGE" "$REPEATS" "$PRECISIONS" "$PHASE" "$MODELS"
     printf 'LLAMA_ATTN=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_ATTN:-}"
+    printf 'LLAMA_KV_LAYOUT=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_KV_LAYOUT:-}"
   } > "$OUT/environment.txt"
   (cd "$ROOT" && find src include tests tools scripts Makefile -type f ! -path '*/__pycache__/*' -print0 | sort -z |
     xargs -0 sha256sum) > "$OUT/source-$(basename "$ROOT").sha256"
@@ -468,7 +473,7 @@ check_stage() {
     # the phases that run a unit test binary (C5, C6, ...) still need the binaries
     (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && env -u LLAMA_ATTN OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
+    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_KV_LAYOUT OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
       > "$OUT/test.log" 2>&1 ||
       status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi

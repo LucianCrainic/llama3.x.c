@@ -43,7 +43,7 @@ int kernels_amx_active(void); /* LLAMA_KERNELS=amx was selected */
 const char *kernels_attention_name(void);
 const char *kernels_attention_decode_name(void);
 int kernels_attention_select(const char *batch, const char *decode);
-/* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default rows). rows: a layer's cache is
+/* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default head since E5.4). rows: a layer's cache is
  * [position][kv_head][head_dim]; head: [kv_head][position][head_dim] with room for seq_len positions per head (the same
  * bytes). Engines address the cache through the helpers at the end of this header; the results are bitwise the same in
  * both layouts. kernels_kv_layout_select picks one directly (returns 0 for an unknown name); tests use it. */

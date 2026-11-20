@@ -125,7 +125,7 @@ section 8 come from the 96 reports (`throughput_tokens_per_second.decode`, `prof
 ## E5.4: head-major K/V layout in the engine (2026-11-19/20)
 
 **Status: run.** Results: [decode-attention-results.md](decode-attention-results.md) section 9. The decision rules (9.1) were
-committed in a35b3b4 before any job was submitted. Branch `feature/kv-head-layout`, merged into `develop` after review (the layout stays opt-in).
+committed in a35b3b4 before any job was submitted. Branch `feature/kv-head-layout`, merged into `develop` after review as opt-in; made the engine default on 2026-11-20 by the owner's decision (V3 cell waived; see the results, section 9.7).
 
 ### Provenance
 

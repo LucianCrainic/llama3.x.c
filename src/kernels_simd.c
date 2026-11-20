@@ -2653,9 +2653,10 @@ void k_attention_batch_layout(float *out, const float *q, const float *key_cache
 // ----------------------------------------------------------------------------
 // K/V cache layout (E5.4): LLAMA_KV_LAYOUT=rows|head
 
-/* rows (default): a layer's cache is [position][kv_head][head_dim]. head: [kv_head][position][head_dim], each head with
- * room for seq_len positions, so the cache is the same size. The cache pointer of a layer is the same in both. */
-static int kv_layout_head;
+/* head (the default since E5.4): a layer's cache is [kv_head][position][head_dim], each head with room for seq_len
+ * positions. rows (the layout before E5.4): [position][kv_head][head_dim]. The cache is the same size and the cache
+ * pointer of a layer is the same in both; the results are bitwise equal. */
+static int kv_layout_head = 1;
 
 int kernels_kv_layout_head(void) {
   return kv_layout_head;
@@ -2677,7 +2678,7 @@ int kernels_kv_layout_select(const char *name) {
 
 static void kv_layout_init_from_env(void) {
   const char *layout = getenv("LLAMA_KV_LAYOUT");
-  kv_layout_head = 0;
+  kv_layout_head = 1; /* unset, empty and auto are head */
   if (layout && *layout && strcmp(layout, "auto") && !kernels_kv_layout_select(layout))
     fail("LLAMA_KV_LAYOUT must be rows or head");
 }

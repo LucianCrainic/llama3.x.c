@@ -728,3 +728,10 @@ on every path tested, it meets both original E5 value targets, and it never hurt
 three 2048-token prefill cells of 0.4-2.2%. It stays opt-in (`LLAMA_KV_LAYOUT=head`); the decision to make it the default
 (possibly together with `LLAMA_ATTN_DECODE=group` for contexts of 8192 and above) and to waive or keep the V3 cell is the
 owner's. Nothing was merged and no default was changed.
+
+**Owner decision (2026-11-20).** The repository owner made `head` the engine default and waived the V3 cell: the miss is the
+`group` kernel's known effect at 512 tokens, and with the default `split` kernel head is faster in that very cell (16.60 against
+16.45 tok/s). An unset, empty or `auto` `LLAMA_KV_LAYOUT` now selects `head`; `LLAMA_KV_LAYOUT=rows` restores the previous
+layout. Campaign jobs export `LLAMA_KV_LAYOUT=rows` unless a run or the submitter names a layout (as they keep `LLAMA_ATTN=split`),
+so their throughput stays comparable with every earlier campaign; `make test` runs without it and sees the engine default.
+The decode default stays `split`.
