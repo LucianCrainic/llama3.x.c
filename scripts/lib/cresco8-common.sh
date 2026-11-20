@@ -63,10 +63,11 @@ job_begin() {
   # wants tiled names it per run (E2, E4), which overrides this; a submitter may export LLAMA_ATTN to change it job-wide.
   # `make test` runs without it, so the tests see the engine's own default.
   export LLAMA_ATTN=${LLAMA_ATTN:-split}
-  # The same for the D2 defaults that came after these campaigns (two sockets on an HBM node, batched prefill, AMX-INT8
-  # for Q8): campaigns keep the defaults they measured (one socket, per-token prefill, AVX-512), and every run that wants
-  # another names it. `make test` runs without these too.
+  # The same for the defaults that came after these campaigns (two sockets on an HBM node, batched prefill, AMX-INT8 for
+  # Q8, worker teams): campaigns keep the defaults they measured (one socket, per-token prefill, AVX-512, OpenMP), and
+  # every run that wants another names it. `make test` runs without these too.
   export LLAMA_SOCKETS=${LLAMA_SOCKETS:-1} LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_KERNELS=${LLAMA_KERNELS:-avx512}
+  export LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -472,7 +473,7 @@ check_stage() {
     # the phases that run a unit test binary (C5, C6, ...) still need the binaries
     (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
+    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS -u LLAMA_BACKEND OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
       > "$OUT/test.log" 2>&1 ||
       status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi

@@ -45,7 +45,7 @@ the machine (sockets, backend, placement, prefill batch, AMX) are resolved as in
 
 | Variable | Values | Meaning |
 | --- | --- | --- |
-| `LLAMA_BACKEND` | `omp` (one socket), `teams` (two) | OpenMP regions, or persistent pinned worker teams. A build without `OPENMP=1` (the `make` default) runs `omp` serially: set `teams` on one socket |
+| `LLAMA_BACKEND` | `teams`, `omp` | persistent pinned worker teams, or OpenMP regions (serial in a build without `OPENMP=1`, the `make` default) |
 | `LLAMA_THREADS` | N | team size (default: every allowed CPU for one team; each socket's allowed physical cores with two sockets) |
 | `LLAMA_TOPOLOGY` | `auto`, `virtual:SxT`, `explicit:C0/H0/D0,C1/H1/D1` | socket/NUMA map: discovered, S fake unpinned sockets of T threads (tests), or explicit package/HBM/DDR nodes |
 | `LLAMA_SOCKETS` | `2` on a dual-socket HBM node, else `1` | tensor parallelism over two sockets (runs on `teams`; `omp` is an error). Unset, 2 is chosen only on a discovered topology whose two sockets each have an allowed HBM node, with no `LLAMA_BACKEND=omp`, `LLAMA_TOPOLOGY` or `LLAMA_PLACEMENT=file\|ddr` |

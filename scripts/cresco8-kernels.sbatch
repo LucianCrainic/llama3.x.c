@@ -15,8 +15,8 @@
 # STAGE=check builds, tests and validates only; STAGE=bench (default) adds the
 # benchmark matrix. REPEATS defaults to three for the headline configurations.
 set -euo pipefail
-# Per-token prefill, as measured before batched prefill became the default on AVX-512 (D2 §7).
-export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1}
+# Per-token prefill on OpenMP, as measured before batched prefill and worker teams became the defaults.
+export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
 : "${SLURM_JOB_ID:?submit through Slurm}"
 : "${SIMD_ROOT:?tree under test required}"
 : "${BASE_ROOT:?comparison tree required}"

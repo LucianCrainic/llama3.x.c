@@ -54,7 +54,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_baseline_numerical_regression(self):
         # The OpenMP/serial path, then worker teams with odd counts that stress range splitting.
-        backends = [{}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
+        backends = [{'LLAMA_BACKEND': 'omp'}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
         for env in backends:
             for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
                 result = subprocess.run([str(BUILD/unit), str(self.shared/filename)],capture_output=True,text=True,
@@ -76,10 +76,13 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(key, data)
         # Batched prefill is the default where the GEMM runs (AVX-512): 128 rows, capped at the fixture's context of 32.
         scalar = data['build']['kernels'] == 'scalar'
-        self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
+        self.assertEqual(data['runtime'], {'backend': 'teams', 'sockets': 1, 'placement': 'file', 'thp': 'off',
             'precision_mode': 'fp32', 'prefill_batch': 1 if scalar else 32, 'prefill_logits': 'last',
             'kernels_prefill': None if scalar else 'avx512', 'attn_row_block': 4})
-        self.assertIsNone(data['teams'])
+        self.assertEqual(len(data['teams']), 1)  # teams by default: one team on the allowed CPUs
+        _, omp = self.execute('run', env={'LLAMA_BACKEND': 'omp'})
+        self.assertEqual(omp['runtime']['backend'], 'omp')
+        self.assertIsNone(omp['teams'])
         self.assertEqual(data['regions'], [])
         self.assertIsNone(data['phase_seconds'])
         self.assertEqual(set(data['kv']), {'reserved_bytes', 'resident_bytes', 'active_bytes', 'node', 'verified', 'full',
@@ -99,10 +102,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(data['topology_error'])
         self.assertEqual(topology['sockets'], [{'package': -1, 'cpus': None, 'threads': 3, 'ddr_node': -1,
             'hbm_node': -1, 'ddr_allowed': True, 'hbm_allowed': True, 'classification': 'virtual'}])
-        # A topology that cannot be discovered is reported, not fatal, and failures still write valid JSON.
-        _, data = self.execute('run', env={'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1', 'LLAMA_SYSFS_ROOT': '/nonexistent'})
-        self.assertIsNone(data['topology'])
-        self.assertIn('cannot read', data['topology_error'])
+        # A topology that cannot be discovered is reported, not fatal, where nothing needs it: OpenMP, and the default
+        # teams without a LLAMA_TOPOLOGY map (they take the allowed CPUs). A team placed by a map does need it.
+        for env in ({'LLAMA_BACKEND': 'omp', 'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1'}, {}):
+            with self.subTest(env=env):
+                _, data = self.execute('run', env={**env, 'LLAMA_SYSFS_ROOT': '/nonexistent'})
+                self.assertIsNone(data['topology'])
+                self.assertIn('cannot read', data['topology_error'])
+                self.assertEqual(data['runtime']['sockets'], 1)
 
     def test_tokens_out_records_prompt_and_generated_ids(self):
         """LLAMA_TOKENS_OUT: prompt = every id forwarded before the first sample (warm-up ids first), generated = every

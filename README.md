@@ -29,7 +29,8 @@ make test                # unit tests, emulated AVX-512/AMX tests and end-to-end
 ```
 
 `MODE=debug|profile|sanitize|tsan` select other builds, `NATIVE=1` adds `-march=native`, `OPENMP=1` enables the OpenMP
-backend. AMX code needs x86-64 and GCC 11 or later.
+backend (`LLAMA_BACKEND=omp`; the default backend, worker teams, needs no OpenMP). AMX code needs x86-64 and GCC 11 or
+later.
 
 ## Convert a model
 
@@ -60,8 +61,7 @@ weights in HBM, batched prefill, and (for Q8_0) AMX-INT8 prefill, and the `--jso
 build/release/runq checkpoints/llama-int8.bin -z checkpoints/tokenizer.bin --chat-template -i 'Explain what a CPU does.' -t 0 --json report.json
 ```
 
-On one socket, add `LLAMA_BACKEND=teams` (or build with `make OPENMP=1`): the default build has no OpenMP, so its default
-backend runs on one thread.
+On any other machine the same command runs on one socket, on every allowed CPU (`LLAMA_THREADS` caps it).
 
 Every option and environment variable is listed in [docs/configuration.md](docs/configuration.md).
 

@@ -17,9 +17,9 @@ void kernels_init(void);
 int kernels_select(KernelIsa isa); /* 0 when unsupported; used by tests */
 const char *kernels_name(void);    /* NULL before kernels_init() */
 
-/* Execution backend. With LLAMA_BACKEND=teams (default omp) the engine starts one persistent worker team
- * (LLAMA_THREADS threads, else the allowed CPUs; LLAMA_TOPOLOGY selects its CPUs) and every kernel runs on it
- * instead of opening OpenMP regions. kernels_set_team routes kernels to a team (NULL = OpenMP); set it before
+/* Execution backend. With LLAMA_BACKEND=teams (the default) the engine starts one persistent worker team per socket
+ * (LLAMA_THREADS threads, else the allowed CPUs; LLAMA_TOPOLOGY selects its CPUs) and every kernel runs on it;
+ * LLAMA_BACKEND=omp opens OpenMP regions instead (serial in a build without OpenMP). kernels_set_team routes kernels to a team (NULL = OpenMP); set it before
  * k_attention_init, which sizes the split-K workspace from the worker count. */
 struct Team;
 void kernels_set_team(struct Team *team);

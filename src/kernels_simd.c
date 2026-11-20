@@ -2458,8 +2458,8 @@ void kernels_backend_init(void) {
   const char *backend = getenv("LLAMA_BACKEND");
   if (backend && *backend && strcmp(backend, "omp") && strcmp(backend, "teams"))
     fail("LLAMA_BACKEND must be omp or teams");
-  /* Unset: OpenMP, except on two sockets, which run on teams only. */
-  if (backend && *backend ? !strcmp(backend, "omp") : sockets == 1)
+  /* Unset: teams (F2: faster than OpenMP, and the only backend that runs in parallel in a build without OpenMP). */
+  if (backend && *backend && !strcmp(backend, "omp"))
     return;
   if (backend_started)
     return;

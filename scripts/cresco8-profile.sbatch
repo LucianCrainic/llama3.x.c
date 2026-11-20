@@ -12,8 +12,8 @@
 # once unprofiled to bound the profiler's own cost, and an empty OpenMP region
 # loop measures the fork/join floor.
 set -euo pipefail
-# Per-token prefill, as measured before batched prefill became the default on AVX-512 (D2 §7).
-export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1}
+# Per-token prefill on OpenMP, as measured before batched prefill and worker teams became the defaults.
+export LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_BACKEND=${LLAMA_BACKEND:-omp}
 : "${ROOT:?}" "${OUT:?}" "${MODELS:?NAME:ARTIFACTS entries required}"
 REPEATS=${REPEATS:-2}
 mkdir -p "$OUT/unprofiled"
