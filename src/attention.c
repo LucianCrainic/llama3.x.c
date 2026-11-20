@@ -1266,7 +1266,7 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
 
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
  * (batched, prefill) and LLAMA_ATTN_DECODE (single row). A later variant is one new table entry plus its function;
- * run.c, runq.c and tp.c need no change. The first entry is the default: tiled for the
+ * engine.c and tp.c need no change. The first entry is the default: tiled for the
  * batched path since E4 (owner decision, 2026-11-19; split stays selectable with LLAMA_ATTN=split), split for decode. */
 typedef void (*AttentionBatchFn)(float *out, const float *q, const float *key_cache, const float *value_cache,
                                  float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim,

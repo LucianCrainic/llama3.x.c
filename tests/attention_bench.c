@@ -3,7 +3,7 @@
  *   attention-bench --mode prefill [--shape 8b|1b|H/KV/HD,...] [--prompt 512,2048,8192] [--m 16,64,256] [--reps R]
  *   attention-bench --mode decode  [--shape ...] [--context 8192,32768] [--reps R] [--kv-layout rows|head]
  * Common: [--node N] [--kv-heads-local N] [--seq-extra N] [--portable] [--cold-mib N]
- * Prefill runs the whole prompt of one layer as src/run.c does (microbatches at pos0 = 0, M, 2M, ...; the workspace of
+ * Prefill runs the whole prompt of one layer as src/engine.c does (microbatches at pos0 = 0, M, 2M, ...; the workspace of
  * k_attention_init_rows with rows = M; k_attention_batch), so ms_layer * layers is comparable with the engine's profiled
  * attention time. Decode calls k_attention at the last position of a context, cycling through enough copies of K/V
  * (--cold-mib, default 1024) that each call reads memory the previous one did not leave in the cache.

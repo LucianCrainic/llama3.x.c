@@ -17,8 +17,8 @@ Two executables share every source file except the forward pass:
 
 | Executable | Checkpoint | Weights | Activations |
 | --- | --- | --- | --- |
-| `run` (`src/run.c`) | FP32 v3 (`tools/export.py`) | FP32; optional BF16 packed copy for prefill | FP32 |
-| `runq` (`src/runq.c`) | Q8_0 v3 | int8 with one FP32 scale per group of `gs` inputs | int8 per group (W8A8, default) or FP32 (W8A32) |
+| `run` (`src/run.c`, `src/engine.c`) | FP32 v3 (`tools/export.py`) | FP32; optional BF16 packed copy for prefill | FP32 |
+| `runq` (`src/runq.c`, `src/engine.c`) | Q8_0 v3 | int8 with one FP32 scale per group of `gs` inputs | int8 per group (W8A8, default) or FP32 (W8A32) |
 
 The checkpoint format, tokenizer format, chat template and the build modes are specified in [phase2.md](phase2.md).
 
@@ -74,8 +74,10 @@ FP32), see [audit-2026-11.md](audit-2026-11.md) §6.
 ```
 src/app.c          CLI: options, prompt handling, prefill/decode loop, --warm-context, chat
 src/report.c       the schema-v1 JSON performance report (--json)
-src/run.c          FP32 engine: weights view, run state, forward (per token, batched GEMM, BF16)
-src/runq.c         Q8_0 engine: the same structure with quantized weights and activations
+src/engine.c       one-socket engine for both formats: weights view, run state, forward (per token, batched GEMM),
+                   packing (BF16, AMX-INT8); the precision lives in the embedding row and the project_* helpers
+src/run.c          the FP32 executable: engine_q8 = 0
+src/runq.c         the Q8_0 executable: engine_q8 = 1
 src/tp.c           two-socket engine used by both executables when LLAMA_SOCKETS=2
 src/prefill.c      prefill policy shared by both engines (batch size, GEMM on/off, precision guard)
 src/runtime.c      checkpoint validation and mapping, logging, fail(), accounted allocator
@@ -101,7 +103,7 @@ hooks only tests and benches call (portable references, forced schedules, attent
 
 ### 4.1 Load
 
-`engine_load_context` (in `run.c` / `runq.c`):
+`engine_load_context` (in `engine.c`; `run` and `runq` differ only in `engine_q8`, the checkpoint format):
 
 1. `kernels_init` reads the ISA and attention knobs and refuses retired knobs; `kernels_backend_init` discovers the
    topology, resolves the socket count (section 2.1) and, for `teams` (the default), starts the pinned worker pool (one

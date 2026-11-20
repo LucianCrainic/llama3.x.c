@@ -340,7 +340,7 @@ static void forward_fp32(Tp *tp, int s) {
   SPROFILE(PHASE_CLASSIFIER, k_matmul(tp->logits + cls->row0, sk->x, cls->q, dim, cls->rows));
 }
 
-/* Q8_0 (B6): the same group size, scales and activation rule as runq.c. Row shards quantize the full normalized input,
+/* Q8_0 (B6): the same group size, scales and activation rule as the one-socket engine (engine.c). Row shards quantize the full normalized input,
  * which is identical on both sockets; Wo and W2 quantize only the owned slice, which starts on a group boundary, so
  * its groups are exactly the original groups. */
 static K8Weight q8_weight(const Shard *sh) {

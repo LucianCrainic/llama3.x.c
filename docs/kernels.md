@@ -5,8 +5,8 @@ The numerical hot paths of both engines live in
 [src/gemv.c](../src/gemv.c) (GEMV, Q8 matmul, quantization) and
 [src/attention.c](../src/attention.c) (attention, K/V layout), declared in
 [include/kernels.h](../include/kernels.h); test-only hooks are in
-[include/testing.h](../include/testing.h). The engines (`src/run.c`, `src/runq.c`)
-now only lay out weights, caches and the order of operations. The motivation
+[include/testing.h](../include/testing.h). The engine (`src/engine.c`, for both
+formats) and `src/tp.c` only lay out weights, caches and the order of operations. The motivation
 and the roofline behind each kernel are in [hbm-roofline.md](hbm-roofline.md).
 
 ## Instruction set selection
