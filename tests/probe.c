@@ -75,6 +75,38 @@ int main(int argc, char **argv) {
     }
     memory_free(tokens);
     engine_free(&model);
+  } else if (!strcmp(argv[1], "tail")) {
+    /* tail MODEL K tokens...: the prompt except its last K tokens goes through the batched prefill when
+     * LLAMA_PREFILL_BATCH allows it (no logits), then each of the last K tokens is a per-token forward whose logits are
+     * written. It reads the decode path on a long retained context without forwarding the whole prompt token by token.
+     */
+    if (argc < 5)
+      return 2;
+    int tail = atoi(argv[3]), n = argc - 4;
+    if (tail < 1 || tail > n)
+      return 2;
+    Model model = {0};
+    load(&model, argv[2], n);
+    int *tokens = memory_alloc(n, sizeof(int), MEM_PROMPT);
+    for (int i = 0; i < n; i++)
+      tokens[i] = atoi(argv[i + 4]);
+    int head = n - tail;
+    int done = 0;
+    if (engine_max_batch(&model) > 1)
+      while (done < head) {
+        int count = head - done < engine_max_batch(&model) ? head - done : engine_max_batch(&model);
+        engine_forward_batch(&model, tokens + done, count, done, LOGITS_NONE);
+        done += count;
+      }
+    for (; done < head; done++)
+      engine_forward(&model, tokens[done], done);
+    for (int i = head; i < n; i++) {
+      float *logits = engine_forward(&model, tokens[i], i);
+      if (fwrite(logits, sizeof(float), model.config.vocab_size, stdout) != (size_t)model.config.vocab_size)
+        return 1;
+    }
+    memory_free(tokens);
+    engine_free(&model);
   } else if (!strcmp(argv[1], "generate")) {
     if (argc < 5)
       return 2;

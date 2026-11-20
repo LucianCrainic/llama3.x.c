@@ -4,7 +4,8 @@
 
 Every weights/embedding region must be on its node, fully verified, with no mismatched or missing page. With
 --kv-node the KV caches and the work region must be on that node too, the post-prompt and final KV snapshots must be
-verified with no page elsewhere, and active <= resident <= reserved (plus one page per layer of slack) must hold.
+verified with no page elsewhere, and active <= resident <= reserved (plus one page per layer of slack, one per layer and KV
+head with LLAMA_KV_LAYOUT=head, whose touched positions are a prefix of each head's span) must hold.
 Prints one PASS or FAIL line per check and exits non-zero if any failed. Reads only; never touches the engine.
 """
 import argparse
@@ -71,6 +72,8 @@ def main(argv=None):
                   f"elsewhere={snapshot.get('pages_wrong_node')} missing={snapshot.get('pages_missing')} full={snapshot.get('full')}")
             if snapshot.get('verified'):
                 slack = PAGE * max(args.layers, 1)
+                if (report.get('build') or {}).get('kv_layout') == 'head':  # one partly touched page per (layer, KV head)
+                    slack *= max(((report.get('model') or {}).get('configuration') or {}).get('n_kv_heads') or 1, 1)
                 check(f'kv {label}: active <= resident <= reserved',
                       snapshot['active_bytes'] <= snapshot['resident_bytes'] <= snapshot['reserved_bytes'] + slack,
                       f"active={snapshot['active_bytes']} resident={snapshot['resident_bytes']} reserved={snapshot['reserved_bytes']}")

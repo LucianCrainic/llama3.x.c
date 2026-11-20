@@ -473,6 +473,40 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, (knob, value))
             self.assertIn(message, result.stderr)
 
+    def test_kv_layout_is_reported_validated_and_bitwise_neutral(self):
+        """E5.4: LLAMA_KV_LAYOUT=rows|head (default head) is recorded in build.kv_layout and refuses other values. The
+        head-major cache gives the same text and the same generated ids as rows, for FP32 and W8A8, with the batched prefill
+        on (the GEMM writes the projections, RoPE, then the per-head store), both prefill kernels and both decode kernels
+        (on scalar kernels the variants run split; the AVX-512 kernels run in test_tp.py's probes)."""
+        for engine in ('run', 'runq'):
+            _, data = self.execute(engine)
+            self.assertEqual(data['build']['kv_layout'], 'head')
+            for value in ('', 'auto', 'rows', 'head'):
+                _, data = self.execute(engine, env={'LLAMA_KV_LAYOUT': value})
+                self.assertEqual(data['build']['kv_layout'], 'rows' if value == 'rows' else 'head')
+            out = self.root/'kv-tokens.json'
+            def run(layout, **extra):
+                out.unlink(missing_ok=True)
+                result, data = self.execute(engine, '-n', '30', env={'LLAMA_KV_LAYOUT': layout, 'LLAMA_TOKENS_OUT': str(out),
+                                                                    'LLAMA_PREFILL_GEMM': 'on', 'LLAMA_PREFILL_BATCH': '4',
+                                                                    **extra})
+                self.assertEqual(data['build']['kv_layout'], layout)
+                return result.stdout, json.loads(out.read_text()), data['kv']
+            for extra in ({}, {'LLAMA_ATTN': 'split'}, {'LLAMA_ATTN_DECODE': 'group'},
+                          {'LLAMA_ATTN': 'tiled', 'LLAMA_ATTN_DECODE': 'group'}, {'LLAMA_PREFILL_BATCH': '2'},
+                          {'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '3'}):
+                with self.subTest(engine=engine, **extra):
+                    rows, head = run('rows', **extra), run('head', **extra)
+                    self.assertGreaterEqual(len(rows[1]['generated']), 8)
+                    self.assertEqual(rows[:2], head[:2])
+                    self.assertEqual(rows[2]['reserved_bytes'], head[2]['reserved_bytes'])  # the cache is the same size
+                    self.assertEqual(rows[2]['active_bytes'], head[2]['active_bytes'])
+            result = subprocess.run([str(BUILD/engine), str(self.shared/('int8.bin' if engine == 'runq' else 'fp32.bin')),
+                                     '-z', str(self.shared/'tokenizer.bin'), '-i', 'A', '-t', '0'],
+                                    capture_output=True, text=True, env={**os.environ, 'LLAMA_KV_LAYOUT': 'columns'})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('LLAMA_KV_LAYOUT must be rows or head', result.stderr)
+
     # ---- C5: the explicit BF16 precision mode
     def test_bf16_mode_is_explicit_and_validated(self):
         for engine, env, text in (

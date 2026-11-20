@@ -64,6 +64,10 @@ job_begin() {
   # another names it. `make test` runs without these too. The OpenMP backend the early campaigns used is gone (F2):
   # every run is on the worker teams, so a rerun of an OpenMP configuration measures teams.
   export LLAMA_SOCKETS=${LLAMA_SOCKETS:-1} LLAMA_PREFILL_BATCH=${LLAMA_PREFILL_BATCH:-1} LLAMA_KERNELS=${LLAMA_KERNELS:-avx512}
+  # Likewise the K/V cache defaults to head-major since E5.4 (bitwise equal to rows); campaigns keep rows, the layout
+  # every earlier campaign measured, so their throughput stays comparable. A phase that names a layout per run (E5's
+  # E5_KV_LAYOUTS) overrides this; a submitter may export LLAMA_KV_LAYOUT=head to change it job-wide.
+  export LLAMA_KV_LAYOUT=${LLAMA_KV_LAYOUT:-rows}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -75,6 +79,7 @@ record_environment() {
     printf "%s %s\n" "$ROOT" "$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD)"
     printf 'STAGE=%s REPEATS=%s PRECISIONS=%s PHASE=%s MODELS=%s\n' "$STAGE" "$REPEATS" "$PRECISIONS" "$PHASE" "$MODELS"
     printf 'LLAMA_ATTN=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_ATTN:-}"
+    printf 'LLAMA_KV_LAYOUT=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_KV_LAYOUT:-}"
   } > "$OUT/environment.txt"
   (cd "$ROOT" && find src include tests tools scripts Makefile -type f ! -path '*/__pycache__/*' -print0 | sort -z |
     xargs -0 sha256sum) > "$OUT/source-$(basename "$ROOT").sha256"
@@ -432,7 +437,7 @@ check_stage() {
     # the phases that run a unit test binary (C5, C6, ...) still need the binaries
     (cd "$ROOT" && make CC=gcc test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS -u LLAMA_BACKEND numactl --cpunodebind=0 --membind=0 make CC=gcc test) \
+    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_KV_LAYOUT -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH -u LLAMA_KERNELS -u LLAMA_BACKEND numactl --cpunodebind=0 --membind=0 make CC=gcc test) \
       > "$OUT/test.log" 2>&1 ||
       status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi

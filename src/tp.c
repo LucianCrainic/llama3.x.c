@@ -32,7 +32,9 @@ typedef struct {
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
   float *x, *xb, *hb, *q, *att, *rope; /* socket-local activations, in the work region */
-  float *key_cache, *value_cache;      /* [layer][seq][kv_dim / 2] */
+  float *key_cache, *value_cache; /* [layer][seq][kv_dim / 2]; LLAMA_KV_LAYOUT=head: [layer][kv head][seq][head_dim] */
+  float *kstage,
+      *vstage; /* LLAMA_KV_LAYOUT=head: the K/V rows of the projections (rows x kv_dim / 2), stored per head */
   AttentionWork attention;
   float *debug; /* LLAMA_TP_CHECK: x after every layer */
   uint64_t *debug_hash; /* LLAMA_TP_CHECK, batched forward: a hash of x (all rows) after every layer */
@@ -302,13 +304,18 @@ static void forward_fp32(Tp *tp, int s) {
   for (int l = 0; l < p->n_layers; l++) {
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
     size_t layer = (size_t)l * p->seq_len * kvl;
-    float *k = sk->key_cache + layer + (size_t)pos * kvl, *v = sk->value_cache + layer + (size_t)pos * kvl;
+    int head_layout = kernels_kv_layout_head();
+    float *k = head_layout ? sk->kstage : sk->key_cache + layer + (size_t)pos * kvl,
+          *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
     const float *wq = shards_find(&tp->set, T_WQ, l, s)->q, *wk = shards_find(&tp->set, T_WK, l, s)->q,
                 *wv = shards_find(&tp->set, T_WV, l, s)->q;
     SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / SOCKETS, kvl));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
-    SPROFILE(PHASE_ATTENTION, k_attention(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
-                                          &sk->attention, hl, kl, hd, p->seq_len, pos));
+    if (head_layout)
+      SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
+               k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
+    SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
+                                             &sk->attention, hl, kl, hd, p->seq_len, pos));
     const Shard *wo = shards_find(&tp->set, T_WO, l, s);
     float *partial = exchange_partial(tp->exchange, s);
     if (!partial)
@@ -363,13 +370,18 @@ static void forward_q8(Tp *tp, int s) {
     K8Input in;
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
     size_t layer = (size_t)l * p->seq_len * kvl;
-    float *k = sk->key_cache + layer + (size_t)pos * kvl, *v = sk->value_cache + layer + (size_t)pos * kvl;
+    int head_layout = kernels_kv_layout_head();
+    float *k = head_layout ? sk->kstage : sk->key_cache + layer + (size_t)pos * kvl,
+          *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
     K8Weight wq = q8_weight(shards_find(&tp->set, T_WQ, l, s)), wk = q8_weight(shards_find(&tp->set, T_WK, l, s)),
              wv = q8_weight(shards_find(&tp->set, T_WV, l, s));
     SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / SOCKETS, kvl, gs));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
-    SPROFILE(PHASE_ATTENTION, k_attention(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
-                                          &sk->attention, hl, kl, hd, p->seq_len, pos));
+    if (head_layout)
+      SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
+               k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
+    SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
+                                             &sk->attention, hl, kl, hd, p->seq_len, pos));
     const Shard *wo = shards_find(&tp->set, T_WO, l, s);
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->xb, dim / SOCKETS));
     float *partial = exchange_partial(tp->exchange, s);
@@ -502,29 +514,32 @@ static void forward_batch(Tp *tp, int s) {
     SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), m));
     size_t layer = (size_t)l * p->seq_len * kvl;
     float *kc = sk->key_cache + layer, *vc = sk->value_cache + layer;
+    int head_layout = kernels_kv_layout_head();
+    float *kd = head_layout ? sk->kstage : kc + (size_t)pos0 * kvl,
+          *vd = head_layout ? sk->vstage : vc + (size_t)pos0 * kvl;
     const Shard *wq = shards_find(&tp->set, T_WQ, l, s), *wk = shards_find(&tp->set, T_WK, l, s),
                 *wv = shards_find(&tp->set, T_WV, l, s);
     if (q8) {
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
       GemmQ8Segment qkv[3] = {
           {.c = sk->q, .ldc = ql, .w = q8_weight(wq), .pw = packed_copy(sk, l, 0), .n = ql, .kind = GEMM_STORE},
-          {.c = kc + (size_t)pos0 * kvl, .ldc = kvl, .w = q8_weight(wk), .pw = packed_copy(sk, l, 1), .n = kvl,
-           .kind = GEMM_STORE},
-          {.c = vc + (size_t)pos0 * kvl, .ldc = kvl, .w = q8_weight(wv), .pw = packed_copy(sk, l, 2), .n = kvl,
-           .kind = GEMM_STORE}};
+          {.c = kd, .ldc = kvl, .w = q8_weight(wk), .pw = packed_copy(sk, l, 1), .n = kvl, .kind = GEMM_STORE},
+          {.c = vd, .ldc = kvl, .w = q8_weight(wv), .pw = packed_copy(sk, l, 2), .n = kvl, .kind = GEMM_STORE}};
       SPROFILE(PHASE_QKV, k_gemm_q8(sk->xq, sk->xs, m, dim, gs, qkv, 3));
     } else {
-      GemmSegment qkv[3] = {
-          {.c = sk->q, .ldc = ql, .w = wq->q, .ldw = wq->ld, .n = ql, .kind = GEMM_STORE},
-          {.c = kc + (size_t)pos0 * kvl, .ldc = kvl, .w = wk->q, .ldw = wk->ld, .n = kvl, .kind = GEMM_STORE},
-          {.c = vc + (size_t)pos0 * kvl, .ldc = kvl, .w = wv->q, .ldw = wv->ld, .n = kvl, .kind = GEMM_STORE}};
+      GemmSegment qkv[3] = {{.c = sk->q, .ldc = ql, .w = wq->q, .ldw = wq->ld, .n = ql, .kind = GEMM_STORE},
+                            {.c = kd, .ldc = kvl, .w = wk->q, .ldw = wk->ld, .n = kvl, .kind = GEMM_STORE},
+                            {.c = vd, .ldc = kvl, .w = wv->q, .ldw = wv->ld, .n = kvl, .kind = GEMM_STORE}};
       void *const pq[3] = {packed_copy(sk, l, 0), packed_copy(sk, l, 1), packed_copy(sk, l, 2)};
       SPROFILE(PHASE_QKV, gemm_f32_or_bf16(tp, sk, sk->xb, dim, dim, qkv, 3, pq, NULL));
     }
-    SPROFILE(PHASE_ROPE, k_rope_apply_rows(sk->q, (size_t)ql, kc + (size_t)pos0 * kvl, (size_t)kvl, sk->rope,
-                                           (size_t)2 * hd, m, hl, kl, hd));
-    SPROFILE(PHASE_ATTENTION, k_attention_batch(sk->xb, sk->q, kc, vc, sk->att, &sk->attention, hl, kl, hd,
-                                                p->seq_len, pos0, m));
+    SPROFILE(PHASE_ROPE,
+             k_rope_apply_rows(sk->q, (size_t)ql, kd, (size_t)kvl, sk->rope, (size_t)2 * hd, m, hl, kl, hd));
+    if (head_layout)
+      SPROFILE(PHASE_KV_STORE, k_kv_store(kc, kd, (size_t)kvl, pos0, m, kl, hd, p->seq_len);
+               k_kv_store(vc, vd, (size_t)kvl, pos0, m, kl, hd, p->seq_len));
+    SPROFILE(PHASE_ATTENTION,
+             k_attention_batch_kv(sk->xb, sk->q, kc, vc, sk->att, &sk->attention, hl, kl, hd, p->seq_len, pos0, m));
     int ok;
     if (q8)
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->xb, (size_t)ql, ql));
@@ -607,6 +622,10 @@ static void setup_socket(Tp *tp, int s) {
   CARVE(sk->q, rows * (p->dim / SOCKETS), float);
   CARVE(sk->att, (size_t)hl * p->seq_len, float);
   CARVE(sk->rope, rows * 2 * (size_t)p->head_dim, float);
+  if (kernels_kv_layout_head()) {
+    CARVE(sk->kstage, rows * (size_t)kl * p->head_dim, float);
+    CARVE(sk->vstage, rows * (size_t)kl * p->head_dim, float);
+  }
   if (tp->quantized) {
     /* Quantized rows are padded to whole 32-row blocks: the AMX kernel loads 16 rows at a time. */
     size_t padded = (rows + 31) / 32 * 32;
@@ -635,6 +654,8 @@ size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
   bytes += (size_t)rows * (size_t)(2 * p->dim + p->hidden_dim / SOCKETS + p->dim / SOCKETS + 2 * p->head_dim) *
            sizeof(float);
   bytes += (size_t)hl * p->seq_len * sizeof(float);
+  if (kernels_kv_layout_head()) /* the K/V row buffers of LLAMA_KV_LAYOUT=head */
+    bytes += 2 * (size_t)rows * (size_t)kl * (size_t)p->head_dim * sizeof(float);
   if (quantized) { /* xq, xs, aq, as, for whole 32-row blocks */
     size_t padded = ((size_t)rows + 31) / 32 * 32;
     bytes += padded * ((size_t)p->dim + (size_t)p->dim / gs * sizeof(float) + slice + slice / gs * sizeof(float));

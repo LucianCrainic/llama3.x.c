@@ -44,7 +44,7 @@ exists for tests and measurements only and is never a deployment setting.
 | W8A32 Q8 decode (`LLAMA_Q8_ACTIVATIONS=fp32`) | Opt-in | [kernels.md](kernels.md) |
 | Transparent huge pages for owned regions (`LLAMA_THP=on`) | Opt-in; measured neutral | [numa-placement.md](numa-placement.md) |
 | Profile (`LLAMA_PROFILE=1`), JSON report (`--json`), `LLAMA_TP_CHECK=1` | Diagnostic | section 9 |
-| Head-major K/V layout | Experimental, on branch `feature/kv-head-layout`, not in this tree | [decode-attention-results.md](decode-attention-results.md) §8 |
+| Head-major K/V cache (`LLAMA_KV_LAYOUT=head`) | Default since E5.4 (owner decision 2026-11-20); `rows` is opt-in and bitwise equal | [decode-attention-results.md](decode-attention-results.md) §8, §9: 1B decode at 32768 one socket 1.34x FP32, 1.65x W8A8 |
 | AMX flash attention (E3) | Not implemented (postponed) | [E-followups](plans/E-followups/README.md) |
 
 Removed after measurement (setting their knobs is an error, see [audit-2026-11.md](audit-2026-11.md)): the packed4 FP32 decode
@@ -64,7 +64,7 @@ set on 20 November 2026. Each rule applies only while its own knob is unset, and
 | Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
 
 To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
-`LLAMA_ATTN=split` for runs before E4). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`). Runs made
+`LLAMA_ATTN=split` for runs before E4, `LLAMA_KV_LAYOUT=rows` for runs before E5.4; the layout changes speed, never results). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`). Runs made
 on OpenMP now run on worker teams of the same size: decode is 5-8% faster there and prefill within 2% (6.5% slower for 1B
 FP32), see [audit-2026-11.md](audit-2026-11.md) §6.
 
@@ -119,7 +119,11 @@ per generated token. `--warm-context N` first fills N positions untimed, so deco
 ### 4.3 The forward pass
 
 Every path computes the same Llama block: `x += Wo · attn(rope(Wq·n(x)), rope(Wk·n(x)), Wv·n(x))`, then
-`x += W2 · (silu(W1·n(x)) * W3·n(x))`, with RMSNorm `n` and the K/V rows appended to the cache.
+`x += W2 · (silu(W1·n(x)) * W3·n(x))`, with RMSNorm `n` and the K/V rows appended to the cache. The cache is head-major
+(`[layer][kv_head][position][head_dim]`, section 6 item 8): the projections write K/V rows to a staging buffer, RoPE runs
+on it, and `k_kv_store` copies each head's slice into place (`PHASE_KV_STORE`); attention goes through `k_attention_kv` /
+`k_attention_batch_kv`. With `LLAMA_KV_LAYOUT=rows` (`[layer][position][kv_head][head_dim]`) the projections write
+straight into the cache, as before E5.4.
 
 | Path | Where | Projections | Attention | When |
 | --- | --- | --- | --- | --- |
@@ -191,6 +195,12 @@ below follows from those three numbers.
    ([tensor-parallel.md](tensor-parallel.md)).
 7. **Pin each socket's leader to its own socket.** The thread that calls `team_run` is worker 0; `team_adopt_leader` pins
    the socket-1 coordinator to socket 1. Before this fix both leaders shared one CPU and two sockets were slower than one.
+8. **Give long-context attention contiguous K/V streams.** At long contexts the K/V cache, not the weights, dominates
+   the bytes a decode token reads. In the head-major cache each KV head's positions are one contiguous run of
+   `position x head_dim` floats, so a split-K chunk streams a dense range instead of one `head_dim` slice (256 or 512 bytes) per position
+   strided by the whole row of KV heads. Same bytes and same cache size, bitwise equal results; 1.49-2.86x in the
+   attention microbenchmark at 8192 and 32768 tokens, 1.34x (FP32) and 1.65x (W8A8) for 1B decode at 32768 on one socket
+   ([decode-attention-results.md](decode-attention-results.md) §8, §9).
 
 The packed4 layout (four rows interleaved into one stream) reached 612 GB/s in a microbenchmark but only +3.2% end to end at
 context 512 for 14 GB more HBM per socket; it was removed.

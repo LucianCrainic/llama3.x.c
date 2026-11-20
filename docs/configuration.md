@@ -31,6 +31,7 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_Q8_ACTIVATIONS` (`runq` only) | `int8`, `fp32` | W8A8 (Q8_0 rule) or W8A32; W8A32 never uses the batched GEMM |
 | `LLAMA_ATTN` | `tiled`, `split` | batched prefill attention (`tiled` falls back to `split` without AVX-512) |
 | `LLAMA_ATTN_DECODE` | `split`, `group` | decode attention |
+| `LLAMA_KV_LAYOUT` | `head`, `rows` | K/V cache layout: `head` is `[kv_head][position][head_dim]` per layer (default since E5.4), `rows` is `[position][kv_head][head_dim]`; results are bitwise equal, `head` is faster at long contexts |
 | `LLAMA_GEMV_SCHED` | `auto`, `static`, `dynamic`, `hybrid` | how a team splits GEMV rows |
 
 ### Prefill

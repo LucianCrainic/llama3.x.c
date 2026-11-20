@@ -109,6 +109,9 @@ def main(argv=None):
     parser.add_argument('--probe-batch', type=int, default=1, metavar='M',
                         help='prefill microbatch for the probe (default 1: one token at a time, like decode)')
     parser.add_argument('--output', help='write the JSON result here as well as to stdout')
+    parser.add_argument('--require-identical', action='store_true',
+                        help='exit 1 unless the two generated sequences and the two recorded prompts are identical '
+                             '(a gate; without it the comparison is recorded and the exit status is 0)')
     args = parser.parse_args(argv)
     if args.steps < 1 or args.warm_context < 0 or args.probe_batch < 1:
         raise SystemExit('--steps and --probe-batch must be positive, --warm-context nonnegative')
@@ -140,7 +143,7 @@ def main(argv=None):
     if args.output:
         Path(args.output).write_text(out)
     print(out, end='')
-    return 0
+    return 1 if args.require_identical and not (result['identical'] and result['prompt_identical']) else 0
 
 
 if __name__ == '__main__':

@@ -442,6 +442,83 @@ class TensorParallelTests(unittest.TestCase):
         self.assertEqual(implied.returncode, 0, implied.stderr.decode())
         self.assertEqual(implied.stdout, self.probe('fp32', 'shared', None, 2))
 
+    def test_kv_head_layout_is_bitwise_the_rows_layout(self):
+        """E5.4: LLAMA_KV_LAYOUT=head ([kv_head][position][head_dim]) gives the very bytes of the rows layout, not merely
+        values within a tolerance: per-token logits, batched prefill (last and all rows, several microbatches), greedy
+        generation (batched prefill writes, then per-token decode writes), FP32 and W8A8, one and two sockets (virtual
+        2x3), on the scalar kernels and on the AVX-512 kernels on the scalar intrinsic model (decode split and group,
+        prefill split and tiled), and BF16 on the AMX tile model. Both layouts run the same binary, so a difference
+        is the layout alone."""
+        tokens = [65 + (i * 7) % 20 for i in range(64)]
+
+        def same(precision, fixture, mode, sockets, threads=3, **args):
+            rows = self.probe(precision, fixture, mode, sockets, threads, LLAMA_KV_LAYOUT='rows', **args)
+            head = self.probe(precision, fixture, mode, sockets, threads, LLAMA_KV_LAYOUT='head', **args)
+            self.assertGreater(len(rows), 0)
+            self.assertEqual(rows, head)
+
+        for precision in ('fp32', 'int8'):
+            for fixture in ('shared', 'odd', 'wide'):
+                for sockets in (1, 2):
+                    with self.subTest(what='per-token', precision=precision, fixture=fixture, sockets=sockets):
+                        same(precision, fixture, None, sockets, tokens=tokens)
+        for precision, binary in (('fp32', 'probe-fp32-avx512-emul'), ('int8', 'probe-int8-avx512-emul')):
+            self.need(binary)
+            for fixture in ('shared', 'wide'):
+                for sockets in (1, 2):
+                    for decode in ('split', 'group'):
+                        for threads in ((1, 3, 7) if sockets == 1 and fixture == 'shared' else (3,)):
+                            with self.subTest(what='decode', precision=precision, fixture=fixture, sockets=sockets,
+                                              decode=decode, threads=threads):
+                                same(precision, fixture, None, sockets, threads, tokens=tokens, binary=binary,
+                                     LLAMA_KERNELS='avx512', LLAMA_ATTN_DECODE=decode)
+                    for attn in ('split', 'tiled'):
+                        for batch in ('64', '24', '5'):
+                            with self.subTest(what='batch', precision=precision, fixture=fixture, sockets=sockets,
+                                              attn=attn, batch=batch):
+                                same(precision, fixture, 'batch', sockets, tokens=tokens, binary=binary,
+                                     LLAMA_KERNELS='avx512', LLAMA_ATTN=attn, LLAMA_PREFILL_BATCH=batch,
+                                     LLAMA_PREFILL_LOGITS='all', LLAMA_PREFILL_GEMM='on')
+            for sockets in (1, 2):
+                with self.subTest(what='generate', precision=precision, sockets=sockets):
+                    generated = [self.probe(precision, 'unshared', 'generate', sockets, binary=binary,
+                                            LLAMA_KERNELS='avx512', LLAMA_ATTN='tiled', LLAMA_ATTN_DECODE='group',
+                                            LLAMA_PREFILL_BATCH='4', LLAMA_PREFILL_GEMM='on', LLAMA_KV_LAYOUT=layout)
+                                 for layout in ('rows', 'head')]
+                    self.assertGreaterEqual(len(generated[0].split()), 8)
+                    self.assertEqual(generated[0], generated[1])
+        for precision in ('fp32', 'int8'):  # the scalar kernels: batched prefill and generation
+            for sockets in (1, 2):
+                with self.subTest(what='scalar batch', precision=precision, sockets=sockets):
+                    same(precision, 'shared', 'batch', sockets, tokens=tokens, LLAMA_PREFILL_BATCH='24',
+                         LLAMA_PREFILL_LOGITS='all', LLAMA_PREFILL_GEMM='on')
+                    generated = [self.probe(precision, 'unshared', 'generate', sockets, LLAMA_PREFILL_BATCH='4',
+                                            LLAMA_PREFILL_GEMM='on', LLAMA_KV_LAYOUT=layout)
+                                 for layout in ('rows', 'head')]
+                    self.assertGreaterEqual(len(generated[0].split()), 8)
+                    self.assertEqual(generated[0], generated[1])
+        binary = 'probe-fp32-amx-emul'  # BF16 prefill on the tile model: the packed projections write K/V
+        self.need(binary)
+        for sockets in (1, 2):
+            for batch in ('2', '5', '32'):
+                with self.subTest(what='bf16', sockets=sockets, batch=batch):
+                    same('fp32', 'shared', 'batch', sockets, tokens=tokens[:33], binary=binary,
+                         LLAMA_PRECISION='bf16', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH=batch,
+                         LLAMA_PREFILL_LOGITS='all')
+
+    def test_kv_head_layout_is_reported_and_validated(self):
+        """E5.4: the active layout is in the report (build.kv_layout, default head) and a bad value is refused."""
+        for sockets in (1, 2):
+            for layout, expected in ((None, 'head'), ('auto', 'head'), ('', 'head'), ('rows', 'rows'), ('head', 'head')):
+                extra = {} if layout is None else {'LLAMA_KV_LAYOUT': layout}
+                with self.subTest(sockets=sockets, layout=layout):
+                    data = self.report('run', 'fp32.bin', sockets=sockets, full=True, **extra)
+                    self.assertEqual(data['build']['kv_layout'], expected)
+        result = subprocess.run([str(BUILD/'probe-fp32'), str(self.fixtures['shared']/'fp32.bin'), '65'],
+                                capture_output=True, timeout=60, env=environment(2, LLAMA_KV_LAYOUT='columns'))
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertIn('LLAMA_KV_LAYOUT must be rows or head', result.stderr.decode())
+
     def test_incompatible_configurations_are_rejected(self):
         model = self.one_kv/'fp32.bin'
         cases = [
