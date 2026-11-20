@@ -193,5 +193,5 @@ change (compared with ROOT normalized).
    per (layer, KV head) that the head layout leaves, and is tested, but no cluster report was run through it.
 7. **First-touch effect**: with `head` the projection outputs go through a row buffer and the per-head store runs on the calling
    thread, so on the owned-placement paths the K/V pages are first written by that thread; the K/V store phase costs under
-   0.04 ms per step and placement was verified in the reports (pages verified on the HBM node, no page elsewhere) but this was not
-   compared against rows.
+   0.04 ms per step and in all 480 completed reports of the three data jobs the KV pages were verified with none on another node (`kv.verified`,
+   `kv.pages_wrong_node` 0), rows and head alike; first-touch cost itself was not compared.
