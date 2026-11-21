@@ -103,6 +103,8 @@ xe_require_env() {
     [[ $NODE_ROLE != cache ]] || : "${UPERF:?UPERF (user-space perf binary) required on the Cache node}"
   fi
   XE_CELL_PY="$ROOT/tools/xengine_cell.py"
+  C_ENGINE=${C_ENGINE:-$ROOT/build/release/runq}
+  C_COMMIT=$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)
   if [[ $XE_AMX_OPS == 1 ]]; then
     XE_COMPUTE_EVENTS='cycles,ref-cycles,instructions,AMX_OPS_RETIRED.INT8,EXE.AMX_BUSY,power/energy-pkg/,power/energy-ram/'
   fi
@@ -432,8 +434,6 @@ c_matrix() {
 }
 
 c_prepare() {
-  C_ENGINE=${C_ENGINE:-$ROOT/build/release/runq}
-  C_COMMIT=$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD 2> /dev/null || echo unknown)
   need_shm
   if dry_run; then
     C_STAGED=$(stage_model_on 0 llama31-8b int8 "$ARTIFACTS")
