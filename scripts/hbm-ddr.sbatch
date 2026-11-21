@@ -72,7 +72,7 @@ for ((rep=0; rep<repeats; rep++)); do
     fi
     date +%s%N > "$prefix.launch"
     env "${knobs[@]}" LLAMA_TOKENS_OUT="$prefix.tokens.json" \
-      "$binary" "$CHECKPOINT" -z "$TOKENIZER" --benchmark --chat-template --no-text -t 0 \
+      "$binary" "$CHECKPOINT" -z "$TOKENIZER" --benchmark --chat-template --no-text -t 0 -n 0 \
       --context-length "$context" --warm-context "$warm" --generation-length "$generation" "${prompt[@]}" --json "$prefix.json" \
       > "$prefix.stdout" 2> "$prefix.stderr" &
     pid=$!

@@ -121,7 +121,8 @@ static void kv_fields(FILE *f, const KvStats *k) {
     fprintf(f, "%d", k->node);
   else
     fputs("null", f);
-  fprintf(f, ", \"residency_scope\": \"%s\"", k->active_prefix_only ? "active_prefix" : "reserved");
+  if (k->active_prefix_only)
+    fputs(", \"residency_scope\": \"active_prefix\"", f);
   fprintf(f, ", \"verified\": %s, \"full\": %s, \"pages_queried\": %zu, \"pages_wrong_node\": %zu, "
              "\"pages_missing\": %zu",
           k->verified ? "true" : "false", k->full ? "true" : "false", k->pages_queried, k->pages_wrong_node,
