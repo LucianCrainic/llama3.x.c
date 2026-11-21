@@ -926,6 +926,7 @@ typedef struct {
   int m, k, gs, groups, count;
   Q8GemmBackend backend;
   GemmQ8Segment segment[GEMM_MAX_SEGMENTS];
+  int blocks[GEMM_MAX_SEGMENTS]; /* blocks of each segment: channel chunks x row blocks */
 } Q8GemmJob;
 
 /* acc[mb][32] = the Q8 sums of activation rows [m0, m0 + mb) against weight rows [n0, n0 + nc). */
@@ -960,31 +961,46 @@ static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, int 
   }
 }
 
-static void q8_gemm_chunks(const void *p, int s, int first, int last) {
-  const Q8GemmJob *job = p;
-  const GemmQ8Segment *seg = &job->segment[s];
-  const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
-  _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
-  for (int chunk = first; chunk < last; chunk++) {
-    int n0 = chunk * chunk_n, nc = seg->n - n0 < chunk_n ? seg->n - n0 : chunk_n;
-    for (int m0 = 0; m0 < job->m; m0 += Q8_MB) {
-      int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
-      q8_sums(job, seg->w, seg->pw, n0, nc, m0, mb, acc);
-      if (seg->kind == GEMM_SWIGLU)
-        q8_sums(job, seg->w3, seg->pw3, n0, nc, m0, mb, gate);
-      for (int r = 0; r < mb; r++) {
-        float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
-        const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
-        for (int c = 0; c < nc; c++) {
-          if (seg->kind == GEMM_ADD)
-            out[c] += sum[c];
-          else if (seg->kind == GEMM_SWIGLU)
-            out[c] = silu_gate(sum[c], g[c]);
-          else
-            out[c] = sum[c];
-        }
-      }
+/* One block of the product: activation rows [m0, m0 + Q8_MB) against output channels [n0, n0 + chunk_n) of segment s,
+ * with the segment's epilogue. Each output element belongs to exactly one block, and its value does not depend on which
+ * worker computes the block or in which order, so any partition of the blocks gives bitwise the same result. */
+static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0, int nc, int m0, float *acc,
+                          float *gate) {
+  int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
+  q8_sums(job, seg->w, seg->pw, n0, nc, m0, mb, acc);
+  if (seg->kind == GEMM_SWIGLU)
+    q8_sums(job, seg->w3, seg->pw3, n0, nc, m0, mb, gate);
+  for (int r = 0; r < mb; r++) {
+    float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
+    const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
+    for (int c = 0; c < nc; c++) {
+      if (seg->kind == GEMM_ADD)
+        out[c] += sum[c];
+      else if (seg->kind == GEMM_SWIGLU)
+        out[c] = silu_gate(sum[c], g[c]);
+      else
+        out[c] = sum[c];
     }
+  }
+}
+
+/* Blocks [first, last) of the whole product. The blocks of all segments form one list (segment, then channel chunk,
+ * then row block), split into balanced contiguous ranges: every worker gets the same number of blocks whatever the
+ * segments' widths (QKV's narrow K/V segments no longer leave workers idle), and consecutive blocks of a worker share a
+ * weight chunk, which stays in its L2 across the row blocks. */
+static void q8_gemm_blocks(const void *p, int unused, int first, int last) {
+  (void)unused;
+  const Q8GemmJob *job = p;
+  const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
+  const int mblocks = (job->m + Q8_MB - 1) / Q8_MB;
+  _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
+  int s = 0, base = 0;
+  for (int t = first; t < last; t++) {
+    while (t >= base + job->blocks[s])
+      base += job->blocks[s++];
+    const GemmQ8Segment *seg = &job->segment[s];
+    int chunk = (t - base) / mblocks, n0 = chunk * chunk_n, nc = seg->n - n0 < chunk_n ? seg->n - n0 : chunk_n;
+    q8_gemm_block(job, seg, n0, nc, ((t - base) % mblocks) * Q8_MB, acc, gate);
   }
 }
 
@@ -1015,13 +1031,14 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
   if (m <= 0 || k <= 0)
     return;
   Q8GemmJob job = {.xq = xq, .xs = xs, .m = m, .k = k, .gs = gs, .groups = k / gs, .count = count, .backend = backend};
-  int chunks[GEMM_MAX_SEGMENTS];
-  const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16;
+  const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16, mblocks = (m + Q8_MB - 1) / Q8_MB;
+  int total = 0;
   for (int s = 0; s < count; s++) {
     job.segment[s] = segments[s];
-    chunks[s] = (segments[s].n + chunk_n - 1) / chunk_n;
+    job.blocks[s] = (segments[s].n + chunk_n - 1) / chunk_n * mblocks;
+    total += job.blocks[s];
   }
-  kernels_parallel_segments(count, chunks, q8_gemm_chunks, &job);
+  kernels_parallel_segments(1, &total, q8_gemm_blocks, &job);
 }
 
 void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count) {
