@@ -307,11 +307,19 @@ class TensorParallelTests(unittest.TestCase):
 
     def test_amx_bf16_attention_on_one_and_two_sockets(self):
         """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
-        from its work region, so two sockets agree with one socket at the fixture tolerance (all positions, batches that
-        end mid-block). Against the default attention the logits stay within a noise budget: this sinusoidal fixture
-        amplifies rounding (the BF16 GEMM alone moves its logits by rms 0.03, max 0.14; AMX attention by rms 0.05, max
-        0.25), so the budget is twice that, and the kernel itself is held to 0.03 in tests/kernels.c. The report names
-        the variant. Decode is untouched (the knob acts on batched prefill)."""
+        from its work region. The kernel is partition-invariant, bitwise (tests/kernels.c: one KV head per call against
+        all heads, any team against serial), but two sockets are not bitwise one socket: the row-parallel Wo/W2 partial
+        sums are added across sockets, which moves FP32 values by an ulp (tiled attention: 1S against 2S 4.8e-7 on this
+        fixture, hardware job 5892453), and such an ulp can flip one BF16 rounding of a Q or P element in the next layer.
+        By the triangle inequality |amx 1S - amx 2S| <= |amx 1S - tiled 1S| + |tiled 1S - tiled 2S| + |tiled 2S - amx 2S|,
+        i.e. twice the AMX-against-tiled budget plus the fixture tolerance, so two sockets are held to that budget below.
+        So that the envelope cannot hide a partitioning bug, most rows must stay sharp: the median over rows of each
+        row's worst |difference| / (fixture tolerance) is at most 1 (measured on hardware: 1S against 2S max 2.7e-3 on
+        row 1, every other row within 7.2e-7, job 5892455). Against the tiled
+        attention the logits stay within a noise budget: this sinusoidal fixture amplifies rounding (the BF16 GEMM alone
+        moves its logits by rms 0.03, max 0.14; AMX attention by rms 0.05, max 0.26), so the budget is twice that, and
+        the kernel itself is held to 0.03 in tests/kernels.c. The report names the variant. Decode is untouched (the
+        knob acts on batched prefill)."""
         self.need('probe-int8-amx-emul')
         knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
         tokens = [65 + (i * 7) % 20 for i in range(33)]
@@ -319,11 +327,16 @@ class TensorParallelTests(unittest.TestCase):
             with self.subTest(batch=batch):
                 args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
                 amx = [self.logits('int8', 'wide', 'batch', s, LLAMA_ATTN='amx', **args) for s in (1, 2)]
-                self.assert_agree(amx[0], amx[1], TP_WIDE_CONFIG[5])
                 tiled = self.logits('int8', 'wide', 'batch', 1, LLAMA_ATTN='tiled', **args)  # the pre-fix-7 default
-                diff = [abs(a - b) for a, b in zip(tiled, amx[0])]
-                self.assertLessEqual(max(diff), 0.5)
-                self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+                for other in (tiled, amx[1]):
+                    diff = [abs(a - b) for a, b in zip(other, amx[0])]
+                    self.assertLessEqual(max(diff), 0.5)
+                    self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+                vocab = TP_WIDE_CONFIG[5]
+                worst = sorted(max(abs(a - b) / (ABS + REL * abs(a)) for a, b in
+                                   zip(amx[0][r * vocab:(r + 1) * vocab], amx[1][r * vocab:(r + 1) * vocab]))
+                               for r in range(len(amx[0]) // vocab))
+                self.assertLessEqual(worst[len(worst) // 2], 1.0, 'most rows of two sockets must match one socket')
         for sockets in (1, 2):
             data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
                                LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_ATTN='amx')
@@ -368,11 +381,14 @@ class TensorParallelTests(unittest.TestCase):
     def test_per_channel_int8_checkpoint(self):
         """Fix 9 (docs/prefill-gap.md): a version 4 checkpoint holds one scale per output channel, so every product is
         one group over its whole (per-socket) input and activations get one scale per token. The batched prefill equals
-        the per-token path; two sockets agree with one within the W8A8 noise (each socket quantizes its own Wo/W2 input
-        slice, as a tensor-parallel rank does); on the AMX tile model the pipelined kernel (its full-K path) equals the
-        chunk kernel bitwise; the report names format 4 and group size 0."""
+        the per-token path on the same attention and SwiGLU exponential (LLAMA_ATTN=tiled, LLAMA_SWIGLU_EXP=libm: the
+        W8A8 defaults round attention to BF16 in prefill only, moving this fixture by up to 0.31, hardware job
+        5892453); two sockets agree with one within the W8A8 noise (each socket quantizes its own Wo/W2 input slice, as a
+        tensor-parallel rank does); on the AMX tile model the pipelined kernel (its full-K path) equals the chunk kernel
+        bitwise; the report names format 4 and group size 0."""
         tokens = [65 + (i * 7) % 20 for i in range(33)]
-        all_logits = {'LLAMA_PREFILL_LOGITS': 'all', 'LLAMA_PREFILL_BATCH': '32'}
+        all_logits = {'LLAMA_PREFILL_LOGITS': 'all', 'LLAMA_PREFILL_BATCH': '32', 'LLAMA_ATTN': 'tiled',
+                      'LLAMA_SWIGLU_EXP': 'libm'}
         batched = {}
         for sockets in (1, 2):
             with self.subTest(sockets=sockets):
@@ -383,7 +399,7 @@ class TensorParallelTests(unittest.TestCase):
         self.assertLessEqual(max(diff), 0.5)
         self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
         self.need('probe-int8-amx-emul')
-        amx = {'LLAMA_KERNELS': 'amx', 'LLAMA_ATTN': 'tiled', 'LLAMA_SWIGLU_EXP': 'libm', **all_logits}
+        amx = {'LLAMA_KERNELS': 'amx', **all_logits}
         for sockets in (1, 2):
             with self.subTest(sockets=sockets, kernel='pipelined'):
                 args = dict(tokens=tokens, binary='probe-int8-amx-emul', **amx)
