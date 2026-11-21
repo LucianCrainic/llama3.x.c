@@ -65,8 +65,8 @@ process exit:
   so a misjudged teardown of a few tenths of a second moves the window along the plateau, not out of it.
 Perf clock: `perf -I` stamps are seconds since counting started. The start is not known to better than the perf start-up
 time (tens to hundreds of ms), but perf stops within one `tail` poll (0.1 s) of the engine's exit, so the clock is lined
-up at the end: perf_t0_ns = end_ns - last perf time stamp + half the poll period (system-wide perf; zero for the
-wrapper mode, where perf ends with the child). The launch-based estimate is recorded next to it (perf_t0_launch_ns) and
+up at the end: perf_t0_ns = end_ns - last perf time stamp + half the poll period (system-wide or attached perf). In the
+wrapper mode (Cache node, perf starts the child) perf time 0 is the launch. The launch-based estimate is recorded next to it (perf_t0_launch_ns) and
 their difference is reported by the summariser as perf_clock_skew_s. Uncertainty of any window edge: about 0.1 s.
 """
 import argparse
@@ -184,11 +184,15 @@ def perf_clock(anchors, markers, perf_csv):
     if mode == 'none' or last is None:
         return {}
     out = {'perf_mode': mode}
-    wrapper = mode == 'wrap'
-    out['perf_t0_ns'] = int(markers['end_ns'] - last * NS + (0.0 if wrapper else TAIL_POLL_S / 2 * NS))
-    start = anchors.get('launch_ns') if wrapper else anchors.get('perf_start_ns')
-    if start:
-        out['perf_t0_launch_ns'] = int(start)
+    if mode == 'wrap':
+        # perf starts the child itself: its time 0 is the launch. The end-based estimate is not used here (the job's
+        # end_ns includes perf's own shutdown after the child exited, 0.4 s on the Cache node) and is kept for the skew.
+        out['perf_t0_ns'] = int(anchors['launch_ns'])
+        out['perf_t0_launch_ns'] = int(markers['end_ns'] - last * NS)
+        return out
+    out['perf_t0_ns'] = int(markers['end_ns'] - last * NS + TAIL_POLL_S / 2 * NS)
+    if anchors.get('perf_start_ns'):
+        out['perf_t0_launch_ns'] = int(anchors['perf_start_ns'])
     return out
 
 

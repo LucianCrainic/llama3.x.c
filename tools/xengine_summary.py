@@ -317,6 +317,8 @@ def summarize_run(out, rundir, hbm_bytes=HBM_CAS_BYTES, upi_bytes=UPI_DATA_FLIT_
         return [dict(base, phase='run', status=status if status != 'ok' else 'failed', note=note or 'no phase data')]
     markers_path = rundir/'markers.json'
     markers = json.loads(markers_path.read_text()) if markers_path.exists() else None
+    if markers is not None and (rundir/'anchors').exists():  # always line the perf clock up with the current rule
+        markers.update(xengine_cell.perf_clock(xengine_cell.read_kv(rundir/'anchors'), markers, rundir/'perf.csv'))
     if markers is None and (rundir/'anchors').exists():  # job died before its post-processing
         anchors = xengine_cell.read_kv(rundir/'anchors')
         if 'launch_ns' in anchors and 'end_ns' in anchors and base['engine'] in xengine_cell.MARKER_DERIVERS:
