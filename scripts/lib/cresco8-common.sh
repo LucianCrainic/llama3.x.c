@@ -98,7 +98,8 @@ build_tree() {
   cp "$ROOT/build/$mode/config" "$OUT/build-config-$(basename "$ROOT").txt"
 }
 
-# Uncore CAS counters (64-byte lines) show which tier served the reads. Perf is optional: whether it ran is recorded.
+# Uncore CAS counters show which tier served the reads: ddr_cas_rd counts 64-byte lines (DDR 64 B), hbm_cas_rd counts
+# 32-byte units (HBM 32 B, calibrated in job 5892172). Perf is optional: whether it ran is recorded.
 EVENTS='uncore_imc/event=0x05,umask=0xcf,name=ddr_cas_rd/,uncore_type_14/event=0x05,umask=0xcf,name=hbm_cas_rd/,unc_upi_rxl_flits.all_data'
 PERF=0
 perf_available() {
