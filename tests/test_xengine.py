@@ -322,6 +322,11 @@ class LlamaCppTests(unittest.TestCase):
                                        LLAMACPP_2S_HBM_THREADS='96', LLAMACPP_2S_HBM_FLAGS='-b 1024')
         self.assertIn('--interleave=all', text)
         self.assertIn('-t 96 -b 1024', text)
+        text, v = TestCaseHelper.cells('A', ENGINES='llamacpp', LLAMACPP_2S_VARIANT='c2', LLAMACPP_2S_HBM_THREADS='64',
+                                       LLAMACPP_2S_HBM_MASK='0xffffffff000000ffffffff')
+        self.assertIn('llamacpp-s2-hbm-c2-P-r1', v)
+        self.assertIn('llamacpp-s1-hbm-P-r1', v)
+        self.assertIn('-C 0xffffffff000000ffffffff -t 64', text)
         text, c = TestCaseHelper.cells('cache', ENGINES='llamacpp')
         cmds = '\n'.join(ln for ln in text.splitlines() if ln.strip().startswith('cmd:'))
         self.assertNotIn('--membind', cmds)

@@ -582,6 +582,21 @@ LCPP_MASK_2S=0xffffffffffffffffffffffffffff
 LCPP_STAGED=
 LCPP_SANITY_PROMPT='The capital of France is Paris. The capital of Italy is'
 
+# llamacpp_matrix: the default matrix; LLAMACPP_2S_VARIANT (e.g. c2, the tuned two-socket configuration) labels the
+# two-socket cells in labels and manifest.
+llamacpp_matrix() {
+  local mem s
+  for mem in $MEMS; do
+    for s in $SOCKETS; do
+      if [[ $s == 2 && -n ${LLAMACPP_2S_VARIANT:-} ]]; then
+        printf '2 %s:%s %s\n' "$mem" "$LLAMACPP_2S_VARIANT" "$WORKLOADS"
+      else
+        printf '%s %s %s\n' "$s" "$mem" "$WORKLOADS"
+      fi
+    done
+  done
+}
+
 # lcpp_config S MEM: sets LCPP_NUMACTL (array), LCPP_THREADS, LCPP_MASK, LCPP_FLAGS (array of extra flags).
 lcpp_config() {
   local s=$1 mem=$2 words=''
