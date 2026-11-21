@@ -271,9 +271,10 @@ class TensorParallelTests(unittest.TestCase):
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
 
     def test_amx_int8_pipelined_kernel_is_bitwise_the_chunk_kernel(self):
-        """LLAMA_Q8_GEMM=pipelined (tile-order activations, transposed weight scales, overlapped rescale) gives bitwise
-        the logits of the default chunk kernel, on one and two sockets, all positions, batches that end mid-block; it is
-        reported in build.q8_gemm, packs the transposed scales, and refuses other values."""
+        """LLAMA_Q8_GEMM=pipelined (the default: tile-order activations, transposed weight scales, overlapped rescale)
+        gives bitwise the logits of the chunk kernel (LLAMA_Q8_GEMM=chunk, the way back), on one and two sockets, all
+        positions, batches that end mid-block; it is reported in build.q8_gemm, packs the transposed scales, and refuses
+        other values."""
         self.need('probe-int8-amx-emul')
         knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
         for prompt in (5, 33):
@@ -282,8 +283,8 @@ class TensorParallelTests(unittest.TestCase):
                 for sockets in (1, 2):
                     with self.subTest(prompt=prompt, batch=batch, sockets=sockets):
                         args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
-                        chunk = self.probe('int8', 'wide', 'batch', sockets, **args)
-                        pipelined = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='pipelined', **args)
+                        chunk = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
+                        pipelined = self.probe('int8', 'wide', 'batch', sockets, **args)
                         self.assertEqual(len(chunk), prompt * TP_WIDE_CONFIG[5] * 4)
                         self.assertEqual(chunk, pipelined)
         for sockets in (1, 2):
@@ -299,7 +300,7 @@ class TensorParallelTests(unittest.TestCase):
                                  str(directory/'tokenizer.bin'), '-i', 'A', '-t', '0'], capture_output=True, text=True,
                                 timeout=60, env=environment(1, LLAMA_Q8_GEMM='bogus'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('LLAMA_Q8_GEMM must be chunk or pipelined', result.stderr)
+        self.assertIn('LLAMA_Q8_GEMM must be pipelined or chunk', result.stderr)
 
     def test_amx_bf16_attention_on_one_and_two_sockets(self):
         """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
@@ -347,8 +348,8 @@ class TensorParallelTests(unittest.TestCase):
         for sockets in (1, 2):
             with self.subTest(sockets=sockets, kernel='pipelined'):
                 args = dict(tokens=tokens, binary='probe-int8-amx-emul', **amx)
-                chunk = self.logits('int8', 'wide-pc', 'batch', sockets, **args)
-                pipelined = self.logits('int8', 'wide-pc', 'batch', sockets, LLAMA_Q8_GEMM='pipelined', **args)
+                chunk = self.logits('int8', 'wide-pc', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
+                pipelined = self.logits('int8', 'wide-pc', 'batch', sockets, **args)
                 self.assertEqual(chunk.tobytes(), pipelined.tobytes())
                 self.assert_agree(batched[sockets], chunk, TP_WIDE_CONFIG[5], abs_tol=0.05, rel_tol=0.02)
             data = self.report('runq', 'int8.bin', sockets, fixture='wide-pc', binary='runq-amx-emul', full=True,

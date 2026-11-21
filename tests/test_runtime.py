@@ -614,8 +614,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(data['build']['kernels'], 'amx')
         layers, d, h, kv = self.WIDE[2], self.WIDE[0], self.WIDE[1], self.WIDE[0] // self.WIDE[3] * self.WIDE[4]
         pad = lambda rows, cols: -(-rows // 16) * 16 * (-(-cols // 64) * 64)
+        scales_t = lambda rows, cols: -(-rows // 32) * 32 * (cols // 64) * 4  # the pipelined kernel's transposed scales
+        both = lambda rows, cols: pad(rows, cols) + scales_t(rows, cols)
         self.assertEqual(data['memory_bytes']['packed_weights_peak'],
-                         layers * (pad(d, d) * 2 + pad(kv, d) * 2 + pad(h, d) * 2 + pad(d, h)))
+                         layers * (both(d, d) * 2 + both(kv, d) * 2 + both(h, d) * 2 + both(d, h)))
         self.assertIsNotNone(data['timing_seconds']['weight_pack'])
         result, data = run('fp32')
         self.assertIn('W8A32 prefill uses avx512', result.stderr)

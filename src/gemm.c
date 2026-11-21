@@ -1337,16 +1337,18 @@ void k_gemm_q8_tiled(const int8_t *xq, const float *xs, int m, int k, int gs, co
   q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count, 1);
 }
 
-static int q8_pipelined;
+static int q8_pipelined = 1;
 
+/* LLAMA_Q8_GEMM=pipelined (the default: bitwise the chunk kernel's results, faster on one and two sockets; the decision
+ * table is in docs/prefill-gap.md) or chunk, the previous kernel on row-major activations, kept as the way back. */
 void gemm_q8_init_env(void) {
   const char *mode = getenv("LLAMA_Q8_GEMM");
-  q8_pipelined = 0;
-  if (!mode || !*mode || !strcmp(mode, "chunk"))
-    return;
-  if (strcmp(mode, "pipelined"))
-    fail("LLAMA_Q8_GEMM must be chunk or pipelined");
   q8_pipelined = 1;
+  if (!mode || !*mode || !strcmp(mode, "pipelined"))
+    return;
+  if (strcmp(mode, "chunk"))
+    fail("LLAMA_Q8_GEMM must be pipelined or chunk");
+  q8_pipelined = 0;
 }
 
 const char *k_gemm_q8_mode_name(void) {
