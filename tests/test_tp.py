@@ -243,7 +243,10 @@ class TensorParallelTests(unittest.TestCase):
         """D1 (AMX-INT8): int8 shard copies per socket for the tile kernel (group size 64), W8A8, against one socket at the
         same rung and against the per-token reference."""
         self.need('probe-int8-amx-emul')
-        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        # the GEMM's budget: AMX-BF16 attention and the vector SwiGLU exponential (W8A8 defaults, judged by the W8A8
+        # gate) stay on their ways back
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all',
+                 'LLAMA_ATTN': 'tiled', 'LLAMA_SWIGLU_EXP': 'libm'}
         for prompt in (5, 33):
             tokens = [65 + (i * 7) % 20 for i in range(prompt)]
             reference = self.logits('int8', 'wide', None, 1, tokens=tokens)
@@ -344,7 +347,7 @@ class TensorParallelTests(unittest.TestCase):
         self.assertLessEqual(max(diff), 0.5)
         self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
         self.need('probe-int8-amx-emul')
-        amx = {'LLAMA_KERNELS': 'amx', **all_logits}
+        amx = {'LLAMA_KERNELS': 'amx', 'LLAMA_ATTN': 'tiled', 'LLAMA_SWIGLU_EXP': 'libm', **all_logits}
         for sockets in (1, 2):
             with self.subTest(sockets=sockets, kernel='pipelined'):
                 args = dict(tokens=tokens, binary='probe-int8-amx-emul', **amx)
