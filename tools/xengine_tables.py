@@ -97,6 +97,21 @@ def prefill8192(rows, c):
 
 
 # ---- tables --------------------------------------------------------------------------------------------------------------
+def t0(rows):
+    """Headline: decode tok/s (D) and TTFT of the 2048-token prompt (s), median of 3, per engine x sockets x tier."""
+    body = []
+    for eng in ('c', 'llamacpp', 'vllm'):
+        for s in (1, 2):
+            row = [ENG[eng] + (' (HBM: patched)' if eng == 'vllm' else '') , s]
+            for node in ('A', 'B', 'cache'):
+                cs = [c for c in configs(rows, node) if c[1] == eng and c[3] == s and c[2] != 'stock-membind']
+                d = med(vals(sel(rows, cs[0], 'D', 'decode'), 'tok_s'))
+                t = med(vals(sel(rows, cs[0], 'P', 'prefill'), 'ttft_s'))
+                row.append('%.1f / %.3f' % (d, t))
+            body.append(row)
+    return table(['Engine', 'Sockets', 'Flat HBM (node A)', 'Flat DDR (node B)', 'Cache (Cache node)'], body)
+
+
 def t1a(rows):
     body = []
     for c in configs(rows):
@@ -369,7 +384,7 @@ def t11(rows, outs=None):
     return table(['Configuration', 'Tier', 'range/median of D, L, P, 8192 (%)'], body)
 
 
-TABLES = {'T1a': t1a, 'T1b': t1b, 'T2': t2, 'T3': t3, 'T4': t4, 'T5': t5, 'T5b': t5b, 'T6': t6, 'T7': t7, 'T8': t8, 'T9': t9, 'T10': t10, 'T11': t11}
+TABLES = {'T0': t0, 'T1a': t1a, 'T1b': t1b, 'T2': t2, 'T3': t3, 'T4': t4, 'T5': t5, 'T5b': t5b, 'T6': t6, 'T7': t7, 'T8': t8, 'T9': t9, 'T10': t10, 'T11': t11}
 
 
 def main(argv=None):
