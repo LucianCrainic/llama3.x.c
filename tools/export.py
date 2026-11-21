@@ -645,7 +645,7 @@ def load_hf_w8a8(model_path):
     """Imports a compressed-tensors W8A8 checkpoint (llm-compressor `int-quantized`: int8 weights with one scale per
     output channel, dynamic per-token symmetric int8 activations, e.g. RedHatAI's GPTQ/SmoothQuant exports) for a
     per-channel INT8 (version 4) export. The quantized linears keep their int8 values and scales exactly (the scales
-    widened to FP32); the tensors it leaves unquantized (embedding, norms, an ignored lm_head) load as FP32, and the
+    widened to FP32; an int8 -128, outside the engine's [-127, 127], becomes -127 and is counted); the tensors it leaves unquantized (embedding, norms, an ignored lm_head) load as FP32, and the
     export quantizes the embedding and classifier per channel like an RTN export. The engine quantizes activations per
     token at run time, which is the checkpoint's own activation scheme."""
     from transformers import AutoConfig
@@ -675,7 +675,7 @@ def load_hf_w8a8(model_path):
         with safe_open(str(shard), "pt") as f:
             for name in f.keys():
                 tensors[name] = f.get_tensor(name)
-    hf_dict = {}
+    hf_dict, clamped = {}, [0, 0]  # int8 values of -128 set to -127, rows holding one
     for name, t in tensors.items():
         if name.endswith(".weight_scale"):
             continue
@@ -685,12 +685,21 @@ def load_hf_w8a8(model_path):
                 raise ValueError(f"int8 tensor {name} has no weight_scale")
             hf_dict[name] = t.float()
             continue
-        if t.dtype != torch.int8 or tuple(scale.shape) != (t.shape[0], 1) or int(t.abs().max()) > 127:
-            raise ValueError(f"{name}: expected int8 values in [-127, 127] with one scale per row")
+        if t.dtype != torch.int8 or tuple(scale.shape) != (t.shape[0], 1):
+            raise ValueError(f"{name}: expected int8 values with one scale per row")
+        # The engine's int8 range is [-127, 127] (its VNNI kernels negate weights); GPTQ exports may use -128
+        # (llm-compressor's symmetric int8 range). Those values become -127: one quantum, counted and reported.
+        low = t == -128
+        if low.any():
+            clamped[0] += int(low.sum())
+            clamped[1] += int(low.any(1).sum())
+            t = t.clamp(min=-127)
         s = scale.float().view(-1)
         w = t.float() * s[:, None]
         w.q8_import = (t, s)
         hf_dict[name] = w
+    if clamped[0]:
+        print(f"W8A8 import: {clamped[0]} int8 values of -128 in {clamped[1]} rows set to -127 (the engine's range)")
     return model_from_hf(hc, hf_dict, model_path)
 
 

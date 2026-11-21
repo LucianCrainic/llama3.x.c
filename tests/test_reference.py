@@ -74,8 +74,9 @@ class ReferenceTests(unittest.TestCase):
                     scale = (value.float().abs().amax(1, keepdim=True) / 127).to(torch.bfloat16)
                     q = torch.round(value.float() / scale.float()).clamp(-127, 127).to(torch.int8)
                     q[0] //= 2  # a row whose largest value is not 127: a re-quantization would change it
+                    q[1, 3] = -128  # llm-compressor's int8 range includes -128; the engine's ends at -127
                     tensors[name], tensors[name[:-len('weight')] + 'weight_scale'] = q, scale
-                    quantized[name] = (q, scale.float())
+                    quantized[name] = (q.clamp(min=-127), scale.float())
                 else:
                     tensors[name] = value
             save_file(tensors, str(root/'model.safetensors'))
