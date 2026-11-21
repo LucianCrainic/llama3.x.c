@@ -6,7 +6,7 @@ The numerical hot paths of both engines live in
 [src/attention.c](../src/attention.c) (attention, K/V layout), declared in
 [include/kernels.h](../include/kernels.h); test-only hooks are in
 [include/testing.h](../include/testing.h). The engine (`src/engine.c`, for both
-formats) and `src/tp.c` only lay out weights, caches and the order of operations. The motivation
+formats) and its shard engine `src/tp.c` only lay out weights, caches and the order of operations. The motivation
 and the roofline behind each kernel are in [hbm-roofline.md](hbm-roofline.md).
 
 ## Instruction set selection

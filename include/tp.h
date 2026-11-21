@@ -1,10 +1,13 @@
 #ifndef LLAMA_TP_H
 #define LLAMA_TP_H
 
+#include "loader.h"
 #include "runtime.h"
 #include "shards.h"
 
-/* Two-socket tensor-parallel forward pass (B5, B6): one model instance split into two socket-owned shards, each run
+/* The shard engine: the one forward pass of both executables (F3). One socket runs it with S = 1, where every shard is
+ * a whole tensor viewed in the loader's weight store and Wo/W2 add straight into the residual (tp_create_local). Two
+ * sockets run it tensor-parallel (B5, B6): one model instance split into two socket-owned shards, each run
  * by its own worker team, with two cross-socket reductions per layer (B4). Selected by LLAMA_SOCKETS=2, or by default
  * on a dual-socket HBM node (tp_sockets_requested); it runs on worker teams and a topology with two sockets (real, or
  * LLAMA_TOPOLOGY=virtual:2xT where the teams are unpinned and the regions portable).
@@ -34,7 +37,14 @@ int tp_check_topology(const char *placement);
  */
 Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
               int max_batch, TpPack pack);
-float *tp_forward(Tp *tp, int token, int pos);
+/* One socket: the shards are views into `store` (which must outlive the engine), the KV caches and work buffers live in
+ * the loader's run memory and the packed copies in its packed store, so LLAMA_PLACEMENT=file|ddr|hbm places them as
+ * before (A4, A5, C5). Runs on the calling thread and the default worker team. */
+Tp *tp_create_local(const Config *p, const TensorManifest *m, const WeightStore *store, int quantized, int gs,
+                    int fp32_activations, int max_batch, TpPack pack);
+/* One token at `pos`. With `logits` 0 the final norm and classifier are skipped (a prompt row whose logits nobody asked
+ * for) and NULL is returned. */
+float *tp_forward(Tp *tp, int token, int pos, int logits);
 /* D1: `count` consecutive positions from pos0 in one pass over the weights (FP32 and W8A8; W8A32 stays per token,
  * so its capacity is 1).
  * Same return contract as engine_forward_batch: LAST one row, ALL count rows, NONE NULL; the storage belongs to tp. */

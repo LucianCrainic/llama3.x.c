@@ -74,11 +74,12 @@ FP32), see [audit-2026-11.md](audit-2026-11.md) §6.
 ```
 src/app.c          CLI: options, prompt handling, prefill/decode loop, --warm-context, chat
 src/report.c       the schema-v1 JSON performance report (--json)
-src/engine.c       one-socket engine for both formats: weights view, run state, forward (per token, batched GEMM),
-                   packing (BF16, AMX-INT8); the precision lives in the embedding row and the project_* helpers
+src/engine.c       the engine API of both formats: checkpoint mapping, the prefill policy of each format, the
+                   per-token prefill loop; drives the shard engine
 src/run.c          the FP32 executable: engine_q8 = 0
 src/runq.c         the Q8_0 executable: engine_q8 = 1
-src/tp.c           two-socket engine used by both executables when LLAMA_SOCKETS=2
+src/tp.c           the shard engine, the one forward pass (per token, batched GEMM; FP32, BF16, Q8) on 1 or 2
+                   sockets, packing (BF16, AMX-INT8), the two-socket coordinator and reductions
 src/prefill.c      prefill policy shared by both engines (batch size, GEMM on/off, precision guard)
 src/runtime.c      checkpoint validation and mapping, logging, fail(), accounted allocator
 src/shards.c       tensor manifest (file offset of every tensor) and the per-socket shard planner/loader
@@ -111,8 +112,9 @@ hooks only tests and benches call (portable references, forced schedules, attent
 2. `checkpoint_map` validates the header and maps the file read-only; `manifest_build` records the byte offset of every
    tensor. Every later view of a weight (mapped, owned, sharded, packed) is derived from this manifest.
 3. One socket: `weights_open` either keeps the mapping (`file`) or copies the tensors into engine-owned regions bound to a
-   NUMA node (`ddr`/`hbm`), then the run state and KV caches are allocated (`malloc_run_state`). With AMX-INT8 or BF16 the
-   seven per-layer matrices get a packed copy in a bound region.
+   NUMA node (`ddr`/`hbm`). `tp_create_local` then plans one whole-tensor shard per tensor as a view into that store
+   (nothing is copied), carves the run state from the loader's run memory and the KV caches from its cache regions
+   (heap in `file` mode), and with AMX-INT8 or BF16 packs the seven per-layer matrices into the loader's packed store.
 4. Two sockets: `tp_create` plans the shards, reserves each socket's regions on its own nodes, starts the socket-1
    coordinator thread, and both sockets load (and pack) their shards in parallel with `pread`; the file mapping is then
    dropped.
@@ -132,12 +134,13 @@ on it, and `k_kv_store` copies each head's slice into place (`PHASE_KV_STORE`); 
 `k_attention_batch_kv`. With `LLAMA_KV_LAYOUT=rows` (`[layer][position][kv_head][head_dim]`) the projections write
 straight into the cache, as before E5.4.
 
-| Path | Where | Projections | Attention | When |
+| Path | `tp.c` | Projections | Attention | When |
 | --- | --- | --- | --- | --- |
-| Per-token decode, 1 socket | `forward_layer` | GEMV `k_matmul_*` (fused QKV, fused W1/W3+SwiGLU) | `k_attention` (split-K) | every decode step; prefill when M = 1 or the GEMM is off |
-| Batched prefill, 1 socket | `forward_layer_batch` | GEMM: FP32 `k_gemm_f32`, BF16/AMX `k_gemm_bf16`, Q8 `k_gemm_q8` (portable, VNNI, AMX-INT8) | `k_attention_batch` (tiled) | prompt microbatches with M > 1 |
-| Decode, 2 sockets | `tp.c` `forward_fp32` / `forward_q8` | GEMV on each socket's shards; fused Wo/W2 + flag reduction | per socket, its own heads | every decode step |
-| Batched prefill, 2 sockets | `tp.c` `forward_batch` | GEMM on each socket's shards; barrier reduction of M x dim partials | per socket | prompt microbatches |
+| Per token | `forward_fp32` / `forward_q8` | GEMV `k_matmul_*` (fused QKV, fused W1/W3+SwiGLU) on the socket's shards; Wo/W2 add into the residual on one socket, fused projection + flag reduction on two | `k_attention_kv` (split-K), per socket its own heads | every decode step; prefill when M = 1, W8A32 or the GEMM is off (the classifier only on rows whose logits are wanted) |
+| Batched | `forward_batch` | GEMM: FP32 `k_gemm_f32`, BF16/AMX `k_gemm_bf16`, Q8 `k_gemm_q8` (portable, VNNI, AMX-INT8); Wo/W2 `GEMM_ADD` on one socket, M x dim partials and a barrier reduction on two | `k_attention_batch_kv` | prompt microbatches with M > 1 (and M = 1 in BF16 mode) |
+
+Both paths are written once for both socket counts: one socket is S = 1 of the shard planner, where every shard is the
+whole tensor (F3 step 2, [audit-2026-11.md](audit-2026-11.md)).
 
 The per-token path is also the numerical oracle: the batched reference path (scalar kernels) is bitwise identical to it,
 and every faster path is gated against it (section 9).

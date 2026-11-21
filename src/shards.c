@@ -251,6 +251,23 @@ int shards_plan_try(ShardSet *set, const TensorManifest *m, const Config *p, int
     add_shard(set, embed, SHARD_GLOBAL, 0, 0, embed->rows, 0, embed->cols, 0);
   if (set->count > capacity)
     fail("shard set overflow: %d shards, capacity %d", set->count, capacity);
+  /* The forward pass looks shards up per matrix and layer: index them by (role, layer, socket). A GLOBAL shard answers
+   * for every socket. */
+  set->layers = p->n_layers;
+  size_t slots = (size_t)T_ROLE_COUNT * (size_t)(p->n_layers + 1) * (size_t)sockets;
+  set->index = memory_alloc(slots, sizeof(int), MEM_METADATA);
+  for (size_t i = 0; i < slots; i++)
+    set->index[i] = -1;
+  for (int i = 0; i < set->count; i++) {
+    const Shard *sh = &set->t[i];
+    for (int s = 0; s < sockets; s++)
+      if (sh->socket == s || sh->kind == SHARD_GLOBAL) {
+        int *slot = &set->index[((size_t)sh->src->role * (size_t)(p->n_layers + 1) + (size_t)(sh->src->layer + 1)) *
+                                    (size_t)sockets + (size_t)s];
+        if (*slot < 0)
+          *slot = i;
+      }
+  }
   return 0;
 }
 
@@ -262,10 +279,18 @@ void shards_plan(ShardSet *set, const TensorManifest *m, const Config *p, int so
 
 void shards_free(ShardSet *set) {
   memory_free(set->t);
+  memory_free(set->index);
   *set = (ShardSet){0};
 }
 
 const Shard *shards_find(const ShardSet *set, TensorRole role, int layer, int socket) {
+  if (set->index) {
+    if ((unsigned)role >= T_ROLE_COUNT || layer < -1 || layer >= set->layers || socket < 0 || socket >= set->sockets)
+      return NULL;
+    int i = set->index[((size_t)role * (size_t)(set->layers + 1) + (size_t)(layer + 1)) * (size_t)set->sockets +
+                       (size_t)socket];
+    return i < 0 ? NULL : &set->t[i];
+  }
   for (int i = 0; i < set->count; i++) {
     const Shard *sh = &set->t[i];
     if (sh->src->role == role && sh->src->layer == layer && (sh->socket == socket || sh->kind == SHARD_GLOBAL))
