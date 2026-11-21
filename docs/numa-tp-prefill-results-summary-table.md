@@ -1,6 +1,6 @@
 # Final campaign: generated summary tables
 
-> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †. Values hand-scaled from the published tables; regenerating with the fixed tools/summarize_campaign.py from the raw campaign data gives the same values to rounding.
 
 Written by `tools/summarize_campaign.py` for the two D2 campaign directories (jobs 5845031 and 5845032, commit 8f3114f). Curated views and the decisions: [numa-tp-prefill-results.md](numa-tp-prefill-results.md).
 

@@ -113,7 +113,7 @@ across repeats to avoid multiplexing; enabled/running percentages are checked an
 | 3 | No perf | Timing only; compared with repeats 1 and 2 to show perf overhead is negligible |
 
 - Idle baseline of about 10 s per node, subtracted for energy per token.
-- GB/s per tier per socket = CAS count x 64 B / window. Bandwidth is normalised to the measured rooflines: local HBM read
+- GB/s per tier per socket = ddr_cas_rd x 64 B, hbm_cas_rd x 32 B (calibrated, job 5892172) / window. Bandwidth is normalised to the measured rooflines: local HBM read
   about 552 GB/s per socket, local DDR about 262-268 GB/s per socket, remote HBM about 50 GB/s, Cache mode about 560 GB/s
   for an in-cache working set (see [`docs/hbm-roofline.md`](../hbm-roofline.md)).
 - Bytes read per decoded token (derived from counters and TPOT) against nominal model bytes.

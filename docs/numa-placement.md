@@ -69,8 +69,7 @@ pages queried):
 | `anon-ddr` | 5.2 † | 6242 | 40 |
 | `remote-hbm` | 6288 † | 33.1 | **890,339** |
 
-The counters are as `perf` reports them over the whole process (loading, prefill and decode); read them as ratios between configurations. The HBM figures (†) are about 207 times the 30 GB weight set for the whole process, which also includes loading and prefill, so they are not
-one pass per token; the excess is unexplained and does not affect the comparison: owned HBM reads HBM and almost nothing from DDR or across UPI, owned DDR reads only DDR,
+The counters are as `perf` reports them over the whole process (loading, prefill and decode); read them as ratios between configurations. The HBM figures (†) are about 207-210 times the 30 GB weight set for the whole process (6208/30 and 6288/30), which also includes loading and prefill; the excess is unexplained and does not affect the comparison: owned HBM reads HBM and almost nothing from DDR or across UPI, owned DDR reads only DDR,
 and the remote control moves the same HBM volume across UPI (34,000 times the flits of local HBM).
 
 ## Modeled against measured
