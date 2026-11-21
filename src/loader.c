@@ -300,7 +300,7 @@ void runmem_init(RunMemory *rm, size_t kv_bytes_each) {
   rm->budget_claimed = budget_claim(mode, rm->node, checked_mul(2, kv_bytes_each), "the KV caches");
   reserve(&rm->kv[0], kv_bytes_each, rm->node, ROLE_KV_K, mode);
   reserve(&rm->kv[1], kv_bytes_each, rm->node, ROLE_KV_V, mode);
-  /* Reserved, not resident: accounting follows the extent, residency follows the first write at each position. */
+  /* Accounting follows the extent; the engine's team writes the caches once before the first prompt (tp.c). */
   region_mark_populated(&rm->kv[0]);
   region_mark_populated(&rm->kv[1]);
 }

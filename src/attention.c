@@ -1417,18 +1417,44 @@ void k_kv_strides(int n_kv_heads, int head_dim, int seq_len, size_t *pos_stride,
   *head_base = kv_layout_head ? (size_t)seq_len * head_dim : (size_t)head_dim;
 }
 
+typedef struct {
+  float *cache;
+  const float *src;
+  size_t src_ld;
+  int pos0, count, n_kv_heads, head_dim, seq_len, blocks;
+} KvStoreJob;
+
+/* Rows per task of the parallel store: 16 rows of one head are 8 KiB of the destination at head_dim 128. */
+enum { KV_STORE_ROWS = 16 };
+
+/* Tasks [first, last) of the parallel store: task t is rows block t % blocks of KV head t / blocks (rows layout: one head
+ * of n_kv_heads * head_dim), so consecutive tasks of a worker fill a contiguous run of the destination. */
+static void kv_store_chunks(const void *p, int segment, int first, int last) {
+  (void)segment;
+  const KvStoreJob *j = p;
+  int head = kv_layout_head;
+  size_t width = head ? (size_t)j->head_dim : (size_t)j->n_kv_heads * j->head_dim;
+  size_t pos_stride = width, head_base = head ? (size_t)j->seq_len * j->head_dim : 0;
+  for (int t = first; t < last; t++) {
+    int g = t / j->blocks, r0 = (t % j->blocks) * KV_STORE_ROWS;
+    int r1 = r0 + KV_STORE_ROWS < j->count ? r0 + KV_STORE_ROWS : j->count;
+    for (int r = r0; r < r1; r++)
+      memcpy(j->cache + (size_t)g * head_base + (size_t)(j->pos0 + r) * pos_stride,
+             j->src + (size_t)r * j->src_ld + (size_t)g * width, width * sizeof(float));
+  }
+}
+
+/* A plain copy, so the result does not depend on how the rows are split: one row (decode) is copied by the caller, a
+ * batch of rows by the team. */
 void k_kv_store(float *cache, const float *src, size_t src_ld, int pos0, int count, int n_kv_heads, int head_dim,
                 int seq_len) {
-  size_t kv_dim = (size_t)n_kv_heads * head_dim;
-  if (!kv_layout_head) {
-    for (int r = 0; r < count; r++)
-      memcpy(cache + (size_t)(pos0 + r) * kv_dim, src + (size_t)r * src_ld, kv_dim * sizeof(float));
-    return;
-  }
-  for (int r = 0; r < count; r++)
-    for (int g = 0; g < n_kv_heads; g++)
-      memcpy(cache + (size_t)g * seq_len * head_dim + (size_t)(pos0 + r) * head_dim,
-             src + (size_t)r * src_ld + (size_t)g * head_dim, (size_t)head_dim * sizeof(float));
+  int blocks = (count + KV_STORE_ROWS - 1) / KV_STORE_ROWS, heads = kv_layout_head ? n_kv_heads : 1;
+  KvStoreJob job = {cache, src, src_ld, pos0, count, n_kv_heads, head_dim, seq_len, blocks};
+  int tasks = heads * blocks;
+  if (count > 1)
+    kernels_parallel_segments(1, &tasks, kv_store_chunks, &job);
+  else if (count == 1)
+    kv_store_chunks(&job, 0, 0, tasks);
 }
 
 void k_attention_kv(float *out, const float *q, const float *key_cache, const float *value_cache, float *att,

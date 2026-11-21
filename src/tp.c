@@ -621,6 +621,19 @@ static void forward_batch(Tp *tp, int s) {
   }
 }
 
+/* One slice of a region, zeroed by each worker of a team: the team creates the region's pages. */
+typedef struct {
+  void *data;
+  size_t bytes;
+} ZeroSpan;
+
+static void zero_span(const void *p, int worker, int workers) {
+  const ZeroSpan *z = p;
+  size_t lo = (size_t)((unsigned long long)z->bytes * (unsigned)worker / (unsigned)workers);
+  size_t hi = (size_t)((unsigned long long)z->bytes * (unsigned)(worker + 1) / (unsigned)workers);
+  memset((char *)z->data + lo, 0, hi - lo);
+}
+
 /* Carves the socket's activations out of its work region and sizes the attention work from its team. Runs on the
  * socket's coordinator, so the pages are first written by the socket that uses them. */
 static void setup_socket(Tp *tp, int s) {
@@ -669,6 +682,18 @@ static void setup_socket(Tp *tp, int s) {
   if (S == 2) {
     sk->key_cache = sk->kv_k.data;
     sk->value_cache = sk->kv_v.data;
+  }
+  /* The socket's team writes its KV caches once now, so their pages exist (on the socket's node, created by its own
+   * threads) before the first prompt: otherwise each 4 KiB page is faulted in by the K/V store of the prefill, inside
+   * the time to first token. A fresh mapping is zero already; the values do not change. */
+  size_t kv_bytes = (size_t)p->n_layers * p->seq_len * tp->kv_dim_local * sizeof(float);
+  float *caches[2] = {sk->key_cache, sk->value_cache};
+  for (int i = 0; i < 2; i++) {
+    ZeroSpan span = {caches[i], kv_bytes};
+    if (sk->team)
+      team_run(sk->team, zero_span, &span);
+    else
+      zero_span(&span, 0, 1);
   }
 }
 

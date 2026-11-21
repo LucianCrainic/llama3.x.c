@@ -166,7 +166,8 @@ weights, and the vocabulary rows of the classifier (which also serve the embeddi
 
 **Run state and KV cache.** In `file` mode activations and caches are heap allocations. In an owned mode `RunMemory`
 sizes all activation buffers in a first pass, carves them from one `ROLE_WORK` region, and gives each KV cache its own
-region whose pages appear when a position is first written. Two sockets keep everything per socket: its half of the KV
+region; the socket's team writes the caches once at load (`setup_socket`), so every page exists before the first prompt
+and the prefill's K/V store does not fault pages in. Two sockets keep everything per socket: its half of the KV
 heads, its activations, and its exchange buffers.
 
 **HBM budget.** Before reserving anything, the two-socket path checks that each socket's shards, packed copies, KV caches,
