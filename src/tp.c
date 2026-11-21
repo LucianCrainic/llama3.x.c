@@ -441,10 +441,19 @@ static void forward_q8(Tp *tp, int s) {
  * W1, W3) produce this socket's heads and hidden channels, the column shards (Wo, W2) a full M x dim partial that the
  * exchange adds to both residuals once. K/V rows go straight into the socket's own cache, and attention reads only
  * that cache, so no cross-socket barrier is needed besides the two reductions per layer. */
-static void embed_rows(const Tp *tp, TpSocket *sk) {
+typedef struct {
+  const Tp *tp;
+  TpSocket *sk;
+} EmbedJob;
+
+/* Rows [first, last) of the batch's embeddings: a copy, or the dequantized Q8 row (the per-token path's arithmetic). */
+static void embed_chunks(const void *p, int segment, int first, int last) {
+  (void)segment;
+  const EmbedJob *job = p;
+  const Tp *tp = job->tp;
   size_t dim = (size_t)tp->c.dim;
-  for (int i = 0; i < tp->bcount; i++) {
-    float *x = sk->x + (size_t)i * dim;
+  for (int i = first; i < last; i++) {
+    float *x = job->sk->x + (size_t)i * dim;
     if (!tp->quantized) {
       memcpy(x, embedding_row(tp, tp->btokens[i]), dim * sizeof(float));
       continue;
@@ -456,9 +465,23 @@ static void embed_rows(const Tp *tp, TpSocket *sk) {
   }
 }
 
+static void embed_rows(const Tp *tp, TpSocket *sk) {
+  EmbedJob job = {tp, sk};
+  int rows = tp->bcount;
+  kernels_parallel_segments(1, &rows, embed_chunks, &job);
+}
+
+static void rope_chunks(const void *p, int segment, int first, int last) {
+  (void)segment;
+  const EmbedJob *job = p;
+  for (int i = first; i < last; i++)
+    k_rope_table(&job->tp->c, job->tp->bpos0 + i, job->sk->rope + (size_t)i * 2 * job->tp->c.head_dim);
+}
+
 static void rope_tables(const Tp *tp, TpSocket *sk) {
-  for (int i = 0; i < tp->bcount; i++)
-    k_rope_table(&tp->c, tp->bpos0 + i, sk->rope + (size_t)i * 2 * tp->c.head_dim);
+  EmbedJob job = {tp, sk};
+  int rows = tp->bcount;
+  kernels_parallel_segments(1, &rows, rope_chunks, &job);
 }
 
 static void rmsnorm_rows(const Tp *tp, float *out, const float *x, const float *weight, int rows) {
