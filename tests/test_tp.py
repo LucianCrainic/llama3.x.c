@@ -320,14 +320,50 @@ class TensorParallelTests(unittest.TestCase):
                 args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
                 amx = [self.logits('int8', 'wide', 'batch', s, LLAMA_ATTN='amx', **args) for s in (1, 2)]
                 self.assert_agree(amx[0], amx[1], TP_WIDE_CONFIG[5])
-                default = self.logits('int8', 'wide', 'batch', 1, **args)
-                diff = [abs(a - b) for a, b in zip(default, amx[0])]
+                tiled = self.logits('int8', 'wide', 'batch', 1, LLAMA_ATTN='tiled', **args)  # the pre-fix-7 default
+                diff = [abs(a - b) for a, b in zip(tiled, amx[0])]
                 self.assertLessEqual(max(diff), 0.5)
                 self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
         for sockets in (1, 2):
             data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
                                LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_ATTN='amx')
             self.assertEqual(data['build']['attention'], 'amx')
+
+    def test_w8a8_defaults_take_amx_attention_and_vector_exp(self):
+        """The W8A8 defaults of prefill-gap fixes 4 and 7, with no knob set: runq's batched prefill runs AMX-BF16
+        attention where AMX is active and the vector SwiGLU exponential where AVX-512 runs (the hardware build; on a
+        host without AVX-512 the emulated-AMX probe keeps libm). The default path equals LLAMA_ATTN=amx bitwise and stays
+        within a budget of the ways back (LLAMA_ATTN=tiled, LLAMA_SWIGLU_EXP=libm) on one and two sockets. The budget is
+        this fixture's measured AMX-attention noise (rms 0.05, max 0.25, above) scaled by the headroom the W8A8 gate
+        leaves the 8B defaults: rms limit 0.2 over the worst default rms 0.147 and max limit 16 over max 9.4 (job
+        5892385, docs/prefill-gap.md), i.e. rms 0.068 and max 0.43; argmax agreement >= 0.9 as in the gate."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        vocab = TP_WIDE_CONFIG[5]
+        for sockets in (1, 2):
+            for batch in (5, 32):
+                with self.subTest(sockets=sockets, batch=batch):
+                    args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                    default = self.logits('int8', 'wide', 'batch', sockets, **args)
+                    amx = self.logits('int8', 'wide', 'batch', sockets, LLAMA_ATTN='amx', **args)
+                    self.assertEqual(default.tobytes(), amx.tobytes())
+                    back = self.logits('int8', 'wide', 'batch', sockets, LLAMA_ATTN='tiled', LLAMA_SWIGLU_EXP='libm',
+                                       **args)
+                    diff = [abs(a - b) for a, b in zip(default, back)]
+                    max_budget = 0.25 * 16 / 9.4
+                    self.assertLessEqual(max(diff), max_budget)
+                    self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.05 * 0.2 / 0.147)
+                    # argmax agreement >= 0.9, counting a near-tie (within the max budget) of this random fixture's
+                    # 128k-entry rows as agreement, the convention of assert_agree
+                    rows, agree = len(back) // vocab, 0
+                    for r in range(rows):
+                        d, b = default[r * vocab:(r + 1) * vocab], back[r * vocab:(r + 1) * vocab]
+                        agree += b[d.index(max(d))] >= max(b) - max_budget
+                    self.assertGreaterEqual(agree / rows, 0.9)
+            build = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                                LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')['build']
+            self.assertEqual((build['attention'], build['swiglu_exp']), ('amx', 'vector'))
 
     def test_per_channel_int8_checkpoint(self):
         """Fix 9 (docs/prefill-gap.md): a version 4 checkpoint holds one scale per output channel, so every product is
