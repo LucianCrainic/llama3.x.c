@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'tools'))
 import xengine_cell as cell  # noqa: E402
 import xengine_summary as summ  # noqa: E402
+import xengine_tables as tables  # noqa: E402
 
 T0 = 1_800_000_000_000_000_000  # launch of the synthetic run, epoch ns
 SEEN = 3.0  # s after launch: the engine logs its end-of-load line
@@ -40,7 +41,7 @@ def report(generated=128, steps=127, status='completed', sockets=1):
                          'pages_mismatched': 0, 'pages_missing': 0}]}
 
 
-def perf_lines(last, step=0.2, rates=None):
+def perf_lines(last, step=0.2, rates=None, extra=None):
     """`perf stat -a --per-socket -I 200 -x,` lines for a run of `last` seconds, a final partial interval included."""
     rates = rates or {}
     times = []
@@ -58,7 +59,7 @@ def perf_lines(last, step=0.2, rates=None):
             for event, unit, per_s in (('ddr_cas_rd', '', DDR_RATE), ('hbm_cas_rd', '', HBM_RATE if s == 0 else 1e3),
                                        ('unc_upi_rxl_flits.all_data', '', 9e6), ('unc_upi_txl_flits.all_data', '', 9e6),
                                        ('power/energy-pkg/', 'Joules', 300.0 if s == 0 else 100.0),
-                                       ('power/energy-ram/', 'Joules', 20.0 if s == 0 else 5.0)):
+                                       ('power/energy-ram/', 'Joules', 20.0 if s == 0 else 5.0), *(extra or ())):
                 per_s = rates.get(event, per_s)
                 value = per_s*dt
                 text = '%.2f' % value if unit else '%d' % round(value)
@@ -66,7 +67,8 @@ def perf_lines(last, step=0.2, rates=None):
     return '\n'.join(lines) + '\n'
 
 
-def make_run(out, label='c-s1-hbm-D-r1', mem='hbm', sockets=1, rep=1, group='MEM', rep_report=None, status='ok', rates=None):
+def make_run(out, label='c-s1-hbm-D-r1', mem='hbm', sockets=1, rep=1, group='MEM', rep_report=None, status='ok', rates=None,
+             extra=None):
     d = Path(out)/'runs'/label
     d.mkdir(parents=True)
     (d/'cell.json').write_text(json.dumps({'engine': 'c', 'sockets': sockets, 'mem': mem, 'workload': 'D', 'repeat': rep,
@@ -75,7 +77,7 @@ def make_run(out, label='c-s1-hbm-D-r1', mem='hbm', sockets=1, rep=1, group='MEM
     (d/'anchors').write_text('launch_ns=%d\nend_ns=%d\nrc=0\nperf_mode=sys\nperf_start_ns=%d\nload_end_seen_ns=%d\n' % (
         T0, END, T0 + 1_000_000, T0 + int(SEEN*1e9)))
     last = (END - PERF_T0)/1e9 + 0.05  # perf stops 0.05 s after the engine exited (its tail poll)
-    (d/'perf.csv').write_text(perf_lines(last, rates=rates))
+    (d/'perf.csv').write_text(perf_lines(last, rates=rates, extra=extra))
     assert cell.main(['markers', str(d)]) == 0
     return d
 
@@ -169,6 +171,18 @@ class SummaryTests(unittest.TestCase):
             self.assertAlmostEqual(dec['joules_per_token_net'], (total_w - 2*(50 + 10))*win/127, delta=0.05)
             self.assertLess(abs(dec['perf_clock_skew_s'] - (-0.04 + 0.001)), 0.06)
 
+    def test_cycle_columns_and_amx_share(self):
+        extra = (('cycles', '', 1.0e9), ('ref-cycles', '', 5.0e8), ('instructions', '', 2.0e9), ('EXE.AMX_BUSY', '', 2.5e8))
+        with tempfile.TemporaryDirectory() as tmp:
+            make_run(tmp, group='COMPUTE', rep=2, extra=extra)
+            dec = self.rows(tmp)[1]
+            win = DECODE + SAMPLING
+            self.assertAlmostEqual(dec['cycles'], 2*1.0e9*win, delta=1e6)  # both sockets
+            self.assertAlmostEqual(dec['ref_cycles'], 2*5.0e8*win, delta=1e6)
+            self.assertAlmostEqual(dec['amx_busy_share'], 0.25, places=3)
+            self.assertAlmostEqual(dec['ghz_eff'], 2*1.9, places=3)
+            self.assertAlmostEqual(dec['ipc'], 2.0, places=3)
+
     def test_hbm_cas_factor_is_an_option(self):
         with tempfile.TemporaryDirectory() as tmp:
             make_run(tmp)
@@ -227,6 +241,26 @@ def vllm_record(gen=128, ptok=86, ttft=0.2, step=0.025, wall=END/1e9):
     arrivals = [ttft + i*step for i in range(gen)]
     return {'http_status': 200, 'usage_prompt_tokens': ptok, 'usage_completion_tokens': gen, 'token_arrivals': arrivals,
             't_first_token': ttft, 't_end': arrivals[-1] + 0.001, 'wall_time': wall, 'ok': True}
+
+
+class TablesTests(unittest.TestCase):
+    def test_tables_from_a_runs_csv(self):
+        extra = (('cycles', '', 1.0e9), ('ref-cycles', '', 5.0e8), ('instructions', '', 2.0e9), ('EXE.AMX_BUSY', '', 2.5e8))
+        with tempfile.TemporaryDirectory() as tmp:
+            make_run(tmp, label='c-s1-hbm-D-r1')
+            make_run(tmp, label='c-s1-hbm-D-r2', rep=2, group='COMPUTE', extra=extra)
+            out = Path(tmp)/'runs.csv'
+            summ.write_csv(summ.summarize([tmp]), out)
+            rows = tables.load(out)
+            self.assertEqual(rows[0]['sockets'], 1)
+            text = tables.t1b(rows)
+            self.assertIn('llama3.x.c 1S (D only)', text)
+            self.assertIn('| HBM |', text)
+            self.assertIn('98.0%', tables.t3(rows))
+            self.assertIn('llama3.x.c 1S', tables.t2(rows))
+            self.assertEqual(tables.cell([1.0, 3.0, 2.0], '%.1f'), '2.0 (1.0-3.0)')
+            self.assertEqual(tables.cell([]), '-')
+            self.assertEqual(tables.main([str(out), '--only', 'T2']), 0)
 
 
 class VllmTests(unittest.TestCase):

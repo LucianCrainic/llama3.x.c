@@ -24,6 +24,8 @@ Derived columns
   joules_per_token   (package + DRAM energy of both sockets) / tokens;  _net subtracts the idle baseline power of the
                      same OUT (idle-baseline.perf.csv, 10 s at job start) x window
   amx_busy_cycles    EXE.AMX_BUSY summed over sockets;  ghz_eff = cycles / ref-cycles x NOMINAL_GHZ;  ipc = insn / cycles
+  cycles, ref_cycles unhalted core cycles / reference cycles summed over sockets (and over all counted cores);
+                     amx_busy_share = amx_busy_cycles / cycles, the share of unhalted core cycles with the AMX unit busy
 """
 import argparse
 import csv
@@ -206,7 +208,8 @@ COLUMNS = (['node_role', 'engine', 'variant', 'sockets', 'mem', 'workload', 'rep
            [f'upi_{d}_flits_s{s}' for d in ('rx', 'tx') for s in SOCKETS] +
            [f'upi_{d}_gb_s{s}' for d in ('rx', 'tx') for s in SOCKETS] + ['upi_gbps'] +
            [f'pkg_w_s{s}' for s in SOCKETS] + [f'dram_w_s{s}' for s in SOCKETS] +
-           ['joules', 'joules_per_token', 'joules_per_token_net', 'amx_busy_cycles', 'amx_ops_int8', 'ghz_eff', 'ipc'] +
+           ['joules', 'joules_per_token', 'joules_per_token_net', 'amx_busy_cycles', 'amx_ops_int8', 'cycles', 'ref_cycles',
+            'amx_busy_share', 'ghz_eff', 'ipc'] +
            [f'ghz_eff_s{s}' for s in SOCKETS] + [f'ipc_s{s}' for s in SOCKETS])
 
 
@@ -286,6 +289,12 @@ def perf_metrics(series, a, b, tokens, idle, hbm_bytes, upi_bytes, nominal_ghz):
         if cyc[s] and ins[s]:
             row[f'ipc_s{s}'] = ins[s] / cyc[s]
     cs, rs, ns = [sum(v for v in d.values() if v) for d in (cyc, ref, ins)]
+    if cs:
+        row['cycles'] = cs
+        if row.get('amx_busy_cycles') is not None:
+            row['amx_busy_share'] = row['amx_busy_cycles'] / cs
+    if rs:
+        row['ref_cycles'] = rs
     if cs and rs:
         row['ghz_eff'] = cs / rs * nominal_ghz
     if cs and ns:
