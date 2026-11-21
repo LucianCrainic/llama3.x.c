@@ -48,10 +48,10 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_BACKEND` | `teams` | the only backend: persistent pinned worker teams. Any other value is an error; the OpenMP backend (`omp`) was removed ([audit](audit-2026-11.md) F2) |
 | `LLAMA_THREADS` | N | team size (default: every allowed CPU for one team; each socket's allowed physical cores with two sockets) |
 | `LLAMA_TOPOLOGY` | `auto`, `virtual:SxT`, `explicit:C0/H0/D0,C1/H1/D1` | socket/NUMA map: discovered, S fake unpinned sockets of T threads (tests), or explicit package/HBM/DDR nodes |
-| `LLAMA_SOCKETS` | `2` on a dual-socket HBM node, else `1` | tensor parallelism over two sockets. Unset, 2 is chosen only on a discovered topology whose two sockets each have an allowed HBM node, with no `LLAMA_BACKEND=omp`, `LLAMA_TOPOLOGY` or `LLAMA_PLACEMENT=file\|ddr` |
+| `LLAMA_SOCKETS` | `2` on a dual-socket HBM node, else `1` | tensor parallelism over two sockets. Unset, 2 is chosen only on a discovered topology whose two sockets each have an allowed HBM node, with auto topology and `LLAMA_PLACEMENT` unset or `hbm` |
 | `LLAMA_TEAM_FANOUT` | `8`, `0`, N <= 64 | group size of the dispatch tree (0 = flat) |
-| `LLAMA_PLACEMENT` | `file` (one socket), `hbm` (two sockets on an HBM node), `ddr` | where the weights live. Two sockets always copy their shards into owned regions: `hbm`/`ddr` bind them to each socket's node, `file` leaves them unbound (first touch by the socket's own team, which lands in DDR) |
-| `LLAMA_PLACEMENT_STRICT` | `1` for `ddr`/`hbm`, else `0` | fail when a page is found on the wrong node or placement cannot be verified |
+| `LLAMA_PLACEMENT` | `file` (one socket), `hbm` (two sockets on an HBM node) | `file\|hbm\|ddr\|hbm-only\|hybrid`. See [planned placement](#planned-placement) for strict and mixed configurations. |
+| `LLAMA_PLACEMENT_STRICT` | `1` for explicit tier placement, else `0` | require page-placement verification. `hbm-only` and `hybrid` require strict placement. |
 | `LLAMA_HBM_BUDGET_GIB` | `56` | per-socket HBM budget checked before reserving |
 | `LLAMA_THP` | `off`, `on` | transparent huge pages for owned regions |
 | `LLAMA_VERIFY_SAMPLES` | `0` (every page) or N | pages sampled per region by the placement check |

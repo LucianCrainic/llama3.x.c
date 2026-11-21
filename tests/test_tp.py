@@ -3,6 +3,7 @@ backend, on fixtures that can be split (two KV heads)."""
 import array
 import json
 import os
+import struct
 from pathlib import Path
 import subprocess
 import sys
@@ -141,6 +142,39 @@ class TensorParallelTests(unittest.TestCase):
         result, _ = plan('hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='3')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('must be auto or between 0 and 2', result.stderr)
+
+    def test_70b_plan_only_admits_ddr_spill_without_loading_weights(self):
+        model = Path(self.temp.name)/'70b-sizing.bin'
+        d, hidden, layers, heads, kv_heads, vocab, capacity, group = 8192, 28672, 80, 64, 8, 128256, 131072, 64
+        kv_dim = d // heads * kv_heads
+        weight_count = layers * (2 * d * d + 2 * d * kv_dim + 3 * d * hidden) + 2 * vocab * d
+        file_bytes = 256 + (2 * layers + 1) * d * 4 + weight_count + weight_count // group * 4
+        with model.open('wb') as output:
+            header = struct.pack('<Ii7iBi', 0x616b3432, 2, d, hidden, layers, heads, kv_heads, vocab, capacity, 0, group)
+            output.write(header.ljust(256, b'\0'))
+            output.truncate(file_bytes)  # Metadata-only fixture. The tensor payload consists entirely of holes.
+        report = Path(self.temp.name)/'70b-plan.json'
+
+        def plan(mode, context):
+            proc = subprocess.run([str(BUILD/'runq'), str(model), '--context-length', str(context), '--plan-only',
+                                   '--json', str(report)], capture_output=True, text=True, timeout=15,
+                                  env=environment(2, LLAMA_KERNELS='scalar', LLAMA_PLACEMENT=mode,
+                                                  LLAMA_HBM_BUDGET_GIB='56'))
+            return proc, json.loads(report.read_text())
+
+        fit, report_data = plan('hbm-only', 8192)
+        self.assertEqual(fit.returncode, 0, fit.stderr)
+        self.assertEqual(report_data['regions'], [])
+        over, report_data = plan('hbm-only', 98304)
+        self.assertNotEqual(over.returncode, 0)
+        self.assertFalse(report_data['placement_plan']['admitted'])
+        mixed, report_data = plan('hybrid', 98304)
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        placement = report_data['placement_plan']
+        self.assertEqual(placement['weights_hbm_layers'], 80)
+        self.assertGreater(placement['kv_hbm_layers'], 0)
+        self.assertLess(placement['kv_hbm_layers'], 80)
+        self.assertEqual(report_data['regions'], [])
 
     def test_fp32_logits_agree_with_one_socket(self):
         for name, vocab in [('shared', TP_CONFIG[5]), ('unshared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])]:

@@ -40,8 +40,8 @@ PYTHON=${PYTHON:-python3}
   printf 'checkpoint=%s\ntokenizer=%s\n' "$CHECKPOINT" "$TOKENIZER"
 } > "$OUT/environment.txt"
 
-make -C "$ROOT" -j "$threads" CC=gcc > "$OUT/build.log" 2>&1
-binary="$ROOT/build/release/$engine"
+make -C "$ROOT" -j "$threads" CC=gcc BUILD_DIR="$OUT/bin" > "$OUT/build.log" 2>&1
+binary="$OUT/bin/$engine"
 export LLAMA_SOCKETS="$sockets" LLAMA_THREADS="$threads" LLAMA_PLACEMENT_STRICT=1
 export LLAMA_KERNELS="${KERNELS:-avx512}" LLAMA_PREFILL_BATCH=64 LLAMA_PREFILL_LOGITS=last
 export LLAMA_KV_LAYOUT=head LLAMA_ATTN=tiled LLAMA_ATTN_DECODE=split LLAMA_THP=off
