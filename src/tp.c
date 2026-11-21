@@ -745,10 +745,16 @@ static void setup_socket(Tp *tp, int s) {
   }
   float *attention_memory;
   CARVE(attention_memory, k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, tp->rows) / sizeof(float) + 1, float);
+  uint16_t *kv_bf16 = NULL;
+  size_t kv_bf16_bytes = k_attention_kv_bf16_bytes(kl, p->head_dim, p->seq_len, p->n_layers);
+  if (kv_bf16_bytes)
+    CARVE(kv_bf16, kv_bf16_bytes / sizeof(uint16_t), uint16_t);
 #undef CARVE
   if (used > sk->work_size)
     fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work_size, used);
   k_attention_init_rows(&sk->attention, hl, kl, p->head_dim, p->seq_len, tp->rows, attention_memory);
+  if (kv_bf16)
+    k_attention_set_kv_bf16(&sk->attention, kv_bf16, kl, p->head_dim, p->seq_len, p->n_layers);
   if (S == 2) {
     sk->key_cache = sk->kv_k.data;
     sk->value_cache = sk->kv_v.data;
@@ -784,6 +790,7 @@ static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs
     bytes += padded * ((size_t)p->dim + slice + groups * sizeof(float));
   }
   bytes += k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, rows) + 64;
+  bytes += k_attention_kv_bf16_bytes(kl, p->head_dim, p->seq_len, p->n_layers) + 64;
   return bytes;
 }
 

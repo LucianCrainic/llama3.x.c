@@ -130,7 +130,18 @@ typedef struct {
   int external;    /* partial was supplied by the caller (a placement region) and is not freed here */
   size_t capacity; /* floats in partial; batched attention processes as many rows per wave as fit */
   uint16_t *kv_bf16; /* LLAMA_ATTN=amx, batched: the BF16 K/V tile operands, after the partials (else NULL) */
+  /* LLAMA_ATTN=amx with a persistent BF16 copy (k_attention_set_kv_bf16): one copy per layer, keyed by the layer's key
+   * cache pointer, packed incrementally (positions [0, kv_valid) of a slot are current). */
+  uint16_t *kv_cache_bf16;
+  size_t kv_layer_elems;
+  int kv_layers, kv_used;
+  const float *kv_key[256];
+  int kv_valid[256];
 } AttentionWork;
+/* Bytes of the persistent BF16 K/V copy of `layers` layers for LLAMA_ATTN=amx (0 when not selected), and its setup. */
+size_t k_attention_kv_bf16_bytes(int n_kv_heads, int head_dim, int seq_len, int layers);
+void k_attention_set_kv_bf16(AttentionWork *work, uint16_t *memory, int n_kv_heads, int head_dim, int seq_len,
+                             int layers);
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
