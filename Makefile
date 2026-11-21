@@ -34,7 +34,7 @@ LDLIBS += $(shell pkg-config --libs libpcre2-8)
 endif
 COMMON = src/runtime.c src/kernels.c src/kernels_simd.c src/gemv.c src/attention.c src/profile.c src/numa.c src/shards.c src/workers.c src/tp.c src/gemm.c src/loader.c src/prefill.c src/tokenizer.c src/sampler.c
 APP = src/app.c src/report.c
-HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h include/testing.h src/kernels_internal.h
+HEADERS = include/runtime.h include/app.h include/kernels.h include/profile.h include/numa.h include/shards.h include/workers.h include/tp.h include/gemm.h include/loader.h include/prefill.h include/testing.h src/kernels_internal.h src/simd_exp.h
 # Regenerate the configuration stamp only when flags change; changing CC or MODE
 # must not silently reuse an executable from an earlier build.
 .PHONY: all clean test FORCE

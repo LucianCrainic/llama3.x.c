@@ -368,6 +368,12 @@ int main(void) {
   }
   run_matrix("single thread");
   run_large("single thread");
+  /* LLAMA_SWIGLU_EXP=vector: the AVX-512 exponential in the SwiGLU epilogue, within the same budget. */
+  setenv("LLAMA_SWIGLU_EXP", "vector", 1);
+  gemm_swiglu_init_env();
+  run_matrix("vector exp");
+  unsetenv("LLAMA_SWIGLU_EXP");
+  gemm_swiglu_init_env();
   int team_sizes[8] = {3, 7};
   size_t team_count = 2;
   const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "28,56" for full-socket teams on the cluster */

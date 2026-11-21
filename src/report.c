@@ -356,6 +356,8 @@ void write_report(void) {
   string(f, kernels_name() ? kernels_kv_layout_name() : NULL);
   fputs(",\n    \"q8_gemm\": ", f);
   string(f, kernels_name() ? k_gemm_q8_mode_name() : NULL);
+  fputs(",\n    \"swiglu_exp\": ", f);
+  string(f, kernels_name() ? k_gemm_swiglu_exp_name() : NULL);
   fputs(",\n    \"amx_permission\": ", f);
   string(f, gemm_amx_permission());
   fputs("\n  },\n  \"parameters\": {\n    \"mode\": ", f);

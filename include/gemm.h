@@ -144,6 +144,10 @@ Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
  * blocks. Scales stay dense [row][k / gs]. Transposed weight scales: st[(c / 32 * groups + g) * 32 + c % 32] for channel
  * c and group g, channels padded to 32 with zeros (s8_scales_t_bytes). */
 void gemm_q8_init_env(void);              /* reads LLAMA_Q8_GEMM (kernels_init) */
+/* LLAMA_SWIGLU_EXP=libm|vector: the batched Q8 GEMM's SwiGLU epilogue with libm expf (default) or the AVX-512
+ * exponential of the attention kernels (where AVX-512 runs); read by kernels_init. */
+void gemm_swiglu_init_env(void);
+const char *k_gemm_swiglu_exp_name(void);
 const char *k_gemm_q8_mode_name(void);    /* "chunk" or "pipelined" */
 int k_gemm_q8_tiled_active(void);         /* pipelined asked for and AMX active */
 size_t s8_scales_t_bytes(int rows, int cols, int gs);

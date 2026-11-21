@@ -25,6 +25,9 @@
 #else
 #define GEMM_AVX512 0
 #endif
+#if GEMM_AVX512
+#include "simd_exp.h"
+#endif
 
 enum { NC = 16, MB = 256, MR = 4, NR = 4, DEFAULT_KC = 1024 };
 
@@ -1110,6 +1113,37 @@ static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, cons
   }
 }
 
+static int swiglu_vector; /* LLAMA_SWIGLU_EXP=vector */
+
+void gemm_swiglu_init_env(void) {
+  const char *mode = getenv("LLAMA_SWIGLU_EXP");
+  swiglu_vector = 0;
+  if (!mode || !*mode || !strcmp(mode, "libm"))
+    return;
+  if (strcmp(mode, "vector"))
+    fail("LLAMA_SWIGLU_EXP must be libm or vector");
+  swiglu_vector = 1;
+}
+
+const char *k_gemm_swiglu_exp_name(void) {
+  return swiglu_vector ? "vector" : "libm";
+}
+
+#if GEMM_AVX512
+/* The SwiGLU epilogue of one block row on AVX-512 (LLAMA_SWIGLU_EXP=vector): silu_gate's expression with exp512 in
+ * place of libm's expf (about 2 ulp), so it is not bitwise the default epilogue; the W8A8 gate judges it. */
+AVX512 static void swiglu_row_avx512(float *out, const float *sum, const float *gate, int nc) {
+  const __m512 one = _mm512_set1_ps(1.0f), zero = _mm512_setzero_ps();
+  for (int c = 0; c < nc; c += 16) {
+    __mmask16 k = nc - c >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << (nc - c)) - 1u);
+    __m512 v = _mm512_maskz_loadu_ps(k, sum + c), g = _mm512_maskz_loadu_ps(k, gate + c);
+    __m512 e = exp512(_mm512_sub_ps(zero, v));
+    v = _mm512_mul_ps(v, _mm512_div_ps(one, _mm512_add_ps(one, e)));
+    _mm512_mask_storeu_ps(out + c, k, _mm512_mul_ps(v, g));
+  }
+}
+#endif
+
 /* One block of the product: activation rows [m0, m0 + Q8_MB) against output channels [n0, n0 + chunk_n) of segment s,
  * with the segment's epilogue. Each output element belongs to exactly one block, and its value does not depend on which
  * worker computes the block or in which order, so any partition of the blocks gives bitwise the same result. */
@@ -1119,6 +1153,18 @@ static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0
   q8_sums(job, seg->w, seg->pw, seg->pws, n0, nc, m0, mb, acc);
   if (seg->kind == GEMM_SWIGLU)
     q8_sums(job, seg->w3, seg->pw3, seg->pws3, n0, nc, m0, mb, gate);
+#if GEMM_AVX512
+#if defined(GEMM_EMULATE_AVX512)
+  const int vector_ok = 1; /* the test model of the intrinsics */
+#else
+  const int vector_ok = kernels_avx512_active();
+#endif
+  if (seg->kind == GEMM_SWIGLU && swiglu_vector && vector_ok) {
+    for (int r = 0; r < mb; r++)
+      swiglu_row_avx512(seg->c + (size_t)(m0 + r) * seg->ldc + n0, acc + (size_t)r * 32, gate + (size_t)r * 32, nc);
+    return;
+  }
+#endif
   for (int r = 0; r < mb; r++) {
     float *out = seg->c + (size_t)(m0 + r) * seg->ldc + n0;
     const float *sum = acc + (size_t)r * 32, *g = gate + (size_t)r * 32;
