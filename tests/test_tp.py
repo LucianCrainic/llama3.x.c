@@ -298,6 +298,30 @@ class TensorParallelTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('LLAMA_Q8_GEMM must be chunk or pipelined', result.stderr)
 
+    def test_amx_bf16_attention_on_one_and_two_sockets(self):
+        """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
+        from its work region, so two sockets agree with one socket at the fixture tolerance (all positions, batches that
+        end mid-block). Against the default attention the logits stay within a noise budget: this sinusoidal fixture
+        amplifies rounding (the BF16 GEMM alone moves its logits by rms 0.03, max 0.14; AMX attention by rms 0.05, max
+        0.25), so the budget is twice that, and the kernel itself is held to 0.03 in tests/kernels.c. The report names
+        the variant. Decode is untouched (the knob acts on batched prefill)."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        for batch in (5, 32):
+            with self.subTest(batch=batch):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                amx = [self.logits('int8', 'wide', 'batch', s, LLAMA_ATTN='amx', **args) for s in (1, 2)]
+                self.assert_agree(amx[0], amx[1], TP_WIDE_CONFIG[5])
+                default = self.logits('int8', 'wide', 'batch', 1, **args)
+                diff = [abs(a - b) for a, b in zip(default, amx[0])]
+                self.assertLessEqual(max(diff), 0.5)
+                self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+        for sockets in (1, 2):
+            data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                               LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_ATTN='amx')
+            self.assertEqual(data['build']['attention'], 'amx')
+
     def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
         """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the
         explicit BF16 mode takes AMX-BF16. The emulated-tile binaries emulate no AVX-512, so `auto` starts from the scalar

@@ -307,5 +307,35 @@ static inline __m512 _mm512_maskz_mov_ps(__mmask16 k, __m512 a) {
   EMUL_LANES(if (!(k >> i & 1)) a.v[i] = 0.0f)
   return a;
 }
+/* The AMX attention's softmax (LLAMA_ATTN=amx): masked merge and the integer round-to-BF16. */
+static inline __m512 _mm512_mask_mov_ps(__m512 src, __mmask16 k, __m512 a) {
+  EMUL_LANES(if (!(k >> i & 1)) a.v[i] = src.v[i])
+  return a;
+}
+static inline __m512i _mm512_castps_si512(__m512 a) {
+  __m512i r;
+  memcpy(&r, &a, sizeof(r));
+  return r;
+}
+static inline __m512i _mm512_and_si512(__m512i a, __m512i b) {
+  EMUL_LANES(a.i32[i] &= b.i32[i])
+  return a;
+}
+static inline __m512i _mm512_add_epi32(__m512i a, __m512i b) {
+  EMUL_LANES(a.i32[i] = (int32_t)((uint32_t)a.i32[i] + (uint32_t)b.i32[i]))
+  return a;
+}
+static inline __m512i _mm512_srli_epi32(__m512i a, unsigned count) {
+  EMUL_LANES(a.i32[i] = (int32_t)((uint32_t)a.i32[i] >> count))
+  return a;
+}
+static inline __m256i _mm512_cvtepi32_epi16(__m512i a) { /* truncation to the low 16 bits of each lane */
+  __m256i r;
+  EMUL_LANES(uint16_t h = (uint16_t)a.i32[i]; memcpy(r.i8 + 2 * i, &h, 2))
+  return r;
+}
+static inline void _mm256_storeu_si256(__m256i *p, __m256i a) {
+  memcpy(p, &a, sizeof(a));
+}
 #undef EMUL_LANES
 #endif

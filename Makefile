@@ -54,9 +54,10 @@ $(BUILD_DIR)/test-int8: tests/unit.c src/runq.c src/engine.c $(COMMON) $(HEADERS
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/unit.c src/runq.c src/engine.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-kernels: tests/kernels.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-# test-kernels with the AVX-512 kernels (src/kernels_simd.c, gemv.c, attention.c) on the scalar model of the intrinsics.
-$(BUILD_DIR)/test-kernels-emul: tests/kernels.c tests/avx512_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
-	$(CC) $(CPPFLAGS) -DKERNELS_EMULATE_AVX512 -ffp-contract=off $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+# test-kernels with the AVX-512 kernels (src/kernels_simd.c, gemv.c, attention.c) on the scalar model of the intrinsics,
+# and the AMX tiles (the LLAMA_ATTN=amx products) on their software model.
+$(BUILD_DIR)/test-kernels-emul: tests/kernels.c tests/avx512_emul.h tests/amx_emul.h $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) -DKERNELS_EMULATE_AVX512 -DGEMM_EMULATE_AMX -ffp-contract=off $(CFLAGS) tests/kernels.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-gemm: tests/gemm.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/gemm.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 # The same test with the AVX-512 microkernel running on a scalar emulation, so its code is exercised on any host.

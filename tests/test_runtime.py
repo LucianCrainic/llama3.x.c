@@ -461,8 +461,10 @@ class RuntimeTests(unittest.TestCase):
         # E5: group is built; it is recorded, and runs split where AVX-512 is not active
         _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'group'))
-        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN must be tiled or split'),
-                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled or split'),
+        # Prefill gap fix 7: amx is built; it is recorded, and runs tiled where AMX is not active
+        _, data = self.execute('run', env={'LLAMA_ATTN': 'amx'})
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('amx', 'split'))
+        for knob, value, message in (('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled, split or amx'),
                                      ('LLAMA_ATTN_TILED_QUERIES', '8', 'LLAMA_ATTN_TILED_QUERIES is no longer supported'),
                                      ('LLAMA_ATTN_TILED_ORDER', 'natural', 'LLAMA_ATTN_TILED_ORDER is no longer supported'),
                                      ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):

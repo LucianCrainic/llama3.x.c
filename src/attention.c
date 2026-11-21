@@ -1,6 +1,7 @@
 /* Attention kernels: split-K decode (split, group), batched causal prefill attention (split, tiled), the variant
  * dispatch (LLAMA_ATTN, LLAMA_ATTN_DECODE) and the K/V cache layout (LLAMA_KV_LAYOUT). Moved out of kernels_simd.c
  * unchanged (F8). */
+#include "gemm.h"
 #include "kernels_internal.h"
 #include "runtime.h"
 #include "testing.h"
@@ -553,11 +554,32 @@ static size_t attention_rows_capacity(int n_heads, int head_dim, int max_chunks,
   return fit < 1 ? 1 : fit < want ? fit : want;
 }
 
+/* Query vectors per task: 32 / kv_mul rows of the microbatch times the kv_mul query heads of one KV head, so one task is
+ * one 32-row A operand of the tile products. Keys go in blocks of 32 positions. */
+enum { AMX_ATTN_QV = 32, AMX_ATTN_KB = 32 };
+
+/* Elements of the BF16 copy of one layer's K and V (all local KV heads, every position of the context): the packed
+ * operands of the tile products, rebuilt for the positions a call reads. */
+static size_t amx_attention_elems(int n_kv_heads, int head_dim, int seq_len) {
+  size_t blocks = ((size_t)seq_len + AMX_ATTN_KB - 1) / AMX_ATTN_KB;
+  return checked_mul(checked_mul(2 * (size_t)n_kv_heads, blocks), (size_t)AMX_ATTN_KB * (size_t)head_dim);
+}
+
+static int attention_amx_selected(void); /* LLAMA_ATTN=amx (the variant table, below) */
+
+/* The split-K partials, then (LLAMA_ATTN=amx, batched) the BF16 K/V copy on the next cache line. */
+static size_t attention_amx_offset(size_t partial_floats) {
+  return (checked_mul(partial_floats, sizeof(float)) + 63) / 64 * 64;
+}
+
 size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
   int chunks = attention_max_chunks(n_kv_heads, seq_len, max_threads());
-  return checked_mul(checked_mul(attention_rows_capacity(n_heads, head_dim, chunks, rows),
-                                 attention_row_floats(n_heads, head_dim, chunks)),
-                     sizeof(float));
+  size_t floats = checked_mul(attention_rows_capacity(n_heads, head_dim, chunks, rows),
+                              attention_row_floats(n_heads, head_dim, chunks));
+  if (rows > 1 && attention_amx_selected())
+    return checked_add(attention_amx_offset(floats),
+                       checked_mul(amx_attention_elems(n_kv_heads, head_dim, seq_len), sizeof(uint16_t)));
+  return checked_mul(floats, sizeof(float));
 }
 
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len) {
@@ -574,7 +596,11 @@ void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int
   work->external = memory != NULL;
   work->capacity = checked_mul(attention_rows_capacity(n_heads, head_dim, work->max_chunks, rows),
                                attention_row_floats(n_heads, head_dim, work->max_chunks));
-  work->partial = memory ? memory : memory_alloc(work->capacity, sizeof(float), MEM_ACTIVATION);
+  size_t bytes = k_attention_bytes_rows(n_heads, n_kv_heads, head_dim, seq_len, rows);
+  work->partial = memory ? memory : memory_alloc(bytes, 1, MEM_ACTIVATION);
+  work->kv_bf16 = bytes > checked_mul(work->capacity, sizeof(float))
+                      ? (uint16_t *)((char *)work->partial + attention_amx_offset(work->capacity))
+                      : NULL;
 }
 
 void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory) {
@@ -1262,6 +1288,236 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
 }
 
 // ----------------------------------------------------------------------------
+// AMX-BF16 flash attention (LLAMA_ATTN=amx, prefill-gap fix 7)
+
+typedef struct {
+  float *out;
+  const float *q, *key_cache, *value_cache;
+  uint16_t *kv; /* [K | V][kv head][key block][AMX_ATTN_KB * head_dim] */
+  int n_heads, n_kv_heads, head_dim, kv_mul, dim, pos0, m, kblocks, qblocks, rows_per_task, tasks;
+  size_t pos_stride, head_base, head_elems;
+  int use_avx512;
+  atomic_int next_task;
+  Team *team;
+} AmxAttentionJob;
+
+static uint16_t *amx_attention_kblock(const AmxAttentionJob *j, int which, int g, int kb) {
+  return j->kv + (size_t)which * (size_t)j->n_kv_heads * j->head_elems + (size_t)g * j->head_elems +
+         (size_t)kb * AMX_ATTN_KB * (size_t)j->head_dim;
+}
+
+/* Packs key block kb of KV head g: K as the B operand of S = Q . K^T (pack_bf16_vnni of the block's rows), V as the B
+ * operand of O = P . V (the transpose: tile nt holds dims 16 nt.., pair row p holds positions 2p, 2p + 1). Positions
+ * past the prefix are zeros, so masked probabilities (exact zeros) never meet garbage. */
+static void amx_attention_pack(const AmxAttentionJob *j, int g, int kb) {
+  int positions = j->pos0 + j->m, t0 = kb * AMX_ATTN_KB;
+  int count = positions - t0 < AMX_ATTN_KB ? positions - t0 : AMX_ATTN_KB, hd = j->head_dim;
+  const float *kc = j->key_cache + (size_t)g * j->head_base + (size_t)t0 * j->pos_stride;
+  const float *vc = j->value_cache + (size_t)g * j->head_base + (size_t)t0 * j->pos_stride;
+  pack_bf16_vnni(amx_attention_kblock(j, 0, g, kb), kc, count, hd, j->pos_stride);
+  uint16_t *vp = amx_attention_kblock(j, 1, g, kb);
+  for (int nt = 0; nt < hd / 16; nt++)
+    for (int p = 0; p < AMX_ATTN_KB / 2; p++)
+      for (int c = 0; c < 16; c++)
+        for (int e = 0; e < 2; e++) {
+          int t = 2 * p + e;
+          vp[(((size_t)nt * (AMX_ATTN_KB / 2) + (size_t)p) * 16 + (size_t)c) * 2 + (size_t)e] =
+              t < count ? bf16_from_f32(vc[(size_t)t * j->pos_stride + (size_t)nt * 16 + (size_t)c]) : 0;
+        }
+}
+
+/* Online softmax of one key block for query vectors [0, nv): s holds the raw scores (stride 32), lim[v] the valid
+ * positions of the block for vector v (0 when it sees none). Updates the running maximum mx and sum l, rescales o
+ * (stride head_dim) by exp(old - new) where the maximum moved, and writes the probabilities as BF16 into p (stride 32;
+ * zeros past lim). Portable: libm expf. */
+static void amx_attention_softmax_portable(const float *s, const int *lim, int nv, float scale, float *mx, float *l,
+                                           float *o, int head_dim, uint16_t *p) {
+  for (int v = 0; v < nv; v++) {
+    uint16_t *pv = p + (size_t)v * AMX_ATTN_KB;
+    if (lim[v] <= 0) {
+      memset(pv, 0, AMX_ATTN_KB * sizeof(uint16_t));
+      continue;
+    }
+    const float *sv = s + (size_t)v * AMX_ATTN_KB;
+    float bm = sv[0] * scale;
+    for (int t = 1; t < lim[v]; t++)
+      bm = sv[t] * scale > bm ? sv[t] * scale : bm;
+    float nm = bm > mx[v] ? bm : mx[v], alpha = expf(mx[v] - nm), sum = 0.0f;
+    for (int t = 0; t < AMX_ATTN_KB; t++) {
+      float e = t < lim[v] ? expf(sv[t] * scale - nm) : 0.0f;
+      sum += e;
+      pv[t] = bf16_from_f32(e);
+    }
+    if (alpha != 1.0f)
+      for (int d = 0; d < head_dim; d++)
+        o[(size_t)v * head_dim + d] *= alpha;
+    l[v] = l[v] * alpha + sum;
+    mx[v] = nm;
+  }
+}
+
+#if HAVE_AVX512
+/* Round to nearest even BF16 of 16 finite floats (bf16_from_f32 without the NaN branch). */
+AVX512 static inline __m256i bf16_round512(__m512 x) {
+  __m512i u = _mm512_castps_si512(x);
+  __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1));
+  u = _mm512_add_epi32(u, _mm512_add_epi32(lsb, _mm512_set1_epi32(0x7fff)));
+  return _mm512_cvtepi32_epi16(_mm512_srli_epi32(u, 16));
+}
+
+/* The same on AVX-512 with exp512 (about 2 ulp). */
+AVX512 static void amx_attention_softmax_avx512(const float *s, const int *lim, int nv, float scale, float *mx,
+                                                float *l, float *o, int head_dim, uint16_t *p) {
+  const __m512 vs = _mm512_set1_ps(scale), ninf = _mm512_set1_ps(-INFINITY);
+  for (int v = 0; v < nv; v++) {
+    uint16_t *pv = p + (size_t)v * AMX_ATTN_KB;
+    if (lim[v] <= 0) {
+      memset(pv, 0, AMX_ATTN_KB * sizeof(uint16_t));
+      continue;
+    }
+    const float *sv = s + (size_t)v * AMX_ATTN_KB;
+    __mmask16 k0 = lane_mask(lim[v]), k1 = lane_mask(lim[v] - 16);
+    __m512 x0 = _mm512_mask_mov_ps(ninf, k0, _mm512_mul_ps(_mm512_loadu_ps(sv), vs));
+    __m512 x1 = _mm512_mask_mov_ps(ninf, k1, _mm512_mul_ps(_mm512_loadu_ps(sv + 16), vs));
+    float bm = _mm512_reduce_max_ps(_mm512_max_ps(x0, x1));
+    float nm = bm > mx[v] ? bm : mx[v], alpha = expf(mx[v] - nm);
+    __m512 shift = _mm512_set1_ps(nm);
+    __m512 e0 = _mm512_maskz_mov_ps(k0, exp512(_mm512_sub_ps(x0, shift)));
+    __m512 e1 = _mm512_maskz_mov_ps(k1, exp512(_mm512_sub_ps(x1, shift)));
+    float sum = _mm512_reduce_add_ps(_mm512_add_ps(e0, e1));
+    _mm256_storeu_si256((__m256i *)pv, bf16_round512(e0));
+    _mm256_storeu_si256((__m256i *)(pv + 16), bf16_round512(e1));
+    if (alpha != 1.0f) {
+      __m512 va = _mm512_set1_ps(alpha);
+      for (int d = 0; d < head_dim; d += 16)
+        _mm512_storeu_ps(o + (size_t)v * head_dim + d, _mm512_mul_ps(_mm512_loadu_ps(o + (size_t)v * head_dim + d), va));
+    }
+    l[v] = l[v] * alpha + sum;
+    mx[v] = nm;
+  }
+}
+#endif
+
+/* One task: KV head g, query block b (rows b * rows_per_task .., all kv_mul query heads of g), over every key block
+ * its rows see. */
+static void amx_attention_task(const AmxAttentionJob *j, int g, int b) {
+  enum { MAX_HD = 256 };
+  _Alignas(64) uint16_t qb[AMX_ATTN_QV * MAX_HD], pb[AMX_ATTN_QV * AMX_ATTN_KB];
+  _Alignas(64) float o[AMX_ATTN_QV * MAX_HD], s[AMX_ATTN_QV * AMX_ATTN_KB], tmp[AMX_ATTN_QV * 32];
+  float mx[AMX_ATTN_QV], l[AMX_ATTN_QV];
+  int limit[AMX_ATTN_QV], lim[AMX_ATTN_QV];
+  const int hd = j->head_dim, row0 = b * j->rows_per_task;
+  const int rows = j->m - row0 < j->rows_per_task ? j->m - row0 : j->rows_per_task, nv = rows * j->kv_mul;
+  const float scale = 1.0f / sqrtf((float)hd);
+  memset(qb, 0, sizeof(uint16_t) * AMX_ATTN_QV * (size_t)hd);
+  memset(pb, 0, sizeof(pb));
+  memset(o, 0, sizeof(float) * (size_t)nv * (size_t)hd);
+  for (int v = 0; v < nv; v++) {
+    int row = row0 + v / j->kv_mul, h = g * j->kv_mul + v % j->kv_mul;
+    const float *qv = j->q + (size_t)row * j->dim + (size_t)h * hd;
+    for (int d = 0; d < hd; d++)
+      qb[(size_t)v * hd + d] = bf16_from_f32(qv[d]);
+    limit[v] = j->pos0 + row + 1;
+    mx[v] = -INFINITY;
+    l[v] = 0.0f;
+  }
+  const int end = j->pos0 + row0 + rows; /* keys the last row sees */
+  for (int kb = 0; kb * AMX_ATTN_KB < end; kb++) {
+    const int t0 = kb * AMX_ATTN_KB, nk = end - t0 < AMX_ATTN_KB ? end - t0 : AMX_ATTN_KB;
+    amx_bf16_tile_gemm(s, AMX_ATTN_KB, qb, (size_t)hd, amx_attention_kblock(j, 0, g, kb), nv, nk, hd);
+    for (int v = 0; v < nv; v++) {
+      int n = limit[v] - t0;
+      lim[v] = n < 0 ? 0 : n > nk ? nk : n;
+    }
+#if HAVE_AVX512
+    if (j->use_avx512)
+      amx_attention_softmax_avx512(s, lim, nv, scale, mx, l, o, hd, pb);
+    else
+#endif
+      amx_attention_softmax_portable(s, lim, nv, scale, mx, l, o, hd, pb);
+    const uint16_t *vp = amx_attention_kblock(j, 1, g, kb);
+    for (int d0 = 0; d0 < hd; d0 += 32) {
+      amx_bf16_tile_gemm(tmp, 32, pb, AMX_ATTN_KB, vp + (size_t)(d0 / 16) * (AMX_ATTN_KB / 2) * 32, nv,
+                         hd - d0 < 32 ? hd - d0 : 32, AMX_ATTN_KB);
+      for (int v = 0; v < nv; v++)
+        for (int d = 0; d < 32 && d0 + d < hd; d++)
+          o[(size_t)v * hd + d0 + d] += tmp[v * 32 + d];
+    }
+  }
+  for (int v = 0; v < nv; v++) {
+    int row = row0 + v / j->kv_mul, h = g * j->kv_mul + v % j->kv_mul;
+    float *out = j->out + (size_t)row * j->dim + (size_t)h * hd, inv = 1.0f / l[v];
+    for (int d = 0; d < hd; d++)
+      out[d] = o[(size_t)v * hd + d] * inv;
+  }
+}
+
+/* Pack every key block the call reads, barrier, then claim tasks longest first (the last query blocks see the most
+ * keys). */
+static void amx_attention_team(const void *p, int worker, int workers) {
+  AmxAttentionJob *j = (AmxAttentionJob *)p;
+  int packs = j->n_kv_heads * j->kblocks;
+  for (int i = (int)((long long)packs * worker / workers); i < (int)((long long)packs * (worker + 1) / workers); i++)
+    amx_attention_pack(j, i / j->kblocks, i % j->kblocks);
+  if (j->team)
+    team_barrier(j->team);
+  for (int task; (task = atomic_fetch_add_explicit(&j->next_task, 1, memory_order_relaxed)) < j->tasks;) {
+    int b = j->qblocks - 1 - task / j->n_kv_heads, g = task % j->n_kv_heads;
+    amx_attention_task(j, g, b);
+  }
+}
+
+static int amx_attention_supported(const AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int m) {
+  int kv_mul = n_heads / n_kv_heads;
+  return m > 1 && gemm_amx_active() && work->kv_bf16 && head_dim % 32 == 0 && head_dim <= 256 && kv_mul >= 1 &&
+         AMX_ATTN_QV % kv_mul == 0;
+}
+
+static void attention_batch_amx(float *out, const float *q, const float *key_cache, const float *value_cache,
+                                float *att, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
+                                int pos0, int m, size_t pos_stride, size_t head_base) {
+  if (!amx_attention_supported(work, n_heads, n_kv_heads, head_dim, m)) {
+    static atomic_flag noted = ATOMIC_FLAG_INIT;
+    if (m > 1 && !atomic_flag_test_and_set(&noted))
+      LOG(LOG_INFO, "LLAMA_ATTN=amx: %s, running tiled attention instead",
+          !gemm_amx_active() ? "AMX is not active"
+                             : "head_dim must be a multiple of 32 up to 256 and 32 a multiple of the query heads per KV head");
+    attention_batch_tiled(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m,
+                          pos_stride, head_base);
+    return;
+  }
+  int kv_mul = n_heads / n_kv_heads, rows_per_task = AMX_ATTN_QV / kv_mul;
+  AmxAttentionJob job = {.out = out,
+                         .q = q,
+                         .key_cache = key_cache,
+                         .value_cache = value_cache,
+                         .kv = work->kv_bf16,
+                         .n_heads = n_heads,
+                         .n_kv_heads = n_kv_heads,
+                         .head_dim = head_dim,
+                         .kv_mul = kv_mul,
+                         .dim = n_heads * head_dim,
+                         .pos0 = pos0,
+                         .m = m,
+                         .kblocks = (pos0 + m + AMX_ATTN_KB - 1) / AMX_ATTN_KB,
+                         .qblocks = (m + rows_per_task - 1) / rows_per_task,
+                         .rows_per_task = rows_per_task,
+                         .pos_stride = pos_stride,
+                         .head_base = head_base,
+                         .head_elems = ((size_t)seq_len + AMX_ATTN_KB - 1) / AMX_ATTN_KB * AMX_ATTN_KB * (size_t)head_dim,
+#if HAVE_AVX512
+                         .use_avx512 = kernels_isa == KERNELS_AVX512,
+#endif
+                         .team = current_team};
+  job.tasks = job.qblocks * n_kv_heads;
+  atomic_init(&job.next_task, 0);
+  if (current_team)
+    team_run(current_team, amx_attention_team, &job);
+  else
+    amx_attention_team(&job, 0, 1);
+}
+
+// ----------------------------------------------------------------------------
 // Attention variant dispatch (E1)
 
 /* Each public attention entry point forwards to one entry of a table, chosen once by kernels_init from LLAMA_ATTN
@@ -1286,6 +1542,7 @@ typedef struct {
 static const AttentionBatchEntry attention_batch_table[] = {
     {"tiled", attention_batch_tiled},
     {"split", attention_batch_split},
+    {"amx", attention_batch_amx},
 };
 static const AttentionDecodeEntry attention_decode_table[] = {
     {"split", attention_decode_split},
@@ -1314,6 +1571,10 @@ int kernels_attention_select(const char *batch, const char *decode) {
   return 1;
 }
 
+static int attention_amx_selected(void) {
+  return attention_batch_active->run == attention_batch_amx;
+}
+
 const char *kernels_attention_name(void) {
   return attention_batch_active->name;
 }
@@ -1334,7 +1595,7 @@ static void attention_init_from_env(void) {
       if (!strcmp(batch, attention_batch_table[i].name))
         found = &attention_batch_table[i];
     if (!found)
-      fail("LLAMA_ATTN must be tiled or split");
+      fail("LLAMA_ATTN must be tiled, split or amx");
     attention_batch_active = found;
     attention_batch_requested = 1;
   }

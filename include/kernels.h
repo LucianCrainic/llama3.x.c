@@ -129,6 +129,7 @@ typedef struct {
   int max_chunks, n_heads, head_dim, workers;
   int external;    /* partial was supplied by the caller (a placement region) and is not freed here */
   size_t capacity; /* floats in partial; batched attention processes as many rows per wave as fit */
+  uint16_t *kv_bf16; /* LLAMA_ATTN=amx, batched: the BF16 K/V tile operands, after the partials (else NULL) */
 } AttentionWork;
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
