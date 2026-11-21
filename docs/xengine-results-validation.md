@@ -134,6 +134,16 @@ The first five rows are computed directly from the report files with a separate 
 | llama3.x.c, 1S, HBM, P, repeat 2 | AMX_BUSY 1.3487e10 cycles of 2.6206e11 unhalted core cycles in a 2.2059 s window | 5.15% | 5.1% (median of the one run) |
 | llama3.x.c, 1S, HBM, D, repeat 1 | package 359.4 W and 161.3 W, DRAM 22.8 W and 20.8 W, 1380.8 J in the window, 127 tokens | 10.87 J/token (re-integrated: 10.872; 4.78 net) | 10.96 and 4.82 (median of repeats 1 and 2) |
 
+## Independent verification
+
+A separate verifier re-derived the results from the raw per-run files of the three campaign directories with its own scripts (not `runs.csv`, not these tables). Result: **verified**, with four wording corrections (applied).
+- All 18 headline cells, both metrics (36 values): maximum deviation 0.17% (llama.cpp 1S DDR decode), none above 1%.
+- About 18 counter-derived cells re-integrated from `perf.csv` and the anchors (bandwidth, GB per token, UPI, AMX share, J per token of the llama3.x.c one-socket decode): all reproduce; the 23 placement rows reproduce to 0.01 GiB; the control cell's server log confirms vLLM re-binds to its CPUs' node.
+- Exactness of all 186 runs (token counts, prompt lengths, no stop token, HTTP 200, 7 prefix-cache checks at 0.0), the check and phase-result counts, and the absence of multiplexing: identical.
+- Corrections applied: "about 4 ms" consistently; basis of "3.6x" (tok/s; 3.65x and 3.71x by TTFT); the UPI factor is "consistent with", not "confirmed"; the llama.cpp 2S Cache cell and the TTFT definitions noted under the headline; job ids in the captions; the nominal-bytes comparison of vLLM reworded.
+- **Not re-derived:** the CAS calibration job 5892172 and the tuning job 5892194 (read as setup records only), the idle-baseline netting, the power ranges (339-366 W), the long-context (L) and 8192-token prefill tables, and the Cache-node window coverage (0.914 minimum). The byte factors (64 B, 32 B, 64/9 B) were taken from this record.
+- Follow-up job 5892206 (llama.cpp two sockets, 64, 48, 40, 32 threads): 64 stays best (see the results document, section 4).
+
 ## How to reproduce
 
 ```bash

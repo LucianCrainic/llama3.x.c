@@ -18,7 +18,7 @@ On one socket HBM speeds up decode by 1.74x (llama3.x.c), 1.63x (llama.cpp) and 
 engine and an equivalent node (anchor ratio 1.004), but only 1.00-1.20x for prefill, which is compute-bound. llama3.x.c decodes fastest
 everywhere (51.9 tok/s on one socket and 99.1 on two, both HBM, against 40.6 / 23.9 for llama.cpp and 40.5 / 61.2 for vLLM) and scales almost
 perfectly to two sockets (1.91x, 0.015 GB of UPI traffic per token, each socket reads its own shard). vLLM is 3.6x faster than llama3.x.c in
-prefill (TTFT 0.618 s against 2.258 s for 2048 tokens on one socket): all three engines use AMX, but llama3.x.c keeps the AMX unit busy
+prefill by tok/s (3.65x by TTFT at one socket, 3.71x at two; TTFT 0.618 s against 2.258 s for 2048 tokens on one socket): all three engines use AMX, but llama3.x.c keeps the AMX unit busy
 for 5% of its core cycles against 21% for vLLM. llama.cpp is the one engine that gets slower on two sockets in HBM (0.59x): its single
 process reads interleaved pages, 4.44 GB per token (50% of all reads) cross UPI, and the 106 GB/s that crossed is about twice the
 roofline of remote HBM (about 50 GB/s). Stock vLLM never reached HBM in Flat mode: with `numactl --membind` to the HBM node it decodes at
@@ -31,6 +31,7 @@ at 339-366 W per active socket for every engine and tier, so energy per token fo
 
 Decode tok/s (workload D, 86-token prompt, 128 generated tokens) and TTFT in seconds (2048-token prompt), median of 3, **measured**. Each
 cell: decode tok/s / TTFT s. Different nodes per column; engines are compared within a column only. vLLM on HBM is the **patched** variant (section 3).
+Notes: (a) the llama.cpp 2S Cache cell (19.3 / 5.707) is the out-of-the-box layout of the Cache set (112 threads, no interleave, by design not tuned), not the tuned layout of the Flat cells (section 7). (b) TTFT is each engine's own definition: llama3.x.c `time_to_first_token` (includes tokenisation and the first sample); llama.cpp 2048 / the `llama-bench` pp rate; vLLM the client-side latency to the first streamed token over HTTP.
 
 | Engine | Sockets | Flat HBM (node A) | Flat DDR (node B) | Cache (Cache node) |
 | --- | ---: | ---: | ---: | ---: |
@@ -105,7 +106,7 @@ llama3.x.c on two sockets in HBM (6.2%) and three llama.cpp cells in DDR (4.8-6.
 
 ## 2. Q2: decode memory bandwidth and bytes per token
 
-Counters of repeat 1 (MEM group: `ddr_cas_rd` at 64 B and `hbm_cas_rd` at 32 B per count, see section 3 for the calibration), cut to the decode
+Counters of repeat 1 (jobs 5892201 and 5892202; MEM group: `ddr_cas_rd` at 64 B and `hbm_cas_rd` at 32 B per count, see section 3 for the calibration), cut to the decode
 window of the run by its marker file; one run per cell, so no range. **Measured** counters, **derived** rates. Roofline: 552 GB/s per socket
 for local HBM and 262 GB/s per socket for local DDR (`hbm-roofline.md`), times the number of sockets used. Nominal bytes per token: 7.97 GB
 for the Q8_0 engines (the 7974764544 B of weights streamed per token: 32 layers 7.416 GB plus the LM head 0.558 GB) and 8.03 GB for
@@ -135,7 +136,7 @@ sits at 73% of its roofline. Two sockets in HBM reach 707 GB/s (64% of 1104). (2
 llama.cpp, read more: 8.72 GB/token (1.09x nominal) for 351 GB/s, against 7.72 GB/token for 400 GB/s. Of llama.cpp's 1.28x deficit in decode
 rate on one socket (40.6 against 51.9 tok/s), 1.14x is bandwidth and 1.13x is bytes (**derived**). The extra bytes are consistent with its
 AMX repack layout (its AMX model buffer is 8498 MiB = 8.91 GB for 7.97 GB of per-token weights; an interpretation, not profiled). vLLM reads
-the least above its nominal (0.98x) but streams only 319 GB/s (58% of the roofline). (3) The long-context cost matches the KV size: llama3.x.c
+0.98x of its nominal (llama3.x.c 0.97x, below nominal as well) but streams only 319 GB/s (58% of the roofline). (3) The long-context cost matches the KV size: llama3.x.c
 adds 2.17 GB per token at 8192 (derived KV 2.16 GB), llama.cpp 1.02-1.13 GB and vLLM 1.00-1.10 GB (derived 1.08 GB).
 
 Precision of these figures: the GB/token of the same configuration read from the DDR counter at 64 B and the HBM counter at 32 B agree to
@@ -144,7 +145,7 @@ sockets in HBM is only 1.34 s long, so its GB/s carries about 0.1 s / 1.34 s of 
 
 ## 3. Q3: which tier served the reads
 
-DDR and HBM read bandwidth summed over both sockets, repeat 1, for decode (D) and prefill (P). "Asked for" is the tier the configuration
+DDR and HBM read bandwidth summed over both sockets (jobs 5892201 and 5892202), repeat 1, for decode (D) and prefill (P). "Asked for" is the tier the configuration
 requested. **Measured** counters, **derived** shares. The vLLM row "stock + membind" is the control: stock vLLM started with
 `numactl --membind` to the HBM node, which vLLM ignores because it binds each worker's memory to the NUMA node of its CPUs.
 
@@ -213,7 +214,7 @@ Mechanisms, from the engines' own configuration and the placement evidence of ea
   (`numa_maps`: 7.05 GiB on node 2 and 7.05 GiB on node 3; DDR: nodes 0 and 1); the only traffic across sockets is the reduce of activations,
   0.015 GB per token. Decode scales 1.91x (HBM), 1.88x (DDR); 8192-token prefill 1.82-1.84x, 2048-token prefill 1.68-1.72x.
 - **llama.cpp: one process, no tensor parallelism.** `numactl --interleave` over the two HBM (or DDR) nodes, 64 threads (32 per socket, the best of
-  eight layouts of the tuning job 5892194: 112 threads 20.8 tok/s, 96 threads 22.1, 64 threads 25.9 on HBM, against 41.6 for one socket). Every second
+  eight layouts of the tuning job 5892194: 112 threads 20.8 tok/s, 96 threads 22.1, 64 threads 25.9 on HBM, against 41.6 for one socket; a follow-up with 64, 48, 40 and 32 threads, job 5892206, kept 64 best: HBM 25.6, 24.3, 25.3, 25.8 and DDR 31.4, 29.1, 28.1, 25.1 tok/s). Every second
   page is remote, so about half of all reads cross UPI: 4.44 GB per token of 8.82 (50.3%) on HBM, 4.41 of 8.81 (50.0%) on DDR. That is **106 GB/s
   of UPI data (58.7 and 47.5 GB/s received at the two sockets, 53 on average, within 6% of the roofline of remote HBM, about 50 GB/s)**, so the two sockets together deliver only
   211 GB/s from HBM, below one socket's 351 GB/s; decode is 0.59x of one socket. In DDR the remote traffic (129 GB/s, 65 on average per socket) is
@@ -224,13 +225,13 @@ Mechanisms, from the engines' own configuration and the placement evidence of ea
   (TPOT 16.3 ms on two sockets against 24.7 ms on one, HBM), which points at fixed per-step costs (scheduler, all-reduce latency, sampling) of about
   4 ms (12.4 ms would be perfect scaling); this is an inference from the numbers, not a profile. On HBM, vLLM's long-context decode scales 1.47x and its prefill 1.68x (2048) to 1.97x (8192).
 
-UPI convention. The flit-to-byte factor (64/9) is the PCM convention and was an unverified assumption; the llama.cpp rows now confirm it:
-interleaving two nodes sends exactly half of the reads over UPI, and the counted 4.44 and 4.41 GB per token are 50.3% and 50.0% of the 8.82 and 8.81 GB read per
-token. Receive and transmit totals are equal in every run.
+UPI convention. The flit-to-byte factor (64/9) is the PCM convention and was an unverified assumption; the llama.cpp rows are consistent with it to about 1%,
+assuming a 50% remote share under interleave over two nodes (8 B per flit would give 56%): the counted 4.44 and 4.41 GB per token are 50.3% and 50.0% of the 8.82 and 8.81 GB read per
+token. This is a consistency check, not a proof (remote writes and snoop responses also use data flits). Receive and transmit totals are equal in every run.
 
 ## 5. Q5: AMX in prefill and decode
 
-Repeat 2 (COMPUTE group: cycles, instructions, `EXE.AMX_BUSY`) on the Flat nodes; the Cache node has only user-mode per-process counters of
+Repeat 2 (jobs 5892201 and 5892202; COMPUTE group: cycles, instructions, `EXE.AMX_BUSY`) on the Flat nodes; the Cache node has only user-mode per-process counters of
 repeat 1. `AMX_OPS_RETIRED.INT8` reads 0 on this CPU in every run, even where AMX demonstrably runs (the setup jobs show `EXE.AMX_BUSY` of 8.3e10
 cycles over a whole `llama-bench` invocation of llama.cpp with its AMX repack and 0 with `--repack 0`), so it carries no information and **`EXE.AMX_BUSY` is the evidence**. The share is
 `EXE.AMX_BUSY` over unhalted core cycles, summed over all counted cores. **Measured**; GHz assumes 1.9 GHz of reference cycles.
@@ -292,7 +293,7 @@ Neither was profiled in this campaign.
 
 ## 6. Q6: power and energy
 
-Average RAPL power per phase, repeats 1 and 2 (both carry the energy events; median of the 2), both sockets summed, and joules per token
+Average RAPL power per phase (jobs 5892201 and 5892202), repeats 1 and 2 (both carry the energy events; median of the 2), both sockets summed, and joules per token
 from package plus DRAM energy of both sockets over the phase window divided by the tokens of the phase (prefill: 2048; decode: 127 steps for llama3.x.c and
 vLLM, 128 for llama.cpp). "net" subtracts the idle baseline of the same job (10 s at job start). The idle baseline per socket is 140.1 / 133.5 W
 (package) and 22.1 / 20.5 W (DRAM) on node A, 135.9 / 134.1 W and 21.1 / 19.1 W on node B. One-socket runs include the idle second socket
@@ -329,7 +330,7 @@ consistent choice, and the HBM advantage in J/token may be slightly overstated i
 
 ## 7. Q7: HBM speedup over DDR, and Cache mode
 
-HBM node A over DDR node B, medians of tok/s, **derived**: raw ratio, and in brackets the ratio divided by the node-to-node anchor (llama3.x.c, one socket, HBM,
+HBM node A (job 5892201) over DDR node B (job 5892202), medians of tok/s, **derived**: raw ratio, and in brackets the ratio divided by the node-to-node anchor (llama3.x.c, one socket, HBM,
 D, run on both nodes: decode tok/s node A / node B = 1.004, 86-token prefill 0.997, section 8). vLLM on HBM is patched, on DDR stock (the DDR case is
 unaffected by the patch: stock already binds DDR). The anchor shifts no cell by more than 0.01.
 
@@ -349,7 +350,7 @@ only 1.00-1.24x (llama.cpp on two sockets 0.84x): prefill is bound by AMX and th
 the engine's use of the bandwidth: llama3.x.c turns 1.72x of extra bandwidth into 1.74x, llama.cpp 1.60x (351 / 219) into 1.63x, vLLM 1.61x (319 / 198) into 1.63x. The HBM / DDR rooflines differ by
 2.1x; no engine reaches it because on one socket the HBM runs reach 58-73% of their roofline and the DDR runs 76-89% of theirs.
 
-Cache mode (Cache node, out of the box, no binding) against Flat DDR and Flat HBM, medians of tok/s (**derived** ratios). The Cache node is a different physical node and has no
+Cache mode (Cache node, job 5892196, out of the box, no binding) against Flat DDR and Flat HBM, medians of tok/s (**derived** ratios). The Cache node is a different physical node and has no
 anchor run, so the ratios carry the node-to-node difference that section 8 bounds at about 1% for the two Flat nodes but not for the Cache node.
 
 | Engine | Metric | Flat DDR | Cache | Flat HBM | Cache / DDR | Flat HBM / Cache |
@@ -463,7 +464,7 @@ on a repeated prompt) in every configuration. No engine produced garbage; the te
 ## 10. Follow-ups
 
 1. Profile the llama3.x.c prefill: the non-AMX 95% of the cycles (the Q8_0 group epilogue and the attention) are where the 3.6x to vLLM sits. A per-channel or per-row-scale prefill path, and AMX attention, are the candidates.
-2. llama.cpp on two sockets: one process per socket with a split (tensor parallel through its RPC backend or a pipeline over two instances), to test whether it can leave the UPI limit; vLLM's two-socket scaling (1.51x in HBM) would also gain from finding the fixed 5 ms.
+2. llama.cpp on two sockets: one process per socket with a split (tensor parallel through its RPC backend or a pipeline over two instances), to test whether it can leave the UPI limit; vLLM's two-socket scaling (1.51x in HBM) would also gain from finding the fixed 4 ms (3.9 ms measured).
 3. Report the vLLM node-binding behaviour upstream or keep the patch with the campaign; check it with the next vLLM release.
 4. G = 1 runs for the cross-run uniform TPOT definition, if the two definitions are to be compared on more than within-run data.
 5. Run an anchor cell on the Cache node and repeat Cache mode with privileged counters (CAS, RAPL), and a working set larger than the HBM cache.
