@@ -336,7 +336,14 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   if (!partial)
     return 0;
   K8Weight wq = tp->quantized ? q8_weight(w) : (K8Weight){0};
-  ProjectJob job = {.n = n, .d = dim, .gs = tp_group(tp, n), .partial = partial, .ld = w->ld, .x = x, .w = w->q, .input = in,
+  ProjectJob job = {.n = n,
+                    .d = dim,
+                    .gs = tp_group(tp, n),
+                    .partial = partial,
+                    .ld = w->ld,
+                    .x = x,
+                    .w = w->q,
+                    .input = in,
                     .wq = tp->quantized ? &wq : NULL};
   SPROFILE(phase, project_reduce(tp, sk, &job, slot));
   return 1;
@@ -384,9 +391,9 @@ static void forward_fp32(Tp *tp, int s) {
 
 /* Q8_0 (B6): the checkpoint's group size and scales and the Q8_0 activation rule (W8A8, or FP32 inputs for W8A32). Row
  * shards quantize the full normalized input, which is identical on both sockets; Wo and W2 quantize only the owned
- * slice, which starts on a group boundary, so its groups are exactly the original groups. Per-channel INT8 has one group
- * per input: each socket's Wo/W2 slice gets its own per-token scale (as a tensor-parallel rank quantizes its shard), so
- * two sockets agree with one within the W8A8 noise, not bitwise. */
+ * slice, which starts on a group boundary, so its groups are exactly the original groups. Per-channel INT8 has one
+ * group per input: each socket's Wo/W2 slice gets its own per-token scale (as a tensor-parallel rank quantizes its
+ * shard), so two sockets agree with one within the W8A8 noise, not bitwise. */
 static K8Input q8_input(const Tp *tp, int8_t *q, float *scales, const float *x, int n) {
   if (tp->fp32_activations)
     return (K8Input){NULL, NULL, x};
@@ -548,8 +555,8 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
     return 0;
   GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
   if (tp->quantized) {
-    GemmQ8Segment seg = {.c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales,
-                         .n = tp->c.dim, .kind = kind};
+    GemmQ8Segment seg = {
+        .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
     gemm_q8(tp, aq, as, k, &seg, 1);
   } else {
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
@@ -582,9 +589,8 @@ static void quantize_batch(const Tp *tp, int8_t *q, float *scales, const float *
 static void norm_quantize_batch(Tp *tp, TpSocket *sk, int s, const float *weight) {
   int m = tp->bcount, dim = tp->c.dim;
   if (tp->quantized && tp->tiled) {
-    SPROFILE(PHASE_QUANTIZE,
-             k_rmsnorm_quantize_rows_tiled(sk->xq, sk->xs, sk->xb, sk->x, weight, m, dim, tp->c.norm_eps,
-                                           tp_group(tp, dim)));
+    SPROFILE(PHASE_QUANTIZE, k_rmsnorm_quantize_rows_tiled(sk->xq, sk->xs, sk->xb, sk->x, weight, m, dim,
+                                                           tp->c.norm_eps, tp_group(tp, dim)));
     return;
   }
   SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, weight, m));
@@ -610,13 +616,27 @@ static void forward_batch(Tp *tp, int s) {
     const Shard *wq = shards_find(&tp->set, T_WQ, l, s), *wk = shards_find(&tp->set, T_WK, l, s),
                 *wv = shards_find(&tp->set, T_WV, l, s);
     if (q8) {
-      GemmQ8Segment qkv[3] = {
-          {.c = sk->q, .ldc = ql, .w = q8_weight(wq), .pw = packed_copy(sk, l, 0), .pws = packed_scales(sk, l, 0),
-           .n = ql, .kind = GEMM_STORE},
-          {.c = kd, .ldc = kvl, .w = q8_weight(wk), .pw = packed_copy(sk, l, 1), .pws = packed_scales(sk, l, 1),
-           .n = kvl, .kind = GEMM_STORE},
-          {.c = vd, .ldc = kvl, .w = q8_weight(wv), .pw = packed_copy(sk, l, 2), .pws = packed_scales(sk, l, 2),
-           .n = kvl, .kind = GEMM_STORE}};
+      GemmQ8Segment qkv[3] = {{.c = sk->q,
+                               .ldc = ql,
+                               .w = q8_weight(wq),
+                               .pw = packed_copy(sk, l, 0),
+                               .pws = packed_scales(sk, l, 0),
+                               .n = ql,
+                               .kind = GEMM_STORE},
+                              {.c = kd,
+                               .ldc = kvl,
+                               .w = q8_weight(wk),
+                               .pw = packed_copy(sk, l, 1),
+                               .pws = packed_scales(sk, l, 1),
+                               .n = kvl,
+                               .kind = GEMM_STORE},
+                              {.c = vd,
+                               .ldc = kvl,
+                               .w = q8_weight(wv),
+                               .pw = packed_copy(sk, l, 2),
+                               .pws = packed_scales(sk, l, 2),
+                               .n = kvl,
+                               .kind = GEMM_STORE}};
       SPROFILE(PHASE_QKV, gemm_q8(tp, sk->xq, sk->xs, dim, qkv, 3));
     } else {
       GemmSegment qkv[3] = {{.c = sk->q, .ldc = ql, .w = wq->q, .ldw = wq->ld, .n = ql, .kind = GEMM_STORE},
@@ -635,18 +655,25 @@ static void forward_batch(Tp *tp, int s) {
     int ok;
     if (q8)
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->xb, (size_t)ql, ql));
-    SPROFILE(PHASE_WO, ok = project_batch_reduce(tp, sk, sk->xb, ql, sk->aq, sk->as, ql,
-                                                 shards_find(&tp->set, T_WO, l, s), packed_copy(sk, l, 3),
-                                                 packed_scales(sk, l, 3)));
+    SPROFILE(PHASE_WO,
+             ok = project_batch_reduce(tp, sk, sk->xb, ql, sk->aq, sk->as, ql, shards_find(&tp->set, T_WO, l, s),
+                                       packed_copy(sk, l, 3), packed_scales(sk, l, 3)));
     if (!ok)
       return;
 
     norm_quantize_batch(tp, sk, s, norm_weight(tp, T_RMS_FFN, l, s));
     const Shard *w1 = shards_find(&tp->set, T_W1, l, s), *w3 = shards_find(&tp->set, T_W3, l, s);
     if (q8) {
-      GemmQ8Segment up = {.c = sk->hb, .ldc = hidden_l, .w = q8_weight(w1), .w3 = q8_weight(w3),
-                          .pw = packed_copy(sk, l, 4), .pw3 = packed_copy(sk, l, 6), .pws = packed_scales(sk, l, 4),
-                          .pws3 = packed_scales(sk, l, 6), .n = hidden_l, .kind = GEMM_SWIGLU};
+      GemmQ8Segment up = {.c = sk->hb,
+                          .ldc = hidden_l,
+                          .w = q8_weight(w1),
+                          .w3 = q8_weight(w3),
+                          .pw = packed_copy(sk, l, 4),
+                          .pw3 = packed_copy(sk, l, 6),
+                          .pws = packed_scales(sk, l, 4),
+                          .pws3 = packed_scales(sk, l, 6),
+                          .n = hidden_l,
+                          .kind = GEMM_SWIGLU};
       SPROFILE(PHASE_W1_W3, gemm_q8(tp, sk->xq, sk->xs, dim, &up, 1));
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->hb, (size_t)hidden_l, hidden_l));
     } else {

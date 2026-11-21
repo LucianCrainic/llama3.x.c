@@ -554,8 +554,8 @@ static size_t attention_rows_capacity(int n_heads, int head_dim, int max_chunks,
   return fit < 1 ? 1 : fit < want ? fit : want;
 }
 
-/* Query vectors per task: 32 / kv_mul rows of the microbatch times the kv_mul query heads of one KV head, so one task is
- * one 32-row A operand of the tile products. Keys go in blocks of 32 positions. */
+/* Query vectors per task: 32 / kv_mul rows of the microbatch times the kv_mul query heads of one KV head, so one task
+ * is one 32-row A operand of the tile products. Keys go in blocks of 32 positions. */
 enum { AMX_ATTN_QV = 32, AMX_ATTN_KB = 32 };
 
 /* Elements of the BF16 copy of one layer's K and V (all local KV heads, every position of the context): the packed
@@ -1327,7 +1327,7 @@ static void attention_batch_tiled(float *out, const float *q, const float *key_c
 typedef struct {
   float *out;
   const float *q, *key_cache, *value_cache;
-  uint16_t *kv; /* [K | V][kv head][key block][AMX_ATTN_KB * head_dim] */
+  uint16_t *kv;  /* [K | V][kv head][key block][AMX_ATTN_KB * head_dim] */
   int pack_from; /* first key block to pack (the persistent copy is current below it) */
   int n_heads, n_kv_heads, head_dim, kv_mul, dim, pos0, m, kblocks, qblocks, rows_per_task, tasks;
   size_t pos_stride, head_base, head_elems;
@@ -1522,8 +1522,9 @@ static void attention_batch_amx(float *out, const float *q, const float *key_cac
     static atomic_flag noted = ATOMIC_FLAG_INIT;
     if (m > 1 && !atomic_flag_test_and_set(&noted))
       LOG(LOG_INFO, "LLAMA_ATTN=amx: %s, running tiled attention instead",
-          !gemm_amx_active() ? "AMX is not active"
-                             : "head_dim must be a multiple of 32 up to 256 and 32 a multiple of the query heads per KV head");
+          !gemm_amx_active()
+              ? "AMX is not active"
+              : "head_dim must be a multiple of 32 up to 256 and 32 a multiple of the query heads per KV head");
     amx_kv_invalidate(work, key_cache, pos0);
     attention_batch_tiled(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m,
                           pos_stride, head_base);
@@ -1566,7 +1567,8 @@ static void attention_batch_amx(float *out, const float *q, const float *key_cac
                          .rows_per_task = rows_per_task,
                          .pos_stride = pos_stride,
                          .head_base = head_base,
-                         .head_elems = ((size_t)seq_len + AMX_ATTN_KB - 1) / AMX_ATTN_KB * AMX_ATTN_KB * (size_t)head_dim,
+                         .head_elems =
+                             ((size_t)seq_len + AMX_ATTN_KB - 1) / AMX_ATTN_KB * AMX_ATTN_KB * (size_t)head_dim,
 #if HAVE_AVX512
                          .use_avx512 = kernels_isa == KERNELS_AVX512,
 #endif
@@ -1750,8 +1752,8 @@ typedef struct {
 /* Rows per task of the parallel store: 16 rows of one head are 8 KiB of the destination at head_dim 128. */
 enum { KV_STORE_ROWS = 16 };
 
-/* Tasks [first, last) of the parallel store: task t is rows block t % blocks of KV head t / blocks (rows layout: one head
- * of n_kv_heads * head_dim), so consecutive tasks of a worker fill a contiguous run of the destination. */
+/* Tasks [first, last) of the parallel store: task t is rows block t % blocks of KV head t / blocks (rows layout: one
+ * head of n_kv_heads * head_dim), so consecutive tasks of a worker fill a contiguous run of the destination. */
 static void kv_store_chunks(const void *p, int segment, int first, int last) {
   (void)segment;
   const KvStoreJob *j = p;

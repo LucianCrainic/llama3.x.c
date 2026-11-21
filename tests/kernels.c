@@ -1,10 +1,10 @@
 /* Kernel regression: every available instruction set against double-precision
  * references, and bitwise agreement for RoPE and activation quantization. */
-#include "gemm.h"
 #include "kernels.h"
+#include "gemm.h"
 #include "numa.h"
-#include "workers.h"
 #include "testing.h"
+#include "workers.h"
 #include <assert.h>
 #include <float.h>
 #include <math.h>
@@ -1465,8 +1465,8 @@ static void test_attention_amx(void) {
           checks++;
           if (variant && !work.kv_bf16 && failures++ < 20)
             fprintf(stderr, "attention amx [%s]: no BF16 K/V workspace\n", current);
-          k_attention_batch_layout(variant ? got : want, q, kc, vc, att, &work, heads, kv, hd, seq, pos0, m,
-                                   (size_t)hd, (size_t)seq * hd);
+          k_attention_batch_layout(variant ? got : want, q, kc, vc, att, &work, heads, kv, hd, seq, pos0, m, (size_t)hd,
+                                   (size_t)seq * hd);
           k_attention_free(&work);
         }
         assert(kernels_attention_select("split", NULL));

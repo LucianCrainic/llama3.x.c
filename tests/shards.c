@@ -184,8 +184,7 @@ static void run_case(const Case *c) {
     size_t elem = sh->src->dtype == DT_Q8 ? 1 : sizeof(float);
     assert(contained(r, sh->q, (size_t)sh->rows * sh->cols * elem) && (uintptr_t)sh->q % 64 == 0);
     if (sh->src->dtype == DT_Q8)
-      assert(contained(r, sh->s, (size_t)sh->rows * (size_t)shard_groups(sh) * 4) &&
-             (uintptr_t)sh->s % 64 == 0);
+      assert(contained(r, sh->s, (size_t)sh->rows * (size_t)shard_groups(sh) * 4) && (uintptr_t)sh->s % 64 == 0);
     if (sh->kind == SHARD_GLOBAL)
       assert(sh->socket == 0 && sh->src->role == T_EMBED && !c->config.shared);
   }

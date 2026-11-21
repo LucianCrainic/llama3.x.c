@@ -659,11 +659,11 @@ AMX_AVX_TARGET static inline void q8_tiled_rescale(float *o, const int32_t *d, c
     const __m512 x = _mm512_set1_ps(xs[(size_t)r * xs_ld]);
     float *orow = o + r * 32;
     const int32_t *drow = d + r * 32;
-    _mm512_store_ps(orow, _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_load_si512(drow)), x), w0,
-                                          _mm512_load_ps(orow)));
+    _mm512_store_ps(
+        orow, _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_load_si512(drow)), x), w0, _mm512_load_ps(orow)));
     if (wide)
-      _mm512_store_ps(orow + 16, _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_load_si512(drow + 16)), x),
-                                                 w1, _mm512_load_ps(orow + 16)));
+      _mm512_store_ps(orow + 16, _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_load_si512(drow + 16)), x), w1,
+                                                 _mm512_load_ps(orow + 16)));
   }
 #endif
 }
@@ -1049,8 +1049,8 @@ static QuantizeTiledJob quantize_tiled_job(int8_t *q, float *s, const float *x, 
   if (gs <= 0 || gs % 64 || n % gs)
     fail("tile-order quantization needs a group size that is a multiple of 64 dividing n");
   int span = gs > Q8_TILED_PIECE ? gs : Q8_TILED_PIECE / gs * gs;
-  return (QuantizeTiledJob){.x = x, .q = q, .s = s, .ldx = ldx, .n = n, .gs = gs, .span = span,
-                            .pieces = (n + span - 1) / span};
+  return (QuantizeTiledJob){
+      .x = x, .q = q, .s = s, .ldx = ldx, .n = n, .gs = gs, .span = span, .pieces = (n + span - 1) / span};
 }
 
 void k_quantize_rows_tiled(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs) {
@@ -1171,7 +1171,8 @@ typedef struct {
   int kgroups;                   /* groups per K-block (tiled; = groups: one block) */
 } Q8GemmJob;
 
-/* acc[mb][32] (+)= the tiled sums of groups [g0, g1) of activation rows [m0, m0 + mb) against channels [n0, n0 + nc). */
+/* acc[mb][32] (+)= the tiled sums of groups [g0, g1) of activation rows [m0, m0 + mb) against channels [n0, n0 + nc).
+ */
 static void q8_sums_tiled(const Q8GemmJob *job, const int8_t *packed, const float *pscales, int n0, int nc, int m0,
                           int mb, float *acc, int g0, int g1) {
   amx_q8_block_tiled(acc, job->xq + (size_t)m0 * (size_t)job->k, job->xs + (size_t)m0 * (size_t)job->groups,
@@ -1390,8 +1391,16 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
       if (!segments[s].pws || (segments[s].kind == GEMM_SWIGLU && !segments[s].pws3))
         fail("the pipelined Q8 GEMM needs the transposed weight scales of every segment");
   }
-  Q8GemmJob job = {.xq = xq, .xs = xs, .m = m, .k = k, .gs = gs, .groups = k / gs, .count = count, .backend = backend,
-                   .tiled = tiled, .kgroups = k / gs};
+  Q8GemmJob job = {.xq = xq,
+                   .xs = xs,
+                   .m = m,
+                   .k = k,
+                   .gs = gs,
+                   .groups = k / gs,
+                   .count = count,
+                   .backend = backend,
+                   .tiled = tiled,
+                   .kgroups = k / gs};
   if (tiled && gs <= Q8_KBLOCK && k > Q8_KBLOCK) /* K-blocks of whole groups (per-channel: one group, one pass) */
     job.kgroups = Q8_KBLOCK / gs;
   const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16, mblocks = (m + Q8_MB - 1) / Q8_MB;

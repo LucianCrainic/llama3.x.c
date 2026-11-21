@@ -222,7 +222,8 @@ static int amx_usable(void) {
 }
 
 /* LLAMA_Q8_GEMM=pipelined: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
- * transposed scales are the scales, and the pipelined kernel equals the AMX chunk kernel bit for bit, for every kind. */
+ * transposed scales are the scales, and the pipelined kernel equals the AMX chunk kernel bit for bit, for every kind.
+ */
 static void check_tiled(const Case *c) {
   const int m = c->m, n = c->n, k = c->k, gs = c->gs, groups = k / gs, ldc = n + 3;
   const size_t rows = up((size_t)m, 32);
@@ -267,7 +268,8 @@ static void check_tiled(const Case *c) {
   pack_s8_scales_t(st3, c->ws3, n, groups, 0, tiles);
   for (int j = 0; j < (int)up((size_t)n, 32); j++)
     for (int g = 0; g < groups; g++) {
-      float want = j < n ? c->ws[(size_t)j * groups + g] : 0.0f, got = st[((size_t)(j / 32) * groups + g) * 32 + j % 32];
+      float want = j < n ? c->ws[(size_t)j * groups + g] : 0.0f,
+            got = st[((size_t)(j / 32) * groups + g) * 32 + j % 32];
       checks++;
       if (memcmp(&got, &want, 4))
         bad("pack_s8_scales_t", "transposed scale differs");
@@ -278,8 +280,15 @@ static void check_tiled(const Case *c) {
   const GemmKind kinds[] = {GEMM_STORE, GEMM_ADD, GEMM_SWIGLU, GEMM_PARTIAL};
   gemm_amx_enable(1);
   for (int t = 0; t < 4; t++) {
-    GemmQ8Segment seg = {.ldc = ldc, .w = {c->wq, c->ws}, .w3 = {c->wq3, c->ws3}, .pw = c->packed,
-                         .pw3 = c->packed3, .pws = st, .pws3 = st3, .n = n, .kind = kinds[t]};
+    GemmQ8Segment seg = {.ldc = ldc,
+                         .w = {c->wq, c->ws},
+                         .w3 = {c->wq3, c->ws3},
+                         .pw = c->packed,
+                         .pw3 = c->packed3,
+                         .pws = st,
+                         .pws3 = st3,
+                         .n = n,
+                         .kind = kinds[t]};
     memcpy(want, base, (size_t)m * ldc * 4);
     memcpy(got, base, (size_t)m * ldc * 4);
     seg.c = want;
@@ -289,8 +298,8 @@ static void check_tiled(const Case *c) {
     checks++;
     if (memcmp(want, got, (size_t)m * ldc * 4)) {
       char detail[160];
-      snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: pipelined differs from the chunk kernel", m, n,
-               k, gs, kinds[t]);
+      snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: pipelined differs from the chunk kernel", m, n, k,
+               gs, kinds[t]);
       bad("k_gemm_q8_tiled", detail);
     }
   }
@@ -344,15 +353,30 @@ static void run_matrix(const char *label) {
 /* Real layers are far larger than the matrix above (K up to 14336, N up to 14336, M = 64 microbatches): sizes that cross
  * several M blocks, N chunks and many K groups, with edges that are not multiples of the tile or chunk sizes. */
 static void run_large(const char *label) {
-  const int shapes[][4] = {{64, 130, 2048, 64}, {64, 33, 8192, 64}, {37, 520, 1024, 64}, {128, 70, 2048, 128},
-                           {64, 600, 4096, 64}, {96, 257, 3072, 64},
+  const int shapes[][4] = {{64, 130, 2048, 64},
+                           {64, 33, 8192, 64},
+                           {37, 520, 1024, 64},
+                           {128, 70, 2048, 128},
+                           {64, 600, 4096, 64},
+                           {96, 257, 3072, 64},
                            /* K sweep up to the largest layer input of the 8B model, then M and N edges */
-                           {16, 48, 128, 64}, {16, 48, 512, 64}, {16, 48, 1024, 64}, {16, 48, 2048, 64},
-                           {16, 48, 4096, 64}, {16, 48, 8192, 64}, {16, 48, 14336, 64}, {64, 4096, 2048, 64},
-                           {64, 14336, 4096, 64}, {53, 1024, 2048, 64},
+                           {16, 48, 128, 64},
+                           {16, 48, 512, 64},
+                           {16, 48, 1024, 64},
+                           {16, 48, 2048, 64},
+                           {16, 48, 4096, 64},
+                           {16, 48, 8192, 64},
+                           {16, 48, 14336, 64},
+                           {64, 4096, 2048, 64},
+                           {64, 14336, 4096, 64},
+                           {53, 1024, 2048, 64},
                            /* per-channel INT8: one group over all of K (gs = K, wider than the quantizer's piece) */
-                           {64, 130, 4096, 4096}, {40, 48, 14336, 14336}, {33, 70, 2048, 2048}, {17, 33, 128, 128},
-                           {16, 48, 4096, 4096}, {40, 17, 3072, 3072}};
+                           {64, 130, 4096, 4096},
+                           {40, 48, 14336, 14336},
+                           {33, 70, 2048, 2048},
+                           {17, 33, 128, 128},
+                           {16, 48, 4096, 4096},
+                           {40, 17, 3072, 3072}};
   int before = failures;
   for (size_t i = 0; i < sizeof(shapes) / sizeof(*shapes); i++) {
     Case c;

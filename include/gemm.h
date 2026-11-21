@@ -140,16 +140,16 @@ Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
  * one 16-row half-step overlapped with the tile instructions of the next.
  * Tile order of A (k % 64 == 0): row r, bytes [64 t, 64 t + 64) live at
  *   ((r / 32 * 2 + r % 32 / 16) * (k / 64) + t) * 1024 + (r % 16) * 64,
- * so a 32-row block is 32 * k contiguous bytes and every 16 x 64 tile is one 1 KiB load. Rows are padded to whole 32-row
- * blocks. Scales stay dense [row][k / gs]. Transposed weight scales: st[(c / 32 * groups + g) * 32 + c % 32] for channel
- * c and group g, channels padded to 32 with zeros (s8_scales_t_bytes). */
-void gemm_q8_init_env(void);              /* reads LLAMA_Q8_GEMM (kernels_init) */
+ * so a 32-row block is 32 * k contiguous bytes and every 16 x 64 tile is one 1 KiB load. Rows are padded to whole
+ * 32-row blocks. Scales stay dense [row][k / gs]. Transposed weight scales: st[(c / 32 * groups + g) * 32 + c % 32] for
+ * channel c and group g, channels padded to 32 with zeros (s8_scales_t_bytes). */
+void gemm_q8_init_env(void); /* reads LLAMA_Q8_GEMM (kernels_init) */
 /* LLAMA_SWIGLU_EXP=vector|libm: the batched Q8 GEMM's SwiGLU epilogue with the AVX-512 exponential of the attention
  * kernels (default, where AVX-512 runs) or libm expf (bitwise the GEMV's silu_gate); read by kernels_init. */
 void gemm_swiglu_init_env(void);
 const char *k_gemm_swiglu_exp_name(void);
-const char *k_gemm_q8_mode_name(void);    /* "chunk" or "pipelined" */
-int k_gemm_q8_tiled_active(void);         /* pipelined asked for and AMX active */
+const char *k_gemm_q8_mode_name(void); /* "chunk" or "pipelined" */
+int k_gemm_q8_tiled_active(void);      /* pipelined asked for and AMX active */
 size_t s8_scales_t_bytes(int rows, int cols, int gs);
 void pack_s8_scales_t(float *st, const float *s, int rows, int groups, int first_tile, int last_tile);
 /* k_quantize_rows with the int8 values in tile order (scales as k_quantize_rows); q holds whole 32-row blocks. */

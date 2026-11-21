@@ -101,7 +101,8 @@ static void build_q8(Builder *b, const Config *p, int kv) {
 void manifest_build(TensorManifest *m, const Config *p, int quantized, int gs, size_t header_bytes) {
   /* 9 per-layer roles plus embedding, final norm, legacy RoPE and classifier. */
   int capacity = p->n_layers * 9 + 4;
-  *m = (TensorManifest){.t = memory_alloc((size_t)capacity, sizeof(TensorDesc), MEM_METADATA), .per_channel = quantized && !gs};
+  *m = (TensorManifest){.t = memory_alloc((size_t)capacity, sizeof(TensorDesc), MEM_METADATA),
+                        .per_channel = quantized && !gs};
   Builder b = {.m = m, .cursor = header_bytes, .gs = quantized ? gs : 0};
   int kv = p->head_dim * p->n_kv_heads;
   if (quantized)
