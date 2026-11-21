@@ -3,7 +3,7 @@
 Run labels follow {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}]
 [-k{kernel}][-x{tag}]-{rep}.json. Repeats of one label are reported as the median with the full range. Schema-v1 reports
 and unknown fields give '-' instead of failing. After the table, tools/campaign_tables.py adds the decode-scaling, prefill-speedup,
-per-socket phase, modeled-against-measured and crossover tables when the campaign has the data for them. summarize_kernels.py stays for old campaigns.
+per-socket phase, modeled-against-measured and crossover tables when the campaign has the data for them.
 """
 import json
 from pathlib import Path
@@ -27,7 +27,7 @@ def parse_label(stem):
 
 
 def perf_traffic(path):
-    """Sum a per-socket `perf stat -x ,` CSV by event name (same layout as summarize_kernels.py)."""
+    """Sum a per-socket `perf stat -x ,` CSV by event name (the layout perf_attach writes)."""
     totals = {}
     for line in path.read_text().splitlines():
         fields = line.split(',')

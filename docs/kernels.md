@@ -83,7 +83,7 @@ The Phase 2 fixed-logit and CLI regressions also run with the selected kernels.
 
 Measured on 2026-11-01 on cresco8-hbm14 (Xeon Max 9480, flat mode, GCC 11.4.1,
 `make CC=gcc OPENMP=1`) with
-[scripts/cresco8-kernels.sbatch](../scripts/cresco8-kernels.sbatch), Slurm job
+`scripts/cresco8-kernels.sbatch` (at tag `campaigns-2026-11`), Slurm job
 5621182. Each run generates 128 tokens after an 86-token prompt. Weights are
 staged into `/dev/shm` with `numactl --membind=2` (HBM) or `--membind=0` (DDR),
 and threads are bound to socket 0 unless noted. `base` is `develop` at
@@ -225,10 +225,10 @@ broken down in [Decode phase profile](#decode-phase-profile).
 Every phase is either serial or ends at a team barrier, so that thread's
 wall time is the phase's time. Reports gain `profile_seconds` per stage, and
 "other" is forward time outside all phases.
-[tools/summarize_profile.py](../tools/summarize_profile.py) converts the
-reports into per-token tables, and
-[scripts/cresco8-profile.sbatch](../scripts/cresco8-profile.sbatch) runs the
-measurement.
+`tools/summarize_profile.py` converted the reports into per-token tables and
+`scripts/cresco8-profile.sbatch` ran the measurement (both at tag `campaigns-2026-11`); today
+`scripts/cresco8.sbatch STAGE=bench` records one profiled run per cell, and `tools/summarize_campaign.py` shows its top
+phases.
 
 The measurement used job 5621239 (`328760c`) on hbm14. Weights were on HBM
 node 2, with 56 threads on socket 0, 2 runs, and 127 decode steps after an

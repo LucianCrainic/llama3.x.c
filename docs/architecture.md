@@ -65,7 +65,7 @@ set on 20 November 2026. Each rule applies only while its own knob is unset, and
 | Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
 
 To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
-`LLAMA_ATTN=split` for runs before E4, `LLAMA_KV_LAYOUT=rows` for runs before E5.4; the layout changes speed, never results). The campaign scripts do this job-wide (`scripts/lib/cresco8-common.sh`). Runs made
+`LLAMA_ATTN=split` for runs before E4, `LLAMA_KV_LAYOUT=rows` for runs before E5.4; the layout changes speed, never results). The campaign scripts at tag `campaigns-2026-11` did this job-wide; `scripts/cresco8.sbatch` runs at the defaults. Runs made
 on OpenMP now run on worker teams of the same size: decode is 5-8% faster there and prefill within 2% (6.5% slower for 1B
 FP32), see [audit-2026-11.md](audit-2026-11.md) §6.
 
@@ -281,7 +281,18 @@ the two-socket and placement logic is exercised on any machine. `make test-refer
 
 ## 10. Cluster workflow
 
-`scripts/cresco8-*.sbatch` are the campaign scripts (`STAGE=check|bench`, `PHASE=...`), sharing
-`scripts/lib/cresco8-common.sh`; `tools/summarize_*.py` and `tools/campaign_tables.py` turn their JSON reports into the
-results tables. Each results document cites the commit, job IDs and node it was produced on; to reproduce an old campaign,
-check out that commit.
+`scripts/cresco8.sbatch` (with `scripts/lib/cresco8-common.sh`) is the one Slurm job for a Flat node, at the engine
+defaults unless engine knobs are exported job-wide:
+
+- `STAGE=check`: build, `make test`, and per model the logit gates of `tools/compare_engines.py` (one socket against two
+  per token; the defaults and the BF16 prefill against the one-socket per-token reference; W8A8 under its statistical
+  gate, W8A32 strict), the Hugging Face gate (`tools/validate.py`) and profiled smoke runs whose placement is checked.
+- `STAGE=bench`: model x checkpoint x sockets x prompt (time to first token) x retained context (decode), `REPEATS`
+  interleaved repeats plus one profiled run per cell; `tools/summarize_campaign.py` with `tools/campaign_tables.py` writes
+  the tables (decode by context and the two-socket gain, prefill by prompt, per-socket phases, modeled against measured).
+
+`DRY_RUN=1` prints the matrix without running anything; the header of the script lists its knobs.
+`tools/compare_generation.py` (greedy-text determinism), `tools/check_placement.py` and `tools/make_prompts.py` serve
+ad-hoc studies. The phase scripts and one-campaign summarizers of the finished tracks (A-E) are at tag `campaigns-2026-11`;
+each results document cites the commit, job IDs and node it was produced on, so an old campaign is reproduced from that
+commit.

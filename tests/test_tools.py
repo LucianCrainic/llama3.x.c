@@ -1,4 +1,4 @@
-"""Converter smoke checks without installing large ML dependencies."""
+"""Tool and job-script checks without installing large ML dependencies."""
 import ast
 import json
 import os
@@ -16,20 +16,11 @@ TOOLS = ROOT/'tools'
 sys.path[:0] = [str(TOOLS), str(ROOT/'tests')]
 BUILD = Path(os.environ['BUILD_DIR']).resolve() if os.environ.get('BUILD_DIR') else None
 
-# Knobs the campaign scripts read from the environment. A test that runs a script starts from the caller's environment
-# without them, so a run inside a campaign job (which exports BASELINE_ROOT, STAGE, MODELS and so on) sees what it sets.
-CAMPAIGN_KNOBS = {'BASELINE_ROOT', 'B_EXPECT', 'C1_SPEED', 'CMP_PROBE', 'CMP_TOKENS', 'CONTEXT', 'CPU_BIND', 'D2_M1', 'D2_M2',
-                  'DRY_RUN', 'D_THP', 'E0_ATTN', 'E0_DIR', 'E0_MODEL', 'E1_DIR', 'E1_MODEL', 'E1_SMALL_MODEL', 'E2_MODEL', 'E2_SWEEP_CELLS',
-                  'E4_AMX', 'E4_ATTN', 'E4_RUNGS', 'E4_TILED_ENV', 'GATES_ONLY',
-                  'GATE_ENV', 'GATE_TAG', 'GENERATION', 'HF_GATE', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE',
-                  'PRECISIONS', 'PYTHON', 'REP', 'REPEATS', 'ROOT', 'SKIP_PRELUDE_HF', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE',
-                  'WARM'}
-CAMPAIGN_KNOBS |= {'E6_ATTN_CONTEXTS', 'E6_BATCH', 'E6_COLD_MIB', 'E6_CONTEXTS', 'E6_MODELS_BENCH', 'E6_MS', 'E6_REPS', 'E6_THP'}
-# Knobs of phase E5's bench stage (E5 follow-ups).
-CAMPAIGN_KNOBS |= {'E5_ALTERNATE', 'E5_CONTEXTS', 'E5_KERNELS', 'E5_LAYOUTS', 'E5_MICRO_CONTEXTS', 'E5_MICRO_KV',
-                   'E5_MICRO_REPS', 'E5_MICRO_SHAPES', 'E5_PROFILED', 'E5_SKIP_ENGINE', 'E5_SKIP_MICRO', 'E5_SOCKETS'}
-# Knobs of phase E5's K/V layout study (E5.4).
-CAMPAIGN_KNOBS |= {'E5_ATTN', 'E5_KV_CHECK', 'E5_SKIP_DECODE', 'E5_KV_LAYOUTS', 'E5_PREFILL_PROMPTS', 'E5_PREFILL_RUNGS'}
+# Knobs the job script reads from the environment. A test that runs it starts from the caller's environment without them,
+# so a run inside a cluster job (which exports STAGE, MODELS and so on) sees only what the test sets.
+CAMPAIGN_KNOBS = {'BENCH_CONTEXTS', 'BENCH_PROFILE', 'BENCH_PROMPTS', 'BENCH_SOCKETS', 'CONTEXT', 'CPU_BIND', 'DRY_RUN',
+                  'GENERATION', 'LOG_LEVEL', 'MEM_BIND', 'MODELS', 'OUT', 'PERF', 'PHASE', 'PRECISIONS', 'PYTHON', 'REP',
+                  'REPEATS', 'ROOT', 'SKIP_TEST', 'SLURM_JOB_ID', 'STAGE', 'WARM'}
 
 
 def campaign_env():
@@ -89,136 +80,99 @@ class CampaignSummaryTests(unittest.TestCase):
         for bad in ('correctness-1b-fp32', '1b-fp32-omp-file-s1-t56', 'x-fp16-omp-file-s1-t1-1'):
             self.assertIsNone(sc.parse_label(bad))
 
-    def dry_run(self, script, phases, models=('m1b', 'm8b'), **extra):
-        """Runs one campaign script with DRY_RUN=1 and returns its RUN lines; every run label must parse."""
+
+    def dry_run(self, stage, models=('m1b', 'm8b'), **extra):
+        """Runs scripts/cresco8.sbatch with DRY_RUN=1 and returns its output lines; every run label must parse."""
         if not shutil.which('bash'):
             self.skipTest('bash is required')
         from summarize_campaign import parse_label
         with tempfile.TemporaryDirectory() as temp:
             env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': phases,
+                   'PYTHON': sys.executable, 'STAGE': stage,
                    'MODELS': ' '.join(f'{m}:/a/{m}:/hf/{m}' for m in models), **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8.sbatch')], env=env, capture_output=True, text=True,
+                                    timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        runs = [line for line in result.stdout.splitlines() if line.startswith('RUN ')]
-        for line in runs:
-            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
-        return runs
+        lines = result.stdout.splitlines()
+        for line in lines:
+            if line.startswith('RUN '):
+                self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
+        return lines
 
-    def test_campaign_scripts_dry_run_and_their_labels_parse(self):
-        """L6: the B7, C7, D1 and D2 matrices print without running anything, with labels the summarizer understands."""
-        b7 = self.dry_run('cresco8-tp.sbatch', 'B7')
-        self.assertEqual(len(b7), 168)  # 84 launches per model (96 before packed4 was removed): gates aside, see phase_B7
-        self.assertTrue(all('warm=' in line and 'warm=0 ' not in line for line in b7))
-        self.assertEqual({line.split('warm=')[1].split()[0] for line in b7}, {'512', '8192', '32768'})
-        self.assertTrue(any('-s2-t14-' in line for line in b7) and any('xctl' in line for line in b7))
-        self.assertFalse(any('LLAMA_FP32_LAYOUT' in line for line in b7))  # packed4 was removed from the engine
-        self.assertTrue(all('LLAMA_PROFILE=1' in line for line in b7 if 'xprof' in line))
-        d1 = self.dry_run('cresco8-prefill.sbatch', 'D1')
-        self.assertEqual(len(d1), 240)
-        self.assertTrue(any('-s2-' in line and 'kamx_bf16' in line for line in d1) and any('-s1-' in line for line in d1))
-        self.assertEqual({line.split('warm=')[1].split()[0] for line in d1}, {'0', '2048'})
-        d2 = self.dry_run('cresco8-prefill.sbatch', 'D2')
-        self.assertEqual(len(d2), 288)
-        self.assertEqual({line.split('warm=')[1].split()[0] for line in d2}, {'0', '512', '8192'})
-        # GATES_ONLY=1 keeps the gates (and D1's placement runs) and drops the benchmark.
-        self.assertEqual(self.dry_run('cresco8-tp.sbatch', 'B7', GATES_ONLY='1'), [])
-        placement = self.dry_run('cresco8-prefill.sbatch', 'D1', GATES_ONLY='1')
-        self.assertTrue(placement and len(placement) < 20 and all('xplace' in line for line in placement), placement)
-        # Every D1 comparison of the 2048-token prompt reads only the last row, so both sides must run the batched probe
-        # (job 5704685: W8A32 lost its --batch flags and the per-token side wrote every position).
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'D1', 'GATES_ONLY': '1', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
-            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
-                                 text=True, timeout=120).stdout
-        compares = [line for line in out.splitlines() if line.startswith('EXPECT compare-') and 'prompt2048' in line]
-        self.assertEqual(len(compares), 5)  # fp32, bf16, q8, int8, w8a32
-        for line in compares:
-            self.assertIn('--last-only', line)
-            self.assertIn('--batch-a 64', line, line)
-            self.assertIn('--batch-b 64', line, line)
-        # C7's AMX-INT8 comparisons use the W8A8 statistical gate (rms and argmax), not the strict 1e-3 of the other rungs.
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'C7', 'MODELS': 'm1b:/a/m1b:/hf/m1b'}
-            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
-                                 text=True, timeout=120).stdout
-        amx = [line for line in out.splitlines() if line.startswith('EXPECT compare-') and 'c7-amx-int8' in line]
-        self.assertEqual(len(amx), 4)
-        for line in amx:
-            self.assertIn('--rms-max 0.2', line)
-            self.assertNotIn('--max-abs 1e-3', line)
-        for line in [l for l in out.splitlines() if l.startswith('EXPECT compare-') and 'c7-avx512-q8' in l]:
-            self.assertIn('--max-abs 1e-3', line)
-        self.dry_run('cresco8-prefill.sbatch', 'D3')  # the W8A8 AMX diagnostic prints its comparisons and exits 0
-        c7 = self.dry_run('cresco8-prefill.sbatch', 'C7')
-        decode = [line for line in c7 if 'xdec' in line]
-        self.assertTrue(decode and all('warm=2048' in line for line in decode))
+    def test_check_stage_gates_every_precision_at_the_defaults(self):
+        lines = self.dry_run('check')
+        compares = [l for l in lines if l.startswith('EXPECT compare-')]
+        self.assertEqual(len(compares), 2 * 6)  # models x (fp32: 1s-vs-2s, defaults, bf16; int8: w8a8, w8a32, defaults)
+        by = lambda name: next(l for l in compares if f'compare-m8b-{name} ' in l)
+        strict = by('fp32-1s-vs-2s')
+        self.assertIn('--max-abs 1e-3', strict)
+        self.assertIn('--env-b LLAMA_SOCKETS=2 --env-b LLAMA_TP_CHECK=1', strict)
+        defaults = by('fp32-reference-vs-defaults')
+        # side B names no configuration but the batch: the engine's defaults (two sockets, tiled attention, head K/V)
+        words = defaults.split()
+        self.assertEqual([words[i + 1] for i, w in enumerate(words) if w == '--env-b'], ['LLAMA_TP_CHECK=1'])
+        self.assertIn('--batch-b 64', defaults)
+        bf16 = by('fp32-reference-vs-bf16')
+        for word in ('--env-b LLAMA_PRECISION=bf16', '--batch-b 256', '--rms-max 0.05', '--argmax-min 0.97'):
+            self.assertIn(word, bf16)
+        self.assertNotIn('1e-3', bf16)
+        for name in ('int8-w8a8-1s-vs-2s', 'int8-w8a8-reference-vs-defaults'):
+            self.assertIn('--rms-max 0.2', by(name))
+            self.assertNotIn('1e-3', by(name))
+        self.assertIn('--batch-b 256', by('int8-w8a8-reference-vs-defaults'))
+        self.assertIn('--env-b LLAMA_Q8_ACTIVATIONS=fp32', by('int8-w8a32-1s-vs-2s'))
+        self.assertEqual(len([l for l in lines if l.startswith('VALIDATE ')]), 2 * 3)
+        runs = [l for l in lines if l.startswith('RUN ')]
+        self.assertEqual(sorted(l.split()[1] for l in runs if 'm8b' in l),
+                         ['m8b-bf16-teams-hbm-s2-t56-xsmoke', 'm8b-fp32-teams-hbm-s2-t56-xsmoke', 'm8b-int8-teams-hbm-s2-t56-xsmoke'])
+        self.assertTrue(all('LLAMA_PROFILE=1' in l and 'LLAMA_SOCKETS' not in l for l in runs))
+        # PRECISIONS restricts the checkpoints, and without MODELS only the build and the tests would run.
+        self.assertFalse([l for l in self.dry_run('check', PRECISIONS='int8') if 'probe-fp32 ' in l])
+        self.assertFalse([l for l in self.dry_run('check', models=()) if l.startswith(('EXPECT', 'RUN', 'VALIDATE'))])
 
-    def test_e0_dry_run_matrix(self):
-        """E0: the attention campaign prints its bench matrix, the knob's bitwise gate and one profiled 8B engine run."""
-        runs = self.dry_run('cresco8-prefill.sbatch', 'E0')  # only the 8B model of MODELS gets engine runs
-        self.assertEqual(len(runs), 1)
-        self.assertTrue(all(w in runs[0] for w in ('-m256-p8192-', 'kamx_bf16', 'xprof', 'LLAMA_PROFILE=1', 'warm=0')), runs)
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E0', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b'}
-            out = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
-                                 text=True, timeout=120).stdout.splitlines()
-        bench = [line for line in out if line.startswith('EXPECT ') and 'attention-bench' in line]
-        self.assertEqual(len(bench), 6 + 5 + 2 + 4)  # prefill, row block, half KV heads, decode
-        self.assertTrue(all('--node 2' in line and '--cpunodebind=0' in line for line in bench))
-        self.assertEqual(sorted(line.split('LLAMA_ATTN_ROW_BLOCK=')[1].split()[0] for line in bench if 'ROW_BLOCK' in line),
-                         ['1', '16', '2', '4', '8'])
-        self.assertEqual(len([line for line in out if line.startswith('COUNTERS ')]), 2)
-        compare = [line for line in out if line.startswith('EXPECT compare-m8b-fp32-e0-rowblock')]
-        self.assertEqual(len(compare), 1)
-        for word in ('--bitwise', '--last-only', '--batch-a 64', '--batch-b 64', 'LLAMA_ATTN_ROW_BLOCK=4',
-                     'LLAMA_ATTN_ROW_BLOCK=16'):
-            self.assertIn(word, compare[0])
-        self.assertFalse([line for line in out if 'm1b' in line and 'compare' in line])
+    def test_bench_stage_matrix(self):
+        lines = self.dry_run('bench', models=('m8b',), REPEATS='2')
+        runs = [l for l in lines if l.startswith('RUN ')]
+        timed = [l for l in runs if 'prof' not in l.split()[1]]
+        profiled = [l for l in runs if 'prof' in l.split()[1]]
+        # per repeat: fp32 3 prompts x (fp32, bf16) + 3 contexts; int8 3 prompts + 3 contexts + w8a32 at 512 and 8192; x 2 sockets
+        self.assertEqual(len(timed), 2 * 2 * (3 * 2 + 3 + 3 + 3 + 2))
+        self.assertEqual(len(profiled), len(timed) // 2)
+        self.assertTrue(all('LLAMA_PROFILE=1' in l for l in profiled) and not [l for l in timed if 'LLAMA_PROFILE' in l])
+        decode = [l for l in timed if '-xdec' in l]
+        self.assertEqual({l.split('warm=')[1].split()[0] for l in decode}, {'512', '8192', '32768'})
+        self.assertFalse([l for l in decode if 'w8a32' in l and 'warm=32768' in l])
+        self.assertTrue(all('LLAMA_Q8_ACTIVATIONS=fp32' in l for l in runs if '-w8a32-' in l))
+        self.assertTrue(all('LLAMA_PRECISION=bf16' in l for l in runs if '-bf16-' in l))
+        self.assertFalse([l for l in decode if '-bf16-' in l])  # BF16 changes the prefill only
+        self.assertTrue(all('cpu=0 ' in l and 'LLAMA_SOCKETS=1' in l for l in runs if '-s1-' in l))
+        self.assertTrue(all('cpu= ' in l and 'LLAMA_SOCKETS=2' in l for l in runs if '-s2-' in l))
+        self.assertFalse([l for l in runs if 'LLAMA_PREFILL_BATCH' in l or 'LLAMA_KERNELS' in l or 'LLAMA_ATTN' in l])
+        # the repeats interleave per checkpoint: every cell of repeat 1 before any of repeat 2
+        for family in (('-fp32-', '-bf16-'), ('-int8-', '-w8a32-')):
+            reps = [l.split('reps=')[1].split()[0] for l in timed if any(f in l for f in family)]
+            self.assertEqual(reps, sorted(reps), family)
+        # the lists are knobs
+        small = [l for l in self.dry_run('bench', models=('m1b',), REPEATS='1', PRECISIONS='fp32', BENCH_SOCKETS='2',
+                                         BENCH_PROMPTS='2048', BENCH_CONTEXTS='4096', BENCH_PROFILE='0') if l.startswith('RUN ')]
+        self.assertEqual(sorted(l.split()[1] for l in small),
+                         ['m1b-bf16-teams-hbm-s2-t56-p2048', 'm1b-fp32-teams-hbm-s2-t56-p2048', 'm1b-fp32-teams-hbm-s2-t56-p4096-xdec'])
 
-    def e1_dry(self, **extra):
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E1', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', 'REPEATS': '3',
-                   **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-prefill.sbatch')], env=env, capture_output=True,
-                                    text=True, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-            skipped = (Path(temp)/'out'/'E1'/'baseline-not-given.txt').exists()
-        return [line for line in result.stdout.splitlines() if line.startswith('EXPECT ')], skipped
+    def test_bad_knobs_stop_before_anything_runs(self):
+        if not shutil.which('bash'):
+            self.skipTest('bash is required')
+        for patch, text in [({'BENCH_SOCKETS': '3'}, 'BENCH_SOCKETS'), ({'BENCH_PROMPTS': 'x'}, 'token counts'),
+                            ({'BENCH_PROFILE': '2'}, 'BENCH_PROFILE'), ({'PHASE': 'B7'}, 'campaigns-2026-11'),
+                            ({'PRECISIONS': 'bf16'}, 'PRECISIONS'), ({'STAGE': 'campaign'}, 'STAGE must be')]:
+            with tempfile.TemporaryDirectory() as temp:
+                env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
+                       'PYTHON': sys.executable, 'MODELS': 'm1b:/a:/h', **patch}
+                result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8.sbatch')], env=env, capture_output=True,
+                                        text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0, patch)
+                self.assertIn(text, result.stderr, patch)
+                self.assertFalse((Path(temp)/'out').exists(), patch)
 
-    def test_e1_dry_run_matrix(self):
-        """E1: bitwise baseline comparisons on 8B only, item 2b on 1B only, FP32 determinism data on every model."""
-        lines, skipped = self.e1_dry(BASELINE_ROOT='/b')
-        self.assertFalse(skipped)
-        bitwise = [l for l in lines if l.startswith('EXPECT compare-')]
-        self.assertEqual(len(bitwise), 3)
-        for line in bitwise:
-            self.assertIn('m8b-fp32', line)
-            for word in ('--bitwise', '--last-only', 'probe-shim-fp32.sh', 'PROBE_DIR=/b/build/release',
-                         f'PROBE_DIR={ROOT}/build/release', 'LLAMA_ATTN=split'):
-                self.assertIn(word, line)
-        self.assertEqual(len([l for l in bitwise if 'LLAMA_TP_CHECK=1' in l and 'LLAMA_SOCKETS=2' in l]), 1)
-        gen = [l for l in lines if 'compare_generation.py' in l]
-        item2b = [l for l in gen if 'gen-item2b-' in l]
-        self.assertEqual(len(item2b), 3 * 3)  # three cases, REPEATS = 3
-        self.assertTrue(all('m1b' in l and '--warm-context 8192' in l and '--steps 128' in l and '--probe-batch 64' in l and
-                            'probe-int8' in l and '--context-length 8448' in l for l in item2b), item2b)
-        self.assertEqual(len([l for l in item2b if 'w8a32' in l]), 3)
-        self.assertTrue(all('LLAMA_Q8_ACTIVATIONS=fp32' in l for l in item2b if 'w8a32-s1-vs-s2' in l))
-        self.assertTrue(all('LLAMA_TP_CHECK=1' in l for l in item2b if 's1-vs-s2' in l))
-        self.assertFalse([l for l in item2b if 's1-vs-s1' in l and 'LLAMA_SOCKETS=2' in l])
-        fp32 = [l for l in gen if 'gen-fp32-' in l]
-        self.assertEqual(len(fp32), 2 * 2 * 2)  # models x prompts x comparisons
-        self.assertTrue(all('probe-fp32' in l and 'warm-context' not in l for l in fp32))
-        self.assertEqual(len(lines), 3 + 9 + 8)
-        # Without a baseline the bitwise part is skipped and recorded, and nothing else changes.
-        lines, skipped = self.e1_dry()
-        self.assertTrue(skipped)
-        self.assertEqual(len(lines), 9 + 8)
 
     @staticmethod
     def v2(prefill=None, decode=None, warm=0, sockets=1, ttft=1.0, steps=128, decode_seconds=None, model_file=32e9,
@@ -325,21 +279,6 @@ class CampaignSummaryTests(unittest.TestCase):
         for name in ('batched-prefill', 'numa-tp-prefill-results'):
             self.assertIn('| Model | Precision | Prompt | Rung | M | Sockets | Prefill tok/s | TTFT s | Speedup vs 1-socket per-token '
                           '| 2s wins |', (ROOT/'docs'/f'{name}.md').read_text())
-
-    def test_a_phase_sent_to_the_wrong_script_fails_before_the_build(self):
-        """B7 lives in cresco8-tp.sbatch and D1 in cresco8-prefill.sbatch; a mismatch must not cost a build and `make test`."""
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        for script, phases, missing in (('cresco8-prefill.sbatch', 'D1 B7', 'B7'), ('cresco8-tp.sbatch', 'B7 D1', 'D1'),
-                                        ('cresco8-prefill.sbatch', 'C7 D4', 'D4')):
-            with tempfile.TemporaryDirectory() as temp:
-                env = {**campaign_env(), 'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                       'PYTHON': sys.executable, 'PHASE': phases}  # not a dry run: the check must come before check_stage
-                result = subprocess.run(['bash', str(ROOT/'scripts'/script)], env=env, capture_output=True, text=True,
-                                        timeout=60)
-            self.assertNotEqual(result.returncode, 0, (script, phases))
-            self.assertIn(f'no run matrix for phase(s) {missing}', result.stderr)
-            self.assertNotIn('build', result.stdout.lower())
 
     def test_campaign_runs_use_the_whole_context(self):
         """The engine's default of 4096 forward passes capped A6's 8192-token point; run_engine must pass -n 0."""
@@ -758,51 +697,61 @@ class ScriptTests(unittest.TestCase):
         base = {'SLURM_JOB_ID': '1', 'ROOT': str(ROOT), 'PYTHON': 'python3', 'MODELS': '1b:/a:/h'}
         with tempfile.TemporaryDirectory() as temp:
             out = str(Path(temp)/'out')
-            result = self.lib('require_env; printf "%s %s %s %s" "$STAGE" "$REPEATS" "$PRECISIONS" "$PHASE"',
-                              {**base, 'OUT': out})
-            self.assertEqual((result.returncode, result.stdout), (0, 'bench 3 fp32 int8 none'), result.stderr)
+            result = self.lib('require_env; printf "%s %s %s" "$STAGE" "$REPEATS" "$PRECISIONS"', {**base, 'OUT': out})
+            self.assertEqual((result.returncode, result.stdout), (0, 'check 3 fp32 int8'), result.stderr)
             for patch, text in [({'STAGE': 'x'}, 'STAGE must be'), ({'REPEATS': '0'}, 'REPEATS must be'),
-                                ({'PHASE': 'Z9'}, 'PHASE must be'), ({'MODELS': 'bad'}, 'is not NAME:ARTIFACTS:HF'),
-                                ({'OUT': temp}, 'already exists'), ({'SLURM_JOB_ID': ''}, 'submit through Slurm')]:
+                                ({'PHASE': 'B5'}, 'PHASE is gone'), ({'MODELS': 'bad'}, 'is not NAME:ARTIFACTS:HF'),
+                                ({'PRECISIONS': 'fp16'}, 'PRECISIONS must'), ({'OUT': temp}, 'already exists'),
+                                ({'SLURM_JOB_ID': ''}, 'submit through Slurm')]:
                 with self.subTest(patch=patch):
                     result = self.lib('require_env', {**base, 'OUT': out, **patch})
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(text, result.stderr)
             result = self.lib('require_env', {k: v for k, v in {**base, 'OUT': out}.items() if k != 'ROOT'})
             self.assertIn('tree under test required', result.stderr)
-            # MODELS is optional, and PHASE is a list.
-            result = self.lib('require_env; printf "[%s] [%s]" "$MODELS" "$PHASE"',
-                              {**{k: v for k, v in base.items() if k != 'MODELS'}, 'OUT': out, 'PHASE': 'A1 A3 F2'})
-            self.assertEqual((result.returncode, result.stdout), (0, '[] [A1 A3 F2]'), result.stderr)
+            # MODELS is optional.
+            result = self.lib('require_env; printf "[%s]" "$MODELS"', {**{k: v for k, v in base.items() if k != 'MODELS'},
+                                                                       'OUT': out})
+            self.assertEqual((result.returncode, result.stdout), (0, '[]'), result.stderr)
 
-    def test_expect_and_unknown_phases(self):
+    def test_expect(self):
         with tempfile.TemporaryDirectory() as temp:
-            script = (f'OUT={temp}; PHASE="A9"; expect good ok {temp} -- true; expect bad fail {temp} -- false; '
+            script = (f'OUT={temp}; expect good ok {temp} -- true; expect bad fail {temp} -- false; '
                       f'expect wrong ok {temp} -- false; expect free any {temp} -- false; '
                       f'expect talk ok {temp} -- echo hello; cat {temp}/phase-results.txt; echo "overall=$OVERALL"; '
-                      f'cat {temp}/talk.out; run_phases')
+                      f'cat {temp}/talk.out')
             result = self.lib(script)
-            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), [
                 'PASS good exit=0 expected=ok', 'PASS bad exit=1 expected=fail', 'FAIL wrong exit=1 expected=ok',
                 'PASS free exit=1 expected=any', 'PASS talk exit=0 expected=ok', 'overall=1', 'hello'])
-            self.assertIn('phase A9 has no run matrix', result.stderr)
+
+    def test_compare_takes_flags_and_both_environments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = self.lib(f'OUT={temp}; DRY_RUN=1 ROOT=/r PYTHON=py compare {temp} m fp32 /c lab --batch-b 64 -- A=1 B=2 -- C=3')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            words = result.stdout.split()
+            for pair in (['--env-a', 'A=1'], ['--env-a', 'B=2'], ['--env-b', 'C=3'], ['--batch-b', '64'], ['--max-abs', '1e-3']):
+                self.assertIn(' '.join(pair), ' '.join(words))
+            result = self.lib(f'OUT={temp}; DRY_RUN=1 ROOT=/r PYTHON=py compare {temp} m int8 /c lab "${{W8A8_GATE[@]}}" -- -- X=1')
+            self.assertIn('--max-abs 16 --rms-max 0.2', result.stdout)
+            self.assertNotIn('1e-3', result.stdout)
+            self.assertNotIn('--env-a', result.stdout)
 
     def test_run_labels_match_the_summarizer(self):
         import summarize_campaign as sc
         result = self.lib('run_label llama3-8b fp32 teams hbm 2 112 m=256 p=2048 c=4096 k=amx')
         self.assertEqual(result.stdout.strip(), 'llama3-8b-fp32-teams-hbm-s2-t112-m256-p2048-c4096-kamx', result.stderr)
         self.assertIsNotNone(sc.parse_label(result.stdout.strip() + '-1'))
-        result = self.lib('run_label 1b w8a32 omp file 1 56')
-        self.assertEqual(result.stdout.strip(), '1b-w8a32-omp-file-s1-t56')
+        result = self.lib('run_label 1b w8a32 teams file 1 56 x=decprof')
+        self.assertEqual(result.stdout.strip(), '1b-w8a32-teams-file-s1-t56-xdecprof')
         self.assertIsNotNone(sc.parse_label(result.stdout.strip() + '-2'))
 
-    def test_skeletons_refuse_unknown_phases_without_a_cluster(self):
-        for name in ('placement', 'tp', 'prefill'):
-            result = subprocess.run(['bash', str(ROOT/f'scripts/cresco8-{name}.sbatch')], capture_output=True, text=True,
-                                    env={'PATH': os.environ['PATH']})
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn('tree under test required', result.stderr)
+    def test_script_refuses_to_run_without_a_cluster(self):
+        result = subprocess.run(['bash', str(ROOT/'scripts/cresco8.sbatch')], capture_output=True, text=True,
+                                env={'PATH': os.environ['PATH']})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('tree under test required', result.stderr)
 
     @unittest.skipUnless(shutil.which('shellcheck'), 'shellcheck not installed')
     def test_shellcheck(self):
@@ -811,209 +760,6 @@ class ScriptTests(unittest.TestCase):
                 result = subprocess.run(['shellcheck', '-x', '-S', 'warning', str(path)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout)
 
-
-class SummarizeGemmTests(unittest.TestCase):
-    def test_table_has_speedup_and_peak_share(self):
-        line = lambda kernel, m, gf: json.dumps(dict(kernel=kernel, isa='avx512', backend='teams', node=2, n=4096, k=4096, m=m,
-                                                     gflops_best=gf, gflops_mean=gf * .9, weight_gbs_best=100, kc=1024))
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp)/'bench.jsonl'
-            path.write_text('\n'.join([line('gemm', 8, 2000), line('gemv_rows', 8, 500), line('gemm', 64, 4400)]) + '\n')
-            result = subprocess.run([sys.executable, str(TOOLS/'summarize_gemm.py'), str(path)], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('| 8 | 2000 / 1800 | 100 | 23% | 500 | 4.0x |', result.stdout)
-        self.assertIn('| 64 | 4400 / 3960 | 100 | 50% | - | - |', result.stdout)
-
-
-class SummarizeGenerationTests(unittest.TestCase):
-    @staticmethod
-    def gen(identical=True, where=None, margin=None, a=128, b=128, **extra):
-        return dict(identical=identical, first_divergence=where, edit_distance=0 if identical else 5, generated_a=a,
-                    generated_b=b, margin_a=margin, steps=128, **extra)
-
-    def summarize(self, files, *flags):
-        with tempfile.TemporaryDirectory() as temp:
-            for name, data in files.items():
-                (Path(temp)/name).write_text(json.dumps(data))
-            result = subprocess.run([sys.executable, str(TOOLS/'summarize_generation.py'), temp, *flags], capture_output=True,
-                                    text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout
-
-    def test_item_2b_verdicts(self):
-        same, diverged = self.gen(), self.gen(False, 29, margin=0.05, a=29, b=40)
-        base = {'gen-item2b-m1b-w8a32-s1-vs-s2-1.json': same, 'gen-item2b-m1b-w8a8-s1-vs-s1-1.json': same,
-                'gen-item2b-m1b-w8a8-s1-vs-s2-1.json': diverged}
-        out = self.summarize(base)
-        self.assertIn('| item2b-m1b-w8a8-s1-vs-s2 | 1 | no | 29 | 29/40 | 5 | 0.05 |', out)
-        self.assertIn('W8A8, one socket against two: diverged in 1 of 1 runs, first divergence at token [29]', out)
-        self.assertIn('Verdict (m1b): noise floor', out)
-        # a margin above the noise floor, or any W8A32 divergence, is a bug; a missing margin leaves the verdict undecided
-        big = {**base, 'gen-item2b-m1b-w8a8-s1-vs-s2-1.json': self.gen(False, 29, margin=1.5)}
-        self.assertIn('Verdict (m1b): BUG (blocks E2): W8A8 diverged at a margin above the noise floor 0.2', self.summarize(big))
-        w8a32 = {**base, 'gen-item2b-m1b-w8a32-s1-vs-s2-1.json': self.gen(False, 70, margin=0.01)}
-        self.assertIn('BUG (blocks E2): W8A32 diverged between socket counts', self.summarize(w8a32))
-        self.assertIn('undecided: a margin is missing', self.summarize({**base, 'gen-item2b-m1b-w8a8-s1-vs-s2-1.json':
-                                                                       self.gen(False, 29, margin=None)}))
-        none = {k: same for k in base}
-        self.assertIn('no divergence reproduced', self.summarize(none))
-        self.assertIn('control, one socket against one socket (run-to-run): diverged in 1 of 1 runs',
-                      self.summarize({**base, 'gen-item2b-m1b-w8a8-s1-vs-s1-1.json': diverged}))
-
-    def test_repeats_and_fp32_gate(self):
-        files = {f'gen-item2b-m1b-w8a8-s1-vs-s2-{r}.json': self.gen(False, 29 + r, margin=0.1) for r in (1, 2, 3)}
-        files['gen-fp32-m8b-2048-s1-vs-s2-1.json'] = self.gen()
-        files['gen-fp32-m8b-short-pertoken-vs-m64-1.json'] = self.gen(False, 12, margin=1e-4)
-        files['gen-fp32-m1b-short-s1-vs-s2-1.json'] = self.gen(False, 7, margin=0.4)
-        files['gen-broken-1.json'] = {'nonsense': 1}  # skipped, not a crash
-        out = self.summarize(files)
-        self.assertIn('diverged in 3 of 3 runs', out)
-        self.assertIn('| fp32-m8b-2048-s1-vs-s2 | 1 | PASS (identical) |', out)
-        self.assertIn('| fp32-m8b-short-pertoken-vs-m64 | 1 | PASS (diverges at 12, margin within the tolerance) |', out)
-        self.assertIn('| fp32-m1b-short-s1-vs-s2 | 1 | FAIL (diverges at 7) |', out)
-        self.assertIn('1 of the FP32 comparisons outside the gate', out)
-        self.assertNotIn('gen-broken', out)
-        # the tolerance follows the observed max |delta logit|
-        self.assertIn('| fp32-m1b-short-s1-vs-s2 | 1 | PASS (diverges at 7, margin within the tolerance) |',
-                      self.summarize(files, '--max-dlogit', '0.5'))
-
-    def test_bitwise_table_and_empty_directory(self):
-        compare = dict(passed=True, summary=dict(bitwise=True, max_abs=0.0))
-        out = self.summarize({'compare-m8b-fp32-e1-m64-prompt2048.json': compare})
-        self.assertIn('| m8b-fp32-e1-m64-prompt2048 | yes | 0 | PASS |', out)
-        self.assertIn('No generation comparison results', self.summarize({}))
-
-
-class SummarizeAttentionBenchTests(unittest.TestCase):
-    @staticmethod
-    def prefill(ms, row_block=4, m=256, kv=8, kv_model=8, **extra):
-        return dict(mode='prefill', isa='avx512', backend='teams', workers=56, node=2, shape='8b', heads=4 * kv, kv_heads=kv,
-                    head_dim=128, kv_heads_model=kv_model, row_block=row_block, prompt=8192, m=m, reps=3, ms_layer_median=ms,
-                    ms_layer_best=ms * .98, ms_layer_max=ms * 1.03, gflops_median=770.0, last_microbatch_ms_median=ms / 20,
-                    flops=5.5e11, tasks=1000, waves=40, streamed_over_unique=63.5, busy_mean=.8, busy_min=.7,
-                    tail_fraction=.12, task_phase_fraction=.97, **extra)
-
-    def run_tool(self, directory, *flags):
-        result = subprocess.run([sys.executable, str(TOOLS/'summarize_attention_bench.py'), str(directory), *flags],
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout
-
-    def test_tables_cross_check_counters_and_missing_inputs(self):
-        write = lambda path, rows: path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
-        with tempfile.TemporaryDirectory() as temp:
-            d = Path(temp)
-            write(d/'bench-prefill.jsonl', [self.prefill(700.0), self.prefill(900.0, m=64)])
-            write(d/'rowblock.jsonl', [self.prefill(700.0 * 4 / r, row_block=r) for r in (1, 4, 16)])
-            write(d/'bench-prefill-kv4.jsonl', [self.prefill(330.0, kv=4, kv_model=8)])
-            write(d/'bench-decode.jsonl', [dict(mode='decode', shape='1b', kv_heads=8, context=32768, chunks=7, tasks=56,
-                                                ms_layer_median=.3, ms_layer_best=.29, ms_layer_max=.4, gbs_median=120.0,
-                                                gflops_median=60.0, busy_mean=.9, tail_fraction=.05, isa='avx512',
-                                                backend='teams', node=2)])
-            write(d/'counters-prefill-8b-8192-m256.jsonl', [self.prefill(700.0)])
-            (d/'counters-prefill-8b-8192-m256.perf.csv').write_text(
-                'S0,56,1.0e12,,cycles,1,100.0,,\nS0,56,2.0e12,,instructions,1,100.0,,\nS1,56,5,,cycles,1,100.0,,\n'
-                'S0,56,<not supported>,,l2_rqsts.miss,0,0.0,,\n')
-            (d/'engine-profile.json').write_text(json.dumps({'profile_seconds': {'prefill': {'forward': 30.0, 'attention': 23.0}}}))
-            out = self.run_tool(d, '--counters-csv', str(d/'counters.csv'))
-            # 22.4 s from the bench against 23.0 s from the engine: inside 20%
-            self.assertIn('= 22.40 s against the profiled engine attention 23.00 s', out)
-            self.assertIn('PASS (within +-20%)', out)
-            self.assertIn('| 4 | 700.00 (686.00-721.00) | 1.00x |', out)
-            self.assertIn('| 16 | 175.00 (171.50-180.25) | 4.00x |', out)
-            self.assertIn('H3: the best row block is 16 at 4.00x over 4 (at or above the 1.3x', out)
-            self.assertIn('| 8b | 8192 | 256 | 700.00 | 330.00 | 2.12 |', out)
-            self.assertIn('| 1b | 8 | 32768 | 7 | 56 | 0.30 (0.29-0.40) | 120 | 22% |', out)
-            self.assertIn('| 8b kv8 | 56 | 8192 | 256 | 700.00 (686.00-721.00) | 770 | 9% |', out)
-            self.assertIn('| prefill-8b-8192-m256 | 1e+12 | 2e+12 | 2.00 | 0.727 |', out)  # 2e12 / (5.5e11 * 5 passes)
-            csv_lines = (d/'counters.csv').read_text().splitlines()
-            self.assertEqual(csv_lines[0], 'cell,socket,event,value')
-            self.assertIn('prefill-8b-8192-m256,S0,instructions,2000000000000', csv_lines)
-            self.assertIn('prefill-8b-8192-m256,S0,l2_rqsts.miss,', csv_lines)
-            # an engine run 1.5x slower than the bench's prediction fails the gate
-            (d/'engine-profile.json').write_text(json.dumps({'profile_seconds': {'prefill': {'forward': 40.0, 'attention': 34.0}}}))
-            self.assertIn('FAIL (within +-20%)', self.run_tool(d))
-        with tempfile.TemporaryDirectory() as temp:  # nothing measured yet: no crash, counters recorded as unavailable
-            out = self.run_tool(temp, '--counters-csv', str(Path(temp)/'counters.csv'))
-            self.assertIn('Counters: not available', out)
-            self.assertEqual((Path(temp)/'counters.csv').read_text(), 'not available\n')
-
-
-class SummarizeAttentionCompareTests(unittest.TestCase):
-    """--compare of tools/summarize_attention_bench.py and the E2 summaries of tools/summarize_e2.py."""
-
-    @staticmethod
-    def row(attn, ms, prompt=8192, m=256, gflops=800.0, **extra):
-        return dict(SummarizeAttentionBenchTests.prefill(ms, m=m, **extra), prompt=prompt, attn=attn, gflops_median=gflops)
-
-    @staticmethod
-    def write(path, rows):
-        path.write_text('\n'.join(json.dumps(r) for r in rows) + '\n')
-
-    def run_tool(self, tool, *args):
-        result = subprocess.run([sys.executable, str(TOOLS/tool), *map(str, args)], capture_output=True, text=True)
-        return result.returncode, result.stdout
-
-    def test_compare_speedups_and_gates(self):
-        with tempfile.TemporaryDirectory() as temp:
-            d = Path(temp)
-            self.write(d/'a.jsonl', [self.row('split', 700.0), self.row('split', 40.0, prompt=2048, m=64)])
-            self.write(d/'b.jsonl', [self.row('tiled', 300.0, gflops=1900.0), self.row('tiled', 30.0, prompt=2048, m=64)])
-            self.write(d/'sweep.jsonl', [self.row('tiled', 310.0, tiled_queries=4, tiled_order='natural'),
-                                         self.row('tiled', 290.0, tiled_queries=16, tiled_order='longest')])
-            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'b.jsonl', '--sweep', d/'sweep.jsonl')
-            self.assertEqual(code, 0, out)
-            self.assertIn('| split ms/layer | tiled ms/layer | speedup |', out)
-            self.assertIn('| 256 | 700.00 (686.00-721.00) | 300.00 (294.00-309.00) | 2.33x | 800 | 1900 |', out)
-            self.assertIn('| 64 | 40.00 (39.20-41.20) | 30.00 (29.40-30.90) | 1.33x |', out)
-            self.assertIn('Kernel gate (8b, prompt 8192, M 256, 56 threads): 2.33x, PASS', out)
-            self.assertIn('2048-token cells not slower: PASS', out)
-            self.assertIn('Best for 8b prompt 8192 M 256: queries 16, order longest (290.00 ms/layer).', out)
-            # a slower 2048 cell and a missed gate are reported as FAIL
-            self.write(d/'b.jsonl', [self.row('tiled', 500.0), self.row('tiled', 45.0, prompt=2048, m=64)])
-            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'b.jsonl')
-            self.assertIn('1.40x, FAIL', out)
-            self.assertIn('2048-token cells not slower: FAIL', out)
-            # the directory summary of any prefill matrix file, without the counters
-            code, out = self.run_tool('summarize_attention_bench.py', d, '--prefill-file', d/'b.jsonl', '--no-counters')
-            self.assertEqual(code, 0, out)
-            self.assertIn('| 8b kv8 | 56 | 8192 | 256 | 500.00 (490.00-515.00) |', out)
-            self.assertNotIn('## Counters', out)
-            # a missing file is not a crash
-            code, out = self.run_tool('summarize_attention_bench.py', '--compare', d/'a.jsonl', d/'none.jsonl')
-            self.assertEqual(code, 0, out)
-            self.assertIn('no comparison', out)
-
-    def test_checks_table_and_ttft_csv(self):
-        with tempfile.TemporaryDirectory() as temp:
-            d = Path(temp)
-            ok = dict(passed=True, budget=dict(max_abs=1e-3, argmax_agreement=1.0, bitwise=False, rms_max=None, statistical=False),
-                      summary=dict(max_abs=4e-5, argmax_agreement=1.0, rms=1e-5))
-            bad = dict(ok, passed=False, summary=dict(max_abs=0.2, argmax_agreement=0.9, rms=0.01),
-                       budget=dict(max_abs=2.0, argmax_agreement=0.97, bitwise=False, rms_max=0.05, statistical=True))
-            (d/'compare-m8b-fp32-e2-tiled-m64-prompt2048.json').write_text(json.dumps(ok))
-            (d/'compare-m8b-fp32-e2-bf16-prompt2048.json').write_text(json.dumps(bad))
-            (d/'compare-broken.json').write_text('{}')
-            code, out = self.run_tool('summarize_e2.py', 'checks', d)
-            self.assertEqual(code, 1, out)
-            self.assertIn('| m8b-fp32-e2-tiled-m64-prompt2048 | max 0.001, argmax 100% | 4e-05 | 100.0% | PASS |', out)
-            self.assertIn('| m8b-fp32-e2-bf16-prompt2048 | max 2, rms 0.05, argmax 97% (statistical) | 0.2 | 90.0% | FAIL |', out)
-            self.assertIn('2 comparisons, 1 failed.', out)
-        with tempfile.TemporaryDirectory() as temp:
-            d = Path(temp)
-            for tag, times in (('attnsplit', (10.0, 11.0, 12.0)), ('attntiled', (7.0, 8.0, 9.0)), ('proftiled', (8.5,))):
-                for rep, t in enumerate(times, 1):
-                    (d/f'm8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16-x{tag}-{rep}.json').write_text(json.dumps(
-                        dict(status='completed', timing_seconds=dict(time_to_first_token=t),
-                             throughput_tokens_per_second=dict(prefill=8192 / t))))
-            (d/'m8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16-xattnsplit-4.json').write_text(json.dumps(dict(status='error')))
-            code, out = self.run_tool('summarize_e2.py', 'ttft', d)
-            self.assertEqual(code, 0, out)
-            lines = out.splitlines()
-            self.assertEqual(lines[0].split(',')[0:3], ['configuration', 'attn', 'repeats'])
-            self.assertIn('m8b-bf16-teams-file-s1-t56-m256-p8192-c8448-kamx_bf16,split,3,11.0000,10.0000,12.0000,744.7,', out)
-            self.assertIn(',tiled,3,8.0000,7.0000,9.0000,1024.0,1.375', out)
-            self.assertIn(',profiled-tiled,1,8.5000,8.5000,8.5000,963.8,', out)
 
 
 class CheckPlacementTests(unittest.TestCase):
@@ -1085,460 +831,8 @@ class CheckPlacementTests(unittest.TestCase):
             self.assertIn('FAIL', out, name)
 
 
-class SummarizeE4Tests(unittest.TestCase):
-    """tools/summarize_e4.py bench and checks on small synthetic report directories."""
-
-    @staticmethod
-    def report(ttft=None, decode=None, share=None, status='completed', verified='full'):
-        report = dict(status=status, runtime=dict(placement='hbm'),
-                      regions=[dict(role='weights', verified=verified, pages_mismatched=0, pages_missing=0, bytes=1 << 30)],
-                      timing_seconds=dict(time_to_first_token=ttft), throughput_tokens_per_second=dict(decode=decode))
-        if share is not None:
-            report['profile_seconds'] = dict(prefill=dict(forward=10.0, attention=10.0 * share))
-        return report
-
-    @classmethod
-    def write(cls, root, model, kernel, m, prompt, sockets, attn, ttfts, decodes=None, share=None, **extra):
-        base = f'{model}-fp32-teams-hbm-s{sockets}-t56-m{m}-p{prompt}-k{kernel}'
-        for rep, ttft in enumerate(ttfts, 1):
-            decode = (decodes or [5.0] * len(ttfts))[rep - 1]
-            (Path(root)/f'{base}-xattn{attn}-{rep}.json').write_text(json.dumps(cls.report(ttft, decode, **extra)))
-        if share is not None:
-            (Path(root)/f'{base}-xprof{attn}-1.json').write_text(json.dumps(cls.report(1.0, share=share)))
-
-    def bench(self, root):
-        result = subprocess.run([sys.executable, str(TOOLS/'summarize_e4.py'), 'bench', str(root)], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout
-
-    def populate(self, root, tiled8192=(19.2, 20.4, 20.6), tiled2048=(4.4, 4.5, 4.6), decode_tiled=(5.0, 5.1, 5.2),
-                 verified='full'):
-        def w(*args, **kwargs):
-            self.write(root, *args, **kwargs)
-        w('m8b', 'amx_bf16', 256, 8192, 1, 'split', [30.6, 30.9, 31.2], [5.0, 5.1, 5.2], share=0.75)
-        w('m8b', 'amx_bf16', 256, 8192, 1, 'tiled', list(tiled8192), list(decode_tiled), share=0.40, verified=verified)
-        w('m8b', 'amx_bf16', 256, 8192, 2, 'split', [14.0, 14.2, 14.4], [6.0, 6.1, 6.2])
-        w('m8b', 'amx_bf16', 256, 8192, 2, 'tiled', [10.0, 10.1, 10.2], [6.0, 6.1, 6.2])
-        w('m8b', 'amx_bf16', 256, 2048, 1, 'split', [4.5, 4.6, 4.7], [5.0, 5.1, 5.2], share=0.30)
-        w('m8b', 'amx_bf16', 256, 2048, 1, 'tiled', list(tiled2048), [5.0, 5.1, 5.2], share=0.15)
-        w('m1b', 'avx512_fp32', 64, 8192, 1, 'split', [9.0, 9.1, 9.2])
-        w('m1b', 'avx512_fp32', 64, 8192, 1, 'tiled', [7.0, 7.1, 7.2])
-
-    def test_matrix_and_passing_gates(self):
-        with tempfile.TemporaryDirectory() as temp:
-            self.populate(temp)
-            out = self.bench(temp)
-        row = [line for line in out.splitlines() if line.startswith('| m8b | amx_bf16 | 256 | 8192 | 1 | tiled')][0]
-        cells = [c.strip() for c in row.strip('|').split('|')]
-        self.assertEqual(cells[6], '3')
-        self.assertEqual(cells[7], '20.400 [19.200-20.600]')  # median and range of TTFT
-        self.assertEqual(cells[8], '1.51x')  # 30.9 / 20.4
-        self.assertEqual(cells[9], '40%')  # attention share of the profiled repeat
-        self.assertEqual(cells[10], '5.1 [5.0-5.2]')
-        split = [line for line in out.splitlines() if line.startswith('| m8b | amx_bf16 | 256 | 8192 | 1 | split')][0]
-        self.assertIn('| 75% |', split)
-        self.assertIn('Value gate (the amx_bf16 rung): **PASS**', out)
-        self.assertIn('| yes | PASS |', out)  # slowest tiled repeat 20.6 < fastest split repeat 30.6: beyond variability
-        self.assertIn('2048 gate: **PASS**', out)
-        self.assertIn('Decode gate: **PASS**', out)
-        self.assertIn('Placement gate: **PASS**', out)
-        self.assertIn('| m8b | amx_bf16 | 256 | 8192 | tiled | 20.400 [19.200-20.600] | 10.100 [10.000-10.200] | 2.02x |', out)
-        self.assertIn('- value: PASS', out)
-
-    def test_decode_noise_and_placement_evidence(self):
-        # Job 5864134: with three repeats a variant median just outside the split range is noise when the ranges overlap; a
-        # faster variant is not a regression; two-socket reports say placement 'file' and one-socket work regions are not
-        # verified by design. Only non-overlapping slower decode or bad region evidence fails.
-        def gates(decode_tiled, regions=None, placement='hbm'):
-            with tempfile.TemporaryDirectory() as temp:
-                self.populate(temp, decode_tiled=decode_tiled)
-                if regions is not None:
-                    for path in Path(temp).glob('m8b-*-s1-*-xattntiled-*.json'):
-                        data = json.loads(path.read_text())
-                        data['regions'], data['runtime']['placement'] = regions, placement
-                        path.write_text(json.dumps(data))
-                out = self.bench(temp)
-            return ('Decode gate: **PASS**' in out, 'Placement gate: **PASS**' in out)
-        full = lambda role: dict(role=role, verified='full', pages_mismatched=0, pages_missing=0, bytes=1 << 30)
-        self.assertEqual(gates((5.15, 5.25, 5.3))[0], True)   # median 5.25 above split's 5.2, ranges overlap
-        self.assertEqual(gates((5.3, 5.4, 5.5))[0], True)     # faster, no overlap: not a regression
-        self.assertEqual(gates((4.5, 4.6, 4.7))[0], False)    # slower, no overlap
-        work = dict(role='work', verified='unverified', pages_mismatched=0, pages_missing=0, bytes=70 << 20)
-        self.assertEqual(gates((5.0, 5.1, 5.2), [full('weights'), full('kv.k'), work])[1], True)
-        self.assertEqual(gates((5.0, 5.1, 5.2), [full('weights'), full('kv.k')], placement='file')[1], True)
-        self.assertEqual(gates((5.0, 5.1, 5.2), [dict(full('weights'), pages_mismatched=3)])[1], False)
-        self.assertEqual(gates((5.0, 5.1, 5.2), [dict(full('kv.k'), verified='sampled')])[1], False)
-        self.assertEqual(gates((5.0, 5.1, 5.2), [])[1], False)
-
-    def test_each_gate_fails_on_its_own_condition(self):
-        for name, kwargs, text in [
-                ('value', dict(tiled8192=(25.0, 25.5, 26.0)), 'Value gate (the amx_bf16 rung): **FAIL**'),
-                ('2048', dict(tiled2048=(4.8, 4.9, 5.0)), '2048 gate: **FAIL**'),
-                ('decode', dict(decode_tiled=(4.0, 4.1, 4.2)), 'Decode gate: **FAIL**'),
-                ('placement', dict(verified='sampled'), 'Placement gate: **FAIL**')]:
-            with self.subTest(gate=name), tempfile.TemporaryDirectory() as temp:
-                self.populate(temp, **kwargs)
-                out = self.bench(temp)
-                self.assertIn(text, out)
-                self.assertEqual(out.count('**FAIL**'), 1, out)  # the other gates are not affected
-
-    def test_overlapping_ranges_are_not_beyond_variability(self):
-        with tempfile.TemporaryDirectory() as temp:
-            self.populate(temp, tiled8192=(19.2, 20.4, 31.0))  # the slowest tiled repeat is above the fastest split one (30.6)
-            out = self.bench(temp)
-        self.assertIn('| no | PASS |', out)
-
-    def test_empty_directory_and_failed_runs(self):
-        with tempfile.TemporaryDirectory() as temp:
-            self.assertIn('No E4 reports', self.bench(temp))
-            self.write(temp, 'm8b', 'amx_bf16', 256, 8192, 1, 'split', [30.0, 31.0])
-            self.write(temp, 'm8b', 'amx_bf16', 256, 8192, 1, 'tiled', [None], status='error')
-            out = self.bench(temp)
-        self.assertIn('(1 failed)', out)
-        self.assertIn('Placement gate: **FAIL**', out)
-        self.assertIn('- value: no data', out)
-
-    def test_checks_title_and_failure_status(self):
-        with tempfile.TemporaryDirectory() as temp:
-            summary = dict(max_abs=0.0005, argmax_agreement=1.0)
-            good = dict(passed=True, summary=summary, budget=dict(max_abs=1e-3, argmax_agreement=1.0))
-            (Path(temp)/'compare-m8b-fp32-e4-tiled-m64-prompt2048.json').write_text(json.dumps(good))
-
-            def run():
-                return subprocess.run([sys.executable, str(TOOLS/'summarize_e4.py'), 'checks', temp], capture_output=True, text=True)
-            result = run()
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('# E4 correctness', result.stdout)
-            self.assertIn('| m8b-fp32-e4-tiled-m64-prompt2048 | max 0.001, argmax 100% |', result.stdout)
-            (Path(temp)/'compare-m8b-fp32-e4-bad.json').write_text(json.dumps(dict(good, passed=False)))
-            self.assertEqual(run().returncode, 1)
-
-
-class PhaseE4DryRunTests(unittest.TestCase):
-    """phase_E4 prints its matrix and its gates without running anything (DRY_RUN=1)."""
-
-    def run_phase(self, stage, **extra):
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E4', 'STAGE': stage, 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts/cresco8-prefill.sbatch')], env=env, capture_output=True, text=True,
-                                    timeout=120)
-        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return result.stdout.splitlines()
-
-    def runs(self, stage='bench', **extra):
-        from summarize_campaign import parse_label
-        runs = [line for line in self.run_phase(stage, **extra) if line.startswith('RUN ')]
-        for line in runs:
-            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
-        return runs
-
-    def test_bench_matrix(self):
-        runs = self.runs()
-        self.assertEqual(len(runs), 256)  # 2 models x 8 rung-variant pairs x 2 prompts x 2 sockets x (3 repeats + 1 profile)
-        timed = [line for line in runs if '-xattn' in line]
-        self.assertEqual(len(timed), 192)
-        self.assertTrue(all('gen=32' in line for line in timed))
-        profiled = [line for line in runs if '-xprof' in line]
-        self.assertEqual(len(profiled), 64)
-        self.assertTrue(all('LLAMA_PROFILE=1' in line and 'gen=1 ' in line for line in profiled))
-        self.assertFalse(any('LLAMA_PROFILE=1' in line for line in timed))
-        self.assertEqual({line.split('-s')[1][0] for line in runs}, {'1', '2'})
-        self.assertEqual({line.split('-p')[1].split('-')[0] for line in runs}, {'2048', '8192'})
-        self.assertEqual({line.split('-m')[1].split('-')[0] for line in runs}, {'64', '128', '256'})
-        self.assertFalse(any('LLAMA_ATTN=amx' in line for line in runs))
-        self.assertTrue(all('LLAMA_SOCKETS=2' in line for line in runs if '-s2-' in line))
-        self.assertTrue(all('cpu=0 ' in line for line in runs if '-s1-' in line))
-        self.assertTrue(all('LLAMA_PLACEMENT=hbm' in line for line in runs))
-        self.assertTrue(all('LLAMA_KERNELS=amx' in line for line in runs if 'kamx_int8' in line))
-
-    def test_check_writes_only_into_its_own_directory(self):
-        # Job 5864123: the generation comparisons wrote into E1/, which a job without phase E1 does not create.
-        lines = [line for line in self.run_phase('check') if line.startswith('EXPECT ')]
-        gen = [line for line in lines if line.startswith('EXPECT gen-')]
-        self.assertEqual(len(gen), 12)
-        self.assertTrue(all('/out/E4/gen-' in line for line in gen), gen[0])
-        self.assertFalse(any('/out/E1/' in line for line in lines))
-
-    def test_amx_only_on_the_bf16_rung_and_only_when_opted_in(self):
-        runs = self.runs(E4_AMX='1')
-        self.assertEqual(len(runs), 288)
-        amx = [line for line in runs if 'LLAMA_ATTN=amx' in line]
-        self.assertEqual(len(amx), 32)  # 2 models x 2 prompts x 2 sockets x 4 runs
-        self.assertTrue(all('kamx_bf16' in line and 'LLAMA_PRECISION=bf16' in line for line in amx))
-        self.assertTrue(all('-xattnamx-' not in line or 'kamx_bf16' in line for line in runs))
-
-    def test_attention_list_and_tiled_knob_are_overridable(self):
-        knob = 'LLAMA_ATTN_TILED_QUERIES=8 LLAMA_ATTN_TILED_ORDER=natural'
-        runs = self.runs(E4_ATTN='tiled', E4_TILED_ENV=knob)
-        self.assertEqual(len(runs), 128)
-        self.assertTrue(all(line.endswith(f'LLAMA_ATTN=tiled {knob}') for line in runs))
-        both = self.runs(E4_TILED_ENV='LLAMA_ATTN_TILED_QUERIES=8')
-        self.assertTrue(all('TILED_QUERIES' not in line for line in both if 'LLAMA_ATTN=split' in line))
-        self.assertEqual(sum('TILED_QUERIES=8' in line for line in both), 128)
-        self.assertEqual(len(self.runs(REPEATS='1')), 128)  # (1 repeat + 1 profile) x 32 cells x 2 models
-
-    def test_check_gates_every_variant(self):
-        lines = self.run_phase('check')
-        names = [line.split()[1] for line in lines if line.startswith('EXPECT ')]
-        self.assertEqual(len(names), 42)
-        for model in ('m1b', 'm8b'):
-            for attn in ('split', 'tiled'):
-                for case in (f'compare-{model}-fp32-e4-{attn}-m64-prompt86', f'compare-{model}-fp32-e4-{attn}-m64-prompt2048',
-                             f'compare-{model}-fp32-e4-{attn}-m128-prompt2048', f'compare-{model}-fp32-e4-s2-{attn}-m64-prompt2048',
-                             f'compare-{model}-fp32-e4-s2-bf16-{attn}-m256-prompt2048',
-                             f'compare-{model}-int8-e4-s2-w8a8-{attn}-m256-prompt2048',
-                             f'gen-fp32-e4-{model}-2048-{attn}-s1-vs-s2-1', f'gen-fp32-e4-{model}-short-{attn}-s1-vs-s2-1'):
-                    self.assertIn(case, names)
-            self.assertIn(f'compare-{model}-fp32-e4-bf16-tiled-vs-split-prompt86', names)
-            self.assertIn(f'compare-{model}-int8-e4-w8a8-tiled-vs-split-prompt2048', names)
-            self.assertIn(f'gen-fp32-e4-{model}-2048-split-vs-tiled-1', names)
-            self.assertNotIn(f'compare-{model}-fp32-e4-bf16-split-vs-split-prompt86', names)
-        self.assertFalse(any('amx' in name for name in names))
-        self.assertNotIn('LLAMA_ATTN=amx', '\n'.join(lines))
-        # FP32 strict against the one-socket per-token reference, BF16 and W8A8 their statistical gates, two sockets checked
-        fp32 = [line for line in lines if line.startswith('EXPECT compare-m8b-fp32-e4-tiled-m64-prompt2048')][0]
-        self.assertIn('--max-abs 1e-3 --batch-a 1 --batch-b 64 --last-only', fp32)
-        two = [line for line in lines if line.startswith('EXPECT compare-m8b-fp32-e4-s2-tiled-m64')][0]
-        self.assertIn('--env-b LLAMA_SOCKETS=2 --env-b LLAMA_TP_CHECK=1', two)
-        self.assertIn('--env-a LLAMA_SOCKETS=1', two)
-        self.assertIn('--max-abs 2 --rms-max 0.05 --argmax-min 0.97', [x for x in lines if 'e4-bf16-tiled-vs-split-prompt86' in x][0])
-        self.assertIn('--max-abs 16 --rms-max 0.2', [x for x in lines if 'e4-w8a8-tiled-vs-split-prompt2048' in x][0])
-        self.assertIn('--env-a LLAMA_ATTN=split', [x for x in lines if 'gen-fp32-e4-m8b-2048-split-vs-tiled' in x][0])
-
-    def test_check_with_amx_and_the_tiled_knob(self):
-        lines = self.run_phase('check', E4_AMX='1', E4_TILED_ENV='LLAMA_ATTN_TILED_QUERIES=8')
-        names = [line.split()[1] for line in lines if line.startswith('EXPECT ')]
-        self.assertEqual(len(names), 56)
-        amx = [name for name in names if 'amx' in name]
-        self.assertEqual(len(amx), 14)  # per model: bf16 against split x 2, two sockets, and 4 generation comparisons
-        self.assertTrue(all('bf16' in name for name in amx))
-        self.assertIn('gen-bf16-e4-m8b-2048-split-vs-amx-1', names)
-        for line in lines:
-            if line.startswith('EXPECT ') and 'LLAMA_ATTN=tiled' in line:
-                self.assertIn('LLAMA_ATTN_TILED_QUERIES=8', line)
-
-    def test_models_empty_is_recorded(self):
-        lines = self.run_phase('bench', MODELS='')
-        self.assertTrue(any('no E4 run was made' in line for line in lines))
-
-
-class DecodeAttentionCampaignTests(unittest.TestCase):
-    """E5: phase_E5 of scripts/cresco8-tp.sbatch (LLAMA_ATTN_DECODE=group) prints its matrix without running anything."""
-
-    def e5(self, stage, **extra):
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': stage, 'REPEATS': '3',
-                   'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
-                                    text=True, timeout=120)
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return result.stdout.splitlines()
-
-    def test_check_stage_matrix(self):
-        out = self.e5('check')
-        compares = [l for l in out if l.startswith('EXPECT compare-')]
-        self.assertEqual(len(compares), 2 * 2 * 3)  # models x precisions x (one socket, split vs two-socket group, 2048)
-        for line in compares:
-            self.assertIn('LLAMA_ATTN_DECODE=split', line)
-            self.assertIn('LLAMA_ATTN_DECODE=group', line)
-            self.assertNotIn('--batch-a', line)  # the per-token path: the knob acts in decode
-            self.assertNotIn('--batch-b', line)
-            self.assertNotIn('--last-only', line)
-            gate = '--rms-max 0.2' if '-int8-' in line else '--max-abs 1e-3'
-            self.assertIn(gate, line)
-        self.assertTrue(all('LLAMA_TP_CHECK=1' in l and 'LLAMA_SOCKETS=2' in l for l in compares if 's1split-vs-s2group' in l))
-        self.assertTrue(all('m8b-tokens-2048' in l or 'm1b-tokens-2048' in l for l in compares if '-2048-' in l))
-        gen = [l for l in out if 'compare_generation.py' in l]
-        self.assertEqual(len(gen), 2 * 2 * 2)  # models x precisions x (one socket, two sockets)
-        for line in gen:
-            for word in ('--steps 128', '--warm-context 8192', '--env-a LLAMA_ATTN_DECODE=split',
-                         '--env-b LLAMA_ATTN_DECODE=group', '--probe-batch 64'):
-                self.assertIn(word, line)
-        self.assertTrue(all('LLAMA_TP_CHECK=1' in l for l in gen if '-s2-' in l))
-        hf = [l for l in out if l.startswith('VALIDATE ')]
-        self.assertEqual(len(hf), 2 * 2)  # FP32 only, one socket and two sockets
-        self.assertTrue(all('fp32' in l and 'LLAMA_ATTN_DECODE=group' in l for l in hf))
-        self.assertEqual(len([l for l in hf if 'LLAMA_SOCKETS=2' in l and 'LLAMA_TP_CHECK=1' in l]), 2)
-        self.assertEqual([l for l in out if l.startswith('RUN ')], [])
-        # HF_GATE=0 records that the Hugging Face gate was not run
-        self.assertEqual([l for l in self.e5('check', HF_GATE='0') if l.startswith('VALIDATE ')], [])
-
-    def test_bench_stage_matrix(self):
-        from summarize_campaign import parse_label
-        out = self.e5('bench')
-        runs = [l for l in out if l.startswith('RUN ')]
-        # models x precisions x (3 repeats x 3 contexts + 3 profiled) x two configurations x two kernels
-        self.assertEqual(len(runs), 2 * 2 * (3 * 3 + 3) * 2 * 2)
-        for line in runs:
-            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
-            kernel = 'group' if '-xattngroup' in line else 'split'
-            self.assertIn(f'LLAMA_ATTN_DECODE={kernel}', line)
-            self.assertEqual(line.count('LLAMA_ATTN_DECODE='), 1)
-            self.assertIn('LLAMA_PROFILE=1' if 'prof ' in line else 'LLAMA_PREFILL_GEMM=on', line)
-        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '8192', '32768'})
-        self.assertEqual({l.split('-s')[1][0] for l in (r.split()[1] for r in runs)}, {'1', '2'})
-        self.assertTrue(all('LLAMA_PROFILE=1' in l for l in runs if 'prof ' in l))
-        self.assertFalse([l for l in runs if 'LLAMA_PROFILE=1' in l and 'prof ' not in l])
-        self.assertFalse([l for l in runs if '-s2-t14-' in l or 'xctl' in l or 'xp4' in l])  # a subset of B7
-        bench = [l for l in out if l.startswith('EXPECT bench-decode-') and 'attention-bench' in l]
-        self.assertEqual(len(bench), 2 * 2 * 2)  # shapes x KV heads (all, half) x kernels
-        for line in bench:
-            for word in ('--mode decode', '--context 512,8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
-                self.assertIn(word, line)
-        self.assertEqual(sorted(l.split('LLAMA_ATTN_DECODE=')[1].split()[0] for l in bench), ['group'] * 4 + ['split'] * 4)
-        self.assertEqual([l for l in out if l.startswith('EXPECT compare-')], [])  # the correctness gates are the check stage's
-
-
-class E6Tests(unittest.TestCase):
-    """The E6 batched-decode experiment: its shapes, its job matrix (DRY_RUN) and the two benchmarks it relies on."""
-
-    def run_phase(self, **extra):
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E6', 'MODELS': 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b', **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-e6.sbatch')], env=env, capture_output=True, text=True,
-                                    timeout=120)
-        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return result.stdout.splitlines()
-
-    def test_decode_shapes_and_kv_capacity(self):
-        import e6_model as e6
-        self.assertEqual(e6.decode_shapes('8b', 1), [('qkv', 6144, 4096), ('wo', 4096, 4096), ('w13', 28672, 4096),
-                                                     ('w2', 4096, 14336), ('cls', 128256, 4096)])
-        # two sockets: rows are split for QKV, W1/W3 and the classifier, columns for Wo and W2; the bytes add up
-        for model in ('8b', '1b'):
-            one, two = e6.decode_shapes(model, 1), e6.decode_shapes(model, 2)
-            self.assertEqual([2 * n * k for _, n, k in two], [n * k for _, n, k in one])
-        self.assertEqual(e6.kv_bytes_per_token('8b'), 256 * 1024)  # the 256 KiB per token of the plan
-        self.assertEqual(e6.kv_bytes_per_token('1b'), 64 * 1024)
-        self.assertEqual(e6.weight_bytes('8b', 'int8') // 10**6, 7_973)
-        out = subprocess.run([sys.executable, str(TOOLS/'e6_model.py'), 'shapes', '1b', '2'], capture_output=True, text=True)
-        self.assertEqual(out.stdout.strip(), '1536x2048,2048x1024,8192x2048,2048x4096,64128x2048')
-
-    def test_step_model_interpolates_and_charges_attention_per_request(self):
-        import e6_model as e6
-        gemm = {p: {1: 1e-3, 8: 1.5e-3, 32: 3e-3} for p in e6.PHASES}
-        base = e6.step_seconds('1b', gemm, 0.1, 1)
-        self.assertAlmostEqual(base, 16 * 4e-3 + 1e-3 + 16 * 1e-4)
-        eight = e6.step_seconds('1b', gemm, 0.1, 8)
-        self.assertAlmostEqual(eight, 16 * 4 * 1.5e-3 + 1.5e-3 + 8 * 16 * 1e-4)
-        self.assertAlmostEqual(e6.step_seconds('1b', gemm, 0.1, 20), 16 * 4 * (1.5e-3 + 12 / 24 * 1.5e-3) + 2.25e-3 + 20 * 16 * 1e-4)
-        tokens, latency = e6.throughput(eight, 8)
-        self.assertAlmostEqual(tokens * latency, 8)
-        self.assertGreater(e6.exchange_seconds('8b', 32), e6.exchange_seconds('8b', 1))
-
-    def test_dry_run_matrix(self):
-        from summarize_campaign import parse_label
-        out = self.run_phase()
-        gemm = [l for l in out if l.startswith('GEMM ')]
-        self.assertEqual(len(gemm), 2 * 2 * 4)  # models x socket counts x kernels
-        for line in gemm:
-            for word in ('--m 1,2,4,8,16,32', '--cold-mib 1024', '--reps 100'):
-                self.assertIn(word, line)
-        self.assertEqual(len([l for l in gemm if '--gemv' in l]), 2 * 2 * 2)  # the GEMV baseline for FP32 and VNNI Q8 only
-        self.assertEqual({l.split()[1] for l in gemm}, {'f32', 'q8v', 'q8amx', 'bf16amx'})
-        self.assertTrue(all('kernels=amx' in l for l in gemm if l.split()[1] in ('q8amx', 'bf16amx')))
-        self.assertEqual(len([l for l in out if l.startswith('EXPECT amx-t')]), 4)
-        attention = [l for l in out if l.startswith('EXPECT attention-')]
-        self.assertEqual(len(attention), 8)
-        for line in attention:
-            for word in ('--mode decode', '--context 512,2048,8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
-                self.assertIn(word, line)
-        runs = [l for l in out if l.startswith('RUN ')]
-        self.assertEqual(len(runs), 2 * 2 * (2 * 2 * 3 + 2))  # models x precisions x (contexts x sockets x repeats + profiled)
-        for line in runs:
-            self.assertIsNotNone(parse_label(line.split()[1] + '-1'), line)
-        profiled = [l for l in runs if 'xe6prof' in l]
-        self.assertEqual(len(profiled), 2 * 2 * 2)
-        self.assertTrue(all('LLAMA_PROFILE=1' in l and 'p2048' in l for l in profiled))
-        self.assertFalse([l for l in runs if 'LLAMA_PROFILE=1' in l and 'xe6prof' not in l])
-        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '2048'})
-        self.assertTrue(all('LLAMA_SOCKETS=2' in l for l in runs if '-s2-' in l))
-        self.assertTrue(all('cpu=0 ' in l for l in runs if '-s1-' in l))
-
-    def test_dry_run_without_models_skips_the_engine_cells(self):
-        out = self.run_phase(MODELS='')
-        self.assertFalse([l for l in out if l.startswith('RUN ')])
-        self.assertEqual(len([l for l in out if l.startswith('GEMM ')]), 16)
-
-    def synthetic_job(self, root):
-        """A fake job directory: 1B FP32 on one socket. GEMM time grows slowly with M (weights read once), the GEMV baseline
-        linearly; attention 0.05 ms per layer at every context; a profiled run and three timed runs at N = 1."""
-        import e6_model as e6
-        e6dir = root/'E6'
-        e6dir.mkdir(parents=True)
-        for tag, kernel, per_row in (('f32', 'gemm', 0.1e-3), ('f32', 'gemv_rows', 1e-3)):
-            lines = []
-            for phase, n, k in e6.decode_shapes('1b', 1):
-                for m in e6.NS:
-                    t = 1e-3 + (m - 1) * per_row if kernel == 'gemm' else m * 1e-3
-                    lines.append(json.dumps(dict(kernel=kernel, n=n, k=k, m=m, median_s=t, best_s=t)))
-            path = e6dir/'gemm-f32-1b-s1.out'
-            path.write_text((path.read_text() if path.exists() else '') + '\n'.join(lines) + '\n')
-        att = [dict(mode='decode', shape='1b', kv_heads=8, attn_decode=kernel, context=c, ms_layer_median=0.05)
-               for kernel in ('split', 'group') for c in e6.CONTEXTS]
-        (e6dir/'attention-1b.out').write_text('\n'.join(json.dumps(a) for a in att) + '\n')
-        label = 'm1b-fp32-teams-hbm-s1-t56-p{}-{}'
-        for context in (512, 2048):
-            for rep in (1, 2, 3):
-                report = dict(status='completed', timing_seconds=dict(decode=1.28), tokens=dict(decode_steps=128))
-                (root/(label.format(context, 'xe6') + f'-{rep}.json')).write_text(json.dumps(report))
-        profile = dict(forward_passes=128, forward=1.28, qkv=0.128, wo=0.128, w1_w3_swiglu=0.4, w2=0.2, classifier=0.1,
-                       attention=0.1, embedding=0.01)
-        report = dict(status='completed', profile_seconds=dict(decode=profile))
-        (root/(label.format(2048, 'xe6prof') + '-1.json')).write_text(json.dumps(report))
-        return e6dir
-
-    def test_model_report_from_a_synthetic_job(self):
-        import e6_model as e6
-        with tempfile.TemporaryDirectory() as temp:
-            e6dir = self.synthetic_job(Path(temp))
-            result = e6.report(e6dir)
-            rows = result['rows']
-            one = next(r for r in rows if (r['model'], r['precision'], r['n'], r['context'], r['kernel']) == ('1b', 'fp32', 1, 2048, 'split'))
-            # 16 layers x 4 phases x 1 ms + classifier 1 ms + 16 x 0.05 ms attention + other (10 ms in the profile) = 10 ms + ...
-            other = 1e3 * (1.28 - 0.128 - 0.128 - 0.6 - 0.1 - 0.1) / 128
-            self.assertAlmostEqual(one['step_ms'], 16 * 4 + 1 + 0.8 + other, places=6)
-            eight = next(r for r in rows if (r['model'], r['precision'], r['n'], r['context'], r['kernel']) == ('1b', 'fp32', 8, 2048, 'split'))
-            self.assertAlmostEqual(eight['gemm_ms'], 16 * 4 * 1.7 + 1.7, places=6)  # the GEMM (1.7 ms), not 8 GEMVs, is used at M = 8
-            self.assertAlmostEqual(eight['attention_ms'], 8 * 16 * 0.05, places=6)
-            self.assertEqual(len(result['repro']), 2)  # contexts 512 and 2048, one socket, FP32 only
-            repro = next(r for r in result['repro'] if r['context'] == 2048)
-            self.assertAlmostEqual(repro['measured_ms'], 10.0)
-            self.assertAlmostEqual(repro['modeled_ms'], one['step_ms'])
-            self.assertEqual(len(result['phases']), 1)
-            text = e6.markdown(result)
-            for word in ('N = 1 reproduction', 'E6.3 gate', 'N=32'):
-                self.assertIn(word, text)
-            self.assertEqual(e6.gate(rows), [])  # the gate row is 8B W8A8: nothing to judge in this job
-            result_cli = subprocess.run([sys.executable, str(TOOLS/'e6_model.py'), 'model', str(e6dir)], capture_output=True, text=True)
-            self.assertEqual(result_cli.returncode, 0, result_cli.stderr)
-            self.assertIn('1b fp32 (avx512), 1 socket(s)', result_cli.stdout)
-
-    def test_gate_needs_both_conditions(self):
-        import e6_model as e6
-        def rows(step8):
-            common = dict(model='8b', precision='int8', policy='avx512', sockets=1, kernel='split', context=2048)
-            return [dict(common, n=1, step_ms=20.0, agg_tok_s=50.0), dict(common, n=8, step_ms=step8, agg_tok_s=8000 / step8)]
-        self.assertEqual([g['passes'] for g in e6.gate(rows(25.0))], [True])
-        both = e6.gate(rows(60.0))[0]  # 3x the step: 2.67x the throughput passes, but the latency is 3x
-        self.assertTrue(both['throughput_ok'] and not both['latency_ok'] and not both['passes'])
-        self.assertFalse(e6.gate(rows(100.0))[0]['throughput_ok'])
-
-    def test_kv_capacity(self):
-        import e6_model as e6
-        self.assertAlmostEqual(e6.kv_gib_per_request('8b', 32768), 8.0)
-        self.assertAlmostEqual(e6.kv_gib_per_request('1b', 2048), 0.125)
-        self.assertLess(e6.fit_requests('8b', 'fp32', 32768, 1), e6.fit_requests('8b', 'int8', 32768, 1))
-        self.assertGreater(e6.fit_requests('8b', 'int8', 32768, 2), 2 * e6.fit_requests('8b', 'int8', 32768, 1) - 1)
+class BenchToolTests(unittest.TestCase):
+    """The C benchmarks (gemm-bench, amx-bench) the cluster studies call; the JSON rows they print."""
 
     def bench(self, name, *args, env=None):
         if BUILD is None or not (BUILD/name).exists():
@@ -1599,310 +893,6 @@ class E6Tests(unittest.TestCase):
         if result is not None:
             self.assertEqual(result.returncode, 2)
 
-
-class DecodeAttentionFollowupTests(unittest.TestCase):
-    """E5 follow-ups: the bench stage of phase E5 is selectable by knobs (E5_CONTEXTS, E5_KERNELS, E5_SOCKETS, E5_PROFILED,
-    E5_ALTERNATE, E5_SKIP_ENGINE, E5_SKIP_MICRO, E5_MICRO_*, E5_LAYOUTS); the defaults are the first E5 job's matrix."""
-
-    MODELS = 'm1b:/a/m1b:/hf/m1b m8b:/a/m8b:/hf/m8b'
-
-    def run_e5(self, expect_ok=True, **extra):
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': 'bench', 'REPEATS': '3', 'MODELS': self.MODELS, **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
-                                    text=True, timeout=120)
-        if expect_ok:
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return result
-
-    def lines(self, **extra):
-        return self.run_e5(**extra).stdout.splitlines()
-
-    @staticmethod
-    def runs(out):
-        return [l for l in out if l.startswith('RUN ')]
-
-    @staticmethod
-    def cells(out):
-        return [l for l in out if l.startswith('EXPECT bench-decode-') and 'attention-bench' in l]
-
-    @staticmethod
-    def label(line):
-        return line.split()[1]
-
-    @staticmethod
-    def kernel(line):
-        return line.split()[1].rsplit('xattn', 1)[1].replace('prof', '')
-
-    def test_defaults_are_the_first_job_matrix(self):
-        out = self.lines()
-        runs = self.runs(out)
-        self.assertEqual(len(runs), 2 * 2 * (3 * 3 + 3) * 2 * 2)
-        cells = self.cells(out)
-        self.assertEqual(sorted(self.label(l) for l in cells),
-                         sorted(f'bench-decode-{k}-{s}-kv{v}' for k in ('split', 'group') for s in ('8b', '1b') for v in (8, 4)))
-        self.assertFalse([l for l in cells if '--kv-layout' in l])  # the rows layout is the default and adds no flag
-        self.assertTrue(all('--reps 1000' in l and '--context 512,8192,32768' in l for l in cells))
-        # one profiled repeat, and the kernel order is split then group in every repeat
-        self.assertEqual({l.split()[2] for l in runs if 'prof' in self.label(l)}, {'reps=1-1'})
-        one = [self.kernel(l) for l in runs if 'm1b-fp32' in l and '-p512-' in l and '-s1-' in l and 'prof' not in self.label(l)]
-        self.assertEqual(one, ['split', 'group'] * 3)
-
-    def test_settle_matrix_for_the_512_gate(self):
-        # 8B, one socket, FP32 and W8A8, contexts 512 and 8192, nine interleaved repeats and three profiled runs per kernel
-        out = self.lines(MODELS='m8b:/a/m8b:/hf/m8b', E5_CONTEXTS='512 8192', E5_SOCKETS='1', E5_PROFILED='3',
-                         E5_ALTERNATE='1', E5_SKIP_MICRO='1', REPEATS='9')
-        runs = self.runs(out)
-        prof = [l for l in runs if 'prof' in self.label(l)]
-        timed = [l for l in runs if 'prof' not in self.label(l)]
-        self.assertEqual(len(timed), 2 * 9 * 2 * 2)  # precisions x repeats x contexts x kernels
-        self.assertEqual(len(prof), 2 * 3 * 2 * 2)   # precisions x profiled repeats x contexts x kernels
-        self.assertTrue(all('m8b-' in l and '-s1-t56-' in l and 'LLAMA_SOCKETS=1' in l for l in runs))
-        self.assertEqual({l.split('warm=')[1].split()[0] for l in runs}, {'512', '8192'})
-        self.assertEqual({l.split()[2] for l in prof}, {'reps=1-1', 'reps=2-2', 'reps=3-3'})
-        self.assertTrue(all('LLAMA_PROFILE=1' in l for l in prof))
-        self.assertFalse([l for l in timed if 'LLAMA_PROFILE=1' in l])
-        self.assertEqual(self.cells(out), [])
-        # interleaved and alternating: odd repeats launch split first, even repeats group first, within one cell
-        one = [(l.split()[2], self.kernel(l)) for l in timed if '-fp32-' in l and '-p512-' in l]
-        self.assertEqual(one[:4], [('reps=1-1', 'split'), ('reps=1-1', 'group'), ('reps=2-2', 'group'), ('reps=2-2', 'split')])
-        self.assertEqual(one[-2:], [('reps=9-9', 'split'), ('reps=9-9', 'group')])
-        # without E5_ALTERNATE every repeat is split then group
-        plain = self.lines(MODELS='m8b:/a/m8b:/hf/m8b', E5_CONTEXTS='512', E5_SOCKETS='1', E5_SKIP_MICRO='1',
-                           PRECISIONS='fp32', REPEATS='2')
-        self.assertEqual([self.kernel(l) for l in self.runs(plain) if 'prof' not in self.label(l)],
-                         ['split', 'group', 'split', 'group'])
-
-    def test_one_kernel_and_socket_lists(self):
-        out = self.lines(E5_KERNELS='group', E5_SOCKETS='2', E5_CONTEXTS='32768', E5_SKIP_MICRO='1', E5_PROFILED='0')
-        runs = self.runs(out)
-        self.assertEqual(len(runs), 2 * 2 * 3)  # models x precisions x repeats
-        self.assertTrue(all('LLAMA_ATTN_DECODE=group' in l and 'LLAMA_SOCKETS=2' in l and 'warm=32768' in l for l in runs))
-        self.assertFalse([l for l in runs if 'prof' in self.label(l)])
-
-    def test_skip_switches(self):
-        engine_off = self.lines(E5_SKIP_ENGINE='1')
-        self.assertEqual(self.runs(engine_off), [])
-        self.assertEqual(len(self.cells(engine_off)), 8)
-        both = self.lines(E5_SKIP_ENGINE='1', E5_SKIP_MICRO='1')
-        self.assertEqual(self.runs(both) + self.cells(both), [])
-
-    def test_microbenchmark_layout_cells(self):
-        out = self.lines(E5_SKIP_ENGINE='1', E5_LAYOUTS='rows head', E5_MICRO_CONTEXTS='8192 32768', E5_MICRO_REPS='1000')
-        cells = self.cells(out)
-        self.assertEqual(len(cells), 2 * 2 * 2 * 2)  # kernels x shapes x KV heads x layouts
-        for line in cells:
-            layout = self.label(line).rsplit('-', 1)[1]
-            self.assertIn(layout, ('rows', 'head'))
-            self.assertIn(f'--kv-layout {layout}', line)
-            for word in ('--context 8192,32768', '--reps 1000', '--node 2', '--cpunodebind=0'):
-                self.assertIn(word, line)
-        self.assertEqual({self.label(l).rsplit('-', 1)[1] for l in cells}, {'rows', 'head'})
-        self.assertEqual(len({self.label(l) for l in cells}), 16)
-        head_only = self.cells(self.lines(E5_SKIP_ENGINE='1', E5_LAYOUTS='head', E5_MICRO_SHAPES='1b', E5_MICRO_KV='4',
-                                          E5_KERNELS='group'))
-        self.assertEqual(len(head_only), 1)
-        for word in ('bench-decode-group-1b-kv4-head', '--shape 1b', '--kv-heads-local 4', '--kv-layout head'):
-            self.assertIn(word, head_only[0])
-        # the microbenchmark contexts follow E5_CONTEXTS unless named
-        followed = self.cells(self.lines(E5_SKIP_ENGINE='1', E5_CONTEXTS='512 8192'))
-        self.assertTrue(followed and all('--context 512,8192 ' in l for l in followed))
-
-    def test_bad_values_stop_before_any_launch(self):
-        for knob, value in (('E5_KERNELS', 'tiled'), ('E5_SOCKETS', '3'), ('E5_LAYOUTS', 'columns'), ('E5_CONTEXTS', '512 x'),
-                            ('E5_MICRO_REPS', '2000'), ('E5_PROFILED', '-1'), ('E5_ALTERNATE', '2'), ('E5_SKIP_MICRO', 'yes'),
-                            ('E5_MICRO_SHAPES', 'huge')):
-            result = self.run_e5(expect_ok=False, **{knob: value})
-            self.assertNotEqual(result.returncode, 0, f'{knob}={value}')
-            self.assertIn('E5', result.stderr + result.stdout, f'{knob}={value}')
-            self.assertEqual([l for l in result.stdout.splitlines() if l.startswith(('RUN ', 'EXPECT bench-decode'))], [],
-                             f'{knob}={value}')
-
-
-class KvLayoutCampaignTests(unittest.TestCase):
-    """E5.4: the K/V layout study of phase E5 (E5_KV_LAYOUTS, E5_ATTN, E5_PREFILL_PROMPTS, E5_PREFILL_RUNGS, E5_KV_CHECK) prints
-    its matrix without running anything; with none of these knobs the engine runs are the first E5 job's (no LLAMA_KV_LAYOUT)."""
-
-    ONE = 'm1b:/a/m1b:/hf/m1b'
-
-    def run_e5(self, stage='bench', expect_ok=True, models=ONE, **extra):
-        if not shutil.which('bash'):
-            self.skipTest('bash is required')
-        with tempfile.TemporaryDirectory() as temp:
-            env = {**campaign_env(), 'DRY_RUN': '1', 'SLURM_JOB_ID': 'dry', 'ROOT': str(ROOT), 'OUT': str(Path(temp)/'out'),
-                   'PYTHON': sys.executable, 'PHASE': 'E5', 'STAGE': stage, 'REPEATS': '3', 'MODELS': models, **extra}
-            result = subprocess.run(['bash', str(ROOT/'scripts'/'cresco8-tp.sbatch')], env=env, capture_output=True,
-                                    text=True, timeout=120)
-        if expect_ok:
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return result
-
-    def lines(self, *args, **extra):
-        return self.run_e5(*args, **extra).stdout.splitlines()
-
-    @staticmethod
-    def runs(out):
-        return [l for l in out if l.startswith('RUN ')]
-
-    @staticmethod
-    def label(line):
-        return line.split()[1]
-
-    def test_defaults_add_no_layout_and_no_prefill_cells(self):
-        runs = self.runs(self.lines())
-        self.assertEqual(len(runs), 2 * (3 * 3 + 3) * 2 * 2)  # precisions x (3 repeats x 3 contexts + 3) x sockets x kernels
-        self.assertFalse([l for l in runs if 'LLAMA_KV_LAYOUT' in l or 'LLAMA_ATTN=' in l or 'xkv' in l or 'warm=0 ' in l])
-        # empty knobs (as a submitter's `export E5_KV_LAYOUTS=`) are the defaults
-        self.assertEqual(self.runs(self.lines(E5_KV_LAYOUTS='', E5_ATTN='', E5_PREFILL_PROMPTS='')), runs)
-
-    def test_layout_variants_run_inside_each_repeat_in_alternating_order(self):
-        from summarize_campaign import parse_label
-        out = self.lines(E5_KV_LAYOUTS='rows head', E5_ATTN='tiled', E5_ALTERNATE='1', E5_SKIP_MICRO='1', E5_CONTEXTS='512 8192',
-                         E5_SOCKETS='1', PRECISIONS='fp32')
-        runs = self.runs(out)
-        prof = [l for l in runs if 'LLAMA_PROFILE=1' in l]
-        timed = [l for l in runs if 'LLAMA_PROFILE=1' not in l]
-        self.assertEqual(len(timed), 3 * 2 * 4)  # repeats x contexts x (kernel, layout) variants
-        self.assertEqual(len(prof), 1 * 2 * 4)
-        for line in runs:
-            self.assertIsNotNone(parse_label(self.label(line) + '-1'), line)
-            tag = self.label(line).rsplit('-x', 1)[1]
-            kernel, layout = ('group' if 'group' in tag else 'split'), ('head' if 'kvhead' in tag else 'rows')
-            self.assertTrue(tag.startswith('attn' + kernel + 'kv' + layout), tag)
-            for word in (f'LLAMA_ATTN_DECODE={kernel}', f'LLAMA_KV_LAYOUT={layout}', 'LLAMA_ATTN=tiled'):
-                self.assertEqual(line.count(word), 1, (word, line))
-            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 1)
-        # one cell: every variant once per repeat; odd repeats in order, even repeats reversed
-        cell = [(l.split()[2], self.label(l).rsplit('-x', 1)[1]) for l in timed if '-p512-' in l]
-        self.assertEqual(cell[:4], [('reps=1-1', 'attnsplitkvrows'), ('reps=1-1', 'attnsplitkvhead'),
-                                    ('reps=1-1', 'attngroupkvrows'), ('reps=1-1', 'attngroupkvhead')])
-        self.assertEqual([t for r, t in cell[4:8]], ['attngroupkvhead', 'attngroupkvrows', 'attnsplitkvhead', 'attnsplitkvrows'])
-        self.assertEqual({r for r, _ in cell[4:8]}, {'reps=2-2'})
-        # without E5_ALTERNATE every repeat has the same order, and E5_ATTN unset leaves the job-wide default
-        plain = self.runs(self.lines(E5_KV_LAYOUTS='head', E5_SKIP_MICRO='1', E5_CONTEXTS='512', E5_SOCKETS='1',
-                                     PRECISIONS='fp32', REPEATS='2', E5_PROFILED='0'))
-        self.assertEqual([self.label(l).rsplit('-x', 1)[1] for l in plain], ['attnsplitkvhead', 'attngroupkvhead'] * 2)
-        self.assertFalse([l for l in plain if 'LLAMA_ATTN=' in l])
-
-    def test_prefill_cells(self):
-        from summarize_campaign import parse_label
-        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_ALTERNATE='1', E5_CONTEXTS='512',
-                         E5_SOCKETS='1', E5_PROFILED='0', E5_SKIP_MICRO='1')
-        prefill = [l for l in self.runs(out) if 'warm=0 ' in l]
-        # FP32: avx512_fp32 and amx_bf16; W8A8: avx512_q8 and amx_int8; two prompts, two layouts, three repeats
-        self.assertEqual(len(prefill), 4 * 2 * 2 * 3)
-        for line in prefill:
-            info = parse_label(self.label(line) + '-1')
-            self.assertEqual((info['sockets'], info['threads'], info['placement']), ('1', '56', 'hbm'))
-            self.assertIn(info['prompt'], ('2048', '8192'))
-            for word in ('LLAMA_SOCKETS=1', 'LLAMA_ATTN=tiled', 'gen=32', 'cpu=0'):
-                self.assertIn(word, line)
-            self.assertNotIn('LLAMA_ATTN_DECODE', line)
-            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 1)
-            self.assertIn(f"ctx={int(info['prompt']) + 256} ", line)
-            self.assertEqual(self.label(line).rsplit('-x', 1)[1], 'kv' + line.split('LLAMA_KV_LAYOUT=')[1].split()[0])
-        rungs = {info['kernel'] for info in (parse_label(self.label(l) + '-1') for l in prefill)}
-        self.assertEqual(rungs, {'avx512_fp32', 'amx_bf16', 'avx512_q8', 'amx_int8'})
-        self.assertTrue(all('LLAMA_PRECISION=bf16' in l for l in prefill if 'kamx_bf16' in l))
-        self.assertTrue(all('LLAMA_KERNELS=amx' in l for l in prefill if 'kamx_' in l))
-        self.assertEqual({self.label(l).split('-m')[1].split('-')[0] for l in prefill if 'kavx512_fp32' in l}, {'128'})
-        # the layout order alternates between repeats, within a cell
-        cell = [(l.split()[2], self.label(l).rsplit('-x', 1)[1]) for l in prefill
-                if 'm1b-fp32' in l and 'kavx512_fp32' in l and '-p8192-' in l]
-        self.assertEqual(cell, [('reps=1-1', 'kvrows'), ('reps=1-1', 'kvhead'), ('reps=2-2', 'kvhead'), ('reps=2-2', 'kvrows'),
-                                ('reps=3-3', 'kvrows'), ('reps=3-3', 'kvhead')])
-        # rungs and the attention kernel are selectable
-        some = self.runs(self.lines(E5_KV_LAYOUTS='head', E5_PREFILL_PROMPTS='2048', E5_PREFILL_RUNGS='amx_bf16', E5_ATTN='split',
-                                    E5_SKIP_MICRO='1', E5_CONTEXTS='512', E5_SOCKETS='1', E5_PROFILED='0', PRECISIONS='fp32',
-                                    REPEATS='1'))
-        self.assertEqual([self.label(l) for l in some if 'warm=0 ' in l],
-                         ['m1b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16-xkvhead'])
-        self.assertTrue(all('LLAMA_ATTN=split' in l for l in some))
-
-    def test_bench_stage_writes_the_prompt_files_of_the_prefill_cells(self):
-        """Jobs 5876582 and 5876584: the prefill cells read prompt-N.txt, which only the check stage wrote. The bench stage
-        must ask for exactly the lengths of E5_PREFILL_PROMPTS (the dry run names them) and nothing without the cells."""
-        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_MICRO='1')
-        self.assertEqual([l for l in out if l.startswith('E5 prompts')], ['E5 prompts: 2048,8192'])
-        self.assertFalse([l for l in self.lines() if l.startswith('E5 prompts')])
-        # the same call the real stage makes: make_prompt writes prompt-N.txt for every length it is given
-        script = (ROOT/'scripts'/'cresco8-tp.sbatch').read_text()
-        self.assertIn('a_models "$dir" "${E5_PREFILL_PROMPTS// /,}"', script)
-
-    def test_skip_decode_leaves_only_the_prefill_cells(self):
-        out = self.lines(E5_KV_LAYOUTS='rows head', E5_PREFILL_PROMPTS='2048 8192', E5_SKIP_DECODE='1', E5_SKIP_MICRO='1',
-                         E5_ALTERNATE='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')
-        runs = self.runs(out)
-        self.assertEqual(len(runs), 2 * 4 * 2 * 2 * 3)  # models x rungs (two per precision) x prompts x layouts x repeats
-        self.assertTrue(all('warm=0 ' in l and 'LLAMA_ATTN_DECODE' not in l and 'LLAMA_PROFILE' not in l for l in runs))
-        self.assertEqual(self.runs(self.lines(E5_SKIP_DECODE='1', E5_SKIP_MICRO='1')), [])
-        result = self.run_e5(expect_ok=False, E5_SKIP_DECODE='2')
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_check_stage_gates_rows_against_head_bitwise(self):
-        out = self.lines('check', E5_KV_CHECK='1', models=f'{self.ONE} m8b:/a/m8b:/hf/m8b')
-        compares = [l for l in out if l.startswith('EXPECT compare-')]
-        gens = [l for l in out if l.startswith('EXPECT gen-')]
-        # per model and precision: two sockets x (two decode kernels x (short, tail) + prefill + AMX rung); and 2 x 2 generations
-        self.assertEqual(len(compares), 2 * 2 * 2 * (2 * 2 + 2))
-        self.assertEqual(len(gens), 2 * 2 * 2 * 2)
-        for line in compares:
-            self.assertIn('--bitwise', line)
-            self.assertNotIn('--max-abs', line)
-            self.assertEqual(line.count('--env-a LLAMA_KV_LAYOUT=rows'), 1)
-            self.assertEqual(line.count('--env-b LLAMA_KV_LAYOUT=head'), 1)
-            self.assertEqual(line.count('LLAMA_KV_LAYOUT='), 2)
-            if '-s2' in line.split()[1]:
-                self.assertEqual(line.count('LLAMA_TP_CHECK=1'), 2)
-            if 'tail8192' in line:
-                self.assertIn('--tail 8', line)
-                self.assertIn('--batch-a 64 --batch-b 64', line)
-                self.assertIn('-tokens-8192.txt', line)
-            if '-kv-short-' in line:
-                self.assertNotIn('--batch-a', line)  # the per-token path at every position of the short prompt
-                self.assertNotIn('-tokens-8192.txt', line)
-            if '-prefill8192-' in line:
-                self.assertIn('--last-only', line)
-                self.assertEqual(line.count('LLAMA_ATTN=tiled'), 2)
-            if 'amx' in line.split()[1]:
-                self.assertIn('LLAMA_KERNELS=amx', line)
-        self.assertEqual({l.split('LLAMA_ATTN_DECODE=')[1].split()[0] for l in compares if 'LLAMA_ATTN_DECODE=' in l},
-                         {'split', 'group'})
-        self.assertTrue(any('-amxbf16-' in l and 'LLAMA_PRECISION=bf16' in l for l in compares))
-        self.assertTrue(any('-amxint8-' in l for l in compares))
-        for line in gens:
-            for word in ('--steps 128', '--warm-context 8192', '--env-a LLAMA_KV_LAYOUT=rows', '--env-b LLAMA_KV_LAYOUT=head',
-                         '--env-a LLAMA_ATTN=tiled', '--env-b LLAMA_ATTN=tiled', '--probe-batch 64', '--require-identical'):
-                self.assertIn(word, line)
-        self.assertEqual({l.split('-s')[1][0] for l in (g.split()[1] for g in gens)}, {'1', '2'})
-        hf = [l for l in out if l.startswith('VALIDATE ')]
-        self.assertEqual(len(hf), 2 * 2)  # FP32 only, one socket and two sockets, per model
-        self.assertTrue(all('LLAMA_KV_LAYOUT=head' in l for l in hf))
-        self.assertEqual(self.runs(out), [])
-        self.assertEqual([l for l in self.lines('check', E5_KV_CHECK='1', HF_GATE='0') if l.startswith('VALIDATE ')], [])
-        # without E5_KV_CHECK the check stage is the split-against-group one, unchanged
-        default = self.lines('check')
-        self.assertTrue([l for l in default if l.startswith('EXPECT compare-')])
-        self.assertFalse([l for l in default if 'LLAMA_KV_LAYOUT' in l])
-
-    def test_bad_values_stop_before_any_launch(self):
-        for knob, value in (('E5_KV_LAYOUTS', 'columns'), ('E5_ATTN', 'amx'), ('E5_PREFILL_PROMPTS', '2048 x'),
-                            ('E5_PREFILL_RUNGS', 'per_token'), ('E5_KV_CHECK', '2')):
-            extra = {'E5_PREFILL_PROMPTS': '2048', 'E5_KV_LAYOUTS': 'head'}
-            extra[knob] = value
-            stage = 'bench'
-            if knob == 'E5_KV_CHECK':
-                extra, stage = {knob: value}, 'check'
-            result = self.run_e5(stage, expect_ok=False, **extra)
-            self.assertNotEqual(result.returncode, 0, f'{knob}={value}')
-            self.assertIn(knob, result.stderr + result.stdout, f'{knob}={value}')
-            self.assertEqual([l for l in result.stdout.splitlines() if l.startswith(('RUN ', 'EXPECT'))], [], f'{knob}={value}')
-        result = self.run_e5(expect_ok=False, E5_PREFILL_PROMPTS='2048')  # prefill cells compare layouts: they need some
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('E5_PREFILL_PROMPTS needs E5_KV_LAYOUTS', result.stderr + result.stdout)
 
 
 if __name__ == '__main__':
