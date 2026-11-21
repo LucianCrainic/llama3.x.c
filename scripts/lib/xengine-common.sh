@@ -20,6 +20,12 @@
 #   <engine>_matrix                  optional; prints "S MEM WL..." lines (default: every MEM x every SOCKETS x WORKLOADS)
 #   <engine>_prepare                 optional; builds, stages the model, checks inputs once per job (non-zero = skip engine)
 #   <engine>_begin_config S MEM / <engine>_end_config S MEM   optional; start and stop a server once per configuration
+#                                    (XE_CONFIG_VARIANT and XE_CONFIG_WLS describe the configuration; a matrix line may name a
+#                                    variant as MEM:VARIANT, which becomes part of the cell label and the manifest)
+#   <engine>_describe_config S MEM   optional; prints the server command for DRY_RUN
+#   <engine>_finalize                optional; runs after the process ended, before markers and checks (e.g. builds report.json)
+#   CELL_ANCHORS (array of key=value) adds anchors; CELL_PERF_ATTACH (a function printing pids) makes the Cache node's
+#                                    user-space perf attach with -p to those pids instead of wrapping the command
 #   <engine>_estimate_s S MEM WL REP and <engine>_config_overhead_s S MEM   seconds, for the DRY_RUN estimate
 #   <engine>_environment             optional; writes versions to stdout (appended to environment.txt)
 # and a reader of its report in tools/xengine_summary.py (PHASE_READERS) plus a marker deriver in tools/xengine_cell.py.
@@ -93,11 +99,22 @@ xe_require_env() {
     ARTIFACTS=${ARTIFACTS:-'<ARTIFACTS>'}
     PROMPTS_DIR=${PROMPTS_DIR:-'<PROMPTS_DIR>'}
     UPERF=${UPERF:-'<UPERF>'}
+    VLLM_SIF=${VLLM_SIF:-'<VLLM_SIF>'}
+    VLLM_MODEL=${VLLM_MODEL:-'<VLLM_MODEL>'}
+    VLLM_PATCHED_WORKER=${VLLM_PATCHED_WORKER:-'<VLLM_PATCHED_WORKER>'}
   else
     for value in $ENGINES; do
       if [[ $value == c ]]; then
         : "${ARTIFACTS:?ARTIFACTS (directory with int8-v3.bin and tokenizer-v2.bin) required for the c engine}"
         : "${PROMPTS_DIR:?PROMPTS_DIR (short-86.txt, prompt-2048.txt, prompt-8192.txt) required for the c engine}"
+      fi
+    done
+    for value in $ENGINES; do
+      if [[ $value == vllm ]]; then
+        : "${VLLM_SIF:?VLLM_SIF (Apptainer image of vLLM 0.34.0 CPU) required for vllm}"
+        : "${VLLM_MODEL:?VLLM_MODEL (directory of the W8A8 checkpoint) required for vllm}"
+        : "${PROMPTS_DIR:?PROMPTS_DIR (the *.ids.json files) required for vllm}"
+        [[ $NODE_ROLE == cache ]] || : "${VLLM_PATCHED_WORKER:?VLLM_PATCHED_WORKER (patched cpu_worker.py, scripts/vllm/numa-hbm.patch applied) required for vllm on a Flat node}"
       fi
     done
     [[ $NODE_ROLE != cache ]] || : "${UPERF:?UPERF (user-space perf binary) required on the Cache node}"
@@ -128,6 +145,7 @@ xe_job_begin() {
         --campaign "workloads=$WORKLOADS" --campaign "repeats=$REPEATS" || true
       "$PYTHON" "$ROOT/tools/xengine_summary.py" "$OUT" -o "$OUT/runs.csv" || true
     fi
+    if declare -F vllm_stop > /dev/null; then vllm_stop || true; fi
     [[ -z $shm ]] || rm -rf -- "$shm"
     exit "$status"
   }
@@ -220,11 +238,12 @@ xe_perf_group_for_rep() {
 CELL_TODO=
 # xe_run_cell ENGINE S MEM WL REP: sets the cell globals and hands over to run_<engine>_cell.
 xe_run_cell() {
-  CELL_ENGINE=$1 CELL_S=$2 CELL_MEM=$3 CELL_WL=$4 CELL_REP=$5
-  CELL_LABEL="$CELL_ENGINE-s$CELL_S-$CELL_MEM-$CELL_WL-r$CELL_REP"
+  CELL_ENGINE=$1 CELL_S=$2 CELL_MEM=$3 CELL_WL=$4 CELL_REP=$5 CELL_VARIANT=${6:-}
+  CELL_LABEL="$CELL_ENGINE-s$CELL_S-$CELL_MEM${CELL_VARIANT:+-$CELL_VARIANT}-$CELL_WL-r$CELL_REP"
   CELL_DIR="$OUT/runs/$CELL_LABEL"
   CELL_PERF_GROUP=$(xe_perf_group_for_rep "$CELL_REP")
-  CELL_ENV=() CELL_CMD=() CELL_CHECK=()
+  CELL_ENV=() CELL_CMD=() CELL_CHECK=() CELL_ANCHORS=()
+  CELL_PERF_ATTACH=
   CELL_VERSION= CELL_CONFIG= CELL_GEN= CELL_PROC= CELL_LOAD_PATTERN= CELL_TODO=
   "run_${CELL_ENGINE}_cell" "$CELL_S" "$CELL_MEM" "$CELL_WL" "$CELL_REP"
 }
@@ -237,7 +256,13 @@ xe_perf_command_text() {
   case $1 in
     MEM) printf 'sudo -n %s stat -a --per-socket -I %s -x, -e %s -o %s/perf.csv -- tail -s 0.1 --pid=<engine pid> -f /dev/null' "$PERF_BIN" "$XE_PERF_INTERVAL_MS" "$XE_MEM_EVENTS" "$CELL_DIR" ;;
     COMPUTE) printf 'sudo -n %s stat -a --per-socket -I %s -x, -e %s -o %s/perf.csv -- tail -s 0.1 --pid=<engine pid> -f /dev/null' "$PERF_BIN" "$XE_PERF_INTERVAL_MS" "$XE_COMPUTE_EVENTS" "$CELL_DIR" ;;
-    USER) printf '%s stat -I %s -x, -e %s -o %s/perf.csv -- <command>' "${UPERF:-<UPERF>}" "$XE_PERF_INTERVAL_MS" "$XE_USER_EVENTS" "$CELL_DIR" ;;
+    USER)
+      if [[ -n $CELL_PERF_ATTACH ]]; then
+        printf '%s stat -I %s -x, -e %s -p <worker pids> -o %s/perf.csv -- tail -s 0.1 --pid=<client pid> -f /dev/null' "${UPERF:-<UPERF>}" "$XE_PERF_INTERVAL_MS" "$XE_USER_EVENTS" "$CELL_DIR"
+      else
+        printf '%s stat -I %s -x, -e %s -o %s/perf.csv -- <command>' "${UPERF:-<UPERF>}" "$XE_PERF_INTERVAL_MS" "$XE_USER_EVENTS" "$CELL_DIR"
+      fi
+      ;;
     *) printf 'none' ;;
   esac
 }
@@ -261,7 +286,7 @@ xe_write_cell() {
   local env_args=() word
   for word in ${CELL_ENV[@]+"${CELL_ENV[@]}"}; do env_args+=(--env "$word"); done
   "$PYTHON" "$XE_CELL_PY" write-cell "$CELL_DIR" --field "label=$CELL_LABEL" --field "node_role=$NODE_ROLE" \
-    --field "engine=$CELL_ENGINE" --field "version=$CELL_VERSION" --field "config=$CELL_CONFIG" --field "sockets=$CELL_S" \
+    --field "engine=$CELL_ENGINE" --field "variant=$CELL_VARIANT" --field "version=$CELL_VERSION" --field "config=$CELL_CONFIG" --field "sockets=$CELL_S" \
     --field "mem=$CELL_MEM" --field "workload=$CELL_WL" --field "repeat=$CELL_REP" --field "generation=$CELL_GEN" \
     --field "perf_group=$CELL_PERF_GROUP" --field "perf_events=$(xe_perf_events "$CELL_PERF_GROUP")" \
     --field "job=$SLURM_JOB_ID" --field "status=$1" --field "status_detail=$2" --field "rc=$3" \
@@ -321,6 +346,7 @@ xe_execute_cell() {
     MEM | COMPUTE) mode=sys ;;
     USER) mode=wrap ;;
   esac
+  [[ $mode != wrap || -z $CELL_PERF_ATTACH ]] || mode=attach
   if [[ $mode != none && $XE_PERF != 1 ]]; then
     mode=none CELL_PERF_GROUP=none events=
   fi
@@ -339,6 +365,12 @@ xe_execute_cell() {
       tail -s 0.1 --pid="$pid" -f /dev/null < /dev/null > /dev/null 2> "$d/perf.err" &
     perfpid=$!
   fi
+  if [[ $mode == attach ]]; then
+    perf_start_ns=$(xe_now_ns)
+    "$UPERF" stat -I "$XE_PERF_INTERVAL_MS" -x, -e "$events" -p "$("$CELL_PERF_ATTACH")" -o "$d/perf.csv" -- \
+      tail -s 0.1 --pid="$pid" -f /dev/null < /dev/null > /dev/null 2> "$d/perf.err" &
+    perfpid=$!
+  fi
   xe_sampler "$d" "$pid" "$mode" < /dev/null &
   samp=$!
   wait "$pid" || rc=$?
@@ -348,8 +380,10 @@ xe_execute_cell() {
   {
     printf 'launch_ns=%s\nend_ns=%s\nrc=%s\nperf_mode=%s\n' "$launch_ns" "$end_ns" "$rc" "$mode"
     [[ -z $perf_start_ns ]] || printf 'perf_start_ns=%s\n' "$perf_start_ns"
+    printf '%s\n' ${CELL_ANCHORS[@]+"${CELL_ANCHORS[@]}"}
     [[ ! -s $d/load_end_seen_ns ]] || printf 'load_end_seen_ns=%s\n' "$(< "$d/load_end_seen_ns")"
   } > "$d/anchors"
+  if declare -F "${CELL_ENGINE}_finalize" > /dev/null; then "${CELL_ENGINE}_finalize" || true; fi
   "$PYTHON" "$XE_CELL_PY" markers "$d" 2> "$d/markers.err" || true
   local status=ok detail='' crc=0
   if ((${#CELL_CHECK[@]})); then "${CELL_CHECK[@]}" > "$d/check.txt" 2>&1 || crc=$?; fi
@@ -376,7 +410,7 @@ xe_matrix_default() {
 
 # xe_run_engine ENGINE: prepare, then per configuration (begin hook, REPEATS x workloads, end hook).
 xe_run_engine() {
-  local engine=$1 s mem wls rep wl
+  local engine=$1 s mem memtok wls rep wl variant
   declare -F "run_${engine}_cell" > /dev/null || die "engine '$engine' has no run_${engine}_cell"
   if declare -F "${engine}_prepare" > /dev/null; then
     "${engine}_prepare" || {
@@ -384,12 +418,18 @@ xe_run_engine() {
       return 0
     }
   fi
-  while read -r s mem wls; do
+  while read -r s memtok wls; do
     [[ -n $s ]] || continue
+    mem=${memtok%%:*} variant=
+    [[ $memtok != *:* ]] || variant=${memtok#*:}
+    XE_CONFIG_VARIANT=$variant XE_CONFIG_WLS=$wls
     if dry_run && declare -F "${engine}_config_overhead_s" > /dev/null; then
-      printf 'CONFIG %s s%s %s begin/end (server start, etc.) est=%ss\n' "$engine" "$s" "$mem" "$("${engine}_config_overhead_s" "$s" "$mem")" |
+      printf 'CONFIG %s s%s %s%s begin/end (server start, etc.) est=%ss\n' "$engine" "$s" "$mem" "${variant:+ ($variant)}" "$("${engine}_config_overhead_s" "$s" "$mem")" |
         tee -a "$OUT/dry-run.txt"
       printf '%s %s\n' "$engine" "$("${engine}_config_overhead_s" "$s" "$mem")" >> "$OUT/estimate.tsv"
+    fi
+    if dry_run && declare -F "${engine}_describe_config" > /dev/null; then
+      "${engine}_describe_config" "$s" "$mem" | tee -a "$OUT/dry-run.txt"
     fi
     if declare -F "${engine}_begin_config" > /dev/null && ! dry_run; then
       "${engine}_begin_config" "$s" "$mem" || {
@@ -398,7 +438,7 @@ xe_run_engine() {
       }
     fi
     for ((rep = 1; rep <= REPEATS; rep++)); do
-      for wl in $wls; do xe_run_cell "$engine" "$s" "$mem" "$wl" "$rep"; done
+      for wl in $wls; do xe_run_cell "$engine" "$s" "$mem" "$wl" "$rep" "$variant"; done
     done
     if declare -F "${engine}_end_config" > /dev/null && ! dry_run; then "${engine}_end_config" "$s" "$mem" || true; fi
   done < <(if declare -F "${engine}_matrix" > /dev/null; then "${engine}_matrix"; else xe_matrix_default; fi)
@@ -496,8 +536,8 @@ run_c_cell() {
   xe_execute_cell
 }
 
-# ---- llama.cpp and vLLM: sections to be filled in with their verified command lines ----------------------------------
-# Placeholders only: the estimates follow the plan (section 8); the run functions record the cell as not implemented.
+# ---- llama.cpp: section to be filled in with its verified command line ----------------------------------------------------
+# Placeholder only: the estimate follows the plan (section 8); the run function records the cell as not implemented.
 llamacpp_estimate_s() {
   local run
   case $3 in P) run=6 ;; D) run=14 ;; L) run=45 ;; esac
@@ -508,16 +548,221 @@ run_llamacpp_cell() {
   xe_execute_cell
 }
 
-# vLLM runs as one server per configuration (started once, all workloads and repeats issued against it).
-vllm_config_overhead_s() {
-  echo "${XE_VLLM_START_S:-300}"
+# ---- vLLM 0.34.0 CPU backend (Apptainer image, RedHatAI W8A8 checkpoint) ------------------------------------------------
+# One server per configuration, started in vllm_begin_config and stopped in vllm_end_config; every cell is one separate
+# streaming request of tools/xengine_vllm_client.py (exact token ids of the c engine's prompt files, greedy, ignore_eos),
+# so perf attaches to the request: system-wide on Flat nodes (tail --pid=<client>), user-space `perf -p <workers>` on the
+# Cache node. Compiled mode (default), 55 OMP threads per socket (cores 55 and 111 stay free for the frontend and the
+# client), prefix caching off and proven off (vllm:prefix_cache_hits_total == 0 at the end of every configuration).
+# Configurations (MEM[:VARIANT] in the matrix): hbm:patched = ranks bound to the HBM nodes by the disclosed one-line patch
+# (scripts/vllm/numa-hbm.patch, mounted over cpu_worker.py, VLLM_HBM_NODE_OFFSET=2); hbm:stock-membind = stock vLLM under
+# `numactl --membind=2` (it rebinds itself to DDR; kept as a finding, D only); ddr and cache = stock.
+# Env: VLLM_SIF, VLLM_MODEL, VLLM_PATCHED_WORKER (Flat), optional VLLM_WORK (node-local scratch), VLLM_PORT, VLLM_VERSION,
+# VLLM_MODEL_REV, VLLM_CLIENT_CPU (55), XE_VLLM_START_TIMEOUT_S (1500), APPTAINER_CACHEDIR / APPTAINER_TMPDIR.
+VLLM_PORT=${VLLM_PORT:-8000}
+VLLM_SERVED=llama31-8b-w8a8
+VLLM_VERSION=${VLLM_VERSION:-0.34.0+cpu}
+VLLM_STARTUP_S=
+VLLM_T0_NS=
+VLLM_SERVER_PID=
+VLLM_CFG_DIR=
+VLLM_CFG_TAG=
+
+vllm_matrix() {
+  local mem s
+  for mem in $MEMS; do
+    for s in $SOCKETS; do
+      if [[ $mem == hbm ]]; then printf '%s hbm:patched %s\n' "$s" "$WORKLOADS"; else printf '%s %s %s\n' "$s" "$mem" "$WORKLOADS"; fi
+    done
+  done
+  if [[ $NODE_ROLE == A && ${XE_VLLM_MEMBIND_CONTROL:-1} == 1 ]] && xe_in_list 1 $SOCKETS && xe_in_list D $WORKLOADS; then
+    printf '1 hbm:stock-membind D\n'
+  fi
 }
+
+# Seconds per request including about 6 s of client start-up; per configuration: server start-up (about 190 s compiled), a
+# warm-up request per workload, placement evidence and shutdown.
 vllm_estimate_s() {
   local run
-  case $3 in P) run=15 ;; D) run=30 ;; L) run=60 ;; esac
+  case $3 in P) run=10 ;; D) run=20 ;; L) run=35 ;; esac
   echo "$run"
 }
+vllm_config_overhead_s() {
+  echo "${XE_VLLM_START_S:-260}"
+}
+
+# vllm_build_server S VARIANT: sets VLLM_SERVER_CMD (an array) for the configuration.
+vllm_build_server() {
+  local s=$1 variant=$2 bind wrap=() binds=() envs=()
+  local local_dir="${VLLM_WORK:-/tmp/vllm-xengine}/$SLURM_JOB_ID-$VLLM_CFG_TAG"
+  if [[ $s == 1 ]]; then
+    bind=0-54
+    wrap=(numactl --cpunodebind=0)
+    [[ $variant != stock-membind ]] || wrap+=(--membind=2)
+  else
+    bind='0-54|56-110'
+  fi
+  if [[ $variant == patched ]]; then
+    binds+=(--bind "$VLLM_PATCHED_WORKER:/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/cpu_worker.py:ro")
+    envs+=(--env VLLM_HBM_NODE_OFFSET=2)
+  fi
+  VLLM_SERVER_CMD=(${wrap[@]+"${wrap[@]}"} apptainer exec --cleanenv --no-home --bind "$VLLM_MODEL:/model:ro" --bind "$local_dir:/cache"
+    ${binds[@]+"${binds[@]}"} --env "VLLM_CPU_OMP_THREADS_BIND=$bind" --env VLLM_CACHE_ROOT=/cache/vllm
+    --env TORCHINDUCTOR_CACHE_DIR=/cache/inductor --env HF_HOME=/cache/hf --env HF_HUB_OFFLINE=1 --env VLLM_LOGGING_LEVEL=INFO
+    --env TOKENIZERS_PARALLELISM=false --env CXX=g++ --env HOME=/cache/home --env TRITON_CACHE_DIR=/cache/triton
+    --env XDG_CACHE_HOME=/cache/xdg ${envs[@]+"${envs[@]}"} "$VLLM_SIF" vllm serve /model --served-model-name "$VLLM_SERVED"
+    --dtype bfloat16 --tensor-parallel-size "$s" --max-model-len 8704 --max-num-seqs 1 --max-num-batched-tokens 8192
+    --no-enable-prefix-caching --seed 0 --generation-config vllm --kv-cache-memory-bytes 4G --port "$VLLM_PORT")
+  VLLM_LOCAL=$local_dir
+}
+
+vllm_set_cfg() {
+  VLLM_CFG_TAG="s$1-$2${XE_CONFIG_VARIANT:+-$XE_CONFIG_VARIANT}"
+  VLLM_CFG_DIR="$OUT/vllm-config-$VLLM_CFG_TAG"
+}
+
+vllm_describe_config() {
+  vllm_set_cfg "$1" "$2"
+  vllm_build_server "$1" "$XE_CONFIG_VARIANT"
+  printf 'SERVER vllm %s (workloads %s): start once, wait for /health, one warm-up request per workload, numastat -p per worker\n' \
+    "$VLLM_CFG_TAG" "$XE_CONFIG_WLS"
+  printf '  cmd:   %s\n' "${VLLM_SERVER_CMD[*]}"
+}
+
+# vllm_workload WL: sets VLLM_PROMPT (ids file stem), VLLM_G, VLLM_PTOK.
+vllm_workload() {
+  case $1 in
+    P) VLLM_PROMPT=prompt-2048 VLLM_G=1 VLLM_PTOK=2048 ;;
+    D) VLLM_PROMPT=short-86 VLLM_G=128 VLLM_PTOK=86 ;;
+    L) VLLM_PROMPT=prompt-8192 VLLM_G=128 VLLM_PTOK=8192 ;;
+  esac
+}
+
+# vllm_client_cmd OUTDIR WL: VLLM_CLIENT_CMD (array), the client pinned to a spare core, inside the image (its python and
+# tokenizers); OUTDIR is mounted as /out.
+vllm_client_cmd() {
+  vllm_workload "$2"
+  VLLM_CLIENT_CMD=(taskset -c "${VLLM_CLIENT_CPU:-55}" apptainer exec --cleanenv --no-home --bind "$VLLM_MODEL:/model:ro"
+    --bind "$ROOT/tools:/res:ro" --bind "$PROMPTS_DIR:/prompts:ro" --bind "$1:/out" "$VLLM_SIF" python3 /res/xengine_vllm_client.py
+    --tokenizer /model --model "$VLLM_SERVED" --port "$VLLM_PORT" --workload "$2" --ids-file "/prompts/$VLLM_PROMPT.ids.json"
+    --gen "$VLLM_G")
+}
+
+vllm_worker_pids() {
+  pgrep -u "$(id -un)" -f 'VLLM::Worker|VLLM::.*Worker' | tr '\n' ' '
+}
+vllm_worker_pids_csv() {
+  vllm_worker_pids | sed 's/ *$//; s/ /,/g'
+}
+
+vllm_prepare() {
+  if dry_run; then
+    printf 'PREP  vllm: check image, checkpoint, patched worker, ids files; one server per configuration\n'
+    return 0
+  fi
+  local f
+  for f in "$VLLM_SIF" "$VLLM_MODEL/config.json" "$PROMPTS_DIR/short-86.ids.json" "$PROMPTS_DIR/prompt-2048.ids.json" \
+    "$PROMPTS_DIR/prompt-8192.ids.json" "$ROOT/tools/xengine_vllm_client.py"; do
+    [[ -e $f ]] || {
+      echo "vllm_prepare: missing $f" >&2
+      return 1
+    }
+  done
+  [[ $NODE_ROLE == cache ]] || [[ -e $VLLM_PATCHED_WORKER ]] || return 1
+  mkdir -p "${VLLM_WORK:-/tmp/vllm-xengine}"
+}
+
+vllm_environment() {
+  printf 'vllm %s image sha256 %s checkpoint revision %s patch sha256 %s\n' "$VLLM_VERSION" \
+    "$(sha256sum "$VLLM_SIF" 2> /dev/null | cut -d' ' -f1)" "${VLLM_MODEL_REV:-unrecorded}" \
+    "$(sha256sum "$ROOT/scripts/vllm/numa-hbm.patch" 2> /dev/null | cut -d' ' -f1)"
+  printf 'apptainer: %s\n' "$(apptainer --version 2> /dev/null || echo unavailable)"
+}
+
+vllm_stop() {
+  [[ -z $VLLM_SERVER_PID ]] && return 0
+  pkill -TERM -P "$VLLM_SERVER_PID" 2> /dev/null || true
+  kill -TERM "$VLLM_SERVER_PID" 2> /dev/null || true
+  local i
+  for i in $(seq 1 30); do
+    pgrep -u "$(id -un)" -f 'vllm serve' > /dev/null || break
+    sleep 1
+  done
+  pkill -KILL -u "$(id -un)" -f 'vllm serve' 2> /dev/null || true
+  pkill -KILL -u "$(id -un)" -f 'VLLM::' 2> /dev/null || true
+  wait "$VLLM_SERVER_PID" 2> /dev/null || true
+  VLLM_SERVER_PID=
+  rm -rf -- "${VLLM_LOCAL:-/nonexistent-xengine}"
+  sleep 2
+}
+
+# Starts the server (start-up time = launch to /health), runs one discarded warm-up request per workload, then records
+# the placement evidence (numastat -p and a numa_maps summary of every worker) and the metrics baseline.
+vllm_begin_config() {
+  local s=$1 mem=$2 d wl pid now
+  vllm_set_cfg "$s" "$mem"
+  d=$VLLM_CFG_DIR
+  mkdir -p "$d"
+  vllm_build_server "$s" "$XE_CONFIG_VARIANT"
+  rm -rf "$VLLM_LOCAL"
+  mkdir -p "$VLLM_LOCAL/home" "$VLLM_LOCAL/triton" "$VLLM_LOCAL/xdg"
+  printf '%s\n' "${VLLM_SERVER_CMD[*]}" > "$d/serve-cmd.txt"
+  VLLM_T0_NS=$(xe_now_ns)
+  "${VLLM_SERVER_CMD[@]}" < /dev/null > "$d/server.log" 2>&1 &
+  VLLM_SERVER_PID=$!
+  until curl -sf "http://127.0.0.1:$VLLM_PORT/health" > /dev/null; do
+    if ! kill -0 "$VLLM_SERVER_PID" 2> /dev/null; then
+      tail -30 "$d/server.log" >&2
+      VLLM_SERVER_PID=
+      return 1
+    fi
+    now=$(xe_now_ns)
+    if ((now - VLLM_T0_NS > ${XE_VLLM_START_TIMEOUT_S:-1500} * 1000000000)); then
+      vllm_stop
+      return 1
+    fi
+    sleep 1
+  done
+  now=$(xe_now_ns)
+  VLLM_STARTUP_S=$(awk -v a="$VLLM_T0_NS" -v b="$now" 'BEGIN { printf "%.1f", (b - a) / 1e9 }')
+  printf 'startup_seconds=%s\nserver_launch_ns=%s\n' "$VLLM_STARTUP_S" "$VLLM_T0_NS" > "$d/startup.txt"
+  for wl in $XE_CONFIG_WLS; do
+    vllm_client_cmd "$d" "$wl"
+    "${VLLM_CLIENT_CMD[@]}" --warmups 1 --repeats 0 --out "/out/warmup-$wl.jsonl" < /dev/null > "$d/warmup-$wl.stdout" 2>&1 ||
+      record_result "warmup-vllm-$VLLM_CFG_TAG-$wl" FAIL 'warm-up request failed'
+  done
+  for pid in $(vllm_worker_pids); do
+    numastat -p "$pid" > "$d/numastat-$pid.txt" 2>&1 || true
+    "$PYTHON" "$XE_CELL_PY" numa-maps "$pid" > "$d/numa_maps-$pid.json" 2> /dev/null || true
+  done
+  curl -sf "http://127.0.0.1:$VLLM_PORT/metrics" > "$d/metrics-before.txt" || true
+}
+
+vllm_end_config() {
+  local d=$VLLM_CFG_DIR
+  curl -sf "http://127.0.0.1:$VLLM_PORT/metrics" > "$d/metrics-after.txt" || true
+  if "$PYTHON" "$XE_CELL_PY" check-prefix "$d" > "$d/prefix-check.txt" 2>&1; then
+    record_result "prefix-cache-vllm-$VLLM_CFG_TAG" PASS
+  else
+    record_result "prefix-cache-vllm-$VLLM_CFG_TAG" FAIL "$(cat "$d/prefix-check.txt")"
+  fi
+  vllm_stop
+}
+
 run_vllm_cell() {
-  CELL_TODO='vLLM section not filled in yet (command line pending)'
+  local s=$1 wl=$3
+  vllm_set_cfg "$s" "$2"
+  vllm_client_cmd "$CELL_DIR" "$wl"
+  CELL_GEN=$VLLM_G
+  CELL_CMD=("${VLLM_CLIENT_CMD[@]}" --warmups 0 --repeats 1 --out /out/client.jsonl --tag "$CELL_LABEL")
+  CELL_VERSION=$VLLM_VERSION
+  CELL_CONFIG="tp=$s omp_threads_per_socket=55 variant=${CELL_VARIANT:-stock} compiled prefix_caching=off max_num_seqs=1 kv_cache=4G prompt=$VLLM_PROMPT generation=$VLLM_G greedy ignore_eos startup_s=${VLLM_STARTUP_S:-n/a} server_cmd_file=$VLLM_CFG_TAG/serve-cmd.txt"
+  CELL_ANCHORS=("load_start_ns=${VLLM_T0_NS:-0}")
+  CELL_PERF_ATTACH=vllm_worker_pids_csv
+  CELL_CHECK=("$PYTHON" "$XE_CELL_PY" check-vllm "$CELL_DIR" --generation "$VLLM_G" --prompt-tokens "$VLLM_PTOK")
   xe_execute_cell
+}
+
+vllm_finalize() {
+  "$PYTHON" "$XE_CELL_PY" vllm-report "$CELL_DIR" 2> /dev/null
 }

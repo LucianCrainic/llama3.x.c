@@ -223,6 +223,62 @@ class SummaryTests(unittest.TestCase):
             self.assertTrue(out.exists())
 
 
+def vllm_record(gen=128, ptok=86, ttft=0.2, step=0.025, wall=END/1e9):
+    arrivals = [ttft + i*step for i in range(gen)]
+    return {'http_status': 200, 'usage_prompt_tokens': ptok, 'usage_completion_tokens': gen, 'token_arrivals': arrivals,
+            't_first_token': ttft, 't_end': arrivals[-1] + 0.001, 'wall_time': wall, 'ok': True}
+
+
+class VllmTests(unittest.TestCase):
+    def test_markers_from_the_client_clock(self):
+        r = vllm_record()
+        m = cell.derive_markers_vllm({'launch_ns': str(T0 + 5_000_000_000), 'end_ns': str(END + 400_000_000),
+                                      'load_start_ns': str(T0)}, r)
+        self.assertEqual(m['load_start_ns'], T0)  # server launch, not the client's
+        send = r['wall_time']*1e9 - r['t_end']*1e9
+        self.assertAlmostEqual((m['first_token_ns'] - send)/1e9, 0.2, places=5)
+        self.assertAlmostEqual((m['decode_end_ns'] - m['first_token_ns'])/1e9, 127*0.025, places=5)
+        self.assertAlmostEqual(m['teardown_s'], 0.4, places=3)
+
+    def test_reader_checks_and_report(self):
+        phases = summ.read_vllm_phases(vllm_record())
+        self.assertAlmostEqual(phases['prefill']['tok_s'], 86/0.2)
+        self.assertEqual(phases['decode']['tokens'], 127)
+        self.assertAlmostEqual(phases['decode']['tok_s'], 40.0, places=6)
+        self.assertAlmostEqual(phases['decode']['tpot_s'], 0.025)
+        self.assertNotIn('decode', summ.read_vllm_phases(vllm_record(gen=1, ptok=2048)))
+        self.assertTrue(all(o for o, _, _ in cell.check_vllm(vllm_record(), 128, 86)))
+        self.assertFalse(all(o for o, _, _ in cell.check_vllm(vllm_record(gen=100), 128, 86)))
+        self.assertFalse(all(o for o, _, _ in cell.check_vllm(vllm_record(), 128, 87)))
+
+    def test_prefix_hits_and_report_file(self):
+        text = ('# HELP x\nvllm:prefix_cache_hits_total{engine="0",model_name="m"} 0.0\n'
+                'vllm:prefix_cache_hits_created{engine="0"} 1.7e9\n')
+        self.assertEqual(cell.prefix_hits(text), 0.0)
+        self.assertEqual(cell.prefix_hits(text.replace('} 0.0', '} 16.0')), 16.0)
+        self.assertIsNone(cell.prefix_hits('nothing'))
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d/'client.jsonl').write_text(json.dumps(dict(vllm_record(), warmup=True)) + '\n' + json.dumps(vllm_record()) + '\n')
+            self.assertEqual(cell.main(['vllm-report', str(d)]), 0)
+            self.assertEqual(json.loads((d/'report.json').read_text())['status'], 'completed')
+            (d/'metrics-after.txt').write_text(text)
+            self.assertEqual(cell.main(['check-prefix', str(d)]), 0)
+
+    def test_summary_rows_for_a_vllm_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)/'runs'/'vllm-s1-hbm-patched-D-r3'
+            d.mkdir(parents=True)
+            (d/'cell.json').write_text(json.dumps({'engine': 'vllm', 'variant': 'patched', 'sockets': 1, 'mem': 'hbm',
+                                                   'workload': 'D', 'repeat': 3, 'perf_group': 'none', 'node_role': 'A',
+                                                   'status': 'ok'}))
+            (d/'report.json').write_text(json.dumps(dict(vllm_record(), status='completed')))
+            rows = summ.summarize([tmp])
+            self.assertEqual([r['phase'] for r in rows], ['prefill', 'decode'])
+            self.assertEqual(rows[0]['variant'], 'patched')
+            self.assertAlmostEqual(rows[1]['tpot_uniform_s'], (127*0.025 + 0.001)/127, places=6)
+
+
 class CheckTests(unittest.TestCase):
     def test_check_c(self):
         ok = cell.check_c(report(), 1, 'hbm', 128, 86)
@@ -291,6 +347,24 @@ class DryRunTests(unittest.TestCase):
         self.assertIn('--generation-length 128', text)
         self.assertNotIn('--chat-template', text)
 
+    def test_vllm_matrix_per_role(self):
+        text, a = self.cells('A', ENGINES='vllm')
+        self.assertEqual(len(a), 2*3*3 + 3)  # patched 1S, 2S x P D L x 3, plus the stock-membind control (D)
+        self.assertEqual([c for c in a if 'stock-membind' in c], ['vllm-s1-hbm-stock-membind-D-r%d' % i for i in (1, 2, 3)])
+        self.assertIn('VLLM_HBM_NODE_OFFSET=2', text)
+        self.assertIn('--membind=2', text)
+        self.assertIn('--tensor-parallel-size 2', text)
+        self.assertIn('0-54|56-110', text)
+        self.assertIn('--no-enable-prefix-caching', text)
+        self.assertNotIn('not filled in yet', text)
+        text, b = self.cells('B', ENGINES='vllm')
+        self.assertEqual(len(b), 2*3*3)
+        self.assertNotIn('VLLM_HBM_NODE_OFFSET', text)
+        text, c = self.cells('cache', ENGINES='vllm')
+        self.assertEqual(len(c), 2*3*3)
+        self.assertIn('-p <worker pids>', text)
+        self.assertIn('--ids-file /prompts/short-86.ids.json', text)
+
     def test_validation_and_unimplemented_engines(self):
         with tempfile.TemporaryDirectory() as tmp:
             for env, msg in (({'NODE_ROLE': 'X'}, 'NODE_ROLE must be'), ({'NODE_ROLE': 'A', 'MEMS': 'cache'}, 'MEMS on a Flat'),
@@ -325,7 +399,7 @@ xe_now_ns() {{ python3 -c 'import time;print(time.time_ns())'; }}
 mkdir -p "$OUT"; XE_PERF=0; PYTHON=python3; XE_CELL_PY=$ROOT/tools/xengine_cell.py; XE_PLACEMENT_REPS=1
 CELL_ENGINE=c CELL_S=1 CELL_MEM=hbm CELL_WL=D CELL_REP=1 CELL_LABEL=c-s1-hbm-D-r1 CELL_DIR=$OUT/runs/c-s1-hbm-D-r1
 CELL_PERF_GROUP=MEM CELL_ENV=(A=1) CELL_VERSION=abc CELL_CONFIG=cfg CELL_GEN=128 CELL_PROC=fake-engine
-CELL_LOAD_PATTERN='placement=' CELL_TODO=
+CELL_LOAD_PATTERN='placement=' CELL_TODO= CELL_VARIANT= CELL_ANCHORS=() CELL_PERF_ATTACH=
 CELL_CMD=({engine} --json "$CELL_DIR/report.json")
 CELL_CHECK=(python3 $ROOT/tools/xengine_cell.py check-c "$CELL_DIR" --sockets 1 --mem hbm --generation 128 --prompt-tokens 86)
 c_estimate_s() {{ echo 1; }}; C_ENGINE=x

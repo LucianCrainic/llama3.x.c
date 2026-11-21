@@ -13,6 +13,12 @@ Subcommands (all stdlib only, so they run on any node):
       tokens, the socket count, and the memory placement of every region. Prints PASS/FAIL lines, exit 1 on any FAIL.
   assemble OUT [--campaign K=V ...]
       Merges OUT/runs/*/cell.json into OUT/manifest.json.
+  vllm-report DIR
+      Turns DIR/client.jsonl (one measured request of tools/xengine_vllm_client.py) into DIR/report.json.
+  check-vllm DIR --generation G --prompt-tokens N
+      Verifies a vLLM request: HTTP 200, exact prompt and completion token counts, G token arrivals.
+  check-prefix CONFIG_DIR
+      Asserts vllm:prefix_cache_hits_total == 0 in CONFIG_DIR/metrics-after.txt (prefix caching must stay off).
   numa-maps PID
       Summarises /proc/PID/numa_maps as JSON (pages per NUMA node, split by kind of mapping).
 
@@ -36,6 +42,13 @@ llama3.x.c has no hooks, so the markers come from its JSON timings (timing_secon
   end_ns            = process exit (includes freeing the regions, writing the report, process teardown)
   Fallback when the end-of-load line was never seen: the same markers placed backwards from end_ns, assuming zero
   teardown (flagged by anchor=end in markers.json). teardown_s = end_ns - decode_end_ns is recorded as a sanity value.
+vLLM (markers deriver derive_markers_vllm): the client records, per request, t_first_token and every token arrival
+relative to the moment it sent the request, and the wall clock when the request finished (wall_time):
+  load_start_ns     = server launch (anchor load_start_ns written by the job; the client's own launch is launch_ns)
+  prefill_start_ns  = request send = wall_time - t_end (the ids are sent as is, so send is the start of the prefill)
+  first_token_ns    = request send + t_first_token (the first streamed token)
+  decode_end_ns     = request send + last token arrival;  end_ns = client process exit
+  wall_time is taken right after the request returns, so the edges are good to a few ms.
 Perf clock: `perf -I` stamps are seconds since counting started. The start is not known to better than the perf start-up
 time (tens to hundreds of ms), but perf stops within one `tail` poll (0.1 s) of the engine's exit, so the clock is lined
 up at the end: perf_t0_ns = end_ns - last perf time stamp + half the poll period (system-wide perf; zero for the
@@ -112,7 +125,23 @@ def derive_markers_c(anchors, report, perf_csv=None):
     return m
 
 
-MARKER_DERIVERS = {'c': derive_markers_c}  # llama.cpp and vLLM register theirs here
+def derive_markers_vllm(anchors, report, perf_csv=None):
+    end = int(anchors['end_ns'])
+    m = {'load_start_ns': int(anchors.get('load_start_ns') or anchors['launch_ns']), 'end_ns': end, 'prefill_start_ns': None,
+         'first_token_ns': None, 'decode_end_ns': None}
+    r = report or {}
+    arrivals = r.get('token_arrivals') or []
+    if r.get('wall_time') and r.get('t_end') is not None and arrivals:
+        send = r['wall_time'] * NS - r['t_end'] * NS
+        m['anchor'] = 'client_wall_clock'
+        m['prefill_start_ns'] = int(send)
+        m['first_token_ns'] = int(send + r['t_first_token'] * NS)
+        m['decode_end_ns'] = int(send + arrivals[-1] * NS)
+        m['teardown_s'] = (end - r['wall_time'] * NS) / NS  # client exit after the request finished
+    return m
+
+
+MARKER_DERIVERS = {'c': derive_markers_c, 'vllm': derive_markers_vllm}  # llama.cpp registers its deriver here
 
 
 def perf_clock(anchors, markers, perf_csv):
@@ -218,6 +247,54 @@ def check_c(report, sockets, mem, generation, prompt_tokens):
     return res
 
 
+def check_vllm(report, generation, prompt_tokens):
+    if not isinstance(report, dict):
+        return [(False, 'report present', 'no report.json')]
+    res = []
+    res.append((report.get('http_status') == 200, 'HTTP 200', report.get('http_status')))
+    res.append((report.get('usage_prompt_tokens') == prompt_tokens, 'prompt tokens exact',
+                'usage=%s expected=%s' % (report.get('usage_prompt_tokens'), prompt_tokens)))
+    res.append((report.get('usage_completion_tokens') == generation, 'completion tokens == G',
+                'usage=%s G=%s' % (report.get('usage_completion_tokens'), generation)))
+    res.append((len(report.get('token_arrivals') or []) == generation, 'G token arrivals',
+                'arrivals=%s' % len(report.get('token_arrivals') or [])))
+    return [(bool(ok), name, str(detail)) for ok, name, detail in res]
+
+
+def cmd_vllm_report(args):
+    d = Path(args.dir)
+    records = [json.loads(ln) for ln in (d/'client.jsonl').read_text().splitlines() if ln.strip()] \
+        if (d/'client.jsonl').exists() else []
+    records = [r for r in records if not r.get('warmup')]
+    if not records:
+        return 1
+    r = records[-1]
+    r['status'] = 'completed' if r.get('ok') else 'failed'
+    (d/'report.json').write_text(json.dumps(r) + '\n')
+    return 0
+
+
+def cmd_check_vllm(args):
+    res = check_vllm(load_json(Path(args.dir)/'report.json'), args.generation, args.prompt_tokens)
+    for ok, name, detail in res:
+        print('PASS' if ok else 'FAIL', name, '' if ok else detail)
+    return 0 if all(ok for ok, _, _ in res) else 1
+
+
+def prefix_hits(text):
+    """Sum of vllm:prefix_cache_hits_total over all label sets, or None when the metric is absent."""
+    vals = [float(ln.rsplit(' ', 1)[1]) for ln in text.splitlines()
+            if ln.startswith('vllm:prefix_cache_hits_total') and ' ' in ln]
+    return sum(vals) if vals else None
+
+
+def cmd_check_prefix(args):
+    p = Path(args.dir)/'metrics-after.txt'
+    hits = prefix_hits(p.read_text()) if p.exists() else None
+    print('%s prefix_cache_hits_total=%s' % ('PASS' if hits == 0 else 'FAIL', hits))
+    return 0 if hits == 0 else 1
+
+
 def cmd_check_c(args):
     report = load_json(Path(args.dir)/'report.json')
     res = check_c(report, args.sockets, args.mem, args.generation, args.prompt_tokens)
@@ -293,6 +370,17 @@ def main(argv=None):
     p.add_argument('--generation', type=int, required=True)
     p.add_argument('--prompt-tokens', type=int, required=True)
     p.set_defaults(fn=cmd_check_c)
+    p = sub.add_parser('vllm-report')
+    p.add_argument('dir')
+    p.set_defaults(fn=cmd_vllm_report)
+    p = sub.add_parser('check-vllm')
+    p.add_argument('dir')
+    p.add_argument('--generation', type=int, required=True)
+    p.add_argument('--prompt-tokens', type=int, required=True)
+    p.set_defaults(fn=cmd_check_vllm)
+    p = sub.add_parser('check-prefix')
+    p.add_argument('dir')
+    p.set_defaults(fn=cmd_check_prefix)
     p = sub.add_parser('assemble')
     p.add_argument('out')
     p.add_argument('--campaign', action='append')

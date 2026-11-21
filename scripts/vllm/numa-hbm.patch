@@ -1,0 +1,14 @@
+--- a/vllm/v1/worker/cpu_worker.py
++++ b/vllm/v1/worker/cpu_worker.py
+@@ -58,7 +58,10 @@
+ 
+         # On s390x, numa_node may be a synthetic book ID that doesn't
+         # correspond to a real memory node. Fall back to first visible node.
+-        if cpu_core.numa_node in allowed_memory_nodes:
++        _hbm_off = int(os.environ.get("VLLM_HBM_NODE_OFFSET", "0"))
++        if _hbm_off and cpu_core.numa_node + _hbm_off in allowed_memory_nodes:
++            memory_node = cpu_core.numa_node + _hbm_off  # HBM node of this socket
++        elif cpu_core.numa_node in allowed_memory_nodes:
+             memory_node = cpu_core.numa_node
+         else:
+             logger.warning(

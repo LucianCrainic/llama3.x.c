@@ -149,11 +149,28 @@ def read_c_phases(report):
                        'tok_s': thr.get('prefill'), 'ttft_s': t.get('time_to_first_token')}}
     if tok.get('decode_steps'):
         out['decode'] = {'tokens': tok['decode_steps'], 'seconds': t.get('decode'), 'tok_s': thr.get('decode'),
-                         'tpot_s': t.get('average_decode_step')}
+                         'tpot_s': t.get('average_decode_step'), 'e2e_s': t.get('total_inference'),
+                         'tpot_uniform_s': (t['total_inference'] - t['time_to_first_token']) / tok['decode_steps']}
     return out
 
 
-PHASE_READERS = {'c': read_c_phases}  # llama.cpp and vLLM readers register here
+def read_vllm_phases(report):
+    """Native numbers of one vLLM request from the client's token arrival times (seconds since the request was sent):
+    TTFT = first arrival, prefill tok/s = prompt tokens / TTFT, decode = the G - 1 tokens after the first (tok/s and TPOT
+    from the arrival times). tpot_uniform_s = (end-to-end - TTFT) / (G - 1) is the within-run form of the uniform definition."""
+    arr = report['token_arrivals']
+    ttft = report['t_first_token']
+    out = {'prefill': {'tokens': report['usage_prompt_tokens'], 'seconds': ttft, 'tok_s': report['usage_prompt_tokens'] / ttft,
+                       'ttft_s': ttft}}
+    if len(arr) > 1:
+        dec = arr[-1] - arr[0]
+        out['decode'] = {'tokens': len(arr) - 1, 'seconds': dec, 'tok_s': (len(arr) - 1) / dec if dec > 0 else None,
+                         'tpot_s': dec / (len(arr) - 1), 'e2e_s': report['t_end'],
+                         'tpot_uniform_s': (report['t_end'] - ttft) / (len(arr) - 1)}
+    return out
+
+
+PHASE_READERS = {'c': read_c_phases, 'vllm': read_vllm_phases}  # llama.cpp and vLLM readers register here
 
 
 def phase_windows(markers):
@@ -167,8 +184,8 @@ def phase_windows(markers):
 
 
 # ---- one phase of one run ------------------------------------------------------------------------------------------
-COLUMNS = (['node_role', 'engine', 'sockets', 'mem', 'workload', 'repeat', 'perf_group', 'phase', 'status', 'note',
-            'tokens', 'seconds', 'tok_s', 'ttft_s', 'tpot_s', 'window_s', 'window_cover', 'min_pct_running',
+COLUMNS = (['node_role', 'engine', 'variant', 'sockets', 'mem', 'workload', 'repeat', 'perf_group', 'phase', 'status', 'note',
+            'tokens', 'seconds', 'tok_s', 'ttft_s', 'tpot_s', 'e2e_s', 'tpot_uniform_s', 'window_s', 'window_cover', 'min_pct_running',
             'perf_clock_skew_s'] +
            [f'{k}_gb_s{s}' for k in ('ddr', 'hbm') for s in SOCKETS] +
            [f'{k}_gbps_s{s}' for k in ('ddr', 'hbm') for s in SOCKETS] +
@@ -270,7 +287,7 @@ def perf_metrics(series, a, b, tokens, idle, hbm_bytes, upi_bytes, nominal_ghz):
 def summarize_run(out, rundir, hbm_bytes=HBM_CAS_BYTES, upi_bytes=UPI_DATA_FLIT_BYTES, nominal_ghz=NOMINAL_GHZ, idle=None):
     """Rows (dicts of COLUMNS) of one run directory."""
     cell = json.loads((rundir/'cell.json').read_text())
-    base = {k: cell.get(k, '') for k in ('engine', 'sockets', 'mem', 'workload', 'repeat', 'perf_group')}
+    base = {k: cell.get(k, '') for k in ('engine', 'variant', 'sockets', 'mem', 'workload', 'repeat', 'perf_group')}
     base['node_role'] = cell.get('node_role', '')
     status = cell.get('status', 'unknown')
     note = cell.get('status_detail', '')
