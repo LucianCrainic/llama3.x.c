@@ -443,6 +443,7 @@ c_prepare() {
   if [[ ! -x $C_ENGINE ]]; then
     build_tree release build/release/runq || return 1
   fi
+  printf 'c engine binary sha256 %s\n' "$(sha256sum "$C_ENGINE" | cut -d' ' -f1)" >> "$OUT/environment.txt"
   C_STAGED=$(stage_model_on 0 llama31-8b int8 "$ARTIFACTS") || return 1
   cp "$PROMPTS_DIR/prompts.manifest.json" "$OUT/prompts.manifest.json" 2> /dev/null || true
 }

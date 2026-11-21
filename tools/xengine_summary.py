@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turns the raw runs of the cross-engine campaign (scripts/xengine.sbatch) into one tidy runs.csv.
 
-    tools/xengine_summary.py OUT [OUT...] -o runs.csv [--hbm-cas-bytes 64] [--nominal-ghz 1.9]
+    tools/xengine_summary.py OUT [OUT...] -o runs.csv [--hbm-cas-bytes 32] [--nominal-ghz 1.9]
     tools/xengine_summary.py OUT [OUT...] --calibrate
 
 One row per run and phase (prefill, decode; a run that failed gets one row with phase=run). Each OUT is a campaign
@@ -37,9 +37,10 @@ import xengine_cell  # noqa: E402  (marker derivation shared with the job's help
 
 # ---- byte factors --------------------------------------------------------------------------------------------------
 DDR_CAS_BYTES = 64  # uncore_imc event 0x05 umask 0xcf (CAS_COUNT.RD): one 64-byte line per count
-# uncore_type_14 hbm_cas_rd. Default 64 (one cache line per CAS). The C-engine setup measured the HBM figure at exactly
-# 2x the DDR figure for the same weight traffic, so calibration (--calibrate) may show 32; override with --hbm-cas-bytes.
-HBM_CAS_BYTES = 64
+# uncore_type_14 hbm_cas_rd counts 32-byte units, not 64: calibrated with `--calibrate` on c / 1S / D decode runs (check job
+# 5892172): 1S-DDR reads 7.87 GB/token (64 B per ddr_cas_rd), 1S-HBM 15.67 GB/token at 64 B but 7.84 GB/token at 32 B,
+# against the nominal 7.97 GB of weights. Override with --hbm-cas-bytes.
+HBM_CAS_BYTES = 32
 # UNC_UPI_RxL_FLITS.ALL_DATA / TxL: a 64-byte cache line travels as 9 data flits (8 payload flits + 1 header flit), so one
 # data flit stands for 64/9 bytes of payload (the convention of Intel PCM for Skylake-SP and later). ASSUMPTION: recalled
 # from PCM, not verified on this CPU; set --upi-flit-bytes (e.g. 8 for raw 8-byte payload per flit) to change it.
@@ -330,32 +331,32 @@ def write_csv(rows, path):
 
 # ---- calibration ---------------------------------------------------------------------------------------------------
 def calibrate(rows, hbm_bytes):
-    """Prints bytes per decoded token of the c / 1S / D decode rows next to the nominal weight bytes."""
+    """Prints bytes per decoded token of the c / 1S / D decode rows next to the nominal weight bytes, with the HBM
+    reads at 64 and at 32 bytes per hbm_cas_rd count (rows were computed with hbm_bytes)."""
     lines = ['bytes read per decoded token, c engine, 1 socket, workload D (nominal %.2f GB/token)' % NOMINAL_GB_PER_TOKEN,
-             '%-6s %-4s %-5s %12s %12s %14s %14s' % ('mem', 'rep', 'group', 'ddr GB/tok', 'hbm GB/tok', 'x nominal', 'hbm@32 B x nom')]
+             '%-6s %-4s %-5s %11s %11s %11s %11s %11s' % ('mem', 'rep', 'group', 'ddr GB/tok', 'hbm@64', 'hbm@32', 'x nom @64', 'x nom @32')]
     ratios = {64: [], 32: []}
     for r in rows:
         if not (r.get('engine') == 'c' and str(r.get('sockets')) == '1' and r.get('workload') == 'D' and
                 r.get('phase') == 'decode' and r.get('mem') in ('hbm', 'ddr') and r.get('gb_per_token') is not None):
             continue
-        ddr, hbm = r.get('ddr_gb_per_token') or 0.0, r.get('hbm_gb_per_token') or 0.0
-        scaled = hbm * 32 / hbm_bytes
-        total = ddr + hbm
-        lines.append('%-6s %-4s %-5s %12.3f %12.3f %14.3f %14.3f' % (
-            r['mem'], r['repeat'], r['perf_group'], ddr, hbm, total / NOMINAL_GB_PER_TOKEN,
-            (ddr + scaled) / NOMINAL_GB_PER_TOKEN))
+        ddr = r.get('ddr_gb_per_token') or 0.0
+        h64 = (r.get('hbm_gb_per_token') or 0.0) * 64 / hbm_bytes
+        h32 = h64 / 2
+        lines.append('%-6s %-4s %-5s %11.3f %11.3f %11.3f %11.3f %11.3f' % (
+            r['mem'], r['repeat'], r['perf_group'], ddr, h64, h32, (ddr + h64) / NOMINAL_GB_PER_TOKEN,
+            (ddr + h32) / NOMINAL_GB_PER_TOKEN))
         if r['mem'] == 'hbm':
-            ratios[hbm_bytes].append(total / NOMINAL_GB_PER_TOKEN)
-            ratios[32].append((ddr + scaled) / NOMINAL_GB_PER_TOKEN)
+            ratios[64].append((ddr + h64) / NOMINAL_GB_PER_TOKEN)
+            ratios[32].append((ddr + h32) / NOMINAL_GB_PER_TOKEN)
     if len(lines) == 2:
         lines.append('no c / 1S / D decode rows with a MEM-group perf series (repeat 1) found')
-    elif ratios[hbm_bytes]:
+    elif ratios[64]:
         mean = lambda v: sum(v) / len(v)
-        a, b = mean(ratios[hbm_bytes]), mean(ratios[32])
-        lines.append('HBM runs: x nominal %.3f with %d B per hbm CAS, %.3f with 32 B (ddr runs fix the DDR factor at 64 B).' % (
-            a, hbm_bytes, b))
+        a, b = mean(ratios[64]), mean(ratios[32])
+        lines.append('HBM runs: x nominal %.3f with 64 B per hbm CAS, %.3f with 32 B (DDR runs fix the DDR factor at 64 B).' % (a, b))
         lines.append('Pick the HBM factor whose ratio is closest to 1.0 (a few percent above: KV cache, activations, '
-                     'embedding row, other traffic): %s' % ('32' if abs(b - 1) < abs(a - 1) else str(hbm_bytes)))
+                     'embedding row, other traffic): %s' % ('32' if abs(b - 1) < abs(a - 1) else '64'))
     print('\n'.join(lines))
 
 
@@ -363,7 +364,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('outs', nargs='+', metavar='OUT', help='campaign output directories')
     ap.add_argument('-o', '--output', help='runs.csv to write')
-    ap.add_argument('--hbm-cas-bytes', type=int, default=HBM_CAS_BYTES, help='bytes per hbm_cas_rd count (64; calibration may show 32)')
+    ap.add_argument('--hbm-cas-bytes', type=int, default=HBM_CAS_BYTES, help='bytes per hbm_cas_rd count (32, calibrated)')
     ap.add_argument('--upi-flit-bytes', type=float, default=UPI_DATA_FLIT_BYTES, help='payload bytes per UPI data flit (64/9, assumption)')
     ap.add_argument('--nominal-ghz', type=float, default=NOMINAL_GHZ)
     ap.add_argument('--calibrate', action='store_true', help='print GB per decoded token of c/1S/D runs vs the nominal weight bytes')
