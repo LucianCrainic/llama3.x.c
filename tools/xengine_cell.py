@@ -57,7 +57,7 @@ llama.cpp (derive_markers_llamacpp): llama-bench prints no load log and no per-t
 run plus R timed repetitions (-r R), each preceded by an untimed depth prefill (-d). All it reports are the
 repetitions' times (samples_ns). The rule is conservative: only the LAST repetition is placed, working backwards from
 process exit:
-  window_end   = end_ns - teardown_assumed_s   (anchor from the job, default 0.25 s: freeing the model and exit)
+  window_end   = end_ns - teardown_assumed_s   (anchor from the job, default 0.05 s: freeing the model and exit; check job 5892195 showed the memory traffic ending within about 0.1 s of process exit)
   window_start = window_end - samples_ns[-1]
   pp test (-p N -n 0):  prefill_start_ns = window_start, first_token_ns = window_end (prefill window; decode_end absent)
   tg test (-n G):       first_token_ns = window_start (start of the timed decode), decode_end_ns = window_end
@@ -162,7 +162,7 @@ def derive_markers_llamacpp(anchors, report, perf_csv=None):
     r = report or {}
     samples = r.get('samples_ns') or []
     if samples:
-        td = float(anchors.get('teardown_assumed_s', 0.25))
+        td = float(anchors.get('teardown_assumed_s', 0.05))
         wend = end - td * NS
         wstart = wend - samples[-1]
         m['anchor'] = 'process_exit_minus_teardown'

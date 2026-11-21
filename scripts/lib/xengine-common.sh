@@ -692,7 +692,7 @@ lcpp_cell() {
   CELL_CONFIG="threads=$LCPP_THREADS mask=$LCPP_MASK numactl='${LCPP_NUMACTL[*]:1}' flags='${LCPP_FLAGS[*]-}' n_prompt=$np n_gen=$ng depth=$depth reps=3 random_tokens weights=q8_0 kv=f16 no_numa"
   CELL_PROC=llama-bench
   CELL_RSS_TRIGGER_KB=8000000
-  CELL_ANCHORS=("teardown_assumed_s=${XE_LCPP_TEARDOWN_S:-0.25}")
+  CELL_ANCHORS=("teardown_assumed_s=${XE_LCPP_TEARDOWN_S:-0.05}")
   CELL_CHECK=("$PYTHON" "$XE_CELL_PY" check-llamacpp "$CELL_DIR" --n-prompt "$np" --n-gen "$ng" --depth "$depth" --threads "$LCPP_THREADS" --reps 3)
   xe_execute_cell
 }
