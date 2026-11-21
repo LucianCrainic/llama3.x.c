@@ -371,6 +371,9 @@ static void run_large(const char *label) {
 }
 
 int main(void) {
+  /* LLAMA_SWIGLU_EXP=libm (the way back from the vector default) keeps the epilogue bitwise the GEMV's silu_gate. */
+  setenv("LLAMA_SWIGLU_EXP", "libm", 1);
+  gemm_swiglu_init_env();
   /* Scalar instruction set: portable batched Q8 == per-row GEMV, bit for bit. */
   kernels_select(KERNELS_SCALAR);
   {
@@ -386,12 +389,10 @@ int main(void) {
   }
   run_matrix("single thread");
   run_large("single thread");
-  /* LLAMA_SWIGLU_EXP=vector: the AVX-512 exponential in the SwiGLU epilogue, within the same budget. */
-  setenv("LLAMA_SWIGLU_EXP", "vector", 1);
-  gemm_swiglu_init_env();
-  run_matrix("vector exp");
+  /* The default LLAMA_SWIGLU_EXP=vector: the AVX-512 exponential in the SwiGLU epilogue, within the same budget. */
   unsetenv("LLAMA_SWIGLU_EXP");
   gemm_swiglu_init_env();
+  run_matrix("vector exp");
   int team_sizes[8] = {3, 7};
   size_t team_count = 2;
   const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "28,56" for full-socket teams on the cluster */

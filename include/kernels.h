@@ -45,6 +45,9 @@ int kernels_select_amx_auto(void);
  * variant with kernels_attention_select (testing.h). */
 const char *kernels_attention_name(void);
 const char *kernels_attention_decode_name(void);
+/* W8A8 engines (runq) prefer LLAMA_ATTN=amx when LLAMA_ATTN is unset or auto (prefill-gap fix 7: it passes the W8A8
+ * gate and is faster on one and two sockets); amx itself runs tiled where AMX is not active. FP32 and BF16 keep tiled. */
+void kernels_attention_prefer_amx(void);
 /* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default head since E5.4). rows: a layer's cache is
  * [position][kv_head][head_dim]; head: [kv_head][position][head_dim] with room for seq_len positions per head (the same
  * bytes). Engines address the cache through the helpers at the end of this header; the results are bitwise the same in

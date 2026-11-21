@@ -1216,16 +1216,16 @@ static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, cons
   }
 }
 
-static int swiglu_vector; /* LLAMA_SWIGLU_EXP=vector */
+static int swiglu_vector = 1; /* LLAMA_SWIGLU_EXP=vector, the default since prefill-gap fix 4; libm is the way back */
 
 void gemm_swiglu_init_env(void) {
   const char *mode = getenv("LLAMA_SWIGLU_EXP");
-  swiglu_vector = 0;
-  if (!mode || !*mode || !strcmp(mode, "libm"))
-    return;
-  if (strcmp(mode, "vector"))
-    fail("LLAMA_SWIGLU_EXP must be libm or vector");
   swiglu_vector = 1;
+  if (!mode || !*mode || !strcmp(mode, "vector"))
+    return;
+  if (strcmp(mode, "libm"))
+    fail("LLAMA_SWIGLU_EXP must be vector or libm");
+  swiglu_vector = 0;
 }
 
 const char *k_gemm_swiglu_exp_name(void) {

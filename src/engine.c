@@ -109,6 +109,11 @@ static void configure_q8(Model *model) {
   } else if (model->prefill_gemm) {
     if (kernels_amx_active() && gs64) {
       model->prefill_kernel = "amx-int8";
+      /* 1024 rows per pass on AMX-INT8 (prefill-gap fix 8: bitwise any M; the M sweep of job 5892402 put 1024 fastest
+       * at 2048 and 8192 tokens, one and two sockets): each weight matrix streams from memory once per 1024 rows. */
+      const char *batch = getenv("LLAMA_PREFILL_BATCH");
+      if (!batch || !*batch)
+        model->max_batch = c->seq_len < 1024 ? c->seq_len : 1024;
     } else if (kernels_avx512_active() && gs64) {
       model->prefill_kernel = "avx512-q8";
     } else {
@@ -137,6 +142,8 @@ void engine_load_context(Model *model, const char *path, int context) {
     if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
       fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
     fp32_activations = activations && !strcmp(activations, "fp32");
+    if (!fp32_activations)
+      kernels_attention_prefer_amx();
   }
   read_checkpoint(path, t);
   model->config = t->config;

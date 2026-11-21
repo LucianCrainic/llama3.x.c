@@ -622,7 +622,8 @@ int k_attention_chunk_count(const AttentionWork *work, int n_kv_heads, int posit
  * bytes per position and layer, half the FP32 cache), packed incrementally, so a batch packs only its own positions
  * instead of the whole prefix (prefill-gap fix 7). Decode and the other kernels keep reading the FP32 cache. */
 size_t k_attention_kv_bf16_bytes(int n_kv_heads, int head_dim, int seq_len, int layers) {
-  if (!attention_amx_selected() || layers > (int)(sizeof(((AttentionWork *)0)->kv_key) / sizeof(const float *)))
+  if (!attention_amx_selected() || !gemm_amx_active() ||
+      layers > (int)(sizeof(((AttentionWork *)0)->kv_key) / sizeof(const float *)))
     return 0;
   return checked_mul(checked_mul(amx_attention_elems(n_kv_heads, head_dim, seq_len), (size_t)layers), sizeof(uint16_t));
 }
@@ -1799,6 +1800,14 @@ void k_attention_batch_kv(float *out, const float *q, const float *key_cache, co
   }
   k_attention_batch_layout(out, q, key_cache, value_cache, att, work, n_heads, n_kv_heads, head_dim, seq_len, pos0, m,
                            (size_t)head_dim, (size_t)seq_len * head_dim);
+}
+
+void kernels_attention_prefer_amx(void) {
+  if (attention_batch_requested)
+    return;
+  for (size_t i = 0; i < sizeof(attention_batch_table) / sizeof(*attention_batch_table); i++)
+    if (attention_batch_table[i].run == attention_batch_amx)
+      attention_batch_active = &attention_batch_table[i];
 }
 
 void kernels_attention_init_env(void) {
