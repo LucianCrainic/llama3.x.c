@@ -71,6 +71,15 @@ static int contained(const NumaRegion *r, const void *p, size_t bytes) {
          (const char *)p + bytes <= (const char *)r->data + r->data_bytes;
 }
 
+/* Scales per row of a shard and the first of them in the source row: its groups, or for per-channel INT8 (the group is
+ * the whole row) the row's one scale, which a column shard keeps whole. */
+static int shard_groups(const Shard *sh) {
+  return sh->src->group_size == sh->src->cols ? 1 : sh->cols / sh->src->group_size;
+}
+static int shard_group0(const Shard *sh) {
+  return sh->src->group_size == sh->src->cols ? 0 : sh->col0 / sh->src->group_size;
+}
+
 /* Rebuilds the tensor from its shards and compares values and scales with the file. */
 static void reconstruct(const ShardSet *set, const TensorDesc *t, int fd) {
   int q8 = t->dtype == DT_Q8;
@@ -97,9 +106,9 @@ static void reconstruct(const ShardSet *set, const TensorDesc *t, int fd) {
         vcover[dst]++;
       }
     for (int r = 0; q8 && r < sh->rows; r++)
-      for (int g = 0; g < sh->cols / t->group_size; g++) {
-        size_t dst = (size_t)(sh->row0 + r) * groups + sh->col0 / t->group_size + g,
-               src = (size_t)r * (sh->cols / t->group_size) + g;
+      for (int g = 0; g < shard_groups(sh); g++) {
+        size_t dst = (size_t)(sh->row0 + r) * groups + (size_t)shard_group0(sh) + g,
+               src = (size_t)r * (size_t)shard_groups(sh) + g;
         memcpy(scale + dst * sizeof(float), sh->s + src, sizeof(float));
         scover[dst]++;
       }
@@ -175,7 +184,7 @@ static void run_case(const Case *c) {
     size_t elem = sh->src->dtype == DT_Q8 ? 1 : sizeof(float);
     assert(contained(r, sh->q, (size_t)sh->rows * sh->cols * elem) && (uintptr_t)sh->q % 64 == 0);
     if (sh->src->dtype == DT_Q8)
-      assert(contained(r, sh->s, (size_t)sh->rows * (sh->cols / sh->src->group_size) * 4) &&
+      assert(contained(r, sh->s, (size_t)sh->rows * (size_t)shard_groups(sh) * 4) &&
              (uintptr_t)sh->s % 64 == 0);
     if (sh->kind == SHARD_GLOBAL)
       assert(sh->socket == 0 && sh->src->role == T_EMBED && !c->config.shared);
@@ -203,7 +212,7 @@ static void run_case(const Case *c) {
   assert(!cls1 || (cls1->row0 == c->config.vocab_size / 2 && cls1->row0 + cls1->rows == c->config.vocab_size));
   assert(c->sockets == 2 || cls0->rows == c->config.vocab_size);
   if (c->quantized) {
-    size_t row_bytes = (size_t)c->config.hidden_dim + (size_t)c->config.hidden_dim / c->gs * 4;
+    size_t row_bytes = (size_t)c->config.hidden_dim + (c->gs ? (size_t)c->config.hidden_dim / c->gs : 1) * 4;
     size_t limit = c->scratch_limit ? c->scratch_limit : (size_t)64 << 20;
     for (int s = 0; s < c->sockets; s++)
       assert(set.scratch_peak[s] <= (limit > row_bytes ? limit : row_bytes));
@@ -258,9 +267,9 @@ static int shard_matches(const Shard *sh, const unsigned char *file) {
                file + t->offset + src_row * row_values + (size_t)sh->col0 * elem, (size_t)sh->cols * elem))
       return 0;
     if (t->dtype == DT_Q8 &&
-        memcmp(sh->s + (size_t)r * (sh->cols / t->group_size),
-               file + t->scale_offset + src_row * row_scales + (size_t)(sh->col0 / t->group_size) * sizeof(float),
-               (size_t)(sh->cols / t->group_size) * sizeof(float)))
+        memcmp(sh->s + (size_t)r * (size_t)shard_groups(sh),
+               file + t->scale_offset + src_row * row_scales + (size_t)shard_group0(sh) * sizeof(float),
+               (size_t)shard_groups(sh) * sizeof(float)))
       return 0;
   }
   return 1;
@@ -344,9 +353,11 @@ int main(int argc, char **argv) {
   if (argc >= 2 && !strcmp(argv[1], "verify"))
     return verify_mode(argc, argv);
   int count = 0;
+  const int group_sizes[] = {2, 4, 8, 0}; /* 0: per-channel INT8, one scale per row */
   for (int quantized = 0; quantized < 2; quantized++)
-    for (int gs = 2; gs <= 8; gs *= 2) {
-      if (!quantized && gs > 2)
+    for (size_t gi = 0; gi < sizeof(group_sizes) / sizeof(*group_sizes); gi++) {
+      int gs = group_sizes[gi];
+      if (!quantized && gs != 2)
         continue;
       for (int shared = 0; shared < 2; shared++)
         for (int sockets = 1; sockets <= 2; sockets++)
@@ -360,7 +371,7 @@ int main(int argc, char **argv) {
                         .config = make_config(16, 32, 2, 4, 2, vocab, shared)};
               run_case(&c);
               if (quantized) { /* a block of 7 source rows */
-                c.scratch_limit = 7 * (32 + 32 / (size_t)gs * 4);
+                c.scratch_limit = 7 * (32 + (gs ? 32 / (size_t)gs : 1) * 4);
                 run_case(&c);
               }
               count++;

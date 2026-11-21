@@ -160,13 +160,20 @@ static void validate_config(Config *p, int quantized, int gs) {
   if (!isfinite(p->rope_factor) || !isfinite(p->rope_low) || !isfinite(p->rope_high) || p->rope_factor < 1 ||
       p->rope_low <= 0 || p->rope_high <= p->rope_low || p->rope_original <= 0)
     fail("invalid RoPE scaling metadata");
-  if (p->format == 3 && (p->bos_id < 0 || p->bos_id >= p->vocab_size || p->eos_id < 0 || p->eos_id >= p->vocab_size ||
+  if (p->format >= 3 && (p->bos_id < 0 || p->bos_id >= p->vocab_size || p->eos_id < 0 || p->eos_id >= p->vocab_size ||
                          p->eot_id < -1 || p->eot_id >= p->vocab_size || p->eom_id < -1 || p->eom_id >= p->vocab_size))
     fail("invalid special token metadata");
-  if (quantized && (gs <= 0 || gs > 131071 || p->dim % gs || p->hidden_dim % gs))
+  if (quantized && p->format == 4) {
+    /* Per-channel INT8: one scale per output channel, the group of a product is its whole (per-socket) K. */
+    if (gs != 0)
+      fail("per-channel INT8 checkpoint (version 4) must have group size zero, found %d", gs);
+    if (p->dim % 16 || p->hidden_dim % 16 || p->dim > 131071 || p->hidden_dim > 131071)
+      fail("per-channel INT8 needs dim and hidden_dim multiples of 16 that fit int32 accumulation");
+  } else if (quantized && (gs <= 0 || gs > 131071 || p->dim % gs || p->hidden_dim % gs))
     fail("unsupported INT8 group size %d: must divide dim and hidden_dim and fit int32 accumulation", gs);
 }
 
+/* gs is the tensor's group size: the checkpoint's, or for per-channel INT8 (group size 0) the tensor's row length. */
 size_t tensor_bytes(size_t count, int quantized, int gs) {
   if (!quantized)
     return checked_mul(count, sizeof(float));
@@ -219,11 +226,12 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
     header_size = 256;
     int version;
     memcpy(&version, header + 4, 4);
-    if (version == 3) {
+    if (version == 3 || version == 4) {
+      /* Version 4 is version 3's header for per-channel INT8 weights (precision 1, group size 0). */
       int precision;
       memcpy(&precision, header + 36, 4);
-      if (precision < 0 || precision > 1)
-        fail("unsupported checkpoint precision %d", precision);
+      if (precision < 0 || precision > 1 || (version == 4 && precision != 1))
+        fail("unsupported checkpoint precision %d for version %d", precision, version);
       if (precision != quantized)
         fail("checkpoint precision requires %s executable", precision == 0 ? "run" : "runq");
       memcpy(p, header + 8, 28);
@@ -261,7 +269,7 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
       fail("invalid classifier flag in '%s'", path);
   } else {
     if (quantized)
-      fail("unsupported INT8 checkpoint: expected ak42 version 2 or 3");
+      fail("unsupported INT8 checkpoint: expected ak42 version 2, 3 or 4");
     memcpy(p, header, 28);
     if (p->vocab_size == INT_MIN)
       fail("invalid vocabulary size in '%s'", path);
@@ -270,7 +278,7 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
     *gs = 0;
   }
   p->shared = *shared;
-  if (p->format != 3) {
+  if (p->format < 3) {
     p->max_seq_len = p->seq_len;
     p->head_dim = p->n_heads > 0 ? p->dim / p->n_heads : 0;
   }
@@ -280,19 +288,21 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
   size_t embedding = checked_mul((size_t)p->vocab_size, d);
   size_t norm = checked_mul(checked_add(checked_mul(2, l), 1), d);
   size_t needed = checked_add(header_size, checked_mul(norm, sizeof(float)));
-  needed = checked_add(needed, tensor_bytes(embedding, quantized, *gs));
+  /* Per-channel INT8 (group size 0): every row of a matrix is one group, so the group is its input width. */
+  int row_d = *gs ? *gs : (int)d, row_h = *gs ? *gs : (int)h;
+  needed = checked_add(needed, tensor_bytes(embedding, quantized, row_d));
   size_t shapes[] = {checked_mul(d, d), checked_mul(d, kv), checked_mul(d, kv), checked_mul(d, d),
                      checked_mul(d, h), checked_mul(h, d),  checked_mul(d, h)};
   for (size_t i = 0; i < 7; i++)
-    needed = checked_add(needed, checked_mul(l, tensor_bytes(shapes[i], quantized, *gs)));
+    needed = checked_add(needed, checked_mul(l, tensor_bytes(shapes[i], quantized, i == 5 ? row_h : row_d)));
   if (!quantized && p->format == 0)
     needed = checked_add(needed, checked_mul(checked_mul((size_t)p->seq_len, d / p->n_heads), sizeof(float)));
   if (!*shared)
-    needed = checked_add(needed, tensor_bytes(embedding, quantized, *gs));
+    needed = checked_add(needed, tensor_bytes(embedding, quantized, row_d));
   if (needed > *bytes)
     fail("truncated checkpoint '%s': need %zu bytes, found %zu", path, needed, *bytes);
-  if (p->format == 3 && needed != *bytes)
-    fail("version 3 checkpoint has unexpected trailing bytes");
+  if (p->format >= 3 && needed != *bytes)
+    fail("version %d checkpoint has unexpected trailing bytes", p->format);
   if (needed != *bytes)
     LOG(LOG_WARN, "checkpoint '%s' has %zu trailing bytes", path, *bytes - needed);
   /* The manifest is an independent description of the same layout; any

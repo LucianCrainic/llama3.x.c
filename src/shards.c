@@ -23,14 +23,15 @@ const char *manifest_role_name(TensorRole role) {
 static int add_tensor(Builder *b, TensorRole role, int layer, int rows, int cols, TensorDtype dtype) {
   TensorDesc *t = &b->m->t[b->m->count];
   size_t count = checked_mul((size_t)rows, (size_t)cols);
+  int gs = dtype != DT_Q8 ? 0 : b->gs ? b->gs : cols; /* per-channel: one group per row */
   *t = (TensorDesc){.role = role,
                     .layer = layer,
                     .rows = rows,
                     .cols = cols,
                     .dtype = dtype,
-                    .group_size = dtype == DT_Q8 ? b->gs : 0,
+                    .group_size = gs,
                     .offset = b->cursor,
-                    .bytes = tensor_bytes(count, dtype == DT_Q8, b->gs),
+                    .bytes = tensor_bytes(count, dtype == DT_Q8, gs),
                     .alias_of = -1};
   if (dtype == DT_Q8)
     t->scale_offset = checked_add(t->offset, count);
@@ -100,7 +101,7 @@ static void build_q8(Builder *b, const Config *p, int kv) {
 void manifest_build(TensorManifest *m, const Config *p, int quantized, int gs, size_t header_bytes) {
   /* 9 per-layer roles plus embedding, final norm, legacy RoPE and classifier. */
   int capacity = p->n_layers * 9 + 4;
-  *m = (TensorManifest){.t = memory_alloc((size_t)capacity, sizeof(TensorDesc), MEM_METADATA)};
+  *m = (TensorManifest){.t = memory_alloc((size_t)capacity, sizeof(TensorDesc), MEM_METADATA), .per_channel = quantized && !gs};
   Builder b = {.m = m, .cursor = header_bytes, .gs = quantized ? gs : 0};
   int kv = p->head_dim * p->n_kv_heads;
   if (quantized)
@@ -150,10 +151,15 @@ static size_t align_up(size_t value) {
 static size_t value_bytes(const Shard *sh) {
   return checked_mul(checked_mul((size_t)sh->rows, (size_t)sh->cols), sh->src->dtype == DT_Q8 ? 1 : sizeof(float));
 }
+/* Scales per row of a shard: its groups, or the row's one scale when a group spans the whole row (per-channel INT8,
+ * where a column shard keeps that full-row scale). */
+static int shard_groups(const Shard *sh) {
+  const TensorDesc *t = sh->src;
+  return t->group_size == t->cols ? 1 : sh->cols / t->group_size;
+}
 static size_t scale_bytes(const Shard *sh) {
-  return sh->src->dtype == DT_Q8
-             ? checked_mul(checked_mul((size_t)sh->rows, (size_t)(sh->cols / sh->src->group_size)), sizeof(float))
-             : 0;
+  return sh->src->dtype == DT_Q8 ? checked_mul(checked_mul((size_t)sh->rows, (size_t)shard_groups(sh)), sizeof(float))
+                                 : 0;
 }
 
 static int reject(char *err, size_t err_size, const char *format, ...) __attribute__((format(printf, 3, 4)));
@@ -194,8 +200,9 @@ int shards_plan_try(ShardSet *set, const TensorManifest *m, const Config *p, int
   if (!probe)
     return reject(err, err_size, "the manifest has no attention weights");
   set->quantized = probe->dtype == DT_Q8;
-  set->gs = set->quantized ? probe->group_size : 0;
-  if (set->quantized && gs && gs != probe->group_size)
+  set->per_channel = set->quantized && m->per_channel;
+  set->gs = set->quantized && !set->per_channel ? probe->group_size : 0;
+  if (set->quantized && gs && gs != set->gs)
     return reject(err, err_size, "group size %d does not match the checkpoint's %d", gs, probe->group_size);
   if (sockets < 1 || sockets > 2)
     return reject(err, err_size, "%d sockets: only 1 or 2 are supported", sockets);
@@ -210,7 +217,7 @@ int shards_plan_try(ShardSet *set, const TensorManifest *m, const Config *p, int
     return reject(err, err_size, "hidden_dim=%d is not divisible by %d sockets", p->hidden_dim, sockets);
   if (p->dim % sockets || p->vocab_size < sockets)
     return reject(err, err_size, "dim=%d / vocab=%d cannot be split over %d sockets", p->dim, p->vocab_size, sockets);
-  if (set->quantized) {
+  if (set->quantized && !set->per_channel) {
     if ((p->dim / sockets) % set->gs || (p->hidden_dim / sockets) % set->gs)
       return reject(err, err_size,
                     "group size %d does not divide the per-socket slices (dim/%d = %d, hidden/%d = %d); values are "
@@ -360,7 +367,7 @@ static void cols_pack(const void *job_, int worker, int workers) {
   const TensorDesc *t = sh->src;
   int q8 = t->dtype == DT_Q8;
   size_t elem = q8 ? 1 : sizeof(float);
-  int gs = t->group_size;
+  int gs = t->group_size, groups = q8 ? shard_groups(sh) : 0;
   char *scratch_v = job->scratch;
   char *scratch_s = job->scratch + (size_t)job->block_rows * job->row_value_bytes;
   for (int r0 = 0; r0 < sh->rows; r0 += job->block_rows) {
@@ -380,10 +387,11 @@ static void cols_pack(const void *job_, int worker, int workers) {
         size_t dst_row = (size_t)(r0 + r);
         memcpy((char *)sh->q + dst_row * sh->ld * elem,
                scratch_v + (size_t)r * job->row_value_bytes + (size_t)sh->col0 * elem, (size_t)sh->cols * elem);
-        if (q8)
-          memcpy(sh->s + dst_row * (size_t)(sh->cols / gs),
-                 (const char *)(scratch_s + (size_t)r * job->row_scale_bytes) + (size_t)(sh->col0 / gs) * sizeof(float),
-                 (size_t)(sh->cols / gs) * sizeof(float));
+        if (q8) /* the shard's groups; per-channel: the row's one scale, whatever the columns */
+          memcpy(sh->s + dst_row * (size_t)groups,
+                 (const char *)(scratch_s + (size_t)r * job->row_scale_bytes) +
+                     (size_t)(gs == t->cols ? 0 : sh->col0 / gs) * sizeof(float),
+                 (size_t)groups * sizeof(float));
       }
     }
     if (job->team)

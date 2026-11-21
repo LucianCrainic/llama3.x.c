@@ -295,6 +295,12 @@ static const float *embedding_row(const Tp *tp, int token) {
   return (const float *)embed->q + (size_t)token * tp->c.dim;
 }
 
+/* The INT8 group of a product with input width k (per socket): the checkpoint's group size, or with per-channel INT8
+ * (gs 0: one weight scale per output channel, one activation scale per token) the whole of k. */
+static int tp_group(const Tp *tp, int k) {
+  return tp->gs ? tp->gs : k;
+}
+
 static K8Weight q8_weight(const Shard *sh) {
   return (K8Weight){(const int8_t *)sh->q, sh->s};
 }
@@ -321,7 +327,7 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   int dim = tp->c.dim;
   if (tp->sockets == 1) {
     if (tp->quantized)
-      SPROFILE(phase, k_matmul_q8_add(sk->x, in, q8_weight(w), n, dim, tp->gs));
+      SPROFILE(phase, k_matmul_q8_add(sk->x, in, q8_weight(w), n, dim, tp_group(tp, n)));
     else
       SPROFILE(phase, k_matmul_add(sk->x, x, w->q, n, dim));
     return 1;
@@ -330,7 +336,7 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   if (!partial)
     return 0;
   K8Weight wq = tp->quantized ? q8_weight(w) : (K8Weight){0};
-  ProjectJob job = {.n = n, .d = dim, .gs = tp->gs, .partial = partial, .ld = w->ld, .x = x, .w = w->q, .input = in,
+  ProjectJob job = {.n = n, .d = dim, .gs = tp_group(tp, n), .partial = partial, .ld = w->ld, .x = x, .w = w->q, .input = in,
                     .wq = tp->quantized ? &wq : NULL};
   SPROFILE(phase, project_reduce(tp, sk, &job, slot));
   return 1;
@@ -378,19 +384,21 @@ static void forward_fp32(Tp *tp, int s) {
 
 /* Q8_0 (B6): the checkpoint's group size and scales and the Q8_0 activation rule (W8A8, or FP32 inputs for W8A32). Row
  * shards quantize the full normalized input, which is identical on both sockets; Wo and W2 quantize only the owned
- * slice, which starts on a group boundary, so its groups are exactly the original groups. */
+ * slice, which starts on a group boundary, so its groups are exactly the original groups. Per-channel INT8 has one group
+ * per input: each socket's Wo/W2 slice gets its own per-token scale (as a tensor-parallel rank quantizes its shard), so
+ * two sockets agree with one within the W8A8 noise, not bitwise. */
 static K8Input q8_input(const Tp *tp, int8_t *q, float *scales, const float *x, int n) {
   if (tp->fp32_activations)
     return (K8Input){NULL, NULL, x};
-  k_quantize(q, scales, x, n, tp->gs);
+  k_quantize(q, scales, x, n, tp_group(tp, n));
   return (K8Input){q, scales, x};
 }
 
 static void forward_q8(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
-  int S = tp->sockets, dim = p->dim, hd = p->head_dim, gs = tp->gs, hl = p->n_heads / S, kl = p->n_kv_heads / S,
-      kvl = kl * hd;
+  int S = tp->sockets, dim = p->dim, hd = p->head_dim, gs = tp_group(tp, dim), hl = p->n_heads / S,
+      kl = p->n_kv_heads / S, kvl = kl * hd;
   int hidden_l = p->hidden_dim / S, token = tp->token, pos = tp->pos;
   int row;
   const Shard *embed = embedding_shard(tp, token, &row);
@@ -463,7 +471,8 @@ static void embed_chunks(const void *p, int segment, int first, int last) {
     int row;
     const Shard *embed = embedding_shard(tp, tp->btokens[i], &row);
     for (size_t j = 0; j < dim; j++)
-      x[j] = ((const int8_t *)embed->q)[(size_t)row * dim + j] * embed->s[((size_t)row * dim + j) / (size_t)tp->gs];
+      x[j] = ((const int8_t *)embed->q)[(size_t)row * dim + j] *
+             embed->s[((size_t)row * dim + j) / (size_t)tp_group(tp, (int)dim)];
   }
 }
 
@@ -503,9 +512,9 @@ static const float *packed_scales(const TpSocket *sk, int layer, int index) {
 /* The W8A8 product on this batch's quantized activations: tile order for the pipelined kernel, else rows. */
 static void gemm_q8(const Tp *tp, const int8_t *xq, const float *xs, int k, const GemmQ8Segment *seg, int count) {
   if (tp->tiled)
-    k_gemm_q8_tiled(xq, xs, tp->bcount, k, tp->gs, seg, count);
+    k_gemm_q8_tiled(xq, xs, tp->bcount, k, tp_group(tp, k), seg, count);
   else
-    k_gemm_q8(xq, xs, tp->bcount, k, tp->gs, seg, count);
+    k_gemm_q8(xq, xs, tp->bcount, k, tp_group(tp, k), seg, count);
 }
 
 /* One product on FP32 activations: the FP32 GEMM, or in BF16 mode the same segments on the packed copies (the
@@ -562,9 +571,9 @@ static uint64_t hash_floats(const float *x, size_t n) {
 /* Quantizes `rows` rows of n values (stride ldx) of x for the next W8A8 product, exactly as the per-token path does it. */
 static void quantize_batch(const Tp *tp, int8_t *q, float *scales, const float *x, size_t ldx, int n) {
   if (tp->tiled)
-    k_quantize_rows_tiled(q, scales, x, ldx, tp->bcount, n, tp->gs);
+    k_quantize_rows_tiled(q, scales, x, ldx, tp->bcount, n, tp_group(tp, n));
   else
-    k_quantize_rows(q, scales, x, ldx, tp->bcount, n, tp->gs);
+    k_quantize_rows(q, scales, x, ldx, tp->bcount, n, tp_group(tp, n));
 }
 
 /* RMSNorm of the batch into xb, then (W8A8) its quantization for the next product. The pipelined kernel takes both
@@ -574,7 +583,8 @@ static void norm_quantize_batch(Tp *tp, TpSocket *sk, int s, const float *weight
   int m = tp->bcount, dim = tp->c.dim;
   if (tp->quantized && tp->tiled) {
     SPROFILE(PHASE_QUANTIZE,
-             k_rmsnorm_quantize_rows_tiled(sk->xq, sk->xs, sk->xb, sk->x, weight, m, dim, tp->c.norm_eps, tp->gs));
+             k_rmsnorm_quantize_rows_tiled(sk->xq, sk->xs, sk->xb, sk->x, weight, m, dim, tp->c.norm_eps,
+                                           tp_group(tp, dim)));
     return;
   }
   SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, weight, m));
@@ -586,7 +596,7 @@ static void forward_batch(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
   int S = tp->sockets, dim = p->dim, hd = p->head_dim, hl = p->n_heads / S, kl = p->n_kv_heads / S, kvl = kl * hd;
-  int ql = dim / S, hidden_l = p->hidden_dim / S, m = tp->bcount, pos0 = tp->bpos0, gs = tp->gs;
+  int ql = dim / S, hidden_l = p->hidden_dim / S, m = tp->bcount, pos0 = tp->bpos0, gs = tp_group(tp, dim);
   int q8 = tp->quantized;
   SPROFILE(PHASE_EMBED, embed_rows(tp, sk));
   SPROFILE(PHASE_ROPE_TABLE, rope_tables(tp, sk));
@@ -728,10 +738,10 @@ static void setup_socket(Tp *tp, int s) {
     /* Quantized rows are padded to whole 32-row blocks: the AMX kernel loads 16 rows at a time. */
     size_t padded = (rows + 31) / 32 * 32;
     CARVE(sk->xq, padded * p->dim, int8_t);
-    CARVE(sk->xs, padded * (p->dim / tp->gs), float);
+    CARVE(sk->xs, padded * (size_t)(p->dim / tp_group(tp, p->dim)), float);
     size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / S; /* attention output or FFN hidden */
     CARVE(sk->aq, padded * slice, int8_t);
-    CARVE(sk->as, padded * (slice / tp->gs), float);
+    CARVE(sk->as, padded * (slice / (size_t)tp_group(tp, (int)slice)), float);
   }
   float *attention_memory;
   CARVE(attention_memory, k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, tp->rows) / sizeof(float) + 1, float);
@@ -770,7 +780,8 @@ static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs
     bytes += 2 * (size_t)rows * (size_t)kl * (size_t)p->head_dim * sizeof(float);
   if (quantized) { /* xq, xs, aq, as, for whole 32-row blocks */
     size_t padded = ((size_t)rows + 31) / 32 * 32;
-    bytes += padded * ((size_t)p->dim + (size_t)p->dim / gs * sizeof(float) + slice + slice / gs * sizeof(float));
+    size_t groups = gs ? (size_t)p->dim / gs + slice / gs : 2; /* per-channel (gs 0): one scale per row each */
+    bytes += padded * ((size_t)p->dim + slice + groups * sizeof(float));
   }
   bytes += k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, rows) + 64;
   return bytes;
@@ -860,7 +871,7 @@ static size_t pack_bytes_of(const Tp *tp, const Shard *sh) {
   if (tp->pack == TP_PACK_BF16)
     return bf16_vnni_elements(sh->rows, sh->cols) * sizeof(uint16_t);
   size_t tiles = s8_vnni_bytes(sh->rows, sh->cols);
-  return tp->tiled ? align_line(tiles) + s8_scales_t_bytes(sh->rows, sh->cols, tp->gs) : tiles;
+  return tp->tiled ? align_line(tiles) + s8_scales_t_bytes(sh->rows, sh->cols, tp_group(tp, sh->cols)) : tiles;
 }
 
 /* What socket s's packed region must hold: its shard of every matrix of every layer, each on a cache line. */
@@ -918,7 +929,7 @@ static void plan_packing(Tp *tp) {
             PackS8 *job = &tp->sjobs[s][at];
             job->st = sk->pscales_at[at] = (float *)(dst + align_line(s8_vnni_bytes(sh->rows, sh->cols)));
             job->s = sh->s;
-            job->groups = sh->cols / tp->gs;
+            job->groups = sh->cols / tp_group(tp, sh->cols);
           }
         }
       }
@@ -980,7 +991,9 @@ static Tp *tp_new(const Config *p, int sockets, int quantized, int gs, int fp32_
   tp->quantized = quantized;
   tp->fp32_activations = fp32_activations;
   tp->gs = quantized ? gs : 0;
-  tp->tiled = pack == TP_PACK_INT8 && gs % 64 == 0 && k_gemm_q8_tiled_active();
+  /* Per-channel INT8 (gs 0) has one group per product: every per-socket input width must be whole k-steps. */
+  int steps = gs ? gs % 64 == 0 : (p->dim / sockets) % 64 == 0 && (p->hidden_dim / sockets) % 64 == 0;
+  tp->tiled = pack == TP_PACK_INT8 && steps && k_gemm_q8_tiled_active();
   return tp;
 }
 

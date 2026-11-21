@@ -13,6 +13,9 @@ agreement over all positions >= --argmax-min (positions are then not judged one 
 
     compare_engines.py --probe build/release/probe-fp32 --checkpoint fp32-v3.bin --tokens 1,5,9 \\
         --env-b LLAMA_BACKEND=teams --env-b LLAMA_THREADS=4 --output compare.json
+
+--logits-a FILE replaces config A by precomputed float32 logits of every position (tools/hf_logits.py writes the
+Hugging Face FP32 reference), so a checkpoint is judged against the model it was converted from.
 """
 import argparse
 import array
@@ -104,6 +107,8 @@ def main(argv=None):
     group.add_argument('--tokens-file', help='whitespace-separated token ids')
     parser.add_argument('--env-a', action='append', default=[], metavar='KEY=VALUE')
     parser.add_argument('--env-b', action='append', default=[], metavar='KEY=VALUE')
+    parser.add_argument('--logits-a', metavar='FILE',
+                        help='config A is this raw float32 file of logits at every position (e.g. tools/hf_logits.py)')
     parser.add_argument('--batch-a', type=int, metavar='M', help='run config A through the batched prefill path, microbatch M')
     parser.add_argument('--batch-b', type=int, metavar='M', help='run config B through the batched prefill path, microbatch M')
     parser.add_argument('--max-abs', type=float, default=1e-3, help='budget for max |delta logit| (default 1e-3)')
@@ -125,11 +130,14 @@ def main(argv=None):
     env_a, env_b = parse_env(args.env_a), parse_env(args.env_b)
     if args.tail is not None and (args.last_only or not 0 < args.tail <= len(tokens)):
         raise SystemExit('--tail K needs 0 < K <= the number of tokens and cannot be combined with --last-only')
-    blob_a = run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a, args.last_only, args.tail)
+    if args.logits_a and args.tail:
+        raise SystemExit('--logits-a cannot be combined with --tail')
+    blob_a = (Path(args.logits_a).read_bytes() if args.logits_a else
+              run_probe(args.probe, args.checkpoint, tokens, env_a, args.batch_a, args.last_only, args.tail))
     blob_b = run_probe(args.probe, args.checkpoint, tokens, env_b, args.batch_b, args.last_only, args.tail)
     compared = args.tail or len(tokens)
     if args.last_only:
-        row_bytes = len(blob_a) // (len(tokens) if not args.batch_a else 1)
+        row_bytes = len(blob_a) // (len(tokens) if args.logits_a or not args.batch_a else 1)
         blob_a, compared = blob_a[-row_bytes:], 1  # a batched side already returns just the final row
     if len(blob_a) != len(blob_b):
         raise SystemExit('the two configurations produced logits of different sizes')
@@ -153,7 +161,7 @@ def main(argv=None):
         passed = passed and summary['argmax_agreement'] >= argmax_min and (
             args.rms_max is None or summary['rms'] <= args.rms_max)
     result = dict(passed=passed, probe=str(args.probe), checkpoint=str(args.checkpoint),
-                  env_a=env_a, env_b=env_b, batch_a=args.batch_a, batch_b=args.batch_b, tokens=len(tokens),
+                  logits_a=args.logits_a, env_a=env_a, env_b=env_b, batch_a=args.batch_a, batch_b=args.batch_b, tokens=len(tokens),
                   tail=args.tail,
                   budget=dict(max_abs=0.0 if args.bitwise else args.max_abs, argmax_agreement=argmax_min,
                               bitwise=args.bitwise, rms_max=args.rms_max, statistical=statistical),

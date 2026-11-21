@@ -106,7 +106,9 @@ def validate_model(model):
         raise ValueError("tied embedding metadata disagrees with output weights")
 
 
-def version3_header(model, precision, group_size):
+def version3_header(model, precision, group_size, version=3):
+    """The 256-byte v3 header; version 4 is the same header for per-channel INT8 (group_size 0: one scale per output
+    channel of each matrix, the row of its embedding or classifier)."""
     p = model.params
     scaling = p.rope_scaling or {}
     kind = scaling.get("rope_type", scaling.get("type", "default"))
@@ -124,7 +126,7 @@ def version3_header(model, precision, group_size):
         if not -1 <= value < p.vocab_size:
             raise ValueError("invalid EOT/EOM metadata")
     header = bytearray(256)
-    struct.pack_into("<9I", header, 0, 0x616b3432, 3, p.dim, p.hidden_dim, p.n_layers,
+    struct.pack_into("<9I", header, 0, 0x616b3432, version, p.dim, p.hidden_dim, p.n_layers,
                      p.n_heads, p.n_kv_heads or p.n_heads, p.vocab_size, p.max_seq_len)
     struct.pack_into("<3I2fI3f3I4i", header, 36, precision,
                      int(torch.equal(model.tok_embeddings.weight, model.output.weight)), group_size,
@@ -272,15 +274,18 @@ def version1_export(model, filepath):
 def version2_export(model, filepath, group_size=64, version=2):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
+    version 4 is per-channel INT8: every matrix is quantized with one scale per output channel (row), i.e. Q8_0 with
+    the group spanning the whole row, and the header stores group size 0.
     That is:
     - quantize all weights to symmetric int8, in range [-127, 127]
     - all other tensors (the rmsnorm params) are kept and exported in fp32
     - quantization is done in groups of group_size to reduce the effects of any outliers
     """
-    if group_size <= 0 or group_size > 131071:
+    per_channel = version == 4
+    if not per_channel and (group_size <= 0 or group_size > 131071):
         raise ValueError("group size must be 1..131071")
     # let's first do some validation for this export type
-    while model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
+    while not per_channel and model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
         group_size //= 2
         print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
     weights = [
@@ -299,7 +304,7 @@ def version2_export(model, filepath, group_size=64, version=2):
     for i, w in enumerate(weights):
         if w.numel() % 4:
             raise ValueError(f"weight {i} requires aligned FP32 scales (element count must be divisible by 4)")
-        assert (
+        assert per_channel or (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
 
@@ -331,9 +336,9 @@ def version2_export(model, filepath, group_size=64, version=2):
     pad = 256 - out_file.tell()  # pad rest with zeros; tell returns current pos
     assert pad >= 0
     out_file.write(b"\0" * pad)
-    if version == 3:
+    if version in (3, 4):
         out_file.seek(0)
-        out_file.write(version3_header(model, 1, group_size))
+        out_file.write(version3_header(model, 1, 0 if per_channel else group_size, version))
     # now that the header is done, let's write out the model
 
     # first let's write out all the params that we are keeping in fp32: the norms
@@ -348,14 +353,14 @@ def version2_export(model, filepath, group_size=64, version=2):
     ew = []
     for i, w in enumerate(weights):
         # quantize this weight
-        q, s, err = quantize_q80(w, group_size)
+        q, s, err = quantize_q80(w, w.shape[1] if per_channel else group_size)
         # save the int8 weights to file
         serialize_int8(out_file, q)  # save the tensor in int8
         serialize_fp32(out_file, s)  # save scale factors
         # logging
         ew.append((err, w.shape))
         print(
-            f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to Q8_0 with max error {err}"
+            f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to {'per-channel INT8' if per_channel else 'Q8_0'} with max error {err}"
         )
 
     # print the highest error across all weights, should be very small, e.g. O(~0.001)
@@ -782,6 +787,8 @@ if __name__ == "__main__":
         "--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32"
     )
     parser.add_argument("--int8", action="store_true", help="Q8_0 payload for version 3")
+    parser.add_argument("--per-channel", action="store_true",
+                        help="with --int8: one scale per output channel instead of groups of 64 (writes version 4)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
@@ -800,12 +807,15 @@ if __name__ == "__main__":
         parser.error("Can't load input model!")
 
     # export
+    if args.per_channel and not args.int8:
+        parser.error("--per-channel requires --int8")
     if args.int8:
         if args.version != 3:
-            parser.error("--int8 requires --version 3")
+            parser.error("--int8 requires --version 3 (--per-channel writes version 4 itself)")
         validate_model(model)
-        version3_header(model, 1, 64)
-        version2_export(model, args.filepath, version=3)
+        version = 4 if args.per_channel else 3
+        version3_header(model, 1, 0 if args.per_channel else 64, version)
+        version2_export(model, args.filepath, version=version)
     else:
         if args.dtype != "fp32" and args.version != -1:
             parser.error("C checkpoints require --dtype fp32 (or --int8)")

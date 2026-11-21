@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from fixtures import CONFIG, TP_CONFIG, TP_ODD_CONFIG, TP_WIDE_CONFIG, create
+from fixtures import CONFIG, TP_CONFIG, TP_ODD_CONFIG, TP_WIDE_CONFIG, create, upgrade_v3
 
 BUILD = Path(sys.argv.pop(1)).resolve()
 TOKENS = [65, 66, 67, 68, 69, 70, 71]
@@ -37,6 +37,9 @@ class TensorParallelTests(unittest.TestCase):
         }
         cls.fixtures['gs16'] = create(root/'gs16', config=TP_CONFIG, gs=16)
         cls.fixtures['wide'] = create(root/'wide', config=TP_WIDE_CONFIG, gs=64)
+        # per-channel INT8 (version 4): one scale per output channel, the same weights as `wide`
+        cls.fixtures['wide-pc'] = upgrade_v3(create(root/'wide-pc', config=TP_WIDE_CONFIG, gs=0), config=TP_WIDE_CONFIG,
+                                             gs=0, int8_version=4)
         cls.one_kv = create(root/'one-kv', shared=True)
 
     @classmethod
@@ -321,6 +324,52 @@ class TensorParallelTests(unittest.TestCase):
             data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
                                LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_ATTN='amx')
             self.assertEqual(data['build']['attention'], 'amx')
+
+    def test_per_channel_int8_checkpoint(self):
+        """Fix 9 (docs/prefill-gap.md): a version 4 checkpoint holds one scale per output channel, so every product is
+        one group over its whole (per-socket) input and activations get one scale per token. The batched prefill equals
+        the per-token path; two sockets agree with one within the W8A8 noise (each socket quantizes its own Wo/W2 input
+        slice, as a tensor-parallel rank does); on the AMX tile model the pipelined kernel (its full-K path) equals the
+        chunk kernel bitwise; the report names format 4 and group size 0."""
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        all_logits = {'LLAMA_PREFILL_LOGITS': 'all', 'LLAMA_PREFILL_BATCH': '32'}
+        batched = {}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets):
+                per_token = self.logits('int8', 'wide-pc', None, sockets, tokens=tokens)
+                batched[sockets] = self.logits('int8', 'wide-pc', 'batch', sockets, tokens=tokens, **all_logits)
+                self.assert_agree(per_token, batched[sockets], TP_WIDE_CONFIG[5])
+        diff = [abs(a - b) for a, b in zip(batched[1], batched[2])]
+        self.assertLessEqual(max(diff), 0.5)
+        self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+        self.need('probe-int8-amx-emul')
+        amx = {'LLAMA_KERNELS': 'amx', **all_logits}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets, kernel='pipelined'):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', **amx)
+                chunk = self.logits('int8', 'wide-pc', 'batch', sockets, **args)
+                pipelined = self.logits('int8', 'wide-pc', 'batch', sockets, LLAMA_Q8_GEMM='pipelined', **args)
+                self.assertEqual(chunk.tobytes(), pipelined.tobytes())
+                self.assert_agree(batched[sockets], chunk, TP_WIDE_CONFIG[5], abs_tol=0.05, rel_tol=0.02)
+            data = self.report('runq', 'int8.bin', sockets, fixture='wide-pc', binary='runq-amx-emul', full=True,
+                               LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')
+            self.assertEqual((data['model']['checkpoint_format'], data['model']['quantization_group_size']), (4, 0))
+            self.assertEqual(data['runtime']['kernels_prefill'], 'amx-int8')
+
+    def test_per_channel_header_is_validated(self):
+        """Version 4 must say group size 0, and version 3 may not: a mislabelled file fails at load."""
+        source = (self.fixtures['wide-pc']/'int8.bin').read_bytes()
+        for version, gs, message in ((4, 64, b'must have group size zero'), (3, 0, b'unsupported INT8 group size 0')):
+            with self.subTest(version=version, gs=gs):
+                data = bytearray(source)
+                data[4:8] = version.to_bytes(4, 'little')
+                data[44:48] = gs.to_bytes(4, 'little')
+                path = Path(self.temp.name)/f'bad-{version}-{gs}.bin'
+                path.write_bytes(data)
+                result = subprocess.run([str(BUILD/'probe-int8'), str(path), '65'], capture_output=True,
+                                        env=environment(1))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
     def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
         """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the

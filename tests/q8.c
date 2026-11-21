@@ -349,7 +349,10 @@ static void run_large(const char *label) {
                            /* K sweep up to the largest layer input of the 8B model, then M and N edges */
                            {16, 48, 128, 64}, {16, 48, 512, 64}, {16, 48, 1024, 64}, {16, 48, 2048, 64},
                            {16, 48, 4096, 64}, {16, 48, 8192, 64}, {16, 48, 14336, 64}, {64, 4096, 2048, 64},
-                           {64, 14336, 4096, 64}, {53, 1024, 2048, 64}};
+                           {64, 14336, 4096, 64}, {53, 1024, 2048, 64},
+                           /* per-channel INT8: one group over all of K (gs = K, wider than the quantizer's piece) */
+                           {64, 130, 4096, 4096}, {40, 48, 14336, 14336}, {33, 70, 2048, 2048}, {17, 33, 128, 128},
+                           {16, 48, 4096, 4096}, {40, 17, 3072, 3072}};
   int before = failures;
   for (size_t i = 0; i < sizeof(shapes) / sizeof(*shapes); i++) {
     Case c;

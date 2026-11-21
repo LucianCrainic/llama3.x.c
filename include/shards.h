@@ -30,7 +30,7 @@ typedef struct {
   int layer;      /* -1 for global tensors */
   int rows, cols; /* W[out][in]: rows = out, cols = in; norms are 1 x dim */
   TensorDtype dtype;
-  int group_size;      /* 0 for F32 */
+  int group_size;      /* 0 for F32; cols for per-channel INT8 (one scale per row) */
   size_t offset;       /* values */
   size_t scale_offset; /* Q8 scales, else 0 */
   size_t bytes;        /* values + scales; an alias repeats its target's bytes without occupying new ones */
@@ -41,10 +41,11 @@ typedef struct TensorManifest {
   TensorDesc *t; /* in file order */
   int count;
   size_t file_bytes; /* end of the last non-alias tensor */
+  int per_channel;   /* INT8 with one scale per output channel (version 4, group size 0) */
 } TensorManifest;
 
 /* Describes the layout of both executables: FP32 (`run`, formats 0/2/3) and Q8_0
- * (`runq`, formats 2/3). `header_bytes` is where the first tensor starts. */
+ * (`runq`, formats 2/3; gs 0 is per-channel INT8, format 4). `header_bytes` is where the first tensor starts. */
 void manifest_build(TensorManifest *m, const Config *p, int quantized, int gs, size_t header_bytes);
 const TensorDesc *manifest_find(const TensorManifest *m, TensorRole role, int layer);
 void manifest_free(TensorManifest *m);
@@ -79,6 +80,7 @@ typedef struct {
 
 typedef struct {
   int sockets, count, gs, quantized, layers;
+  int per_channel; /* INT8 with one scale per output channel: gs is 0, a product's group is its per-socket K */
   Shard *t;
   int *index; /* [role][layer + 1][socket]: the shard's place in t, or -1 (shards_find in constant time) */
   size_t region_bytes[2]; /* what each socket's weights region must hold, in 64-byte aligned order */
