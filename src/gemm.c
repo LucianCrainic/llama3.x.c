@@ -437,6 +437,9 @@ void aligned_buffer_free(AlignedBuffer *buffer) {
 
 /* ---- tile configuration and microkernels ------------------------------------------------------------------------ */
 
+static _Thread_local float *q8_kb_buffer; /* the K-blocked driver's accumulators (q8_gemm_blocks_kblocked) */
+static _Thread_local size_t q8_kb_floats;
+
 #if GEMM_AMX
 /* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
  * and a 16 x 16 FP32 or int32 C block. Tiles 0-3 hold C (m block x n block), 4-5 the A blocks, 6-7 the B blocks. */
@@ -454,6 +457,9 @@ static pthread_once_t amx_key_once = PTHREAD_ONCE_INIT;
 AMX_TARGET static void amx_thread_exit(void *unused) {
   (void)unused;
   AMX_RELEASE();
+  free(q8_kb_buffer);
+  q8_kb_buffer = NULL;
+  q8_kb_floats = 0;
 }
 
 static void amx_key_create(void) {
@@ -482,6 +488,9 @@ AMX_TARGET void gemm_amx_thread_release(void) {
   AMX_RELEASE();
   amx_thread_ready = 0;
   pthread_setspecific(amx_key, NULL);
+  free(q8_kb_buffer);
+  q8_kb_buffer = NULL;
+  q8_kb_floats = 0;
 }
 
 /* C[m][n] = sum_k A[m][k] * B[n][k] for m, n <= 32, with 2 x 2 C tiles in flight. A is BF16 row-major with leading
@@ -666,12 +675,12 @@ AMX_AVX_TARGET static inline void q8_tiled_rescale(float *o, const int32_t *d, c
  * one of two dot buffers, and the FP32 rescale of the previous half-step runs after its tile instructions are issued,
  * so the vector work overlaps the tile unit. */
 AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, const float *xs, size_t xs_ld,
-                                              const int8_t *bp, const float *wst, int m, int n, int k, int gs) {
+                                              const int8_t *bp, const float *wst, int m, int n, int k, int gs, int g0,
+                                              int g1) {
   amx_thread_configure();
   const size_t tile = (size_t)k * 16, ksteps = (size_t)k / 64;
-  const int wide = n > 16, halves = m > 16 ? 2 : 1, steps = gs / 64, groups = k / gs, count = groups * halves;
+  const int wide = n > 16, halves = m > 16 ? 2 : 1, steps = gs / 64, groups = k / gs, count = g1 * halves;
   _Alignas(64) int32_t dots[2][16 * 32];
-  memset(out, 0, 32 * 32 * sizeof(float));
   if (groups == 1 && halves == 2 && wide) {
     /* One group over all of k (per-channel INT8): the four C tiles accumulate the whole product, each A and B tile is
      * loaded once and used twice, then one rescale (the int32 sums are exact, so the result is the general path's). */
@@ -697,7 +706,7 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
     q8_tiled_rescale(out + 16 * 32, dots[1], xs + 16 * xs_ld, xs_ld, wst, m - 16, 1);
     return;
   }
-  for (int h = 0; h <= count; h++) {
+  for (int h = g0 * halves; h <= count; h++) {
     if (h < count) {
       const int g = h / halves, rb = h % halves;
       int32_t *d = dots[h & 1];
@@ -738,7 +747,7 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
           AMX_STORED(1, d + 16, 32 * sizeof(int32_t));
       }
     }
-    if (h > 0) { /* the previous half-step's rescale */
+    if (h > g0 * halves) { /* the previous half-step's rescale */
       const int p = h - 1, g = p / halves, rb = p % halves, rows = m - rb * 16 < 16 ? m - rb * 16 : 16;
       q8_tiled_rescale(out + rb * 16 * 32, dots[p & 1], xs + (size_t)rb * 16 * xs_ld + (size_t)g, xs_ld,
                        wst + (size_t)g * 32, rows, wide);
@@ -762,8 +771,9 @@ void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const flo
   fail("AMX tile kernels are not compiled into this build");
 }
 static void amx_q8_block_tiled(float *out, const int8_t *ap, const float *xs, size_t xs_ld, const int8_t *bp,
-                               const float *wst, int m, int n, int k, int gs) {
-  (void)out, (void)ap, (void)xs, (void)xs_ld, (void)bp, (void)wst, (void)m, (void)n, (void)k, (void)gs;
+                               const float *wst, int m, int n, int k, int gs, int g0, int g1) {
+  (void)out, (void)ap, (void)xs, (void)xs_ld, (void)bp, (void)wst, (void)m, (void)n, (void)k, (void)gs, (void)g0,
+      (void)g1;
   fail("AMX tile kernels are not compiled into this build");
 }
 #endif
@@ -1158,7 +1168,16 @@ typedef struct {
   GemmQ8Segment segment[GEMM_MAX_SEGMENTS];
   int blocks[GEMM_MAX_SEGMENTS]; /* blocks of each segment: channel chunks x row blocks */
   int tiled;                     /* xq in tile order: the pipelined AMX kernel */
+  int kgroups;                   /* groups per K-block (tiled; = groups: one block) */
 } Q8GemmJob;
+
+/* acc[mb][32] (+)= the tiled sums of groups [g0, g1) of activation rows [m0, m0 + mb) against channels [n0, n0 + nc). */
+static void q8_sums_tiled(const Q8GemmJob *job, const int8_t *packed, const float *pscales, int n0, int nc, int m0,
+                          int mb, float *acc, int g0, int g1) {
+  amx_q8_block_tiled(acc, job->xq + (size_t)m0 * (size_t)job->k, job->xs + (size_t)m0 * (size_t)job->groups,
+                     (size_t)job->groups, packed + (size_t)(n0 / 16) * (size_t)job->k * 16,
+                     pscales + (size_t)(n0 / 32) * (size_t)job->groups * 32, mb, nc, job->k, job->gs, g0, g1);
+}
 
 /* acc[mb][32] = the Q8 sums of activation rows [m0, m0 + mb) against weight rows [n0, n0 + nc). */
 static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, const float *pscales, int n0, int nc,
@@ -1167,8 +1186,8 @@ static void q8_sums(const Q8GemmJob *job, K8Weight w, const int8_t *packed, cons
   const int8_t *x = job->xq + (size_t)m0 * (size_t)job->k;
   const float *xs = job->xs + (size_t)m0 * (size_t)groups;
   if (job->tiled) { /* m0 is a multiple of 32: the block is 32 * k contiguous bytes of the tile order */
-    amx_q8_block_tiled(acc, x, xs, (size_t)groups, packed + (size_t)(n0 / 16) * (size_t)job->k * 16,
-                       pscales + (size_t)(n0 / 32) * (size_t)groups * 32, mb, nc, job->k, job->gs);
+    memset(acc, 0, Q8_MB * 32 * sizeof(float));
+    q8_sums_tiled(job, packed, pscales, n0, nc, m0, mb, acc, 0, groups);
     return;
   }
   if (job->backend == Q8_GEMM_AMX) {
@@ -1231,12 +1250,8 @@ AVX512 static void swiglu_row_avx512(float *out, const float *sum, const float *
 /* One block of the product: activation rows [m0, m0 + Q8_MB) against output channels [n0, n0 + chunk_n) of segment s,
  * with the segment's epilogue. Each output element belongs to exactly one block, and its value does not depend on which
  * worker computes the block or in which order, so any partition of the blocks gives bitwise the same result. */
-static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0, int nc, int m0, float *acc,
-                          float *gate) {
-  int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
-  q8_sums(job, seg->w, seg->pw, seg->pws, n0, nc, m0, mb, acc);
-  if (seg->kind == GEMM_SWIGLU)
-    q8_sums(job, seg->w3, seg->pw3, seg->pws3, n0, nc, m0, mb, gate);
+static void q8_gemm_epilogue(const GemmQ8Segment *seg, int n0, int nc, int m0, int mb, const float *acc,
+                             const float *gate) {
 #if GEMM_AVX512
 #if defined(GEMM_EMULATE_AVX512)
   const int vector_ok = 1; /* the test model of the intrinsics */
@@ -1263,6 +1278,61 @@ static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0
   }
 }
 
+static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0, int nc, int m0, float *acc,
+                          float *gate) {
+  int mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
+  q8_sums(job, seg->w, seg->pw, seg->pws, n0, nc, m0, mb, acc);
+  if (seg->kind == GEMM_SWIGLU)
+    q8_sums(job, seg->w3, seg->pw3, seg->pws3, n0, nc, m0, mb, gate);
+  q8_gemm_epilogue(seg, n0, nc, m0, mb, acc, gate);
+}
+
+/* The pipelined product runs in K-blocks of Q8_KBLOCK elements (prefill-gap fix 8: of 1024 and 2048, 2048 measured
+ * fastest, P 2048 TTFT -1.7% on one socket and -2.5% on two, bitwise; software prefetch of the next tiles was slower),
+ * and a worker holds the accumulators of up to Q8_KB_PIECE blocks across them. */
+enum { Q8_KBLOCK = 2048, Q8_KB_PIECE = 64 };
+
+/* The tiled product in K-blocks: a worker takes up to Q8_KB_PIECE of its blocks at a time and, for each K-block of
+ * job->kgroups groups, adds that K-block's sums to every block's FP32 accumulator before moving to the next, so the
+ * activation panel slice of one K-block (m x K-block bytes) stays in L2 while all the piece's channel chunks pass over
+ * it. Each output element still adds its groups in ascending order through the same fma, so the result is bitwise the
+ * one-pass kernel's. */
+static void q8_gemm_blocks_kblocked(const Q8GemmJob *job, int first, int last) {
+  const int mblocks = (job->m + Q8_MB - 1) / Q8_MB, per = Q8_MB * 32;
+  const size_t need = (size_t)Q8_KB_PIECE * 2 * (size_t)per;
+  if (q8_kb_floats < need) {
+    free(q8_kb_buffer);
+    q8_kb_buffer = aligned_alloc(64, need * sizeof(float));
+    if (!q8_kb_buffer)
+      fail("cannot allocate the K-blocked GEMM accumulators");
+    q8_kb_floats = need;
+  }
+  for (int p0 = first; p0 < last; p0 += Q8_KB_PIECE) {
+    const int p1 = last - p0 < Q8_KB_PIECE ? last : p0 + Q8_KB_PIECE;
+    memset(q8_kb_buffer, 0, (size_t)(p1 - p0) * 2 * (size_t)per * sizeof(float));
+    for (int g0 = 0, g1, done = 0; !done; g0 = g1) {
+      done = g0 >= job->groups;
+      g1 = done || job->groups - g0 < job->kgroups ? job->groups : g0 + job->kgroups;
+      int s = 0, base = 0;
+      for (int t = p0; t < p1; t++) {
+        while (t >= base + job->blocks[s])
+          base += job->blocks[s++];
+        const GemmQ8Segment *seg = &job->segment[s];
+        const int chunk = (t - base) / mblocks, n0 = chunk * 32, nc = seg->n - n0 < 32 ? seg->n - n0 : 32,
+                  m0 = ((t - base) % mblocks) * Q8_MB, mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
+        float *acc = q8_kb_buffer + (size_t)(t - p0) * 2 * (size_t)per, *gate = acc + per;
+        if (done) {
+          q8_gemm_epilogue(seg, n0, nc, m0, mb, acc, gate);
+          continue;
+        }
+        q8_sums_tiled(job, seg->pw, seg->pws, n0, nc, m0, mb, acc, g0, g1);
+        if (seg->kind == GEMM_SWIGLU)
+          q8_sums_tiled(job, seg->pw3, seg->pws3, n0, nc, m0, mb, gate, g0, g1);
+      }
+    }
+  }
+}
+
 /* Blocks [first, last) of the whole product. The blocks of all segments form one list (segment, then channel chunk,
  * then row block), split into balanced contiguous ranges: every worker gets the same number of blocks whatever the
  * segments' widths (QKV's narrow K/V segments no longer leave workers idle), and consecutive blocks of a worker share a
@@ -1270,6 +1340,10 @@ static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0
 static void q8_gemm_blocks(const void *p, int unused, int first, int last) {
   (void)unused;
   const Q8GemmJob *job = p;
+  if (job->tiled && job->kgroups < job->groups) {
+    q8_gemm_blocks_kblocked(job, first, last);
+    return;
+  }
   const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
   const int mblocks = (job->m + Q8_MB - 1) / Q8_MB;
   _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
@@ -1317,7 +1391,9 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
         fail("the pipelined Q8 GEMM needs the transposed weight scales of every segment");
   }
   Q8GemmJob job = {.xq = xq, .xs = xs, .m = m, .k = k, .gs = gs, .groups = k / gs, .count = count, .backend = backend,
-                   .tiled = tiled};
+                   .tiled = tiled, .kgroups = k / gs};
+  if (tiled && gs <= Q8_KBLOCK && k > Q8_KBLOCK) /* K-blocks of whole groups (per-channel: one group, one pass) */
+    job.kgroups = Q8_KBLOCK / gs;
   const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16, mblocks = (m + Q8_MB - 1) / Q8_MB;
   int total = 0;
   for (int s = 0; s < count; s++) {
