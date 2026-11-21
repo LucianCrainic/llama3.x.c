@@ -1,5 +1,7 @@
 # Two-socket tensor-parallel decode
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 **Status: run (2026-11-17, jobs 5839003 and 5839004, commit 2aad124, node cresco8-hbm14).** The decode campaign of phase B7 ran to
 completion for the 1B and 8B models (FP32, W8A8 and W8A32) with 3 repeats: 8 of 8 correctness gates passed, and every profiled
 run is free of the revisit triggers. Provenance and gates: [the validation record](tensor-parallel-validation.md). Plan:
@@ -32,13 +34,13 @@ Every run is in [tensor-parallel-summary-table.md](tensor-parallel-summary-table
 
 | Configuration | Runs | Sockets | Placement | THP | M | Kernel | Precision | Prompt | Warm ctx | TTFT s | Prefill tok/s | Decode tok/s | Decode phases | Reduce+wait | HBM read GB | DDR read GB | UPI rx data flits (M) |
 | --- | ---: | ---: | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
-| 8b-fp32-omp-file-s2-t112-p512-xctl | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.556 [0.556-0.564] | 173.20 [173.09-176.79] | 8.24 [6.18-8.25] | - | - | 8328.0 | 22.5 | 298434 |
-| 8b-fp32-teams-hbm-s1-t56-p512 | 3 | 1 | hbm (verified) | off | - | avx512 | fp32 | 512 | 512 | 0.491 [0.491-0.496] | 196.27 [193.29-196.34] | 16.42 [16.13-16.44] | - | - | 8237.5 | 9.2 | 407 |
-| 8b-fp32-teams-hbm-s2-t56-p512 | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.300 [0.277-0.304] | 347.07 [343.73-380.68] | 30.63 [30.59-30.64] | - | - | 8219.5 | 50.6 | 2408 |
-| 8b-fp32-teams-hbm-s2-t56-p512-xp4 | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.290 [0.286-0.300] | 361.43 [347.17-366.92] | 31.61 [31.61-31.68] | - | - | 8285.1 | 58.6 | 2864 |
-| 8b-int8-omp-file-s2-t112-p512-xctl | 3 | 2 | file | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.384 [0.365-0.548] | 269.36 [172.65-287.99] | 24.67 [24.37-24.76] | - | - | 2255.2 | 5.2 | 81553 |
-| 8b-int8-teams-hbm-s1-t56-p512 | 3 | 1 | hbm (verified) | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.443 [0.442-0.486] | 219.81 [197.79-220.28] | 49.52 [49.52-49.73] | - | - | 2216.3 | 1.5 | 30 |
-| 8b-int8-teams-hbm-s2-t56-p512 | 3 | 2 | file | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.262 [0.255-0.265] | 400.42 [395.68-415.41] | 91.25 [90.08-91.35] | - | - | 2199.3 | 10.0 | 725 |
+| 8b-fp32-omp-file-s2-t112-p512-xctl | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.556 [0.556-0.564] | 173.20 [173.09-176.79] | 8.24 [6.18-8.25] | - | - | 4164.0 † | 22.5 | 298434 |
+| 8b-fp32-teams-hbm-s1-t56-p512 | 3 | 1 | hbm (verified) | off | - | avx512 | fp32 | 512 | 512 | 0.491 [0.491-0.496] | 196.27 [193.29-196.34] | 16.42 [16.13-16.44] | - | - | 4118.8 † | 9.2 | 407 |
+| 8b-fp32-teams-hbm-s2-t56-p512 | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.300 [0.277-0.304] | 347.07 [343.73-380.68] | 30.63 [30.59-30.64] | - | - | 4109.8 † | 50.6 | 2408 |
+| 8b-fp32-teams-hbm-s2-t56-p512-xp4 | 3 | 2 | file | off | - | avx512 | fp32 | 512 | 512 | 0.290 [0.286-0.300] | 361.43 [347.17-366.92] | 31.61 [31.61-31.68] | - | - | 4142.6 † | 58.6 | 2864 |
+| 8b-int8-omp-file-s2-t112-p512-xctl | 3 | 2 | file | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.384 [0.365-0.548] | 269.36 [172.65-287.99] | 24.67 [24.37-24.76] | - | - | 1127.6 † | 5.2 | 81553 |
+| 8b-int8-teams-hbm-s1-t56-p512 | 3 | 1 | hbm (verified) | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.443 [0.442-0.486] | 219.81 [197.79-220.28] | 49.52 [49.52-49.73] | - | - | 1108.2 † | 1.5 | 30 |
+| 8b-int8-teams-hbm-s2-t56-p512 | 3 | 2 | file | off | - | avx512 | int8_q8_0 | 512 | 512 | 0.262 [0.255-0.265] | 400.42 [395.68-415.41] | 91.25 [90.08-91.35] | - | - | 1099.7 † | 10.0 | 725 |
 
 ## Decode tok/s by retained context
 
@@ -197,13 +199,13 @@ Whole-run counters (the 512-token warm-up plus 128 decoded tokens), 8B, `perf_un
 
 | Configuration | HBM read GB | DDR read GB | UPI rx data flits (M) | Weights, packed4, KV verified |
 | --- | ---: | ---: | ---: | --- |
-| 8B FP32, 1 x 56 | 8237.5 | 9.2 | 407 | weights, KV `full` on node 2; work region unverified (10-40 MB) |
-| 8B FP32, 2 x 56 rows | 8219.5 | 50.6 | 2408 | weights, KV, work `full` on nodes 2 and 3 |
-| 8B FP32, 2 x 56 packed4 | 8285.1 | 58.6 | 2864 | additionally the packed4 copy (14.0 GB per socket) `full` |
-| 8B FP32, 112 threads, no tensor parallelism (control) | 8328.0 | 22.5 | 298434 | not applicable |
-| 8B W8A8, 1 x 56 | 2216.3 | 1.5 | 30 | as above |
-| 8B W8A8, 2 x 56 | 2199.3 | 10.0 | 725 | as above |
-| 8B W8A8, 112 threads, control | 2255.2 | 5.2 | 81553 | not applicable |
+| 8B FP32, 1 x 56 | 4118.8 † | 9.2 | 407 | weights, KV `full` on node 2; work region unverified (10-40 MB) |
+| 8B FP32, 2 x 56 rows | 4109.8 † | 50.6 | 2408 | weights, KV, work `full` on nodes 2 and 3 |
+| 8B FP32, 2 x 56 packed4 | 4142.6 † | 58.6 | 2864 | additionally the packed4 copy (14.0 GB per socket) `full` |
+| 8B FP32, 112 threads, no tensor parallelism (control) | 4164.0 † | 22.5 | 298434 | not applicable |
+| 8B W8A8, 1 x 56 | 1108.2 † | 1.5 | 30 | as above |
+| 8B W8A8, 2 x 56 | 1099.7 † | 10.0 | 725 | as above |
+| 8B W8A8, 112 threads, control | 1127.6 † | 5.2 | 81553 | not applicable |
 
 Two sockets with tensor parallelism send 0.8% (FP32) and 0.9% (W8A8) of the UPI data flits of the interleaved 112-thread control:
 no weights and no attention data cross the link, only the activation exchange. The embedding table (2.1 GB) is on DDR node 0 in every

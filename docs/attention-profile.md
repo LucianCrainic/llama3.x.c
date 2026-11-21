@@ -1,5 +1,7 @@
 # Attention profile (phase E0)
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 **Status: run (2026-11-18, job 5860637, commit 397aa10; one HBM node in Flat mode).** The attention microbenchmark
 (`tests/attention_bench.c`), the row-block sweep, the half-KV-head shapes, the decode bench and two `perf stat` runs ran on one
 node. **The value gate failed: the bench reproduces 77% of the profiled engine attention time (gate: within 20%)**, so the bench
@@ -151,7 +153,7 @@ only start-up (7.7e7 cycles).
   about 2.0-2.4 TB/s over 56 cores, about 36-43 GB/s per core, or roughly 19-22 bytes per cycle at 1.9 GHz (**derived**; the node's
   lscpu maximum clock); a core can take 64 bytes per cycle from L2 at best. L2 misses are 6.1 per KFLOP, and l3_miss loads are
   285,000 over 2.75 TFLOP, so the L2 and L3 serve the working set. DRAM and HBM read traffic over the launch: 60.6 million CAS reads on
-  socket 0's HBM (3.9 GB for 5 passes, 0.78 GB per pass, against 70 GB streamed per pass): the K/V of this bench comes from cache.
+  socket 0's HBM (1.9 GB for 5 passes, 0.39 GB per pass †, against 70 GB streamed per pass): the K/V of this bench comes from cache.
 
 ## 3. Cross-check against the engine: failed
 
@@ -169,7 +171,7 @@ w1/w3/SwiGLU 2.59, w2 2.98, everything else under 0.1; non-attention time is 7.9
 
 **Explanation to be confirmed (hypothesis).** The bench reuses the K/V of one layer for every microbatch and every repetition: 8192 positions x 8 KV
 heads x 128 x 4 B x 2 (K and V) = 64 MiB, well inside the 112.5 MiB of L3 of the socket (the node has 225 MiB over two sockets); the counters agree
-(l3_miss 0.000 per KFLOP, 0.78 GB of HBM reads per pass against 70 GB streamed). In the engine the 32 layers each
+(l3_miss 0.000 per KFLOP, 0.39 GB of HBM reads per pass (†) against 70 GB streamed). In the engine the 32 layers each
 have their own 64 MiB of K/V and the weights of a layer (about 436 MB at BF16 for 8B, **derived** from 218 M parameters) are streamed between two attention calls, which evicts
 the K/V from L2 and L3, so the engine's attention reads its K/V from HBM. That would explain an engine that is slower than the bench
 by about 30% (700 ms against 540 ms per layer); the size of the effect is not predicted by the argument, only its direction. Other candidates that the data do not exclude: the clock after AMX GEMM phases, the engine's

@@ -1,5 +1,7 @@
 # NUMA placement, two-socket tensor parallelism and batched prefill: final results
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 **Status: run (2026-11-17, jobs 5845031 and 5845032, commit 8f3114f, node cresco8-hbm14).** The headline points of every feature ran
 from one commit and one node state, 3 interleaved repeats, 288 reports (1B and 8B), all `completed`, placement verified in every
 report. Provenance and deviations: [the validation record](numa-tp-prefill-results-validation.md). Plan:
@@ -32,30 +34,30 @@ the kernels and attention, not in synchronization.
 
 | Configuration | Runs | Sockets | Placement | THP | M | Kernel | Precision | Prompt | Warm ctx | TTFT s | Prefill tok/s | Decode tok/s | Decode phases | Reduce+wait | HBM read GB | DDR read GB | UPI rx data flits (M) |
 | --- | ---: | ---: | --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: |
-| 1b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16 | 3 | 1 | hbm (unverified) | off | 256 | amx_bf16 | bf16 | 2048 | - | 0.662 [0.658-0.676] | 3456.23 [3380.58-3480.83] | 87.83 [87.06-87.89] | - | - | 355.2 | 0.5 | 3 |
-| 1b-bf16-teams-hbm-s2-t56-m256-p2048-kamx_bf16 | 3 | 2 | file | off | 256 | amx_bf16 | bf16 | 2048 | - | 0.409 [0.395-0.430] | 5918.62 [5899.66-6157.50] | 157.21 [155.26-161.76] | - | - | 359.9 | 3.9 | 287 |
-| 1b-fp32-teams-hbm-s1-t56-m1-p2048-kper_token | 3 | 1 | hbm (verified) | off | 1 | per_token | fp32 | 2048 | - | 18.268 [18.252-18.318] | 114.35 [114.03-114.50] | 88.93 [88.55-89.91] | - | - | 16502.5 | 5.9 | 73 |
-| 1b-fp32-teams-hbm-s1-t56-m128-p2048-kavx512_fp32 | 3 | 1 | hbm (unverified) | off | 128 | avx512_fp32 | fp32 | 2048 | - | 1.786 [1.782-1.791] | 1205.95 [1203.20-1208.52] | 87.57 [87.23-88.18] | - | - | 453.5 | 0.6 | 5 |
-| 1b-fp32-teams-hbm-s2-t56-m1-p2048-kper_token | 3 | 2 | file | off | 1 | per_token | fp32 | 2048 | - | 12.692 [12.684-12.791] | 164.78 [163.50-164.86] | 161.90 [160.99-163.60] | - | - | 20497.8 | 13.7 | 1584 |
-| 1b-fp32-teams-hbm-s2-t56-m64-p2048-kavx512_fp32 | 3 | 2 | file | off | 64 | avx512_fp32 | fp32 | 2048 | - | 1.099 [1.099-1.100] | 1997.79 [1994.04-1998.71] | 171.68 [164.67-172.94] | - | - | 564.7 | 4.0 | 288 |
-| 1b-int8-teams-hbm-s1-t56-m1-p2048-kper_token_q8 | 3 | 1 | hbm (verified) | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 6.938 [6.911-7.006] | 302.67 [299.75-303.87] | 226.01 [225.19-227.24] | - | - | 4357.2 | 2.7 | 37 |
-| 1b-int8-teams-hbm-s1-t56-m256-p2048-kamx_int8 | 3 | 1 | hbm (unverified) | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 0.715 [0.712-0.718] | 3181.22 [3162.53-3254.49] | 228.80 [217.89-241.90] | - | - | 108.5 | 0.3 | 2 |
-| 1b-int8-teams-hbm-s1-t56-m256-p2048-kavx512_q8 | 3 | 1 | hbm (unverified) | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 1.660 [1.642-1.663] | 1301.62 [1299.01-1326.38] | 201.74 [198.10-230.41] | - | - | 108.7 | 0.4 | 5 |
-| 1b-int8-teams-hbm-s2-t56-m1-p2048-kper_token_q8 | 3 | 2 | file | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 4.977 [4.970-5.006] | 423.32 [422.56-423.83] | 393.50 [389.15-397.00] | - | - | 5145.8 | 7.0 | 1428 |
-| 1b-int8-teams-hbm-s2-t56-m256-p2048-kamx_int8 | 3 | 2 | file | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 0.446 [0.441-0.457] | 5351.63 [5206.36-5407.64] | 401.65 [401.54-442.57] | - | - | 106.7 | 1.8 | 312 |
-| 1b-int8-teams-hbm-s2-t56-m256-p2048-kavx512_q8 | 3 | 2 | file | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 0.924 [0.910-0.943] | 2403.21 [2347.52-2436.50] | 296.36 [292.94-417.79] | - | - | 104.5 | 1.1 | 270 |
-| 8b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16 | 3 | 1 | hbm (unverified) | off | 256 | amx_bf16 | bf16 | 2048 | - | 2.944 [2.943-2.946] | 722.12 [722.11-722.79] | 15.71 [15.62-15.79] | - | - | 2292.4 | 19.4 | 18 |
-| 8b-bf16-teams-hbm-s2-t56-m256-p2048-kamx_bf16 | 3 | 2 | file | off | 256 | amx_bf16 | bf16 | 2048 | - | 1.611 [1.591-1.612] | 1343.64 [1342.52-1360.27] | 30.74 [30.67-30.91] | - | - | 2264.2 | 47.5 | 2770 |
-| 8b-fp32-teams-hbm-s1-t56-m1-p2048-kper_token | 3 | 1 | hbm (verified) | off | 1 | per_token | fp32 | 2048 | - | 121.309 [121.143-121.358] | 17.17 [17.17-17.20] | 15.81 [15.76-15.81] | - | - | 119312.2 | 55.2 | 273 |
-| 8b-fp32-teams-hbm-s1-t56-m128-p2048-kavx512_fp32 | 3 | 1 | hbm (unverified) | off | 128 | avx512_fp32 | fp32 | 2048 | - | 10.504 [10.500-10.506] | 199.37 [199.32-199.46] | 15.69 [15.61-15.73] | - | - | 2926.2 | 17.4 | 23 |
-| 8b-fp32-teams-hbm-s2-t56-m1-p2048-kper_token | 3 | 2 | file | off | 1 | per_token | fp32 | 2048 | - | 67.073 [67.053-67.133] | 31.07 [31.04-31.08] | 31.05 [30.98-31.11] | - | - | 127741.9 | 83.4 | 5909 |
-| 8b-fp32-teams-hbm-s2-t56-m64-p2048-kavx512_fp32 | 3 | 2 | file | off | 64 | avx512_fp32 | fp32 | 2048 | - | 5.392 [5.386-5.397] | 390.52 [390.09-390.92] | 30.33 [30.10-30.56] | - | - | 3785.0 | 62.0 | 3651 |
-| 8b-int8-teams-hbm-s1-t56-m1-p2048-kper_token_q8 | 3 | 1 | hbm (verified) | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 41.166 [41.042-41.493] | 50.66 [50.25-50.80] | 44.00 [40.99-44.04] | - | - | 32541.1 | 18.7 | 110 |
-| 8b-int8-teams-hbm-s1-t56-m256-p2048-kamx_int8 | 3 | 1 | hbm (unverified) | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 2.823 [2.799-2.829] | 753.90 [751.95-759.85] | 41.79 [41.07-42.41] | - | - | 714.1 | 2.0 | 11 |
-| 8b-int8-teams-hbm-s1-t56-m256-p2048-kavx512_q8 | 3 | 1 | hbm (unverified) | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 9.395 [9.341-9.410] | 223.04 [222.68-224.33] | 44.07 [42.63-44.31] | - | - | 688.3 | 2.2 | 13 |
-| 8b-int8-teams-hbm-s2-t56-m1-p2048-kper_token_q8 | 3 | 2 | file | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 23.625 [23.607-23.805] | 88.35 [87.67-88.41] | 85.80 [84.88-86.15] | - | - | 34542.0 | 22.4 | 4814 |
-| 8b-int8-teams-hbm-s2-t56-m256-p2048-kamx_int8 | 3 | 2 | file | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 1.623 [1.614-1.635] | 1332.16 [1318.86-1337.24] | 83.31 [80.95-83.67] | - | - | 711.1 | 10.9 | 1269 |
-| 8b-int8-teams-hbm-s2-t56-m256-p2048-kavx512_q8 | 3 | 2 | file | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 4.848 [4.831-4.866] | 434.48 [432.80-436.03] | 81.78 [76.01-81.89] | - | - | 686.8 | 19.7 | 1841 |
+| 1b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16 | 3 | 1 | hbm (unverified) | off | 256 | amx_bf16 | bf16 | 2048 | - | 0.662 [0.658-0.676] | 3456.23 [3380.58-3480.83] | 87.83 [87.06-87.89] | - | - | 177.6 † | 0.5 | 3 |
+| 1b-bf16-teams-hbm-s2-t56-m256-p2048-kamx_bf16 | 3 | 2 | file | off | 256 | amx_bf16 | bf16 | 2048 | - | 0.409 [0.395-0.430] | 5918.62 [5899.66-6157.50] | 157.21 [155.26-161.76] | - | - | 180.0 † | 3.9 | 287 |
+| 1b-fp32-teams-hbm-s1-t56-m1-p2048-kper_token | 3 | 1 | hbm (verified) | off | 1 | per_token | fp32 | 2048 | - | 18.268 [18.252-18.318] | 114.35 [114.03-114.50] | 88.93 [88.55-89.91] | - | - | 8251.3 † | 5.9 | 73 |
+| 1b-fp32-teams-hbm-s1-t56-m128-p2048-kavx512_fp32 | 3 | 1 | hbm (unverified) | off | 128 | avx512_fp32 | fp32 | 2048 | - | 1.786 [1.782-1.791] | 1205.95 [1203.20-1208.52] | 87.57 [87.23-88.18] | - | - | 226.8 † | 0.6 | 5 |
+| 1b-fp32-teams-hbm-s2-t56-m1-p2048-kper_token | 3 | 2 | file | off | 1 | per_token | fp32 | 2048 | - | 12.692 [12.684-12.791] | 164.78 [163.50-164.86] | 161.90 [160.99-163.60] | - | - | 10248.9 † | 13.7 | 1584 |
+| 1b-fp32-teams-hbm-s2-t56-m64-p2048-kavx512_fp32 | 3 | 2 | file | off | 64 | avx512_fp32 | fp32 | 2048 | - | 1.099 [1.099-1.100] | 1997.79 [1994.04-1998.71] | 171.68 [164.67-172.94] | - | - | 282.4 † | 4.0 | 288 |
+| 1b-int8-teams-hbm-s1-t56-m1-p2048-kper_token_q8 | 3 | 1 | hbm (verified) | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 6.938 [6.911-7.006] | 302.67 [299.75-303.87] | 226.01 [225.19-227.24] | - | - | 2178.6 † | 2.7 | 37 |
+| 1b-int8-teams-hbm-s1-t56-m256-p2048-kamx_int8 | 3 | 1 | hbm (unverified) | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 0.715 [0.712-0.718] | 3181.22 [3162.53-3254.49] | 228.80 [217.89-241.90] | - | - | 54.3 † | 0.3 | 2 |
+| 1b-int8-teams-hbm-s1-t56-m256-p2048-kavx512_q8 | 3 | 1 | hbm (unverified) | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 1.660 [1.642-1.663] | 1301.62 [1299.01-1326.38] | 201.74 [198.10-230.41] | - | - | 54.4 † | 0.4 | 5 |
+| 1b-int8-teams-hbm-s2-t56-m1-p2048-kper_token_q8 | 3 | 2 | file | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 4.977 [4.970-5.006] | 423.32 [422.56-423.83] | 393.50 [389.15-397.00] | - | - | 2572.9 † | 7.0 | 1428 |
+| 1b-int8-teams-hbm-s2-t56-m256-p2048-kamx_int8 | 3 | 2 | file | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 0.446 [0.441-0.457] | 5351.63 [5206.36-5407.64] | 401.65 [401.54-442.57] | - | - | 53.4 † | 1.8 | 312 |
+| 1b-int8-teams-hbm-s2-t56-m256-p2048-kavx512_q8 | 3 | 2 | file | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 0.924 [0.910-0.943] | 2403.21 [2347.52-2436.50] | 296.36 [292.94-417.79] | - | - | 52.3 † | 1.1 | 270 |
+| 8b-bf16-teams-hbm-s1-t56-m256-p2048-kamx_bf16 | 3 | 1 | hbm (unverified) | off | 256 | amx_bf16 | bf16 | 2048 | - | 2.944 [2.943-2.946] | 722.12 [722.11-722.79] | 15.71 [15.62-15.79] | - | - | 1146.2 † | 19.4 | 18 |
+| 8b-bf16-teams-hbm-s2-t56-m256-p2048-kamx_bf16 | 3 | 2 | file | off | 256 | amx_bf16 | bf16 | 2048 | - | 1.611 [1.591-1.612] | 1343.64 [1342.52-1360.27] | 30.74 [30.67-30.91] | - | - | 1132.1 † | 47.5 | 2770 |
+| 8b-fp32-teams-hbm-s1-t56-m1-p2048-kper_token | 3 | 1 | hbm (verified) | off | 1 | per_token | fp32 | 2048 | - | 121.309 [121.143-121.358] | 17.17 [17.17-17.20] | 15.81 [15.76-15.81] | - | - | 59656.1 † | 55.2 | 273 |
+| 8b-fp32-teams-hbm-s1-t56-m128-p2048-kavx512_fp32 | 3 | 1 | hbm (unverified) | off | 128 | avx512_fp32 | fp32 | 2048 | - | 10.504 [10.500-10.506] | 199.37 [199.32-199.46] | 15.69 [15.61-15.73] | - | - | 1463.1 † | 17.4 | 23 |
+| 8b-fp32-teams-hbm-s2-t56-m1-p2048-kper_token | 3 | 2 | file | off | 1 | per_token | fp32 | 2048 | - | 67.073 [67.053-67.133] | 31.07 [31.04-31.08] | 31.05 [30.98-31.11] | - | - | 63871.0 † | 83.4 | 5909 |
+| 8b-fp32-teams-hbm-s2-t56-m64-p2048-kavx512_fp32 | 3 | 2 | file | off | 64 | avx512_fp32 | fp32 | 2048 | - | 5.392 [5.386-5.397] | 390.52 [390.09-390.92] | 30.33 [30.10-30.56] | - | - | 1892.5 † | 62.0 | 3651 |
+| 8b-int8-teams-hbm-s1-t56-m1-p2048-kper_token_q8 | 3 | 1 | hbm (verified) | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 41.166 [41.042-41.493] | 50.66 [50.25-50.80] | 44.00 [40.99-44.04] | - | - | 16270.6 † | 18.7 | 110 |
+| 8b-int8-teams-hbm-s1-t56-m256-p2048-kamx_int8 | 3 | 1 | hbm (unverified) | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 2.823 [2.799-2.829] | 753.90 [751.95-759.85] | 41.79 [41.07-42.41] | - | - | 357.1 † | 2.0 | 11 |
+| 8b-int8-teams-hbm-s1-t56-m256-p2048-kavx512_q8 | 3 | 1 | hbm (unverified) | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 9.395 [9.341-9.410] | 223.04 [222.68-224.33] | 44.07 [42.63-44.31] | - | - | 344.2 † | 2.2 | 13 |
+| 8b-int8-teams-hbm-s2-t56-m1-p2048-kper_token_q8 | 3 | 2 | file | off | 1 | per_token_q8 | int8_q8_0 | 2048 | - | 23.625 [23.607-23.805] | 88.35 [87.67-88.41] | 85.80 [84.88-86.15] | - | - | 17271.0 † | 22.4 | 4814 |
+| 8b-int8-teams-hbm-s2-t56-m256-p2048-kamx_int8 | 3 | 2 | file | off | 256 | amx_int8 | int8_q8_0 | 2048 | - | 1.623 [1.614-1.635] | 1332.16 [1318.86-1337.24] | 83.31 [80.95-83.67] | - | - | 355.6 † | 10.9 | 1269 |
+| 8b-int8-teams-hbm-s2-t56-m256-p2048-kavx512_q8 | 3 | 2 | file | off | 256 | avx512_q8 | int8_q8_0 | 2048 | - | 4.848 [4.831-4.866] | 434.48 [432.80-436.03] | 81.78 [76.01-81.89] | - | - | 343.4 † | 19.7 | 1841 |
 
 ## 1. Prefill
 
@@ -215,7 +217,7 @@ tables mark those rows `hbm (unverified)`; the two-socket runs verify theirs. Tw
 field while their regions are verified on nodes 2 and 3: the shard loader of `LLAMA_SOCKETS=2` stages from the file and places each socket's shard itself
 (the field names the loader, not the residency). THP was off for all runs (the node's setting is `[always]`, which backs the weights and packed shards with huge pages anyway:
 `thp_bytes` is 99.6-100% of the region size in every report; A6 found the explicit setting neutral). Memory traffic, 8B FP32 decode from a retained context of 512
-tokens (HBM read GB over the run): 8237 on one socket, 8220 on two, so the weights are read once in total and split between the sockets; DDR read
+tokens (HBM read GB over the run, halved †): 4119 on one socket, 4110 on two, so the weights are read once in total and split between the sockets; DDR read
 33 and 51 GB (the embedding rows and the copy); UPI rx data flits 33 M on one socket and 2583 M on two, about 0.6% of the 456,259 M
 that 112 threads reading remote weights produced in `docs/kernels.md` (another context length), i.e. no weight traffic crosses the link (B7 measured 0.8-0.9% against its control).
 

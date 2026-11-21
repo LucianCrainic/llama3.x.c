@@ -1,5 +1,7 @@
 # Compute kernels
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 The numerical hot paths of both engines live in
 [src/kernels_simd.c](../src/kernels_simd.c) (ISA selection, norm, RoPE),
 [src/gemv.c](../src/gemv.c) (GEMV, Q8 matmul, quantization) and
@@ -116,8 +118,8 @@ Decode tok/s, mean ± sd of 3 runs:
 - **8B FP32 on HBM reaches 81% of the stream-read ceiling.** That is
   14.9 tok/s against the modeled 18.3 for one socket's HBM, and above the
   327–358 GB/s of the oneDNN GEMV reference.
-- **Placement is clean.** HBM runs read about 2,075 GB (1B FP32) and 12,780 GB
-  (8B FP32) from HBM, with under 25 GB from DDR. `base` and `simd` move the same
+- **Placement is clean.** HBM runs read about 1,037.5 GB (1B FP32) and 6,390 GB
+  (8B FP32) from HBM (†), with under 25 GB from DDR. `base` and `simd` move the same
   bytes; the gain is per-core throughput only.
 - **Prefill uses the same kernels.** It still runs one GEMV per prompt token,
   so its tok/s tracks decode (batched prefill is listed under
@@ -212,7 +214,7 @@ decode tok/s:
 
 The 14- and 28-thread "Before" values are single runs from job 5621182, and
 the W8A32 "Before" values are also from that job. HBM read traffic is the same
-before and after (3,390 GB for 8B), so the gain is from overlap, not from fewer
+before and after (1,695 GB for 8B, †), so the gain is from overlap, not from fewer
 bytes. Accuracy is unchanged in kind: W8A32 passes, W8A8 fails as described
 below, and `test-kernels` passes at 1, 56 and 112 threads.
 
