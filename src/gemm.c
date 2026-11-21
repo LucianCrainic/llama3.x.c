@@ -948,31 +948,72 @@ void k_quantize_rows(int8_t *q, float *s, const float *x, size_t ldx, int m, int
 
 enum { Q8_TILED_PIECE = 2048 }; /* values quantized per k_quantize call of the tile-order quantizer */
 
-/* One chunk is one row: k_quantize on whole groups of a piece of the row (groups are independent, so the values and
- * scales are those of one call on the whole row), each 64-byte step then stored at its place in the tile order. */
-static void quantize_tiled_chunks(const void *p, int segment, int first, int last) {
-  const QuantizeJob *job = p;
-  (void)segment;
+typedef struct {
+  const float *x, *weight; /* weight: the RMSNorm applied first (k_rmsnorm_quantize_rows_tiled), else NULL */
+  float *xb;               /* the normalised rows, still written for the FP32 consumers */
+  int8_t *q;
+  float *s, eps;
+  size_t ldx;
+  int n, gs, pieces, span;
+} QuantizeTiledJob;
+
+/* k_quantize on whole groups of a piece of a row (groups are independent, so the values and scales are those of one
+ * call on the whole row), each 64-byte step then stored at its place in the tile order. */
+static void quantize_tiled_piece(const QuantizeTiledJob *job, const float *x, int row, int k0) {
   _Alignas(64) int8_t piece[Q8_TILED_PIECE];
-  const int span = Q8_TILED_PIECE / job->gs * job->gs;
   const size_t ksteps = (size_t)job->n / 64;
-  for (int row = first; row < last; row++) {
-    int8_t *block = job->q + ((size_t)row / 32 * 2 + (size_t)row % 32 / 16) * ksteps * 1024 + (size_t)(row % 16) * 64;
-    for (int k0 = 0; k0 < job->n; k0 += span) {
-      int len = job->n - k0 < span ? job->n - k0 : span;
-      k_quantize(piece, job->s + (size_t)row * (size_t)(job->n / job->gs) + (size_t)(k0 / job->gs),
-                 job->x + (size_t)row * job->ldx + (size_t)k0, len, job->gs);
-      for (int t = 0; t < len / 64; t++)
-        memcpy(block + ((size_t)k0 / 64 + (size_t)t) * 1024, piece + (size_t)t * 64, 64);
-    }
+  int8_t *block = job->q + ((size_t)row / 32 * 2 + (size_t)row % 32 / 16) * ksteps * 1024 + (size_t)(row % 16) * 64;
+  int len = job->n - k0 < job->span ? job->n - k0 : job->span;
+  k_quantize(piece, job->s + (size_t)row * (size_t)(job->n / job->gs) + (size_t)(k0 / job->gs), x + (size_t)k0, len,
+             job->gs);
+  for (int t = 0; t < len / 64; t++)
+    memcpy(block + ((size_t)k0 / 64 + (size_t)t) * 1024, piece + (size_t)t * 64, 64);
+}
+
+/* One chunk is one piece of a row (rows x pieces, row-major), so a batch of few rows still spreads over the team. */
+static void quantize_tiled_chunks(const void *p, int segment, int first, int last) {
+  const QuantizeTiledJob *job = p;
+  (void)segment;
+  for (int c = first; c < last; c++) {
+    int row = c / job->pieces, k0 = c % job->pieces * job->span;
+    quantize_tiled_piece(job, job->x + (size_t)row * job->ldx, row, k0);
   }
 }
 
-void k_quantize_rows_tiled(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs) {
+/* One chunk is one row: k_rmsnorm into xb, then the tile-order quantization of that row while it is in L1. */
+static void rmsnorm_quantize_tiled_chunks(const void *p, int segment, int first, int last) {
+  const QuantizeTiledJob *job = p;
+  (void)segment;
+  for (int row = first; row < last; row++) {
+    float *xb = job->xb + (size_t)row * job->ldx;
+    k_rmsnorm(xb, job->x + (size_t)row * job->ldx, job->weight, job->n, job->eps);
+    for (int k0 = 0; k0 < job->n; k0 += job->span)
+      quantize_tiled_piece(job, xb, row, k0);
+  }
+}
+
+static QuantizeTiledJob quantize_tiled_job(int8_t *q, float *s, const float *x, size_t ldx, int n, int gs) {
   if (gs <= 0 || gs % 64 || n % gs || gs > Q8_TILED_PIECE)
     fail("tile-order quantization needs a group size that is a multiple of 64 (at most %d) dividing n", Q8_TILED_PIECE);
-  QuantizeJob job = {x, q, s, ldx, n, gs};
-  kernels_parallel_segments(1, &m, quantize_tiled_chunks, &job);
+  int span = Q8_TILED_PIECE / gs * gs;
+  return (QuantizeTiledJob){.x = x, .q = q, .s = s, .ldx = ldx, .n = n, .gs = gs, .span = span,
+                            .pieces = (n + span - 1) / span};
+}
+
+void k_quantize_rows_tiled(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs) {
+  QuantizeTiledJob job = quantize_tiled_job(q, s, x, ldx, n, gs);
+  long long chunks = (long long)m * job.pieces;
+  if (chunks > INT32_MAX)
+    fail("too many rows to quantize: %lld pieces", chunks);
+  int count = (int)chunks;
+  kernels_parallel_segments(1, &count, quantize_tiled_chunks, &job);
+}
+
+void k_rmsnorm_quantize_rows_tiled(int8_t *q, float *s, float *xb, const float *x, const float *weight, int m, int n,
+                                   float eps, int gs) {
+  QuantizeTiledJob job = quantize_tiled_job(q, s, x, (size_t)n, n, gs);
+  job.xb = xb, job.weight = weight, job.eps = eps;
+  kernels_parallel_segments(1, &m, rmsnorm_quantize_tiled_chunks, &job);
 }
 
 typedef void (*Q8Micro)(int mr, int nr, const int8_t *x, size_t ldx, const float *xs, size_t xs_ld, const int8_t *w,

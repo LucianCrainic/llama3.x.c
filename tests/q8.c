@@ -243,6 +243,21 @@ static void check_tiled(const Case *c) {
         bad("k_quantize_rows_tiled", "int8 values are not k_quantize_rows' values in tile order");
     }
   }
+  /* The fused RMSNorm + tile-order quantizer: xb equals k_rmsnorm_rows and q/s equal the tiled quantizer of xb. */
+  float *norm = zeroed((size_t)k, 4), *xb = zeroed((size_t)m * k, 4), *xb_want = zeroed((size_t)m * k, 4);
+  int8_t *fq = zeroed(rows * k, 1), *fq_want = zeroed(rows * k, 1);
+  float *fs = zeroed(rows * groups, 4), *fs_want = zeroed(rows * groups, 4);
+  for (int i = 0; i < k; i++)
+    norm[i] = 0.5f + uniform();
+  k_rmsnorm_rows(xb_want, c->x, norm, m, k, 1e-5f);
+  k_quantize_rows_tiled(fq_want, fs_want, xb_want, (size_t)k, m, k, gs);
+  k_rmsnorm_quantize_rows_tiled(fq, fs, xb, c->x, norm, m, k, 1e-5f, gs);
+  checks += 3;
+  if (memcmp(xb, xb_want, (size_t)m * k * 4))
+    bad("k_rmsnorm_quantize_rows_tiled", "normalised rows differ from k_rmsnorm_rows");
+  if (memcmp(fq, fq_want, rows * k) || memcmp(fs, fs_want, (size_t)m * groups * 4))
+    bad("k_rmsnorm_quantize_rows_tiled", "int8 values or scales differ from k_quantize_rows_tiled of the norm");
+  free(norm), free(xb), free(xb_want), free(fq), free(fq_want), free(fs), free(fs_want);
   float *st = zeroed(s8_scales_t_bytes(n, k, gs), 1), *st3 = zeroed(s8_scales_t_bytes(n, k, gs), 1);
   for (size_t i = 0; i < s8_scales_t_bytes(n, k, gs) / 4; i++)
     st[i] = st3[i] = NAN; /* every entry must be written, padding included */

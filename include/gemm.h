@@ -154,6 +154,9 @@ size_t s8_scales_t_bytes(int rows, int cols, int gs);
 void pack_s8_scales_t(float *st, const float *s, int rows, int groups, int first_tile, int last_tile);
 /* k_quantize_rows with the int8 values in tile order (scales as k_quantize_rows); q holds whole 32-row blocks. */
 void k_quantize_rows_tiled(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs);
+/* k_rmsnorm_rows (rows of n, stride n) into xb, then k_quantize_rows_tiled of xb, in one pass over the rows. */
+void k_rmsnorm_quantize_rows_tiled(int8_t *q, float *s, float *xb, const float *x, const float *weight, int m, int n,
+                                   float eps, int gs);
 /* k_gemm_q8 on tile-ordered activations; every segment needs pw/pws (and pw3/pws3 for GEMM_SWIGLU) and AMX. */
 void k_gemm_q8_tiled(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count);
 

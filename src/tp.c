@@ -567,6 +567,21 @@ static void quantize_batch(const Tp *tp, int8_t *q, float *scales, const float *
     k_quantize_rows(q, scales, x, ldx, tp->bcount, n, tp->gs);
 }
 
+/* RMSNorm of the batch into xb, then (W8A8) its quantization for the next product. The pipelined kernel takes both
+ * in one pass over the rows (fix 5 of docs/prefill-gap.md; the same k_rmsnorm and k_quantize, so bitwise equal); its
+ * time is then counted as quantize. */
+static void norm_quantize_batch(Tp *tp, TpSocket *sk, int s, const float *weight) {
+  int m = tp->bcount, dim = tp->c.dim;
+  if (tp->quantized && tp->tiled) {
+    SPROFILE(PHASE_QUANTIZE,
+             k_rmsnorm_quantize_rows_tiled(sk->xq, sk->xs, sk->xb, sk->x, weight, m, dim, tp->c.norm_eps, tp->gs));
+    return;
+  }
+  SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, weight, m));
+  if (tp->quantized)
+    SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
+}
+
 static void forward_batch(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
@@ -576,7 +591,7 @@ static void forward_batch(Tp *tp, int s) {
   SPROFILE(PHASE_EMBED, embed_rows(tp, sk));
   SPROFILE(PHASE_ROPE_TABLE, rope_tables(tp, sk));
   for (int l = 0; l < p->n_layers; l++) {
-    SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), m));
+    norm_quantize_batch(tp, sk, s, norm_weight(tp, T_RMS_ATT, l, s));
     size_t layer = (size_t)l * p->seq_len * kvl;
     float *kc = sk->key_cache + layer, *vc = sk->value_cache + layer;
     int head_layout = kernels_kv_layout_head();
@@ -585,7 +600,6 @@ static void forward_batch(Tp *tp, int s) {
     const Shard *wq = shards_find(&tp->set, T_WQ, l, s), *wk = shards_find(&tp->set, T_WK, l, s),
                 *wv = shards_find(&tp->set, T_WV, l, s);
     if (q8) {
-      SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
       GemmQ8Segment qkv[3] = {
           {.c = sk->q, .ldc = ql, .w = q8_weight(wq), .pw = packed_copy(sk, l, 0), .pws = packed_scales(sk, l, 0),
            .n = ql, .kind = GEMM_STORE},
@@ -617,10 +631,9 @@ static void forward_batch(Tp *tp, int s) {
     if (!ok)
       return;
 
-    SPROFILE(PHASE_RMSNORM, rmsnorm_rows(tp, sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), m));
+    norm_quantize_batch(tp, sk, s, norm_weight(tp, T_RMS_FFN, l, s));
     const Shard *w1 = shards_find(&tp->set, T_W1, l, s), *w3 = shards_find(&tp->set, T_W3, l, s);
     if (q8) {
-      SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
       GemmQ8Segment up = {.c = sk->hb, .ldc = hidden_l, .w = q8_weight(w1), .w3 = q8_weight(w3),
                           .pw = packed_copy(sk, l, 4), .pw3 = packed_copy(sk, l, 6), .pws = packed_scales(sk, l, 4),
                           .pws3 = packed_scales(sk, l, 6), .n = hidden_l, .kind = GEMM_SWIGLU};
