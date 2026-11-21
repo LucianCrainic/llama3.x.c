@@ -1,48 +1,50 @@
 # shellcheck shell=bash
-# Shared steps of the CRESCO8 Flat-mode campaigns (placement, tensor parallel, prefill). Source this file from an
-# sbatch script after `set -euo pipefail`. The functions follow scripts/cresco8-kernels.sbatch step for step; only
-# the tree variables differ (one ROOT instead of SIMD_ROOT and BASE_ROOT). Hosts, gateways and credentials never
-# belong here, and model locations only ever arrive through MODELS="NAME:ARTIFACTS:HF ...".
+# The steps of scripts/cresco8.sbatch (STAGE=check and STAGE=bench on a CRESCO8 Flat node). Source this file after
+# `set -euo pipefail`. Hosts, gateways and credentials never belong here, and model locations only ever arrive through
+# MODELS="NAME:ARTIFACTS:HF ...". The phase scripts of the finished campaigns (A1-A6, B1-B7, C1-C7, D1-D3, E0-E6) are at
+# the tag campaigns-2026-11.
 
 die() {
   printf '%s\n' "$*" >&2
   exit 1
 }
 
-# DRY_RUN=1 prints every command a phase would run instead of running it, so a run matrix can be checked on a laptop.
+# DRY_RUN=1 prints every command a stage would run instead of running it, so a run matrix can be checked on a laptop.
 dry_run() {
   [[ ${DRY_RUN:-0} == 1 ]]
 }
 
-# Required: ROOT (tree under test), OUT (must not exist yet), PYTHON. Optional: MODELS (without it the Hugging Face
-# gate and every model-based run is skipped and recorded as such), STAGE=check|bench (default bench), REPEATS
-# (default 3), PRECISIONS (default "fp32 int8"), PHASE (default none): a space-separated list of phase ids.
+# Required: ROOT (tree under test), OUT (must not exist yet), PYTHON. Optional: MODELS (without it every model-based step
+# is skipped and recorded as such), STAGE=check|bench (default check), REPEATS (default 3), PRECISIONS (default
+# "fp32 int8": the checkpoints; the bench stage adds the BF16 prefill of the FP32 checkpoint).
 require_env() {
   : "${SLURM_JOB_ID:?submit through Slurm}"
   : "${ROOT:?tree under test required}"
   : "${OUT:?unique results directory required}"
   : "${PYTHON:?validation Python required}"
   MODELS=${MODELS:-}
-  STAGE=${STAGE:-bench}
+  STAGE=${STAGE:-check}
   REPEATS=${REPEATS:-3}
   PRECISIONS=${PRECISIONS:-"fp32 int8"}
-  PHASE=${PHASE:-none}
   DRY_RUN=${DRY_RUN:-0}
   [[ $DRY_RUN == 0 || $DRY_RUN == 1 ]] || die "DRY_RUN must be 0 or 1, got '$DRY_RUN'"
   [[ $STAGE == check || $STAGE == bench ]] || die "STAGE must be check or bench, got '$STAGE'"
   [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || die "REPEATS must be a positive integer, got '$REPEATS'"
-  local phase
-  for phase in $PHASE; do
-    [[ $phase =~ ^(none|[A-F][0-9]+)$ ]] || die "PHASE must be none or phase ids such as 'A1 A3 F2', got '$PHASE'"
+  local precision entry
+  for precision in $PRECISIONS; do
+    [[ $precision == fp32 || $precision == int8 ]] || die "PRECISIONS must list fp32 and/or int8, got '$PRECISIONS'"
   done
+  [[ -z ${PHASE:-} ]] || die "PHASE is gone (F6): STAGE=check or STAGE=bench; the phase scripts are at tag campaigns-2026-11"
   [[ ! -e $OUT ]] || die "OUT '$OUT' already exists"
   for entry in $MODELS; do
     [[ $entry =~ ^[^:]+:[^:]+:[^:]+$ ]] || die "MODELS entry '$entry' is not NAME:ARTIFACTS:HF"
   done
-  export STAGE REPEATS PRECISIONS PHASE MODELS DRY_RUN
+  export STAGE REPEATS PRECISIONS MODELS DRY_RUN
 }
 
-# Creates OUT, records the exit status, removes the staging directory, and tees job output into OUT.
+# Creates OUT, records the exit status, removes the staging directory, and tees job output into OUT. Engine knobs a
+# submitter exports apply to every run of the job (record_environment writes them down); unset, runs take the engine's
+# defaults (architecture.md section 2.1), except where a step names its configuration.
 job_begin() {
   mkdir "$OUT"
   shm=
@@ -54,19 +56,6 @@ job_begin() {
   }
   trap finish EXIT
   exec > >(tee "$OUT/job.stdout") 2> >(tee "$OUT/job.stderr" >&2)
-  # OMP_PROC_BIND is not exported job-wide: with it set, the OpenMP runtime pins the launching thread of every
-  # process that links it to one core at load, and teams workers would inherit that single-CPU mask. run_engine sets
-  # it for omp runs only.
-  export OMP_DYNAMIC=FALSE
-  # The engine's batched attention defaults to tiled since E4; campaigns keep split, the kernel every earlier campaign
-  # measured, whose batched prefill is bitwise equal to per-token (the A, C, D and E0 gates rely on it). A phase that
-  # wants tiled names it per run (E2, E4), which overrides this; a submitter may export LLAMA_ATTN to change it job-wide.
-  # `make test` runs without it, so the tests see the engine's own default.
-  export LLAMA_ATTN=${LLAMA_ATTN:-split}
-  # Likewise the K/V cache defaults to head-major since E5.4 (bitwise equal to rows); campaigns keep rows, the layout
-  # every earlier campaign measured, so their throughput stays comparable. A phase that names a layout per run (E5's
-  # E5_KV_LAYOUTS) overrides this; a submitter may export LLAMA_KV_LAYOUT=head to change it job-wide.
-  export LLAMA_KV_LAYOUT=${LLAMA_KV_LAYOUT:-rows}
   export USE_TF=0 USE_FLAX=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 
@@ -76,9 +65,8 @@ record_environment() {
     scontrol show job "$SLURM_JOB_ID"
     gcc --version; pkg-config --modversion libpcre2-8
     printf "%s %s\n" "$ROOT" "$(cat "$ROOT/COMMIT" 2> /dev/null || git -C "$ROOT" rev-parse HEAD)"
-    printf 'STAGE=%s REPEATS=%s PRECISIONS=%s PHASE=%s MODELS=%s\n' "$STAGE" "$REPEATS" "$PRECISIONS" "$PHASE" "$MODELS"
-    printf 'LLAMA_ATTN=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_ATTN:-}"
-    printf 'LLAMA_KV_LAYOUT=%s (campaign default for engine runs that do not name one)\n' "${LLAMA_KV_LAYOUT:-}"
+    printf 'STAGE=%s REPEATS=%s PRECISIONS=%s MODELS=%s\n' "$STAGE" "$REPEATS" "$PRECISIONS" "$MODELS"
+    printf 'engine knobs exported job-wide: %s\n' "$(env | grep '^LLAMA_' | sort | tr '\n' ' ')"
   } > "$OUT/environment.txt"
   (cd "$ROOT" && find src include tests tools scripts Makefile -type f ! -path '*/__pycache__/*' -print0 | sort -z |
     xargs -0 sha256sum) > "$OUT/source-$(basename "$ROOT").sha256"
@@ -102,11 +90,11 @@ print(json.dumps(dict(mode='flat', ddr_nodes=[0, 1], hbm_nodes=[2, 3], nodes=nod
 PY
 }
 
-# build_tree OPENMP MODE [targets...]; the log and the build configuration go to OUT.
+# build_tree MODE [targets...]; the log and the build configuration go to OUT.
 build_tree() {
-  local openmp=$1 mode=$2
-  shift 2
-  make -C "$ROOT" CC=gcc OPENMP="$openmp" MODE="$mode" all "$@" > "$OUT/build-$(basename "$ROOT").log"
+  local mode=$1
+  shift
+  make -C "$ROOT" CC=gcc MODE="$mode" all "$@" > "$OUT/build-$(basename "$ROOT").log"
   cp "$ROOT/build/$mode/config" "$OUT/build-config-$(basename "$ROOT").txt"
 }
 
@@ -126,19 +114,9 @@ perf_attach() {
     2> "$2.perf.csv" || true
 }
 
-# stage_checkpoint SOURCE DESTINATION numactl-policy...: tmpfs staging under an explicit memory policy. Kept for
-# baselines; the engine-owned placement of track A does not use it.
-stage_checkpoint() {
-  local source=$1 destination=$2
-  shift 2
-  numactl "$@" cp "$source" "$destination"
-  numactl -H > "$destination.numa.txt"
-}
-
 # run_label MODEL PRECISION BACKEND PLACEMENT SOCKETS THREADS [m=M] [p=PROMPT] [c=CTX] [k=KERNEL] [x=TAG]
 #   {model}-{precision}-{backend}-{placement}-s{sockets}-t{threads}[-m{M}][-p{prompt}][-c{ctx}][-k{kernel}][-x{tag}]
-# (the repeat suffix -{rep} is added by run_engine; tools/summarize_campaign.py parses these labels). TAG tells apart
-# runs that differ in something the label has no field for (THP, a remote-node control, a startup probe).
+# (the repeat suffix -{rep} is added by run_engine; tools/summarize_campaign.py parses these labels).
 run_label() {
   local label="$1-$2-$3-$4-s$5-t$6" extra
   shift 6
@@ -152,12 +130,10 @@ run_label() {
 }
 
 # run_engine LABEL ENGINE CHECKPOINT TOKENIZER PROMPT_FILE REPEATS PERF [env...]
-# One benchmark label, REPEATS independent launches, with the workload of the kernel campaigns.
-# The caller sets the CPU and memory binding through CPU_BIND and MEM_BIND (numactl arguments), or leaves them unset
-# for engine-owned placement, where the job must not impose a memory policy. CONTEXT and GENERATION size the run;
-# WARM=N adds --warm-context N (an untimed prefill of N tokens, so the timed decode starts from a retained context of
-# that length: CONTEXT must exceed N plus the prompt and the generation); LOG_LEVEL (default warn) is info for runs
-# whose per-socket profile lines (LLAMA_PROFILE=1) are wanted.
+# One benchmark label, REPEATS independent launches. CPU_BIND and MEM_BIND (numactl arguments) bind the run; left unset,
+# the engine places itself. CONTEXT and GENERATION size the run; WARM=N adds --warm-context N (an untimed prefill of N
+# tokens, so the timed decode starts from a retained context of that length: CONTEXT must exceed N plus the prompt and
+# the generation); LOG_LEVEL (default warn) is info for runs whose per-socket profile lines (LLAMA_PROFILE=1) are wanted.
 run_engine() {
   local label=$1 engine=$2 checkpoint=$3 tokenizer=$4 prompt=$5 repeats=$6 perf=$7
   shift 7
@@ -176,81 +152,26 @@ run_engine() {
   fi
   for ((r = first; r <= last; r++)); do
     local prefix="$OUT/$label-$r"
-    env OMP_PROC_BIND=close OMP_PLACES=cores "$@" "${launcher[@]}" \
+    env "$@" "${launcher[@]}" \
       "$ROOT/build/release/$engine" "$checkpoint" -z "$tokenizer" --context-length "${CONTEXT:-2048}" --benchmark \
       --chat-template --prompt-file "$prompt" -t 0 --seed 42 -n 0 --generation-length "${GENERATION:-128}" --no-text \
       ${WARM:+--warm-context "$WARM"} --log-level "${LOG_LEVEL:-warn}" --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
     local pid=$!
     if [[ $perf == 1 && $r == "$first" ]]; then perf_attach "$pid" "$prefix"; fi
-    # A failed launch is recorded and the campaign goes on (its report says status error, the summary shows it as failed,
-    # and OVERALL makes the job exit non-zero): one bad configuration must not cost the hours of the rest.
+    # A failed launch is recorded and the job goes on (its report says status error, the summary shows it as failed, and
+    # OVERALL makes the job exit non-zero): one bad configuration must not cost the hours of the rest.
     local rc=0
     wait "$pid" || rc=$?
     [[ $rc -eq 0 ]] || record_result "run-$label-$r" FAIL "exit=$rc"
   done
 }
 
-# validate_gate NAME ARTIFACTS HF PRECISION LABEL [env...]
-# HF validation with the engine under test. FP32 failure is fatal; INT8 results are recorded against the unchanged
-# budget without gating (W8A8 requantizes activations, so FP32 reordering moves its HF deviation).
-validate_gate() {
-  local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
-  shift 5
-  local gate_env=$*
-  if dry_run; then
-    printf 'VALIDATE %s %s %s env=%s\n' "$name" "$precision" "$label" "$*" | tee -a "$OUT/dry-run.txt"
-    return 0
-  fi
-  local extra=()
-  [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
-  (cd "$ROOT" && env "$@" OMP_PROC_BIND=false OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 \
-    "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
-    --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
-    --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
-    > "$OUT/correctness-$name-$label.stdout" 2> "$OUT/correctness-$name-$label.stderr" || status=$?
-  printf '%s %s exit=%s%s\n' "$name" "$label" "$status" "${gate_env:+ env=$gate_env}" >> "$OUT/correctness-status.txt"
-  return "$status"
-}
-
-# make_prompt PROBE TOKENIZER VOCAB [LENGTHS|none]: short.txt (86 tokens) and prompt-{512,2048,8192,32768}.txt in OUT,
-# with their achieved token counts and SHA-256 in prompts.json. LENGTHS is a comma list, or none for short.txt only.
+# make_prompt PROBE TOKENIZER VOCAB [LENGTHS|none]: short.txt (86 tokens) and prompt-{N}.txt in OUT, with their achieved
+# token counts and SHA-256 in prompts.json. LENGTHS is a comma list, or none for short.txt only.
 make_prompt() {
   dry_run && return 0
   python3 "$ROOT/tools/make_prompts.py" --probe "$1" --tokenizer "$2" --vocab "$3" --out "$OUT" \
     --lengths "${4:-512,2048,8192,32768}" > /dev/null
-}
-
-# validate_models: the correctness gate of every model and precision, as in the kernel campaign. HF_GATE=0 skips it
-# (and records that) where no Python environment with torch and transformers exists. GATE_ENV (space-separated
-# KEY=VALUE words, e.g. "LLAMA_BACKEND=teams LLAMA_THREADS=56") runs the engine under test with that environment, and
-# GATE_TAG (e.g. -teams) is appended to the label of every gate so the result files stay apart from the default gate's.
-validate_models() {
-  local entry name artifacts hf precision env_words tag=${GATE_TAG:-}
-  read -r -a env_words <<< "${GATE_ENV:-}"
-  if [[ ${HF_GATE:-1} == 0 ]]; then
-    echo 'HF_GATE=0: Hugging Face validation was not run (no torch/transformers environment)' | tee "$OUT/no-hf-gate.txt"
-    return 0
-  fi
-  if [[ ${SKIP_PRELUDE_HF:-0} == 1 ]]; then
-    echo 'SKIP_PRELUDE_HF=1: the one-socket Hugging Face gate of every precision was not repeated (the phases run their own)' |
-      tee "$OUT/no-prelude-hf.txt"
-    return 0
-  fi
-  if [[ -z $MODELS ]]; then
-    echo 'MODELS is empty: Hugging Face validation and model benchmarks were not run' | tee "$OUT/no-models.txt"
-    return 0
-  fi
-  for entry in $MODELS; do
-    IFS=: read -r name artifacts hf <<< "$entry"
-    for precision in $PRECISIONS; do
-      if [[ $precision == fp32 ]]; then
-        validate_gate "$name" "$artifacts" "$hf" fp32 "fp32$tag" ${env_words[@]+"${env_words[@]}"}
-      else
-        validate_gate "$name" "$artifacts" "$hf" int8 "w8a8$tag" ${env_words[@]+"${env_words[@]}"} || true
-        validate_gate "$name" "$artifacts" "$hf" int8 "w8a32$tag" ${env_words[@]+"${env_words[@]}"} LLAMA_Q8_ACTIVATIONS=fp32 || true
-      fi
-    done
-  done
 }
 
 # OVERALL is the job's exit status: any failed expectation or unit test makes it non-zero, but the evidence that is
@@ -281,23 +202,9 @@ expect() {
   return 0
 }
 
-# run_phases: runs phase_<ID> for each id in PHASE; phase_none does nothing. An unknown phase is an error.
-run_phases() {
-  local phase
-  for phase in $PHASE; do
-    if [[ $phase == none ]]; then
-      continue
-    elif declare -F "phase_$phase" > /dev/null; then
-      mkdir -p "$OUT/$phase"
-      "phase_$phase"
-    else
-      die "phase $phase has no run matrix in $(basename "${BASH_SOURCE[1]:-this script}") yet"
-    fi
-  done
-}
-
-# a_models PHASE_DIR [LENGTHS]: writes the prompts (short.txt, prompt-N.txt) and tokenizes short.txt per model.
-a_models() {
+# prompts DIR [LENGTHS]: writes the prompts (short.txt, prompt-N.txt) and tokenizes short.txt per model into
+# DIR/NAME-tokens.txt (the token ids the logit gates compare at).
+prompts() {
   local dir=$1 entry name artifacts hf
   for entry in $MODELS; do
     IFS=: read -r name artifacts hf <<< "$entry"
@@ -307,107 +214,36 @@ a_models() {
   done
 }
 
-# tokens_of NAME PROMPT_FILE OUTPUT: the token ids of a prompt file, one per line (needs a_models' probe and tokenizer).
-tokens_of() {
-  local entry n artifacts hf
-  for entry in $MODELS; do
-    IFS=: read -r n artifacts hf <<< "$entry"
-    [[ $n == "$1" ]] || continue
-    dry_run || "$ROOT/build/release/probe-fp32" tokenize "$artifacts/tokenizer-v2.bin" 128256 "@$2" > "$3"
-  done
-}
-
-# CMP_FLAGS and CMP_TOKENS shape a_bitwise: the gate flags (default --bitwise) and a tokens file other than the default
-# DIR/NAME-tokens.txt. Phases set them and restore the defaults afterwards.
-CMP_FLAGS=(--bitwise)
-CMP_TOKENS=
-# CMP_PROBE replaces the probe binary of a_bitwise and b_compare (E1: a shim that selects the baseline or the current build).
-CMP_PROBE=
 # W8A8 requantizes its activations: any change in FP32 operation order (another ISA, AMX, a split over two sockets) moves
 # the logits by a noise floor that is the same whatever the cause, and that grows with the model and the context. Measured
-# on 1B, 53 positions: scalar against AVX-512 rms 0.063 / max 0.34, AMX-INT8 against scalar 0.062 / 0.36, two sockets against
-# one 0.063 / 0.41. On 8B (D1/D3, job 5704685): ONE socket, AMX against AVX-512, rms 0.086 / max 1.41 on 86 tokens and 0.115 /
-# 7.58 on the last row of 2048; two sockets against one at the same AMX kernel 0.136 / 4.12 and 0.112 / 8.86; microbatch 64
-# against 16 bitwise identical; W8A32 agrees to 7e-5 in the same runs. A per-position 1e-3 budget therefore cannot hold and
-# the first provisional bounds (max 2.0, rms 0.15, calibrated on 1B) failed on 8B. The bounds below sit a factor of 1.5-2
-# above the largest observed values (rms 0.136, max 8.86): rms and argmax carry the judgment, the max only catches a
-# catastrophic error. The _LAST form is for a single compared row.
+# on 8B (D1/D3, job 5704685): AMX against AVX-512 rms 0.086 / max 1.41 on 86 tokens and 0.115 / 7.58 on the last row of
+# 2048; two sockets against one 0.136 / 4.12 and 0.112 / 8.86; W8A32 agrees to 7e-5 in the same runs. The bounds sit a
+# factor of 1.5-2 above the largest observed values: rms and argmax carry the judgment, the max only catches a
+# catastrophic error.
 W8A8_GATE=(--max-abs 16 --rms-max 0.2 --argmax-min 0.9)
-W8A8_GATE_LAST=(--max-abs 16 --rms-max 0.2 --argmax-min 0)
-# The AMX-BF16 gate (C5, fixed from the Hugging Face and FP32 per-token records of K1, jobs 5830324 and 5694396): AMX-BF16 prefill
-# against the FP32 per-token path, all positions: max 0.057-1.48, rms 0.0096-0.024, argmax agreement 98.1-100% (the 1B flips are
-# near-ties, one position in 53 on the short prompt); against Hugging Face max 0.09 (1B) / 0.22 (8B), rms <= 0.015, greedy
-# continuations identical on every prompt and mode. The bounds sit 1.3-2x above the observed values: max 2.0, rms 0.05, argmax 0.97.
-# BF16 is never judged against the FP32 1e-3 budget. The _LAST form is for a single compared row.
+# The AMX-BF16 gate (C5, fixed from the records of K1, jobs 5830324 and 5694396): AMX-BF16 prefill against the FP32
+# per-token path, all positions: max 0.057-1.48, rms 0.0096-0.024, argmax agreement 98.1-100%. The bounds sit 1.3-2x
+# above the observed values. BF16 is never judged against the FP32 1e-3 budget.
 BF16_GATE=(--max-abs 2 --rms-max 0.05 --argmax-min 0.97)
-BF16_GATE_LAST=(--max-abs 2 --rms-max 0.05 --argmax-min 0)
-# a_bitwise DIR NAME PRECISION STAGED LABEL ENVA_WORDS... -- ENVB_WORDS...: one engine-vs-engine comparison on the
-# tokens of the model (default gate: bitwise equality at every position).
-a_bitwise() {
-  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=() tokens=${CMP_TOKENS:-$1/$2-tokens.txt}
-  shift 5
-  while (($#)); do
-    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
-    shift
-  done
-  expect "compare-$name-$precision-$label" ok "$dir" -- numactl --cpunodebind=0 "$PYTHON" \
-    "$ROOT/tools/compare_engines.py" --probe "${CMP_PROBE:-$ROOT/build/release/probe-$precision}" --checkpoint "$staged" \
-    --tokens-file "$tokens" "${args[@]}" "${CMP_FLAGS[@]}" --output "$dir/compare-$name-$precision-$label.json"
-}
 
-# F2, model-free part: kernels on teams at full-socket size on the hardware ISA, the pinning read-back, and the
-# per-barrier cost. The real-model gate and the omp-versus-teams decode comparison need MODELS and a Hugging Face
-# Python environment and are not part of this phase's model-free check.
-phase_F2() {
-  local dir="$OUT/F2" bin="$ROOT/build/release"
-  expect kernels-teams ok "$dir" -- numactl --cpunodebind=0 env LLAMA_TEST_TEAMS=1,56 "$bin/test-kernels"
-  if grep -q 'avx512 teams:56 ok' "$dir/kernels-teams.out"; then
-    record_result kernels-teams-avx512-56 PASS
-  else
-    record_result kernels-teams-avx512-56 FAIL 'avx512 teams:56 was not exercised'
-  fi
-  expect affinity ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" affinity 56
-  if python3 - "$dir/affinity.out" << 'PY'; then
-import json, sys
-data = json.load(open(sys.argv[1]))
-assert data['supported'] and data['verified'] == 1 and len(data['workers']) == 56, data
-assert all(w['assigned'] == w['observed'] for w in data['workers'])
-PY
-    record_result affinity-readback PASS 'every worker read back as assigned'
-  else
-    record_result affinity-readback FAIL
-  fi
-  expect barrier-cost ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" bench-barrier 200000 56
-  expect barrier-stress ok "$dir" -- numactl --cpunodebind=0 "$bin/test-workers" barrier 1000000 56
-  [[ -z $MODELS ]] || phase_F2_models
-}
-
-# stage_model NAME PRECISION ARTIFACTS: copies a checkpoint into tmpfs ($shm, created by the caller in the parent
-# shell) with its pages on HBM node 2 (socket 0's HBM) and prints the staged path.
-stage_model() {
-  stage_model_on 2 "$@"
-}
-
-# stage_model_on NODE NAME PRECISION ARTIFACTS: the same on any node (its tag keeps copies on two nodes apart).
+# stage_model_on NODE NAME PRECISION ARTIFACTS: copies a checkpoint into tmpfs ($shm, created by need_shm in the parent
+# shell) with its pages on NODE, and prints the staged path.
 stage_model_on() {
   local node=$1 staged="$shm/$2-$3-node$1.bin"
   if dry_run; then
     printf '%s\n' "$staged"
     return 0
   fi
-  [[ -e $staged ]] || stage_checkpoint "$4/$3-v3.bin" "$staged" --membind="$node"
+  if [[ ! -e $staged ]]; then
+    numactl --membind="$node" cp "$4/$3-v3.bin" "$staged"
+    numactl -H > "$staged.numa.txt"
+  fi
   printf '%s\n' "$staged"
 }
 
-# unstage_model_on NODE NAME PRECISION: frees the tmpfs copy (HBM node 2 holds 64 GiB, so copies must not accumulate).
+# unstage_model_on NODE NAME PRECISION: frees the tmpfs copy (copies must not accumulate).
 unstage_model_on() {
   dry_run || rm -f -- "$shm/$2-$3-node$1.bin" "$shm/$2-$3-node$1.bin.numa.txt"
-}
-
-# snapshot_memory FILE: /proc/meminfo and every node's meminfo, to show page-cache and per-node memory before/after.
-snapshot_memory() {
-  dry_run && return 0
-  { date -u +%FT%TZ; cat /proc/meminfo; for f in /sys/devices/system/node/node[0-9]*/meminfo; do echo "== $f"; cat "$f"; done; } > "$1"
 }
 
 # need_shm: creates the tmpfs staging directory in the caller's shell (finish() removes it).
@@ -419,83 +255,29 @@ need_shm() {
   fi
 }
 
-# backend_env omp|teams THREADS: the environment words that select a backend (same shape on both sides of a comparison).
-backend_env() {
-  if [[ $1 == teams ]]; then
-    printf '%s\n' LLAMA_BACKEND=teams "LLAMA_THREADS=$2" OMP_PROC_BIND=false
-  else
-    printf '%s\n' LLAMA_BACKEND=omp "OMP_NUM_THREADS=$2" OMP_PROC_BIND=close OMP_PLACES=cores
-  fi
-}
-
-# F2 with models, one socket (56 threads, weights staged on its HBM): the omp and teams backends agree at every
-# position of an 86-token prompt (C against C, same ISA), and decode speed of teams against omp over REPEATS runs.
-# The Hugging Face gate of a backend that agrees with the validated one is not repeated here (HF_GATE=0 records it).
-phase_F2_models() {
-  local dir="$OUT/F2" bin="$ROOT/build/release" entry name artifacts hf precision engine staged tokenizer label
-  need_shm
-  for entry in $MODELS; do
-    IFS=: read -r name artifacts hf <<< "$entry"
-    tokenizer="$artifacts/tokenizer-v2.bin"
-    make_prompt "$bin/probe-fp32" "$tokenizer" 128256 none
-    "$bin/probe-fp32" tokenize "$tokenizer" 128256 "@$OUT/short.txt" > "$dir/$name-tokens.txt"
-    for precision in $PRECISIONS; do
-      engine=run
-      [[ $precision == fp32 ]] || engine=runq
-      staged=$(stage_model "$name" "$precision" "$artifacts")
-      expect "compare-$name-$precision-omp-vs-teams" ok "$dir" -- numactl --cpunodebind=0 --membind=2 "$PYTHON" \
-        "$ROOT/tools/compare_engines.py" --probe "$bin/probe-$precision" --checkpoint "$staged" \
-        --tokens-file "$dir/$name-tokens.txt" --env-a LLAMA_BACKEND=omp --env-a OMP_NUM_THREADS=56 \
-        --env-b LLAMA_BACKEND=teams --env-b LLAMA_THREADS=56 --env-b OMP_PROC_BIND=false --output "$dir/compare-$name-$precision.json"
-      export CPU_BIND=0 MEM_BIND=2
-      label=$(run_label "$name" "$precision" omp file 1 56)
-      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=omp OMP_NUM_THREADS=56
-      label=$(run_label "$name" "$precision" teams file 1 56)
-      run_engine "$label" "$engine" "$staged" "$tokenizer" "$OUT/short.txt" "$REPEATS" 0 LLAMA_BACKEND=teams \
-        LLAMA_THREADS=56 OMP_PROC_BIND=false
-      unset CPU_BIND MEM_BIND
-      unstage_model_on 2 "$name" "$precision" # HBM node 2 holds 64 GiB: one staged checkpoint at a time
-    done
-  done
-  "$PYTHON" "$ROOT/tools/summarize_campaign.py" "$OUT" > "$dir/summary.md"
-}
-
-# check_stage: everything every skeleton does before a phase matrix: environment, Flat-mode check, build, tests.
-# SKIP_TEST=1 builds but does not run `make test` (recorded as skipped): for a follow-up job on a tree whose full test run
-# already passed on the same hardware.
+# check_stage: environment, Flat-mode check, build, `make test` (with the engine knobs unset, so the tests see the
+# engine's own defaults). SKIP_TEST=1 builds but does not run `make test` (recorded as skipped): for a follow-up job on
+# a tree whose full test run already passed on the same hardware.
 check_stage() {
   record_environment
   check_flat_mode
-  build_tree 1 release build/release/probe-fp32 build/release/probe-int8
+  build_tree release build/release/probe-fp32 build/release/probe-int8
   local status=0
   if [[ ${SKIP_TEST:-0} == 1 ]]; then
     echo 'SKIP_TEST=1: make test was not run in this job' | tee "$OUT/test-skipped.txt"
-    # the phases that run a unit test binary (C5, C6, ...) still need the binaries
-    (cd "$ROOT" && make CC=gcc OPENMP=1 test-bins) > "$OUT/build-test-bins.log" 2>&1 || die "make test-bins failed, see $OUT/build-test-bins.log"
   else
-    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_KV_LAYOUT OMP_NUM_THREADS=56 numactl --cpunodebind=0 --membind=0 make CC=gcc OPENMP=1 test) \
-      > "$OUT/test.log" 2>&1 ||
-      status=$?
+    (cd "$ROOT" && env -u LLAMA_ATTN -u LLAMA_ATTN_DECODE -u LLAMA_KV_LAYOUT -u LLAMA_SOCKETS -u LLAMA_PREFILL_BATCH \
+      -u LLAMA_KERNELS -u LLAMA_BACKEND -u LLAMA_PRECISION -u LLAMA_PLACEMENT numactl --cpunodebind=0 --membind=0 \
+      make CC=gcc test) > "$OUT/test.log" 2>&1 || status=$?
     if [[ $status -eq 0 ]]; then record_result make-test PASS; else record_result make-test FAIL "exit=$status"; fi
   fi
   perf_available
 }
 
-# require_phases: every id in PHASE needs a phase_<ID> function in the script that was submitted (or in the library). Called
-# before anything is built, so a phase sent to the wrong script (B7 lives in cresco8-tp.sbatch, D1 in cresco8-prefill.sbatch)
-# fails at once instead of after the build and the tests.
-require_phases() {
-  local phase missing=
-  for phase in $PHASE; do
-    [[ $phase == none ]] || declare -F "phase_$phase" > /dev/null || missing+=" $phase"
-  done
-  [[ -z $missing ]] || die "no run matrix for phase(s)$missing in $(basename "${BASH_SOURCE[1]:-this script}"): submit each phase to the script of its track"
-}
-
-# ---- two-socket helpers shared by the B and D phases ------------------------------------------------------------------
-# tp_validate NAME ARTIFACTS HF PRECISION LABEL [env...]: the Hugging Face gate without the one-socket numactl binding
-# of validate_gate. FP32 failure is fatal; INT8 is recorded against today's unchanged budget.
-tp_validate() {
+# hf_gate NAME ARTIFACTS HF PRECISION LABEL [env...]: tools/validate.py against Hugging Face with the engine under test
+# (per token, no job-wide binding). FP32 failure is fatal for the job; INT8 is recorded against its budget without gating
+# (W8A8 requantizes activations, so FP32 reordering moves its Hugging Face deviation).
+hf_gate() {
   local name=$1 artifacts=$2 hf=$3 precision=$4 label=$5 status=0
   shift 5
   if dry_run; then
@@ -504,19 +286,20 @@ tp_validate() {
   fi
   local extra=()
   [[ $precision != int8 ]] || extra+=(--max-abs 1.0 --rtol 0.05)
-  # TP_VALIDATE_FLAGS (e.g. --batch 64): validate.py reads the logits through the batched prefill path instead of per token
-  extra+=(${TP_VALIDATE_FLAGS[@]+"${TP_VALIDATE_FLAGS[@]}"})
   (cd "$ROOT" && env "$@" "$PYTHON" tools/validate.py --hf "$hf" --checkpoint "$artifacts/$precision-v3.bin" \
     --tokenizer "$artifacts/tokenizer-v2.bin" --precision "$precision" --threads 56 \
     --output "$OUT/correctness-$name-$label.json" "${extra[@]}") \
     > "$OUT/correctness-$name-$label.stdout" 2> "$OUT/correctness-$name-$label.stderr" || status=$?
   printf '%s %s exit=%s env=%s\n' "$name" "$label" "$status" "$*" >> "$OUT/correctness-status.txt"
-  return "$status"
+  if [[ $precision == fp32 ]]; then
+    if [[ $status -eq 0 ]]; then record_result "hf-$name-$label" PASS; else record_result "hf-$name-$label" FAIL "exit=$status"; fi
+  fi
 }
 
-# tp_placement REPORT [packed]: both sockets' weights regions fully verified on HBM 2 and HBM 3, an untied embedding on
-# DDR 0; with `packed`, also one packed (BF16 or int8 shard copies) region per socket on its node, fully verified.
-tp_placement() {
+# check_placement REPORT [kv] [packed]: both sockets' weights regions fully verified on HBM 2 and HBM 3, an untied
+# embedding on DDR 0; with `kv`, the K/V caches of both sockets; with `packed`, one packed (BF16 or int8 shard copies)
+# region per socket on its node, fully verified.
+check_placement() {
   python3 - "$@" << 'PY'
 import json, sys
 report = json.load(open(sys.argv[1]))
@@ -534,12 +317,6 @@ for socket, node in ((0, 2), (1, 3)):
           len(found) == 1 and found[0]['node'] == node and found[0]['verified'] == 'full' and
           (found[0]['pages_queried'] or 0) > 0 and found[0]['pages_mismatched'] == 0 and found[0]['pages_missing'] == 0,
           str(found))
-if 'scratch' in sys.argv[2:]:
-    for socket, node in ((0, 2), (1, 3)):
-        found = [r for r in regions if r['role'] == 'work' and r['socket'] == socket]
-        check(f'socket {socket} work and exchange regions: on node {node}, fully verified',
-              len(found) >= 2 and all(r['node'] == node and r['verified'] == 'full' and r['pages_mismatched'] == 0 and
-                                      r['pages_missing'] == 0 for r in found), str(found))
 if 'kv' in sys.argv[2:]:
     kv = report.get('kv') or {}
     check('KV caches of both sockets verified, none on another node, none missing', bool(kv.get('verified')) and
@@ -558,23 +335,24 @@ sys.exit(1 if bad else 0)
 PY
 }
 
-B_FLAGS=()
-# B_FLAGS replaces b_compare's strict budget (W8A8 sets the statistical gate), B_EXPECT its expectation (any = recorded
-# only, for the BF16 rung until C5 has fixed its gate), and CMP_TOKENS the token file.
-# b_compare DIR NAME PRECISION STAGED LABEL ENVA... -- ENVB...: logits of one configuration against another at every
-# position of the 86-token prompt (the gate of compare_engines.py: max |delta logit| <= 1e-3).
-b_compare() {
-  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=a args=()
+# compare DIR NAME PRECISION STAGED LABEL [FLAGS...] -- ENVA... -- ENVB...: logits of configuration A against B at every
+# position of the 86-token prompt (tools/compare_engines.py; default budget max |delta logit| <= 1e-3, FLAGS replace it
+# and may add --batch-a/--batch-b M). No job-wide binding, so the engine places and pins itself on both sides.
+compare() {
+  local dir=$1 name=$2 precision=$3 staged=$4 label=$5 side=flags flags=() args=()
   shift 5
   while (($#)); do
-    if [[ $1 == -- ]]; then side=b; else args+=("--env-$side" "$1"); fi
+    if [[ $1 == -- ]]; then
+      [[ $side == flags ]] && side=a || side=b
+    elif [[ $side == flags ]]; then
+      flags+=("$1")
+    else
+      args+=("--env-$side" "$1")
+    fi
     shift
   done
-  # One socket against two, C against C: no job-wide binding, so both teams can pin themselves. B_FLAGS replaces the strict
-  # budget (W8A8 uses the statistical gate of the library).
-  local flags=(--max-abs 1e-3)
-  [[ ${#B_FLAGS[@]} -eq 0 ]] || flags=("${B_FLAGS[@]}")
-  expect "compare-$name-$precision-$label" "${B_EXPECT:-ok}" "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
-    "${CMP_PROBE:-$ROOT/build/release/probe-$precision}" --checkpoint "$staged" --tokens-file "${CMP_TOKENS:-$dir/$name-tokens.txt}" "${args[@]}" \
-    "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
+  [[ " ${flags[*]-} " == *" --max-abs "* ]] || flags+=(--max-abs 1e-3)
+  expect "compare-$name-$precision-$label" ok "$dir" -- "$PYTHON" "$ROOT/tools/compare_engines.py" --probe \
+    "$ROOT/build/release/probe-$precision" --checkpoint "$staged" --tokens-file "$dir/$name-tokens.txt" \
+    ${args[@]+"${args[@]}"} "${flags[@]}" --output "$dir/compare-$name-$precision-$label.json"
 }

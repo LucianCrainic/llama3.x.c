@@ -316,11 +316,10 @@ static void report(Context *c, const char *model, const char *red) {
   size_t n = c->iters;
   double gbps_phase[2][P_COUNT];
   printf("{\"model\": \"%s\", \"precision\": \"%s\", \"sockets\": %d, \"threads\": %d, \"red\": \"%s\", \"stamps\": %d, "
-         "\"join\": \"%s\", \"fanout\": \"%s\", \"sched\": \"%s\", \"swap\": %d, \"layers\": %d, \"iters\": %zu",
+         "\"fanout\": \"%s\", \"sched\": \"%s\", \"swap\": %d, \"layers\": %d, \"iters\": %zu",
          model, c->q8 ? "q8" : "fp32", c->sockets, c->threads, red, c->stamps,
-         getenv("LLAMA_TEAM_JOIN") && *getenv("LLAMA_TEAM_JOIN") ? getenv("LLAMA_TEAM_JOIN") : "flags",
          getenv("LLAMA_TEAM_FANOUT") && *getenv("LLAMA_TEAM_FANOUT") ? getenv("LLAMA_TEAM_FANOUT") : "8",
-         getenv("LLAMA_GEMV_SCHED") && *getenv("LLAMA_GEMV_SCHED") ? getenv("LLAMA_GEMV_SCHED") : "auto", c->swap,
+         "auto" /* the GEMV schedule, fixed since F5 */, c->swap,
          c->layers, n);
   for (int s = 0; s < c->sockets; s++) {
     double layer_mean, layer_p99, layer_med = median(c->layer_s[s], n, 1, 0, &layer_mean, &layer_p99);

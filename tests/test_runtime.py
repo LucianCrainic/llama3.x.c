@@ -53,7 +53,7 @@ class RuntimeTests(unittest.TestCase):
         return result, data
 
     def test_baseline_numerical_regression(self):
-        # The OpenMP/serial path, then worker teams with odd counts that stress range splitting.
+        # The default team (the allowed CPUs), then teams with odd counts that stress range splitting.
         backends = [{}] + [{'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(t)} for t in (1, 2, 3, 7)]
         for env in backends:
             for engine, unit, filename in [('run','test-fp32','fp32.bin'),('runq','test-int8','int8.bin')]:
@@ -74,10 +74,13 @@ class RuntimeTests(unittest.TestCase):
         _, data = self.execute('run')
         for key in v2:
             self.assertIn(key, data)
-        self.assertEqual(data['runtime'], {'backend': 'omp', 'sockets': 1, 'placement': 'file', 'thp': 'off',
-            'precision_mode': 'fp32', 'prefill_batch': 1, 'prefill_logits': 'last', 'kernels_prefill': None,
-            'attn_row_block': 4})
-        self.assertIsNone(data['teams'])
+        # Batched prefill is the default where the GEMM runs (AVX-512): 128 rows, capped at the fixture's context of 32.
+        scalar = data['build']['kernels'] == 'scalar'
+        self.assertEqual(data['runtime'], {'backend': 'teams', 'sockets': 1, 'placement': 'file', 'thp': 'off',
+            'precision_mode': 'fp32', 'prefill_batch': 1 if scalar else 32, 'prefill_logits': 'last',
+            'kernels_prefill': None if scalar else 'avx512'})
+        self.assertEqual(len(data['teams']), 1)  # one team on the allowed CPUs
+        self.assertNotIn('openmp', data['build'])
         self.assertEqual(data['regions'], [])
         self.assertIsNone(data['phase_seconds'])
         self.assertEqual(set(data['kv']), {'reserved_bytes', 'resident_bytes', 'active_bytes', 'node', 'verified', 'full',
@@ -97,10 +100,14 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(data['topology_error'])
         self.assertEqual(topology['sockets'], [{'package': -1, 'cpus': None, 'threads': 3, 'ddr_node': -1,
             'hbm_node': -1, 'ddr_allowed': True, 'hbm_allowed': True, 'classification': 'virtual'}])
-        # A topology that cannot be discovered is reported, not fatal, and failures still write valid JSON.
-        _, data = self.execute('run', env={'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1', 'LLAMA_SYSFS_ROOT': '/nonexistent'})
+        # A topology that cannot be discovered is reported, not fatal, where nothing needs it: a team without a
+        # LLAMA_TOPOLOGY map takes the allowed CPUs. A team placed by a map does need it, and the run fails.
+        _, data = self.execute('run', env={'LLAMA_SYSFS_ROOT': '/nonexistent'})
         self.assertIsNone(data['topology'])
         self.assertIn('cannot read', data['topology_error'])
+        self.assertEqual(data['runtime']['sockets'], 1)
+        self.execute('run', success=False, env={'LLAMA_SYSFS_ROOT': '/nonexistent',
+                                                'LLAMA_TOPOLOGY': 'explicit:0/2/0,1/3/1'})
 
     def test_tokens_out_records_prompt_and_generated_ids(self):
         """LLAMA_TOKENS_OUT: prompt = every id forwarded before the first sample (warm-up ids first), generated = every
@@ -128,7 +135,8 @@ class RuntimeTests(unittest.TestCase):
         self.execute('run', '-m', 'chat', success=False, env={'LLAMA_TOKENS_OUT': str(out)})
 
     def test_backend_environment_is_validated(self):
-        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND must be omp or teams'),
+        for env, text in [({'LLAMA_BACKEND': 'bogus'}, 'LLAMA_BACKEND=bogus is no longer supported'),
+                          ({'LLAMA_BACKEND': 'omp'}, 'the OpenMP backend was removed'),
                           ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': '0'}, 'LLAMA_THREADS must be'),
                           ({'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': 'x'}, 'LLAMA_THREADS must be')]:
             with self.subTest(env=env):
@@ -403,7 +411,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('LLAMA_PREFILL_GEMM', data['error'])
 
     def test_amx_is_explicit_and_fails_clearly_when_unavailable(self):
-        """C4: `auto` never picks amx; an explicit request is honoured or fails with the reason (no silent fallback)."""
+        """C4: `auto` never picks amx for an FP32 checkpoint (nor asks for the tile permission); an explicit request is
+        honoured or fails with the reason (no silent fallback). Q8 W8A8 and the explicit BF16 mode take AMX under auto
+        (D2 §7; test_tp.py covers them on the emulated tiles)."""
         _, data = self.execute('run', env={'LLAMA_KERNELS': 'auto'})
         self.assertNotEqual(data['build']['kernels'], 'amx')
         self.assertEqual(data['build']['amx_permission'], 'not requested')
@@ -451,11 +461,10 @@ class RuntimeTests(unittest.TestCase):
         # E5: group is built; it is recorded, and runs split where AVX-512 is not active
         _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'group'))
-        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN=amx is not implemented yet (E3)'),
-                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be split, tiled or amx'),
-                                     ('LLAMA_ATTN_TILED_QUERIES', '0', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
-                                     ('LLAMA_ATTN_TILED_QUERIES', '17', 'LLAMA_ATTN_TILED_QUERIES must be an integer in 1..16'),
-                                     ('LLAMA_ATTN_TILED_ORDER', 'random', 'LLAMA_ATTN_TILED_ORDER must be longest or natural'),
+        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN must be tiled or split'),
+                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled or split'),
+                                     ('LLAMA_ATTN_TILED_QUERIES', '8', 'LLAMA_ATTN_TILED_QUERIES is no longer supported'),
+                                     ('LLAMA_ATTN_TILED_ORDER', 'natural', 'LLAMA_ATTN_TILED_ORDER is no longer supported'),
                                      ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):
             result = subprocess.run([str(BUILD/'run'), str(self.shared/'fp32.bin'), '-z', str(self.shared/'tokenizer.bin'),
                                      '-i', 'A', '-t', '0'], capture_output=True, text=True,
@@ -502,7 +511,7 @@ class RuntimeTests(unittest.TestCase):
         for engine, env, text in (
                 ('run', {'LLAMA_PRECISION': 'half'}, 'LLAMA_PRECISION must be fp32 or bf16'),
                 ('runq', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4'}, 'applies to FP32 checkpoints'),
-                ('run', {'LLAMA_PRECISION': 'bf16'}, 'set LLAMA_PREFILL_BATCH to 2 or more'),
+                ('run', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '1'}, 'set LLAMA_PREFILL_BATCH to 2 or more'),
                 ('run', {'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4', 'LLAMA_PREFILL_GEMM': 'off'},
                  'LLAMA_PREFILL_GEMM=off')):
             with self.subTest(engine=engine, env=env):
@@ -551,7 +560,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(data['runtime']['placement'], 'ddr')
         # The FP32 copy stays: decode reads it.
         self.assertGreater(data['memory_bytes']['owned_weights_peak'], 0)
-        # Dropping the FP32 copy is reserved for a future BF16 decode GEMV.
+        # Dropping the FP32 copy is not supported: decode reads it.
         _, data = self.execute('run', success=False, env={'LLAMA_PRECISION': 'bf16', 'LLAMA_PREFILL_BATCH': '4',
                                                           'LLAMA_BF16_DROP_FP32': '1'})
         self.assertIn('LLAMA_BF16_DROP_FP32', data['error'])

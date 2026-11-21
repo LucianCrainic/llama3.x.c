@@ -10,7 +10,7 @@
  * default 0 keeps the single copy of C2. q8 also reports the time of quantizing the m activation rows (quant_median_s),
  * which the engine pays once per linear and which is not part of best_s / median_s. Weights and activations are random.
  * Threads, pinning and the instruction set come from the engine's own environment: LLAMA_BACKEND=teams
- * LLAMA_THREADS=56 (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_GEMM_KC. */
+ * LLAMA_THREADS=56 (under numactl --cpunodebind=0), LLAMA_KERNELS. */
 #include "gemm.h"
 #include "kernels.h"
 #include "numa.h"

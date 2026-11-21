@@ -3,14 +3,13 @@
  *   attention-bench --mode prefill [--shape 8b|1b|H/KV/HD,...] [--prompt 512,2048,8192] [--m 16,64,256] [--reps R]
  *   attention-bench --mode decode  [--shape ...] [--context 8192,32768] [--reps R] [--kv-layout rows|head]
  * Common: [--node N] [--kv-heads-local N] [--seq-extra N] [--portable] [--cold-mib N]
- * Prefill runs the whole prompt of one layer as src/run.c does (microbatches at pos0 = 0, M, 2M, ...; the workspace of
+ * Prefill runs the whole prompt of one layer as src/engine.c does (microbatches at pos0 = 0, M, 2M, ...; the workspace of
  * k_attention_init_rows with rows = M; k_attention_batch), so ms_layer * layers is comparable with the engine's profiled
  * attention time. Decode calls k_attention at the last position of a context, cycling through enough copies of K/V
  * (--cold-mib, default 1024) that each call reads memory the previous one did not leave in the cache.
  * Threads, pinning and the instruction set come from the engine's own environment: LLAMA_BACKEND=teams LLAMA_THREADS=56
- * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_DECODE (split|group; decode mode),
- * LLAMA_ATTN_TILED_QUERIES, LLAMA_ATTN_TILED_ORDER, LLAMA_ATTN_ROW_BLOCK,
- * LLAMA_ATTN_WORKSPACE_MIB.
+ * LLAMA_TOPOLOGY (under numactl --cpunodebind=0), LLAMA_KERNELS, LLAMA_ATTN (split|tiled), LLAMA_ATTN_DECODE (split|group; decode mode).
+ * The E0/E2 sweep knobs (row block, tiled queries and order, workspace) were removed in F5; `row_block` is reported as 4.
  * --kv-layout (decode only) picks the K/V layout the kernels read: rows (default here; the engine's layout before E5.4,
  * [position][kv_head][head_dim], k_attention) or head ([kv_head][position][head_dim], k_attention_layout with a position
  * stride of head_dim; the E5.2 layout probe, the engine's default since E5.4). Same values, same kernels, same bytes.
@@ -20,6 +19,7 @@
 #include "kernels.h"
 #include "numa.h"
 #include "workers.h"
+#include "testing.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -232,7 +232,7 @@ static void common_fields(const Setup *s, const char *mode, int workers) {
          "\"heads\": %d, \"kv_heads\": %d, \"head_dim\": %d, \"kv_heads_model\": %d, \"row_block\": %d, \"portable\": %s, "
          "\"attn\": \"%s\", \"attn_decode\": \"%s\", \"kv_layout\": \"%s\", ",
          mode, kernels_name(), kernels_backend_name(), workers, s->node, s->shape.name, s->heads, s->kv_heads, s->hd,
-         s->shape.kv_model, k_attention_row_block(), s->portable ? "true" : "false", kernels_attention_name(),
+         s->shape.kv_model, 4 /* the split row block, fixed since F5 */, s->portable ? "true" : "false", kernels_attention_name(),
          kernels_attention_decode_name(), s->head_major ? "head" : "rows");
 }
 

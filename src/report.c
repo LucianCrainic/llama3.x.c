@@ -13,9 +13,6 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 /* Matches CPU_SETSIZE, the most CPUs an affinity mask can name. */
 #define CPU_LIMIT 1024
 #ifndef BUILD_MODE
@@ -166,7 +163,6 @@ static void write_v2_sections(FILE *f) {
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fputs(",\n    \"kernels_prefill\": ", f);
   string(f, metrics.runtime_ready && model.prefill_gemm ? model.prefill_kernel : NULL);
-  fprintf(f, ",\n    \"attn_row_block\": %d", k_attention_row_block());
   fputs("\n  }", f);
 
   const Topology *topology;
@@ -347,11 +343,6 @@ void write_report(void) {
   string(f, BUILD_MODE);
   fputs(",\n    \"flags\": ", f);
   string(f, BUILD_FLAGS);
-#ifdef _OPENMP
-  fprintf(f, ",\n    \"openmp\": true,\n    \"openmp_version\": %d", _OPENMP);
-#else
-  fputs(",\n    \"openmp\": false,\n    \"openmp_version\": null", f);
-#endif
   fputs(",\n    \"kernels\": ", f);
   if (kernels_name())
     string(f, kernels_name());
@@ -365,12 +356,6 @@ void write_report(void) {
   string(f, kernels_name() ? kernels_kv_layout_name() : NULL);
   fputs(",\n    \"amx_permission\": ", f);
   string(f, gemm_amx_permission());
-  fputs(",\n    \"openmp_max_threads\": ", f);
-#ifdef _OPENMP
-  fprintf(f, "%d", omp_get_max_threads());
-#else
-  fputs("1", f);
-#endif
   fputs("\n  },\n  \"parameters\": {\n    \"mode\": ", f);
   string(f, options.mode);
   fprintf(f, ",\n    \"chat_template\": %s", options.chat_template ? "true" : "false");

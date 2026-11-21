@@ -30,22 +30,19 @@ struct Team {
   TeamFn fn;
   const void *job;
   Counter generation; /* leader publishes a job by bumping it */
-  Counter done;       /* workers finished with the current job (join by counter) */
   int fanout;
   void *group_memory;
   Counter *group_gen; /* per group of `fanout` workers: the generation its head relayed (group 0 unused) */
   void *done_flag_memory;
-  Counter *done_flag; /* per worker: the generation it finished (join by flags; index 0 unused) */
+  Counter *done_flag; /* per worker: the generation it finished (index 0 unused) */
   Counter ready;      /* workers that finished starting up */
   Counter stop;
   Counter barrier_count, barrier_generation;
   unsigned published; /* leader's copy of generation */
 };
 
-/* How team_run learns that every member finished: a shared counter that all members increment (LLAMA_TEAM_JOIN=counter),
- * or one flag line per member that the leader scans (flags, default): 55 increments of one line queue up for about 4 us
- * when the members finish together, which every job of every layer pays. */
-static int join_flags = 1;
+/* team_run learns that every member finished from one flag line per member, which the leader scans. (A shared counter
+ * that all members increment was measured 4 us slower per job with 55 members: the increments of one line queue up.) */
 /* How a job reaches the members: with fanout 0 all of them spin on the leader's generation line, which the owner of the
  * line serves one at a time (the last member starts 3-5 us late with 55 of them). With a fanout F > 0, workers
  * F, 2F, ... are group heads that watch the leader's line and relay the generation on a line of their own to the F - 1
@@ -158,10 +155,7 @@ static void *worker_main(void *p) {
     if (atomic_load_explicit(&team->stop.value, memory_order_acquire))
       return NULL;
     team->fn(team->job, worker, team->size);
-    if (join_flags)
-      atomic_store_explicit(&team->done_flag[worker].value, seen, memory_order_release);
-    else
-      atomic_fetch_add_explicit(&team->done.value, 1, memory_order_release);
+    atomic_store_explicit(&team->done_flag[worker].value, seen, memory_order_release);
   }
 }
 
@@ -199,10 +193,6 @@ static Team *team_create(int index, int threads, const int *cpus) {
 void pool_start(const PoolConfig *config) {
   if (team_count)
     fail("worker pool already started");
-  const char *join = getenv("LLAMA_TEAM_JOIN");
-  if (join && *join && strcmp(join, "flags") && strcmp(join, "counter"))
-    fail("LLAMA_TEAM_JOIN must be flags or counter");
-  join_flags = !(join && !strcmp(join, "counter"));
   const char *fanout = getenv("LLAMA_TEAM_FANOUT");
   dispatch_fanout = 8;
   if (fanout && *fanout) {
@@ -273,15 +263,10 @@ void team_run(Team *team, TeamFn fn, const void *job) {
   }
   team->fn = fn;
   team->job = job;
-  atomic_store_explicit(&team->done.value, 0, memory_order_relaxed);
   atomic_store_explicit(&team->generation.value, ++team->published, memory_order_release);
   fn(job, 0, team->size);
-  if (join_flags) {
-    for (int w = 1; w < team->size; w++)
-      wait_reach(&team->done_flag[w], team->published);
-  } else {
-    wait_reach(&team->done, (unsigned)(team->size - 1));
-  }
+  for (int w = 1; w < team->size; w++)
+    wait_reach(&team->done_flag[w], team->published);
 }
 
 typedef struct {
@@ -547,12 +532,6 @@ void exchange_abort(Exchange *e) {
 
 void exchange_set_timing(Exchange *e, int on) {
   atomic_store_explicit(&e->timing, on, memory_order_relaxed);
-}
-
-void exchange_timing(const Exchange *e, int socket, double *reduce_seconds, double *wait_seconds) {
-  const double *phase = e->phase_seconds[socket];
-  *reduce_seconds = phase[2];
-  *wait_seconds = phase[0] + phase[1] + phase[3] + phase[4];
 }
 
 void exchange_timing_detail(const Exchange *e, int socket, double seconds[5]) {

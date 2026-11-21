@@ -33,13 +33,7 @@ enum { GEMM_MAX_SEGMENTS = 3 };
 
 void k_gemm_f32(const float *a, int lda, int m, int k, const GemmSegment *segments, int count);
 
-/* Test hooks: the same driver with a portable microkernel and an explicit K block, to exercise blocking, tails and
- * epilogues on any host. kc <= 0 uses one block. */
-void k_gemm_f32_portable(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc);
-/* Runs the SIMD microkernel (real AVX-512 on x86, an emulation in the GEMM_EMULATE_AVX512 test build) regardless of
- * the selected instruction set; returns 0 when none is compiled in. The caller must know the CPU can run it. */
-int k_gemm_f32_simd_test(const float *a, int lda, int m, int k, const GemmSegment *segments, int count, int kc);
-/* The K block the active instruction set uses (LLAMA_GEMM_KC overrides the AVX-512 default of 1024). */
+/* The K block the active instruction set uses (1024 on AVX-512, 0 = one block otherwise). */
 int k_gemm_kc(void);
 
 /* ---- AMX (C4) ------------------------------------------------------------------------------------------------------
@@ -53,8 +47,7 @@ const char *gemm_amx_unavailable(void);
 const char *gemm_amx_permission(void);
 void gemm_amx_enable(int on); /* set by the kernel selection */
 int gemm_amx_active(void);
-int gemm_amx_compiled(void); /* the build has AMX code (real or emulated) */
-int gemm_amx_emulated(void); /* ... and it runs on the software tile model (test builds) */
+int gemm_amx_emulated(void); /* the build runs AMX code on the software tile model (test builds) */
 /* Releases the calling thread's tile state. Worker threads release it themselves when they exit. */
 void gemm_amx_thread_release(void);
 
@@ -106,7 +99,7 @@ size_t k_gemm_bf16_panel_bytes(int m, int k);
 void k_gemm_bf16(const float *a, int lda, int m, int k, const GemmBf16Segment *segments, int count,
                  AlignedBuffer *panel);
 
-/* Packs many matrices with the active worker team (or OpenMP, or serially). */
+/* Packs many matrices with the active worker team (or serially without one). */
 typedef struct {
   uint16_t *dst;
   const float *w;
@@ -140,13 +133,8 @@ void k_quantize_rows(int8_t *q, float *s, const float *x, size_t ldx, int m, int
 void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count);
 /* The backend k_gemm_q8 would choose (for logging and reports). */
 Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
-/* Test hooks: one named backend (0 when not compiled in; the caller must know the CPU can run it), and the exact int32
- * group dots of the AMX chunk kernel, dots[(g * m + r) * n + c]. */
-int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
-                           const GemmQ8Segment *segments, int count);
-int k_gemm_q8_amx_dots_test(int32_t *dots, const int8_t *xq, int m, int k, int gs, const int8_t *packed, int n);
 
-/* Packs many int8 matrices with the active worker team (or OpenMP, or serially). */
+/* Packs many int8 matrices with the active worker team (or serially without one). */
 typedef struct {
   int8_t *dst;
   const int8_t *w;

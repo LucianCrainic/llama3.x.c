@@ -1,5 +1,5 @@
 /* Opt-in wall-clock profile of the forward pass, enabled by LLAMA_PROFILE=1.
- * Every phase is serial or ends at an OpenMP barrier, so the calling thread's
+ * Every phase is serial or ends at a team barrier, so the calling thread's
  * wall time is the phase's time. Disabled, each PROFILE costs one branch. */
 #ifndef PROFILE_H
 #define PROFILE_H

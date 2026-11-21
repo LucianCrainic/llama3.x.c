@@ -1,4 +1,5 @@
 #include "loader.h"
+#include "tp.h"
 #include "workers.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -13,15 +14,15 @@ static const char *active_mode = "file";
 
 const char *placement_mode(void) {
   const char *mode = getenv("LLAMA_PLACEMENT");
-  if (!mode || !*mode)
-    return "file";
+  if (!mode || !*mode) /* two sockets own their shards: on an HBM node they go to HBM, as D2 measured them */
+    return tp_sockets_requested() == 2 && tp_hbm_pair() ? "hbm" : "file";
   if (!strcmp(mode, "file") || !strcmp(mode, "ddr") || !strcmp(mode, "hbm"))
     return mode[0] == 'f' ? "file" : mode[0] == 'd' ? "ddr" : "hbm";
   fail("LLAMA_PLACEMENT must be file, ddr or hbm");
 }
 
 const char *placement_active(void) {
-  return active_mode;
+  return tp_sockets_requested() == 2 ? placement_mode() : active_mode; /* tp_create places the shards itself */
 }
 
 size_t placement_hbm_budget(void) {
@@ -314,17 +315,6 @@ void *runmem_alloc(RunMemory *rm, size_t count, size_t size) {
   size_t bytes = checked_mul(count, size), at = checked_add(rm->used, (size_t)(CACHE_LINE - 1)) / CACHE_LINE * CACHE_LINE;
   rm->used = checked_add(at, bytes);
   return rm->phase == RUNMEM_SIZING ? NULL : (char *)rm->work.data + at;
-}
-
-void runmem_attention(RunMemory *rm, AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len,
-                      int rows) {
-  if (rm->phase == RUNMEM_HEAP) {
-    k_attention_init_rows(work, n_heads, n_kv_heads, head_dim, seq_len, rows, NULL);
-    return;
-  }
-  void *memory = runmem_alloc(rm, k_attention_bytes_rows(n_heads, n_kv_heads, head_dim, seq_len, rows), 1);
-  if (!runmem_sizing(rm))
-    k_attention_init_rows(work, n_heads, n_kv_heads, head_dim, seq_len, rows, memory);
 }
 
 static void zero_slice(const void *job, int worker, int workers) {

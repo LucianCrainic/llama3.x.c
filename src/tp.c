@@ -19,31 +19,7 @@ enum { SOCKETS = 2, SPIN_LIMIT = 2048 };
 /* Per-socket profile slots: the engine's phases, then the projections that end in a reduction, timed on their own. */
 enum { TP_WO_MM = PHASE_COUNT, TP_W2_MM, TP_SLOTS };
 
-/* LLAMA_TP_TRACE=FILE: one record per Wo/W2 projection+reduction and socket, written to FILE as CSV when the engine is
- * freed (microseconds relative to the leader's dispatch of the team job). Needs the fused form. Every worker stamps the
- * end of its share of the projection and the steps of exchange_reduce_add (workers.h); the leader folds them into a
- * record after the join. The stamps cost a few clock reads per worker, so a traced run is slightly slower. */
-typedef struct {
-  _Alignas(64) double start, proj_end;
-  ReduceStamps r;
-  double pad[2];
-} WorkerStamp;
-
-typedef struct {
-  int kind, stage;                   /* 0 = Wo, 1 = W2; Stage */
-  double disp;                       /* leader's clock (seconds) when it dispatched the team job */
-  double start_mean, start_max;      /* workers entering the job */
-  double end_first, end_mean, end_last; /* workers finishing their share of the projection */
-  double b1_leader, b1_last;         /* leaving the first barrier */
-  double peer_leader, peer_last;     /* seeing the other socket's partial */
-  double add_mean, add_last;         /* finishing the add */
-  double b2_leader, b2_last;         /* leaving the closing barrier */
-  double ret;                        /* team_run returned */
-  int last_worker;                   /* the worker whose projection ended last */
-} TraceRec;
-enum { TRACE_MAX_RECORDS = 40000, TRACE_MAX_WORKERS = 256 };
-
-typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_REPACK, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP } Command;
+typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP } Command;
 
 /* The seven matrices of a layer that get a packed copy, in the order of TpSocket.packed_at. */
 static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W3};
@@ -51,8 +27,10 @@ static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W
 typedef struct {
   int socket;
   Team *team;
-  NumaRegion weights, kv_k, kv_v, work, exchange, packed, packed_cls, repack;
-  float **repack_at;    /* [layer * 7 + PACK_ROLES index]: the packed4 copy (LLAMA_FP32_LAYOUT=packed4) used by decode, or NULL */
+  NumaRegion weights, kv_k, kv_v, work, exchange, packed, packed_cls;
+  void *work_data, *packed_data; /* where the activations and the packed copies are carved from (a region of this
+                                    socket, or the one-socket loader's run memory and packed store) */
+  size_t work_size, packed_size;
   void **packed_at;     /* [layer * 7 + PACK_ROLES index]: the packed copy in `packed`, or NULL */
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
@@ -69,30 +47,21 @@ typedef struct {
   float *xs;
   int8_t *aq; /* quantized slice that feeds Wo / W2 */
   float *as;
-  /* LLAMA_TP_TRACE */
-  WorkerStamp *stamps;
-  TraceRec *records;
-  size_t record_count;
-  unsigned last_count[2][TRACE_MAX_WORKERS];
-  double late_sum[2][TRACE_MAX_WORKERS];
-  size_t reductions[2];
 } TpSocket;
 
 struct Tp {
   Config c;
+  int sockets; /* 1: the one-socket engine (tp_create_local); 2: tensor parallel over two sockets (tp_create) */
   int quantized, gs, check, fp32_activations;
-  const char *trace_path;
-  int reduce_flags; /* LLAMA_TP_REDUCE=flags (default, fused only): per-row flags instead of two team barriers */
-  int fused; /* LLAMA_TP_FUSED (default 1): the partial projection and the reduction run in one team job */
+  /* One socket: the run state and packed copies live where the one-socket loader places them (A4, A5, C5). */
+  RunMemory mem;
+  PackedStore local_packed, local_cls;
   ShardSet set;
   NumaRegion global;
   TpSocket s[SOCKETS];
   Exchange *exchange;
   float *logits;
   TpPack pack;
-  int packed4; /* LLAMA_FP32_LAYOUT=packed4: decode streams a packed4 copy of the FP32 shards (the shards stay for the GEMM) */
-  Pack4Job *rjobs[SOCKETS];
-  int rjobs_n[SOCKETS];
   PackBf16 *bjobs[SOCKETS]; /* the packing work of each socket, planned on the main thread (regions are not thread-safe) */
   PackS8 *sjobs[SOCKETS];
   int njobs[SOCKETS];
@@ -116,19 +85,39 @@ struct Tp {
   double xch[SOCKETS][STAGE_COUNT][5], xch_last[SOCKETS][5];
   size_t tokens[STAGE_COUNT];
   Command command;
-  int token, pos, loader_fd;
+  int token, pos, want_logits, loader_fd;
 };
 
+int tp_hbm_pair(void) {
+  const Topology *topology;
+  char err[512];
+  return !numa_topology_try(&topology, err, sizeof(err)) && topology->classification != CLASS_VIRTUAL &&
+         !numa_check_placement(topology, SOCKETS, "hbm", err, sizeof(err));
+}
+
+static int knob_set(const char *name) {
+  const char *value = getenv(name);
+  return value && *value;
+}
+
 int tp_sockets_requested(void) {
-  const char *value = getenv("LLAMA_SOCKETS");
-  if (!value || !*value || !strcmp(value, "1"))
-    return 1;
-  if (strcmp(value, "2"))
-    fail("LLAMA_SOCKETS must be 1 or 2");
-  const char *backend = getenv("LLAMA_BACKEND");
-  if (!backend || strcmp(backend, "teams"))
-    fail("LLAMA_SOCKETS=2 requires LLAMA_BACKEND=teams");
-  return 2;
+  static int sockets;
+  if (sockets)
+    return sockets;
+  const char *value = getenv("LLAMA_SOCKETS"), *topology = getenv("LLAMA_TOPOLOGY"), *placement = getenv("LLAMA_PLACEMENT");
+  if (knob_set("LLAMA_SOCKETS")) {
+    if (strcmp(value, "1") && strcmp(value, "2"))
+      fail("LLAMA_SOCKETS must be 1 or 2");
+    return sockets = value[0] - '0';
+  }
+  /* D2 §7: unset, both sockets of a node whose sockets each have an allowed HBM node, unless the other knobs ask for a
+   * one-socket configuration (a given topology, file or DDR placement). */
+  int auto_two = !(knob_set("LLAMA_TOPOLOGY") && strcmp(topology, "auto")) &&
+                 !(knob_set("LLAMA_PLACEMENT") && strcmp(placement, "hbm")) && tp_hbm_pair();
+  if (auto_two)
+    LOG(LOG_INFO, "LLAMA_SOCKETS unset: both sockets have an HBM node, so the model runs on both (LLAMA_SOCKETS=1 keeps "
+                  "one)");
+  return sockets = auto_two ? 2 : 1;
 }
 
 int tp_check_topology(const char *placement) {
@@ -180,6 +169,11 @@ static void *coordinator_main(void *p) {
 /* Runs `command` on both sockets at once: socket 1 on its coordinator, socket 0 on the calling thread. */
 static void run_both(Tp *tp, Command command) {
   tp->command = command;
+  if (tp->sockets == 1) { /* no coordinator thread: socket 0 is the calling thread */
+    if (command != CMD_STOP)
+      socket_command(tp, 0);
+    return;
+  }
   unsigned generation = ++tp->issued;
   atomic_store_explicit(&tp->command_generation, generation, memory_order_release);
   if (command == CMD_STOP)
@@ -220,12 +214,10 @@ typedef struct {
   float *partial, *residual;
   size_t ld;
   const float *x, *w;               /* FP32 */
-  const float *wp;                  /* FP32, packed4 copy of w (decode); NULL: stream w by rows */
   const K8Input *input;             /* Q8 */
   const K8Weight *wq;               /* Q8; NULL for FP32 */
-  double *leader_seconds;           /* fused: the leader's own share of the projection */
-  atomic_int claim;                 /* fused: row counter shared by the members (zero before the team starts) */
-  WorkerStamp *stamps;              /* fused, traced: one per member */
+  double *leader_seconds;           /* LLAMA_PROFILE: the leader's own share of the projection */
+  atomic_int claim;                 /* row counter shared by the members (zero before the team starts) */
 } ProjectJob;
 
 static void rows_done_fn(void *p, int r0, int r1) {
@@ -233,80 +225,22 @@ static void rows_done_fn(void *p, int r0, int r1) {
   exchange_rows_done(job->tp->exchange, job->socket, r0, r1);
 }
 
-static void project_share(const ProjectJob *job, int worker, int workers) {
-  RowsDoneFn done = job->tp->reduce_flags ? rows_done_fn : NULL;
-  if (job->wq)
-    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
-                          workers, (atomic_int *)&job->claim, done, (void *)job);
-  else if (job->wp)
-    k_matmul_p4_worker(job->partial, job->x, job->wp, job->n, job->d, K_PARTIAL, worker, workers,
-                       (atomic_int *)&job->claim, done, (void *)job);
-  else
-    k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
-                       (atomic_int *)&job->claim, done, (void *)job);
-}
-
-/* Fused form: every member computes its rows of the partial and goes straight into the reduction, whose first barrier
- * is the join of the projection. One team dispatch and join instead of two. */
+/* Decode's Wo/W2: projection and reduction fused into one team job, with no team barrier. Every member computes its
+ * rows of the partial and flags them (rows_done_fn), then adds its own element range of both sockets' partials as soon as
+ * the producers of those rows, on both sockets, have flagged them (exchange_reduce_add_flags). Measured on the 8B model:
+ * one dispatch and no barrier instead of two jobs and two barriers saves 17-19 us per reduction (B7 findings). */
 static void project_reduce_fn(const void *p, int worker, int workers) {
   const ProjectJob *job = p;
-  WorkerStamp *stamp = job->stamps ? &job->stamps[worker] : NULL;
   double start = worker == 0 && job->leader_seconds ? monotonic_seconds() : 0.0;
-  if (stamp)
-    stamp->start = start ? start : monotonic_seconds();
-  project_share(job, worker, workers);
-  if (stamp)
-    stamp->proj_end = monotonic_seconds();
-  if (start)
-    *job->leader_seconds = (stamp ? stamp->proj_end : monotonic_seconds()) - start;
-  if (job->tp->reduce_flags)
-    exchange_reduce_add_flags(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
-                              stamp ? &stamp->r : NULL);
+  if (job->wq)
+    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
+                          workers, (atomic_int *)&job->claim, rows_done_fn, (void *)job);
   else
-    exchange_reduce_add_stamped(job->tp->exchange, job->socket, worker, workers, job->residual, job->d,
-                                stamp ? &stamp->r : NULL);
-}
-
-/* Folds the members' stamps of the reduction that just ended into one record of the socket. */
-static void trace_record(Tp *tp, TpSocket *sk, const ProjectJob *job, int kind, double disp, double ret) {
-  if (sk->record_count >= TRACE_MAX_RECORDS)
-    return;
-  int n = team_size(sk->team);
-  TraceRec *r = &sk->records[sk->record_count++];
-  *r = (TraceRec){.kind = kind, .stage = (int)profile_stage, .disp = disp, .ret = ret, .end_first = 1e30};
-  const WorkerStamp *w = job->stamps;
-  for (int i = 0; i < n; i++) {
-    r->start_mean += w[i].start;
-    r->end_mean += w[i].proj_end;
-    r->add_mean += w[i].r.after_add;
-    if (w[i].start > r->start_max)
-      r->start_max = w[i].start;
-    if (w[i].proj_end < r->end_first)
-      r->end_first = w[i].proj_end;
-    if (w[i].proj_end > r->end_last) {
-      r->end_last = w[i].proj_end;
-      r->last_worker = i;
-    }
-    if (w[i].r.after_barrier1 > r->b1_last)
-      r->b1_last = w[i].r.after_barrier1;
-    if (w[i].r.after_peer > r->peer_last)
-      r->peer_last = w[i].r.after_peer;
-    if (w[i].r.after_add > r->add_last)
-      r->add_last = w[i].r.after_add;
-    if (w[i].r.after_barrier2 > r->b2_last)
-      r->b2_last = w[i].r.after_barrier2;
-  }
-  r->start_mean /= n;
-  r->end_mean /= n;
-  r->add_mean /= n;
-  r->b1_leader = w[0].r.after_barrier1;
-  r->peer_leader = w[0].r.after_peer;
-  r->b2_leader = w[0].r.after_barrier2;
-  sk->reductions[kind]++;
-  sk->last_count[kind][r->last_worker < TRACE_MAX_WORKERS ? r->last_worker : 0]++;
-  for (int i = 0; i < n && i < TRACE_MAX_WORKERS; i++)
-    sk->late_sum[kind][i] += w[i].proj_end - r->end_mean;
-  (void)tp;
+    k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
+                       (atomic_int *)&job->claim, rows_done_fn, (void *)job);
+  if (start)
+    *job->leader_seconds = monotonic_seconds() - start;
+  exchange_reduce_add_flags(job->tp->exchange, job->socket, worker, workers, job->residual, job->d, NULL);
 }
 
 static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
@@ -314,30 +248,11 @@ static void project_reduce(Tp *tp, TpSocket *sk, ProjectJob *job, int slot) {
   atomic_init(&job->claim, 0);
   job->socket = sk->socket;
   job->residual = sk->x;
-  double *prof = &tp->prof[sk->socket][profile_stage][slot];
-  if (tp->fused) {
-    double leader = 0.0;
-    job->leader_seconds = profile_enabled ? &leader : NULL;
-    job->stamps = sk->stamps;
-    double disp = sk->stamps ? monotonic_seconds() : 0.0;
-    team_run(sk->team, project_reduce_fn, job);
-    if (tp->reduce_flags)
-      exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
-    if (sk->stamps)
-      trace_record(tp, sk, job, slot - TP_WO_MM, disp, monotonic_seconds());
-    *prof += leader;
-    return;
-  }
-  double start = profile_enabled ? monotonic_seconds() : 0.0;
-  if (job->wq)
-    k_matmul_q8_ld(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL);
-  else if (job->wp)
-    k_matmul_p4(job->partial, job->x, job->wp, job->n, job->d, K_PARTIAL);
-  else
-    k_matmul_ld(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL);
-  if (profile_enabled)
-    *prof += monotonic_seconds() - start;
-  reduce(tp, sk, sk->x, job->d);
+  double leader = 0.0;
+  job->leader_seconds = profile_enabled ? &leader : NULL;
+  team_run(sk->team, project_reduce_fn, job);
+  exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
+  tp->prof[sk->socket][profile_stage][slot] += leader;
 }
 
 static const float *norm_weight(const Tp *tp, TensorRole role, int layer, int socket) {
@@ -351,7 +266,7 @@ static const float *norm_weight(const Tp *tp, TensorRole role, int layer, int so
 static const Shard *embedding_shard(const Tp *tp, int token, int *row) {
   const Shard *cls = shards_find(&tp->set, T_WCLS, -1, 0);
   if (cls->alias) {
-    for (int s = 0; s < SOCKETS; s++) {
+    for (int s = 0; s < tp->sockets; s++) {
       const Shard *sh = shards_find(&tp->set, T_WCLS, -1, s);
       if (token >= sh->row0 && token < sh->row0 + sh->rows) {
         *row = token - sh->row0;
@@ -367,7 +282,7 @@ static const Shard *embedding_shard(const Tp *tp, int token, int *row) {
 static const float *embedding_row(const Tp *tp, int token) {
   const Shard *cls = shards_find(&tp->set, T_WCLS, -1, 0);
   if (cls->alias) { /* tied: the row lives in the vocabulary shard of its owner */
-    for (int s = 0; s < SOCKETS; s++) {
+    for (int s = 0; s < tp->sockets; s++) {
       const Shard *sh = shards_find(&tp->set, T_WCLS, -1, s);
       if (token >= sh->row0 && token < sh->row0 + sh->rows)
         return (const float *)sh->q + (size_t)(token - sh->row0) * tp->c.dim;
@@ -376,6 +291,10 @@ static const float *embedding_row(const Tp *tp, int token) {
   }
   const Shard *embed = shards_find(&tp->set, T_EMBED, -1, 0);
   return (const float *)embed->q + (size_t)token * tp->c.dim;
+}
+
+static K8Weight q8_weight(const Shard *sh) {
+  return (K8Weight){(const int8_t *)sh->q, sh->s};
 }
 
 /* The engine's profile counters are shared, so only socket 0 feeds them; every socket also keeps its own in tp->prof. */
@@ -391,16 +310,35 @@ static const float *embedding_row(const Tp *tp, int token) {
       tp->prof[s][profile_stage][phase] += monotonic_seconds() - sprofile_start_;                                      \
   } while (0)
 
-/* The packed4 copy of matrix `index` (PACK_ROLES order) of layer l on this socket, or NULL. */
-static const float *repack_copy(const TpSocket *sk, int layer, int index) {
-  return sk->repack_at ? sk->repack_at[(size_t)layer * 7 + (size_t)index] : NULL;
+/* Wo or W2 for one token, out += W x into the residual: on one socket the one-socket kernel itself (k_matmul_add,
+ * k_matmul_q8_add); on two, this socket's column share into the exchange, reduced into both residuals. FP32 reads x,
+ * Q8 the prepared input `in`. Returns 0 when the workers aborted. */
+static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w, const float *x, const K8Input *in,
+                            int n) {
+  TpSocket *sk = &tp->s[s];
+  int dim = tp->c.dim;
+  if (tp->sockets == 1) {
+    if (tp->quantized)
+      SPROFILE(phase, k_matmul_q8_add(sk->x, in, q8_weight(w), n, dim, tp->gs));
+    else
+      SPROFILE(phase, k_matmul_add(sk->x, x, w->q, n, dim));
+    return 1;
+  }
+  float *partial = exchange_partial(tp->exchange, s);
+  if (!partial)
+    return 0;
+  K8Weight wq = tp->quantized ? q8_weight(w) : (K8Weight){0};
+  ProjectJob job = {.n = n, .d = dim, .gs = tp->gs, .partial = partial, .ld = w->ld, .x = x, .w = w->q, .input = in,
+                    .wq = tp->quantized ? &wq : NULL};
+  SPROFILE(phase, project_reduce(tp, sk, &job, slot));
+  return 1;
 }
 
 static void forward_fp32(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
-  int dim = p->dim, hd = p->head_dim, hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS, kvl = kl * hd;
-  int hidden_l = p->hidden_dim / SOCKETS, token = tp->token, pos = tp->pos;
+  int S = tp->sockets, dim = p->dim, hd = p->head_dim, hl = p->n_heads / S, kl = p->n_kv_heads / S, kvl = kl * hd;
+  int hidden_l = p->hidden_dim / S, token = tp->token, pos = tp->pos;
   SPROFILE(PHASE_EMBED, memcpy(sk->x, embedding_row(tp, token), (size_t)dim * sizeof(float)));
   SPROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, sk->rope));
   for (int l = 0; l < p->n_layers; l++) {
@@ -411,54 +349,34 @@ static void forward_fp32(Tp *tp, int s) {
           *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
     const float *wq = shards_find(&tp->set, T_WQ, l, s)->q, *wk = shards_find(&tp->set, T_WK, l, s)->q,
                 *wv = shards_find(&tp->set, T_WV, l, s)->q;
-    const float *rq = repack_copy(sk, l, 0), *rk = repack_copy(sk, l, 1), *rv = repack_copy(sk, l, 2);
-    if (rq && rk && rv)
-      SPROFILE(PHASE_QKV, k_matmul_qkv_p4(sk->q, k, v, sk->xb, rq, rk, rv, dim, dim / SOCKETS, kvl));
-    else
-      SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / SOCKETS, kvl));
+    SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / S, kvl));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     if (head_layout)
       SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
                k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
     SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
                                              &sk->attention, hl, kl, hd, p->seq_len, pos));
-    const Shard *wo = shards_find(&tp->set, T_WO, l, s);
-    float *partial = exchange_partial(tp->exchange, s);
-    if (!partial)
+    if (!project_residual(tp, s, PHASE_WO, TP_WO_MM, shards_find(&tp->set, T_WO, l, s), sk->xb, NULL, dim / S))
       return;
-    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .partial = partial, .ld = wo->ld, .x = sk->xb, .w = wo->q,
-                         .wp = repack_copy(sk, l, 3)};
-    SPROFILE(PHASE_WO, project_reduce(tp, sk, &wo_job, TP_WO_MM));
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     const float *w1 = shards_find(&tp->set, T_W1, l, s)->q, *w3 = shards_find(&tp->set, T_W3, l, s)->q;
-    const float *r1 = repack_copy(sk, l, 4), *r3 = repack_copy(sk, l, 6);
-    if (r1 && r3)
-      SPROFILE(PHASE_W1_W3, k_matmul_swiglu_p4(sk->hb, sk->xb, r1, r3, dim, hidden_l));
-    else
-      SPROFILE(PHASE_W1_W3, k_matmul_swiglu(sk->hb, sk->xb, w1, w3, dim, hidden_l));
-    const Shard *w2 = shards_find(&tp->set, T_W2, l, s);
-    partial = exchange_partial(tp->exchange, s);
-    if (!partial)
+    SPROFILE(PHASE_W1_W3, k_matmul_swiglu(sk->hb, sk->xb, w1, w3, dim, hidden_l));
+    if (!project_residual(tp, s, PHASE_W2, TP_W2_MM, shards_find(&tp->set, T_W2, l, s), sk->hb, NULL, hidden_l))
       return;
-    ProjectJob w2_job = {.n = hidden_l, .d = dim, .partial = partial, .ld = w2->ld, .x = sk->hb, .w = w2->q,
-                         .wp = repack_copy(sk, l, 5)};
-    SPROFILE(PHASE_W2, project_reduce(tp, sk, &w2_job, TP_W2_MM));
     if (sk->debug)
       memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
   }
+  if (!tp->want_logits)
+    return;
   SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->x, sk->x, norm_weight(tp, T_RMS_FINAL, -1, s), dim, p->norm_eps));
   const Shard *cls = shards_find(&tp->set, T_WCLS, -1, s);
   SPROFILE(PHASE_CLASSIFIER, k_matmul(tp->logits + cls->row0, sk->x, cls->q, dim, cls->rows));
 }
 
-/* Q8_0 (B6): the same group size, scales and activation rule as runq.c. Row shards quantize the full normalized input,
- * which is identical on both sockets; Wo and W2 quantize only the owned slice, which starts on a group boundary, so
- * its groups are exactly the original groups. */
-static K8Weight q8_weight(const Shard *sh) {
-  return (K8Weight){(const int8_t *)sh->q, sh->s};
-}
-
+/* Q8_0 (B6): the checkpoint's group size and scales and the Q8_0 activation rule (W8A8, or FP32 inputs for W8A32). Row
+ * shards quantize the full normalized input, which is identical on both sockets; Wo and W2 quantize only the owned
+ * slice, which starts on a group boundary, so its groups are exactly the original groups. */
 static K8Input q8_input(const Tp *tp, int8_t *q, float *scales, const float *x, int n) {
   if (tp->fp32_activations)
     return (K8Input){NULL, NULL, x};
@@ -469,9 +387,9 @@ static K8Input q8_input(const Tp *tp, int8_t *q, float *scales, const float *x, 
 static void forward_q8(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
-  int dim = p->dim, hd = p->head_dim, gs = tp->gs, hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS,
+  int S = tp->sockets, dim = p->dim, hd = p->head_dim, gs = tp->gs, hl = p->n_heads / S, kl = p->n_kv_heads / S,
       kvl = kl * hd;
-  int hidden_l = p->hidden_dim / SOCKETS, token = tp->token, pos = tp->pos;
+  int hidden_l = p->hidden_dim / S, token = tp->token, pos = tp->pos;
   int row;
   const Shard *embed = embedding_shard(tp, token, &row);
   SPROFILE(PHASE_EMBED, for (int i = 0; i < dim; i++) sk->x[i] =
@@ -487,39 +405,29 @@ static void forward_q8(Tp *tp, int s) {
           *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
     K8Weight wq = q8_weight(shards_find(&tp->set, T_WQ, l, s)), wk = q8_weight(shards_find(&tp->set, T_WK, l, s)),
              wv = q8_weight(shards_find(&tp->set, T_WV, l, s));
-    SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / SOCKETS, kvl, gs));
+    SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / S, kvl, gs));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     if (head_layout)
       SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
                k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
     SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
                                              &sk->attention, hl, kl, hd, p->seq_len, pos));
-    const Shard *wo = shards_find(&tp->set, T_WO, l, s);
-    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->xb, dim / SOCKETS));
-    float *partial = exchange_partial(tp->exchange, s);
-    if (!partial)
+    SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->xb, dim / S));
+    if (!project_residual(tp, s, PHASE_WO, TP_WO_MM, shards_find(&tp->set, T_WO, l, s), sk->xb, &in, dim / S))
       return;
-    K8Weight wo_weight = q8_weight(wo);
-    ProjectJob wo_job = {.n = dim / SOCKETS, .d = dim, .gs = gs, .partial = partial, .ld = wo->ld, .input = &in,
-                         .wq = &wo_weight};
-    SPROFILE(PHASE_WO, project_reduce(tp, sk, &wo_job, TP_WO_MM));
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
     K8Weight w1 = q8_weight(shards_find(&tp->set, T_W1, l, s)), w3 = q8_weight(shards_find(&tp->set, T_W3, l, s));
     SPROFILE(PHASE_W1_W3, k_matmul_q8_swiglu(sk->hb, &in, w1, w3, dim, hidden_l, gs));
-    const Shard *w2 = shards_find(&tp->set, T_W2, l, s);
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->hb, hidden_l));
-    partial = exchange_partial(tp->exchange, s);
-    if (!partial)
+    if (!project_residual(tp, s, PHASE_W2, TP_W2_MM, shards_find(&tp->set, T_W2, l, s), sk->hb, &in, hidden_l))
       return;
-    K8Weight w2_weight = q8_weight(w2);
-    ProjectJob w2_job = {.n = hidden_l, .d = dim, .gs = gs, .partial = partial, .ld = w2->ld, .input = &in,
-                         .wq = &w2_weight};
-    SPROFILE(PHASE_W2, project_reduce(tp, sk, &w2_job, TP_W2_MM));
     if (sk->debug)
       memcpy(sk->debug + (size_t)l * dim, sk->x, (size_t)dim * sizeof(float));
   }
+  if (!tp->want_logits)
+    return;
   SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->x, sk->x, norm_weight(tp, T_RMS_FINAL, -1, s), dim, p->norm_eps));
   K8Input in;
   SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->x, dim));
@@ -586,18 +494,21 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
  * products the quantized rows `aq`/`as` (dense, stride k and k / gs). */
 static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, const int8_t *aq, const float *as, int k,
                                 const Shard *w, void *packed) {
-  float *partial = exchange_partial(tp->exchange, sk->socket);
+  /* One socket adds the product straight into the residual (GEMM_ADD): no partial, no reduction. */
+  int one = tp->sockets == 1;
+  float *partial = one ? sk->x : exchange_partial(tp->exchange, sk->socket);
   if (!partial)
     return 0;
+  GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
   if (tp->quantized) {
-    GemmQ8Segment seg = {.c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .n = tp->c.dim,
-                         .kind = GEMM_PARTIAL};
+    GemmQ8Segment seg = {.c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .n = tp->c.dim, .kind = kind};
     k_gemm_q8(aq, as, tp->bcount, k, tp->gs, &seg, 1);
   } else {
-    GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = GEMM_PARTIAL};
+    GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
     gemm_f32_or_bf16(tp, sk, a, lda, k, &seg, 1, &packed, NULL);
   }
-  reduce(tp, sk, sk->x, tp->bcount * tp->c.dim);
+  if (!one)
+    reduce(tp, sk, sk->x, tp->bcount * tp->c.dim);
   return !workers_aborted();
 }
 
@@ -617,8 +528,8 @@ static void quantize_batch(const Tp *tp, int8_t *q, float *scales, const float *
 static void forward_batch(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
-  int dim = p->dim, hd = p->head_dim, hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS, kvl = kl * hd;
-  int ql = dim / SOCKETS, hidden_l = p->hidden_dim / SOCKETS, m = tp->bcount, pos0 = tp->bpos0, gs = tp->gs;
+  int S = tp->sockets, dim = p->dim, hd = p->head_dim, hl = p->n_heads / S, kl = p->n_kv_heads / S, kvl = kl * hd;
+  int ql = dim / S, hidden_l = p->hidden_dim / S, m = tp->bcount, pos0 = tp->bpos0, gs = tp->gs;
   int q8 = tp->quantized;
   SPROFILE(PHASE_EMBED, embed_rows(tp, sk));
   SPROFILE(PHASE_ROPE_TABLE, rope_tables(tp, sk));
@@ -715,11 +626,13 @@ static void forward_batch(Tp *tp, int s) {
 static void setup_socket(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
-  int hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS;
+  int S = tp->sockets, hl = p->n_heads / S, kl = p->n_kv_heads / S;
   /* The socket that uses the work region writes all of it once, so every page exists on its own node and the page query
-   * can verify the region like the others (a fresh mapping is zero already; this only makes the pages exist). */
-  memset(sk->work.data, 0, sk->work.data_bytes);
-  char *cursor = sk->work.data;
+   * can verify the region like the others (a fresh mapping is zero already; this only makes the pages exist). One
+   * socket's run memory was zeroed by its team when it was sealed (runmem_seal), or comes zeroed from the heap. */
+  if (S == 2)
+    memset(sk->work_data, 0, sk->work_size);
+  char *cursor = sk->work_data;
   size_t used = 0;
 #define CARVE(pointer, count, type)                                                                                    \
   do {                                                                                                                 \
@@ -730,8 +643,8 @@ static void setup_socket(Tp *tp, int s) {
   size_t rows = (size_t)tp->rows;
   CARVE(sk->x, rows * p->dim, float);
   CARVE(sk->xb, rows * p->dim, float);
-  CARVE(sk->hb, rows * (p->hidden_dim / SOCKETS), float);
-  CARVE(sk->q, rows * (p->dim / SOCKETS), float);
+  CARVE(sk->hb, rows * (p->hidden_dim / S), float);
+  CARVE(sk->q, rows * (p->dim / S), float);
   CARVE(sk->att, (size_t)hl * p->seq_len, float);
   CARVE(sk->rope, rows * 2 * (size_t)p->head_dim, float);
   if (kernels_kv_layout_head()) {
@@ -743,27 +656,29 @@ static void setup_socket(Tp *tp, int s) {
     size_t padded = (rows + 31) / 32 * 32;
     CARVE(sk->xq, padded * p->dim, int8_t);
     CARVE(sk->xs, padded * (p->dim / tp->gs), float);
-    size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / SOCKETS; /* attention output or FFN hidden */
+    size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / S; /* attention output or FFN hidden */
     CARVE(sk->aq, padded * slice, int8_t);
     CARVE(sk->as, padded * (slice / tp->gs), float);
   }
   float *attention_memory;
   CARVE(attention_memory, k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, tp->rows) / sizeof(float) + 1, float);
 #undef CARVE
-  if (used > sk->work.data_bytes)
-    fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work.data_bytes, used);
+  if (used > sk->work_size)
+    fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work_size, used);
   k_attention_init_rows(&sk->attention, hl, kl, p->head_dim, p->seq_len, tp->rows, attention_memory);
-  sk->key_cache = sk->kv_k.data;
-  sk->value_cache = sk->kv_v.data;
+  if (S == 2) {
+    sk->key_cache = sk->kv_k.data;
+    sk->value_cache = sk->kv_v.data;
+  }
 }
 
-/* ---- sizing (D1 §4.2) -------------------------------------------------------------------------------------------- */
+/* ---- region sizes -------------------------------------------------------------------------------------------- */
 
-size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
-  int hl = p->n_heads / SOCKETS, kl = p->n_kv_heads / SOCKETS;
-  size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / SOCKETS;
+static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs, int rows) {
+  int hl = p->n_heads / sockets, kl = p->n_kv_heads / sockets;
+  size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / sockets;
   size_t bytes = 64 * 16; /* alignment of each buffer */
-  bytes += (size_t)rows * (size_t)(2 * p->dim + p->hidden_dim / SOCKETS + p->dim / SOCKETS + 2 * p->head_dim) *
+  bytes += (size_t)rows * (size_t)(2 * p->dim + p->hidden_dim / sockets + p->dim / sockets + 2 * p->head_dim) *
            sizeof(float);
   bytes += (size_t)hl * p->seq_len * sizeof(float);
   if (kernels_kv_layout_head()) /* the K/V row buffers of LLAMA_KV_LAYOUT=head */
@@ -776,52 +691,16 @@ size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
   return bytes;
 }
 
+size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
+  return work_bytes_for(p, SOCKETS, quantized, gs, rows);
+}
+
 size_t tp_exchange_bytes(const Config *p, int rows) {
   return exchange_region_bytes(checked_mul((size_t)rows, (size_t)p->dim));
 }
 
-size_t tp_exchange_payload_bytes(const Config *p, int rows) {
-  return (size_t)rows * (size_t)p->dim * sizeof(float);
-}
-
-size_t tp_peer_bytes_per_token(const Config *p) {
-  return 2 * (size_t)p->n_layers * (size_t)p->dim * sizeof(float);
-}
-
-static double exchange_us(const Config *p, int rows, const TpSizingInput *in) {
-  return 2.0 * (in->exchange_latency_us + (double)tp_exchange_payload_bytes(p, rows) / (in->exchange_gbps * 1e3));
-}
-
-double tp_exchange_fraction(const Config *p, int rows, const TpSizingInput *in) {
-  double exchange = exchange_us(p, rows, in), compute = rows * in->layer_us_per_row;
-  if (compute < in->layer_weight_us)
-    compute = in->layer_weight_us; /* below the ridge a layer costs what streaming its shard costs */
-  return exchange / (exchange + compute);
-}
-
-int tp_choose_batch(const Config *p, int quantized, int gs, const TpSizingInput *in, const int *candidates, int count,
-                    TpSizingRow *out) {
-  int chosen = 0;
-  for (int i = 0; i < count; i++) {
-    int m = candidates[i];
-    TpSizingRow *row = &out[i];
-    row->rows = m;
-    row->work_bytes = tp_work_bytes(p, quantized, gs, m);
-    row->exchange_bytes = tp_exchange_bytes(p, m);
-    row->fits = m >= 1 && (size_t)m * (size_t)p->dim <= (size_t)INT_MAX &&
-                row->work_bytes + row->exchange_bytes <= in->work_budget;
-    row->ridge = m >= in->ridge;
-    row->fraction = tp_exchange_fraction(p, m, in);
-    row->exchange_ok = row->fraction <= in->max_exchange_fraction;
-    row->feasible = row->fits && row->ridge && row->exchange_ok;
-    if (row->feasible && m > chosen)
-      chosen = m;
-  }
-  return chosen;
-}
-
 static size_t work_bytes(const Tp *tp) {
-  return tp_work_bytes(&tp->c, tp->quantized, tp->gs, tp->rows);
+  return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows);
 }
 
 static void socket_command(Tp *tp, int socket) {
@@ -838,9 +717,6 @@ static void socket_command(Tp *tp, int socket) {
       pack_bf16_vnni_many(tp->bjobs[socket], tp->njobs[socket]);
     else
       pack_s8_vnni_many(tp->sjobs[socket], tp->njobs[socket]);
-    break;
-  case CMD_REPACK:
-    k_pack4_many(tp->rjobs[socket], tp->rjobs_n[socket]);
     break;
   case CMD_PACK_CLS:
     pack_bf16_vnni_many(tp->bjobs[socket], 1);
@@ -910,66 +786,23 @@ static size_t packed_region_bytes(const Tp *tp, int s) {
 
 /* The per-socket HBM budget counts everything a socket holds: its weight shards (the FP32 copy stays for decode), the
  * packed copies, both KV caches, the work region and the exchange buffers. */
-static void check_budget(const Tp *tp, int s, const char *mode, size_t kv_bytes, size_t packed_bytes,
-                         size_t repack_bytes) {
+static void check_budget(const Tp *tp, int s, const char *mode, size_t kv_bytes, size_t packed_bytes) {
   size_t budget = placement_hbm_budget();
   if (strcmp(mode, "hbm"))
     return;
   size_t used = tp->set.region_bytes[s] + 2 * kv_bytes + work_bytes(tp) + tp_exchange_bytes(&tp->c, tp->rows) +
-                packed_bytes + repack_bytes;
+                packed_bytes;
   if (used > budget)
-    fail("socket %d needs %zu bytes of HBM (%zu of shards, %zu of packed %s copies, %zu of packed4 decode copies, %zu of "
-         "KV caches) but LLAMA_HBM_BUDGET_GIB allows %zu per socket",
-         s, used, tp->set.region_bytes[s], packed_bytes, tp->pack == TP_PACK_BF16 ? "BF16" : "int8", repack_bytes,
-         2 * kv_bytes, budget);
-}
-
-/* ---- packed4 decode copies (B7) ------------------------------------------------------------------------------------ */
-
-/* Whether the shard can be packed in four-row groups. */
-static int repackable_shape(const Shard *sh) {
-  return sh && (sh->kind == SHARD_ROWS || sh->kind == SHARD_COLS) && sh->rows > 0 && sh->rows % 4 == 0 && sh->cols > 0;
-}
-
-/* What socket s's repack region must hold: its shard of every matrix of every layer that can be packed. */
-static size_t repack_region_bytes(const Tp *tp, int s) {
-  size_t total = 0;
-  for (int l = 0; l < tp->c.n_layers; l++)
-    for (int i = 0; i < 7; i++) {
-      const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
-      if (repackable_shape(sh))
-        total = align_line(total) + k_pack4_floats(sh->rows, sh->cols) * sizeof(float);
-    }
-  return total;
-}
-
-/* Main thread, after the shards are bound: carves the region and plans the packing jobs the coordinators run. */
-static void plan_repack(Tp *tp) {
-  for (int s = 0; s < SOCKETS; s++) {
-    TpSocket *sk = &tp->s[s];
-    size_t count = (size_t)tp->c.n_layers * 7, used = 0;
-    sk->repack_at = memory_alloc(count, sizeof(float *), MEM_METADATA);
-    tp->rjobs[s] = memory_alloc(count, sizeof(Pack4Job), MEM_METADATA);
-    for (int l = 0; l < tp->c.n_layers; l++)
-      for (int i = 0; i < 7; i++) {
-        const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
-        if (!repackable_shape(sh) || !sh->q)
-          continue;
-        used = align_line(used);
-        float *dst = (float *)((char *)sk->repack.data + used);
-        used += k_pack4_floats(sh->rows, sh->cols) * sizeof(float);
-        sk->repack_at[(size_t)l * 7 + (size_t)i] = dst;
-        tp->rjobs[s][tp->rjobs_n[s]++] = (Pack4Job){dst, sh->q, sh->rows, sh->cols, sh->ld};
-      }
-    if (used > sk->repack.logical_bytes)
-      fail("socket %d repack region holds %zu bytes, %zu needed", s, sk->repack.logical_bytes, used);
-  }
+    fail("socket %d needs %zu bytes of HBM (%zu of shards, %zu of packed %s copies, %zu of KV caches) but "
+         "LLAMA_HBM_BUDGET_GIB allows %zu per socket",
+         s, used, tp->set.region_bytes[s], packed_bytes, tp->pack == TP_PACK_BF16 ? "BF16" : "int8", 2 * kv_bytes,
+         budget);
 }
 
 /* Main thread, after the shards are bound: carves the packed region of every socket and plans the packing jobs. The
  * coordinators only run them (the region bookkeeping is not thread-safe). */
 static void plan_packing(Tp *tp) {
-  for (int s = 0; s < SOCKETS; s++) {
+  for (int s = 0; s < tp->sockets; s++) {
     TpSocket *sk = &tp->s[s];
     size_t count = (size_t)tp->c.n_layers * 7;
     sk->packed_at = memory_alloc(count, sizeof(void *), MEM_METADATA);
@@ -983,7 +816,7 @@ static void plan_packing(Tp *tp) {
       for (int i = 0; i < 7; i++) {
         const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
         used = align_line(used);
-        char *dst = (char *)sk->packed.data + used;
+        char *dst = (char *)sk->packed_data + used;
         used += pack_bytes_of(tp, sh);
         size_t at = (size_t)l * 7 + (size_t)i;
         sk->packed_at[at] = dst;
@@ -992,17 +825,31 @@ static void plan_packing(Tp *tp) {
         else
           tp->sjobs[s][at] = pack_s8_job_from_shard((int8_t *)dst, sh);
       }
-    if (used > sk->packed.logical_bytes)
-      fail("socket %d packed region holds %zu bytes, %zu needed", s, sk->packed.logical_bytes, used);
+    if (used > sk->packed_size)
+      fail("socket %d packed region holds %zu bytes, %zu needed", s, sk->packed_size, used);
   }
 }
 
 /* The classifier range of each socket in BF16, built when all-position logits are first asked for (the default
  * last-row classifier stays FP32, as on one socket). */
 static void pack_classifier(Tp *tp) {
+  double start = monotonic_seconds();
+  if (tp->sockets == 1) { /* the one-socket packed store, on the weights' node */
+    const Shard *cls = shards_find(&tp->set, T_WCLS, -1, 0);
+    size_t bytes = bf16_vnni_elements(cls->rows, cls->cols) * sizeof(uint16_t);
+    packed_open(&tp->local_cls, bytes, "the packed BF16 classifier");
+    tp->s[0].cls_bf16 = packed_take(&tp->local_cls, bytes);
+    tp->bjobs[0][0] = pack_bf16_job_from_shard(tp->s[0].cls_bf16, cls);
+    run_both(tp, CMD_PACK_CLS);
+    packed_seal(&tp->local_cls);
+    metrics.weight_pack_s += monotonic_seconds() - start;
+    LOG(LOG_INFO, "packed %zu bytes of BF16 classifier in %.2f s", tp->local_cls.region.logical_bytes,
+        monotonic_seconds() - start);
+    tp->cls_ready = 1;
+    return;
+  }
   const char *mode = placement_mode();
   const Topology *topology = numa_topology();
-  double start = monotonic_seconds();
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];
     const Shard *cls = shards_find(&tp->set, T_WCLS, -1, s);
@@ -1022,44 +869,84 @@ static void pack_classifier(Tp *tp) {
   tp->cls_ready = 1;
 }
 
-Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
-              int max_batch, TpPack pack) {
+/* What both constructors share: the precision, the batch capacity and the packing mode. */
+static Tp *tp_new(const Config *p, int sockets, int quantized, int gs, int fp32_activations, int max_batch,
+                  TpPack pack) {
   Tp *tp = memory_alloc(1, sizeof(*tp), MEM_METADATA);
   if ((pack == TP_PACK_BF16 && quantized) || (pack == TP_PACK_INT8 && (!quantized || fp32_activations)))
     fail("packed shards: BF16 needs an FP32 checkpoint and int8 needs W8A8");
+  tp->sockets = sockets;
   tp->pack = pack;
-  /* The batched forward takes FP32 and W8A8; W8A32 is per token, like the one-socket C6 rule, so it keeps one row. */
+  /* The batched forward takes FP32 and W8A8; W8A32 is per token (the C6 rule), so it keeps one row. */
   tp->rows = (quantized && fp32_activations) || max_batch < 1 ? 1 : max_batch;
-  if (checked_mul((size_t)tp->rows, (size_t)p->dim) > (size_t)INT_MAX)
-    fail("LLAMA_PREFILL_BATCH=%d is too large for LLAMA_SOCKETS=2: the exchange holds %d x %d elements", tp->rows,
-         tp->rows, p->dim);
   tp->c = *p;
   tp->quantized = quantized;
   tp->fp32_activations = fp32_activations;
   tp->gs = quantized ? gs : 0;
+  return tp;
+}
+
+Tp *tp_create_local(const Config *p, const TensorManifest *m, const WeightStore *store, int quantized, int gs,
+                    int fp32_activations, int max_batch, TpPack pack) {
+  Tp *tp = tp_new(p, 1, quantized, gs, fp32_activations, max_batch, pack);
+  TpSocket *sk = &tp->s[0];
+  sk->team = pool_team(0);
+  /* One socket's shards are whole tensors (shards.h), so each is a view into the store at its file offset: the mapping
+   * in file mode, the owned regions otherwise. Nothing is copied here. */
+  shards_plan(&tp->set, m, p, 1, gs);
+  for (int i = 0; i < tp->set.count; i++) {
+    Shard *sh = &tp->set.t[i];
+    if (sh->row0 || sh->col0 || sh->rows != sh->src->rows || sh->cols != sh->src->cols)
+      fail("one-socket shard of %s is not the whole tensor", manifest_role_name(sh->src->role));
+    sh->q = (void *)weights_at(store, sh->src->offset);
+    sh->s = sh->src->dtype == DT_Q8 ? (float *)weights_at(store, sh->src->scale_offset) : NULL;
+  }
+  /* The run state: KV caches and the work region where the loader places them (heap in file mode, else on the
+   * weights' node, sized in a first pass and carved in a second; A5). */
+  tp->kv_dim_local = p->head_dim * p->n_kv_heads;
+  runmem_init(&tp->mem, checked_mul(checked_mul((size_t)p->n_layers, (size_t)p->seq_len),
+                                    (size_t)tp->kv_dim_local * sizeof(float)));
+  sk->work_size = work_bytes(tp);
+  sk->work_data = runmem_alloc(&tp->mem, sk->work_size, 1);
+  if (runmem_sizing(&tp->mem)) {
+    runmem_seal(&tp->mem);
+    sk->work_data = runmem_alloc(&tp->mem, sk->work_size, 1);
+  }
+  sk->key_cache = runmem_cache(&tp->mem, 0);
+  sk->value_cache = runmem_cache(&tp->mem, 1);
+  setup_socket(tp, 0);
+  tp->logits = memory_alloc((size_t)p->vocab_size, sizeof(float), MEM_ACTIVATION);
+  if (pack == TP_PACK_BF16)
+    aligned_buffer_alloc(&sk->panel, k_gemm_bf16_panel_bytes(tp->rows, p->dim > p->hidden_dim ? p->dim : p->hidden_dim),
+                         MEM_ACTIVATION);
+  if (pack != TP_PACK_NONE) {
+    double start = monotonic_seconds();
+    sk->packed_size = packed_region_bytes(tp, 0);
+    packed_open(&tp->local_packed, sk->packed_size,
+                pack == TP_PACK_BF16 ? "the packed BF16 weights" : "the packed int8 weights");
+    sk->packed_data = packed_take(&tp->local_packed, sk->packed_size);
+    plan_packing(tp);
+    run_both(tp, CMD_PACK);
+    packed_seal(&tp->local_packed);
+    metrics.weight_pack_s += monotonic_seconds() - start;
+    metrics.weight_packed = 1;
+    LOG(LOG_INFO, "packed %zu bytes of %s in %.2f s", tp->local_packed.region.logical_bytes,
+        pack == TP_PACK_BF16 ? "BF16 weights" : "int8 weights for AMX-INT8", monotonic_seconds() - start);
+  }
+  return tp;
+}
+
+Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
+              int max_batch, TpPack pack) {
+  Tp *tp = tp_new(p, SOCKETS, quantized, gs, fp32_activations, max_batch, pack);
+  if (checked_mul((size_t)tp->rows, (size_t)p->dim) > (size_t)INT_MAX)
+    fail("LLAMA_PREFILL_BATCH=%d is too large for LLAMA_SOCKETS=2: the exchange holds %d x %d elements", tp->rows,
+         tp->rows, p->dim);
   tp->loader_fd = fd;
   const char *check = getenv("LLAMA_TP_CHECK");
   if (check && *check && strcmp(check, "0") && strcmp(check, "1"))
     fail("LLAMA_TP_CHECK must be 0 or 1");
   tp->check = check && !strcmp(check, "1");
-  const char *fused = getenv("LLAMA_TP_FUSED");
-  if (fused && *fused && strcmp(fused, "0") && strcmp(fused, "1"))
-    fail("LLAMA_TP_FUSED must be 0 or 1");
-  tp->fused = !(fused && !strcmp(fused, "0"));
-  const char *reduce = getenv("LLAMA_TP_REDUCE");
-  if (reduce && *reduce && strcmp(reduce, "flags") && strcmp(reduce, "barrier"))
-    fail("LLAMA_TP_REDUCE must be flags or barrier");
-  tp->reduce_flags = tp->fused && !(reduce && !strcmp(reduce, "barrier"));
-  const char *layout = getenv("LLAMA_FP32_LAYOUT");
-  if (layout && *layout && strcmp(layout, "rows") && strcmp(layout, "packed4"))
-    fail("LLAMA_FP32_LAYOUT must be rows or packed4");
-  tp->packed4 = layout && !strcmp(layout, "packed4");
-  if (tp->packed4 && quantized)
-    fail("LLAMA_FP32_LAYOUT=packed4 applies to FP32 checkpoints");
-  const char *trace = getenv("LLAMA_TP_TRACE");
-  tp->trace_path = trace && *trace ? trace : NULL;
-  if (tp->trace_path && !tp->fused)
-    fail("LLAMA_TP_TRACE needs the fused reduction (LLAMA_TP_FUSED=1)");
   shards_plan(&tp->set, m, p, SOCKETS, gs);
   const char *mode = placement_mode();
   tp_check_topology(mode);
@@ -1080,28 +967,20 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     region_reserve(&sk->kv_k, kv_bytes, s, node, ROLE_KV_K, thp);
     region_reserve(&sk->kv_v, kv_bytes, s, node, ROLE_KV_V, thp);
     size_t packed_bytes = pack == TP_PACK_NONE ? 0 : packed_region_bytes(tp, s);
-    size_t repack_bytes = tp->packed4 ? repack_region_bytes(tp, s) : 0;
-    check_budget(tp, s, mode, kv_bytes, packed_bytes, repack_bytes);
-    if (packed_bytes)
+    check_budget(tp, s, mode, kv_bytes, packed_bytes);
+    if (packed_bytes) {
       region_reserve(&sk->packed, packed_bytes, s, node, ROLE_PACKED, thp);
-    if (repack_bytes)
-      region_reserve(&sk->repack, repack_bytes, s, node, ROLE_PACKED, thp);
+      sk->packed_data = sk->packed.data;
+      sk->packed_size = sk->packed.logical_bytes;
+    }
     region_reserve(&sk->work, work_bytes(tp), s, node, ROLE_WORK, 0);
+    sk->work_data = sk->work.data;
+    sk->work_size = sk->work.data_bytes;
     region_reserve(&sk->exchange, tp_exchange_bytes(p, tp->rows), s, node, ROLE_WORK, 0);
     exchange_regions[s] = &sk->exchange;
     region_mark_populated(&sk->kv_k);
     region_mark_populated(&sk->kv_v);
     region_mark_populated(&sk->work);
-    if (tp->trace_path) {
-      int n = team_size(sk->team);
-      if (n > TRACE_MAX_WORKERS)
-        fail("LLAMA_TP_TRACE supports at most %d workers per socket", TRACE_MAX_WORKERS);
-      if (posix_memalign((void **)&sk->stamps, 64, (size_t)n * sizeof(WorkerStamp)))
-        fail("cannot allocate the trace stamps");
-      sk->records = calloc(TRACE_MAX_RECORDS, sizeof(TraceRec));
-      if (!sk->records)
-        fail("cannot allocate the trace records");
-    }
   }
   if (tp->set.global_bytes)
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
@@ -1167,25 +1046,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     LOG(LOG_INFO, "packed %zu + %zu bytes of %s shard copies in %.2f s", tp->s[0].packed.logical_bytes,
         tp->s[1].packed.logical_bytes, pack == TP_PACK_BF16 ? "BF16" : "int8", monotonic_seconds() - start);
   }
-  if (tp->packed4) {
-    start = monotonic_seconds();
-    plan_repack(tp);
-    run_both(tp, CMD_REPACK);
-    for (int s = 0; s < SOCKETS; s++)
-      if (tp->s[s].repack.mapping_base) {
-        region_mark_populated(&tp->s[s].repack);
-        region_protect(&tp->s[s].repack);
-      }
-    metrics.weight_pack_s += monotonic_seconds() - start;
-    metrics.weight_packed = 1;
-    LOG(LOG_INFO, "packed4 decode copies: %zu + %zu bytes in %.2f s", tp->s[0].repack.logical_bytes,
-        tp->s[1].repack.logical_bytes, monotonic_seconds() - start);
-  }
   start = monotonic_seconds();
   for (int s = 0; s < SOCKETS; s++) {
     verify_bound(&tp->s[s].weights, mode);
     verify_bound(&tp->s[s].packed, mode);
-    verify_bound(&tp->s[s].repack, mode);
     verify_bound(&tp->s[s].work, mode);
     verify_bound(&tp->s[s].exchange, mode);
   }
@@ -1197,57 +1061,9 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
 }
 
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
- * including its reduction, wo_mm/w2_mm the projection alone (unfused: its team job; fused: the leader's own share, so the
- * slowest member's lateness shows up as `straggler`). The exchange components are the leader's: straggler (waiting for
- * the socket's last partial write), peer (waiting for the other socket), add, close (final barrier) and buffer (waiting
- * for a free partial buffer). */
-static void write_trace(const Tp *tp) {
-  FILE *f = fopen(tp->trace_path, "w");
-  if (!f) {
-    LOG(LOG_WARN, "cannot write the reduction trace %s", tp->trace_path);
-    return;
-  }
-  fprintf(f, "socket,stage,kind,index,disp_s,start_mean,start_max,end_first,end_mean,end_last,b1_leader,b1_last,"
-             "peer_leader,peer_last,add_mean,add_last,b2_leader,b2_last,ret,last_worker\n");
-  for (int s = 0; s < SOCKETS; s++)
-    for (size_t i = 0; i < tp->s[s].record_count; i++) {
-      const TraceRec *r = &tp->s[s].records[i];
-#define US(field) ((r->field - r->disp) * 1e6)
-      fprintf(f, "%d,%d,%d,%zu,%.9f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n", s,
-              r->stage, r->kind, i, r->disp, US(start_mean), US(start_max), US(end_first), US(end_mean), US(end_last),
-              US(b1_leader), US(b1_last), US(peer_leader), US(peer_last), US(add_mean), US(add_last), US(b2_leader),
-              US(b2_last), US(ret), r->last_worker);
-#undef US
-    }
-  fclose(f);
-  LOG(LOG_INFO, "reduction trace written to %s", tp->trace_path);
-  /* The members that finish their share last most often, and how late the usual suspects are. */
-  for (int s = 0; s < SOCKETS; s++)
-    for (int kind = 0; kind < 2; kind++) {
-      const TpSocket *sk = &tp->s[s];
-      if (!sk->reductions[kind])
-        continue;
-      int n = team_size(sk->team), top[3] = {-1, -1, -1};
-      for (int w = 0; w < n && w < TRACE_MAX_WORKERS; w++)
-        for (int t = 0; t < 3; t++)
-          if (top[t] < 0 || sk->last_count[kind][w] > sk->last_count[kind][top[t]]) {
-            for (int u = 2; u > t; u--)
-              top[u] = top[u - 1];
-            top[t] = w;
-            break;
-          }
-      char line[512];
-      size_t used = (size_t)snprintf(line, sizeof(line), "trace socket %d %s (%zu reductions): last to finish the projection:", s,
-                                     kind ? "w2" : "wo", sk->reductions[kind]);
-      for (int t = 0; t < 3; t++)
-        if (top[t] >= 0)
-          used += (size_t)snprintf(line + used, sizeof(line) - used, " worker %d %.1f%% (mean %+.2f us)", top[t],
-                                   100.0 * sk->last_count[kind][top[t]] / (double)sk->reductions[kind],
-                                   sk->late_sum[kind][top[t]] / (double)sk->reductions[kind] * 1e6);
-      LOG(LOG_INFO, "%s", line);
-    }
-}
-
+ * including its reduction, wo_mm/w2_mm the leader's own share of the projection, so the slowest member's lateness shows up
+ * as `straggler`. The exchange components are the leader's: straggler (waiting for the socket's last partial write), peer
+ * (waiting for the other socket), add, close (final barrier) and buffer (waiting for a free partial buffer). */
 static void log_profile(const Tp *tp) {
   static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
                                               "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
@@ -1258,9 +1074,8 @@ static void log_profile(const Tp *tp) {
       continue;
     for (int s = 0; s < SOCKETS; s++) {
       char line[1024];
-      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token, fused=%d, reduce=%s):",
-                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage], tp->fused,
-                                     tp->reduce_flags ? "flags" : "barrier");
+      size_t used = (size_t)snprintf(line, sizeof(line), "tp %s socket %d (%zu tokens, ms/token):",
+                                     stage == STAGE_PREFILL ? "prefill" : "decode", s, tp->tokens[stage]);
       for (int i = 0; i < TP_SLOTS && used < sizeof(line); i++)
         if (tp->prof[s][stage][i] > 0)
           used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%.3f", names[i],
@@ -1273,11 +1088,12 @@ static void log_profile(const Tp *tp) {
   }
 }
 
-float *tp_forward(Tp *tp, int token, int pos) {
+float *tp_forward(Tp *tp, int token, int pos, int logits) {
   tp->token = token;
   tp->pos = pos;
+  tp->want_logits = logits;
   run_both(tp, CMD_FORWARD);
-  if (profile_enabled && !workers_aborted()) {
+  if (tp->sockets == 2 && profile_enabled && !workers_aborted()) {
     tp->tokens[profile_stage]++;
     for (int s = 0; s < SOCKETS; s++) {
       double now[5];
@@ -1293,7 +1109,7 @@ float *tp_forward(Tp *tp, int token, int pos) {
       if (memcmp(tp->s[0].debug + (size_t)l * tp->c.dim, tp->s[1].debug + (size_t)l * tp->c.dim,
                  (size_t)tp->c.dim * sizeof(float)))
         fail("LLAMA_TP_CHECK: the residual copies of the two sockets differ after layer %d (position %d)", l, pos);
-  return tp->logits;
+  return logits ? tp->logits : NULL;
 }
 
 float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWanted want) {
@@ -1309,7 +1125,7 @@ float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWa
   tp->bpos0 = pos0;
   tp->bwant = want;
   run_both(tp, CMD_FORWARD_BATCH);
-  if (profile_enabled && !workers_aborted()) {
+  if (tp->sockets == 2 && profile_enabled && !workers_aborted()) {
     tp->tokens[profile_stage] += (size_t)count;
     for (int s = 0; s < SOCKETS; s++) {
       double now[5];
@@ -1328,11 +1144,13 @@ float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWa
   return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? tp->batch_logits : tp->logits;
 }
 
-int tp_batch_capacity(const Tp *tp) {
-  return tp->rows;
-}
-
 void tp_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
+  if (tp->sockets == 1) {
+    size_t active = checked_mul(checked_mul(checked_mul(2, (size_t)tp->c.n_layers), (size_t)position),
+                                (size_t)tp->kv_dim_local * sizeof(float));
+    runmem_kv_stats(&tp->mem, active, verify, out);
+    return;
+  }
   size_t per_socket =
       checked_mul(checked_mul((size_t)tp->c.n_layers, (size_t)tp->c.seq_len), (size_t)tp->kv_dim_local * sizeof(float));
   *out = (KvStats){.reserved_bytes = checked_mul(checked_mul(2, SOCKETS), per_socket),
@@ -1378,10 +1196,6 @@ void tp_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
   out->resident_bytes = (size_t)(resident + 0.5);
 }
 
-size_t tp_shard_bytes(const Tp *tp, int socket) {
-  return tp->set.region_bytes[socket];
-}
-
 void tp_free(Tp *tp) {
   if (!tp)
     return;
@@ -1389,23 +1203,25 @@ void tp_free(Tp *tp) {
     run_both(tp, CMD_STOP);
     pthread_join(tp->thread, NULL);
   }
-  if (profile_enabled)
+  if (profile_enabled && tp->sockets == 2)
     log_profile(tp);
-  if (tp->trace_path)
-    write_trace(tp);
   exchange_destroy(tp->exchange);
+  if (tp->sockets == 1) {
+    runmem_free(&tp->mem, tp->s[0].work_data);
+    runmem_free(&tp->mem, tp->s[0].key_cache);
+    runmem_free(&tp->mem, tp->s[0].value_cache);
+    k_attention_free(&tp->s[0].attention);
+    runmem_release(&tp->mem);
+    packed_close(&tp->local_packed);
+    packed_close(&tp->local_cls);
+  }
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];
     memory_free(sk->debug);
     memory_free(sk->debug_hash);
-    free(sk->stamps);
-    free(sk->records);
     region_release(&sk->weights);
     region_release(&sk->packed);
     region_release(&sk->packed_cls);
-    region_release(&sk->repack);
-    memory_free(sk->repack_at);
-    memory_free(tp->rjobs[s]);
     memory_free(sk->packed_at);
     memory_free(tp->bjobs[s]);
     memory_free(tp->sjobs[s]);

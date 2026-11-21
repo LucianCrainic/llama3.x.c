@@ -275,6 +275,9 @@ on one socket) as attention reaches 74%.
 
 Code defaults are not changed by this run; the table says which default the evidence supports (the owner flips them).
 
+Since 20 November 2026 the code follows this table: the recommended defaults are implemented ([architecture.md](architecture.md)
+§2.1), and packed4 was removed rather than kept as an option ([audit-2026-11.md](audit-2026-11.md) F1, F4).
+
 | Feature | Becomes default when | Evidence | Decision |
 | --- | --- | --- | --- |
 | Engine-owned placement (`LLAMA_PLACEMENT=hbm`) | not slower than staged HBM, and verified | Verified in 288 of 288 reports, 0 mismatched pages. Against staged: A6 8B FP32 decode -2.4% (15.69 against 16.07; marginal miss), Q8 equal; D2 per-token prefill against C7's staged files: FP32 -0.5%, Q8 +3% (different commits) | **Option** (`file` stays the default for one socket). Required for the two-socket path, which always places and verifies its own shards. Use it where residency must be proven and for capacity |

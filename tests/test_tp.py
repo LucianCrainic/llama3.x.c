@@ -18,8 +18,8 @@ ABS, REL = 2e-6, 2e-5   # the fixture tolerance of test_runtime.py
 
 def environment(sockets, threads=3, **extra):
     env = {**os.environ, 'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(threads), 'LLAMA_TP_CHECK': '1', **extra}
-    env.pop('LLAMA_SOCKETS', None)
     env.pop('LLAMA_TOPOLOGY', None)
+    env['LLAMA_SOCKETS'] = '1'  # explicit: unset means two sockets on a dual-socket HBM node
     if sockets == 2:
         env.update(LLAMA_SOCKETS='2', LLAMA_TOPOLOGY=f'virtual:2x{threads}')
     return env
@@ -165,9 +165,7 @@ class TensorParallelTests(unittest.TestCase):
                 self.assert_agree(one, self.logits('int8', 'shared', 'batch', 2, threads, tokens=tokens, **knobs),
                                   TP_CONFIG[5])
         reference = self.probe('int8', 'shared', 'batch', 2, tokens=tokens, **knobs)
-        for variant in ({'LLAMA_TP_REDUCE': 'barrier'}, {'LLAMA_TP_FUSED': '0'}):
-            with self.subTest(**variant):
-                self.assertEqual(reference, self.probe('int8', 'shared', 'batch', 2, tokens=tokens, **knobs, **variant))
+        self.assertEqual(reference, self.probe('int8', 'shared', 'batch', 2, tokens=tokens, **knobs, LLAMA_TEAM_FANOUT='0'))
         # Decode after a batched prefill reads the cache the batch wrote.
         generated = self.probe('int8', 'unshared', 'generate', 1, **knobs)
         self.assertGreaterEqual(len(generated.split()), 8)
@@ -269,6 +267,25 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIsNone(data['runtime']['kernels_prefill'])
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
 
+    def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
+        """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the
+        explicit BF16 mode takes AMX-BF16. The emulated-tile binaries emulate no AVX-512, so `auto` starts from the scalar
+        kernels there unless the host has AVX-512; the GEMM and batch are named (on AVX-512 they are the default)."""
+        auto = {'LLAMA_KERNELS': 'auto', 'LLAMA_PREFILL_GEMM': 'on', 'LLAMA_PREFILL_BATCH': '4'}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets):
+                data = self.report('runq', 'int8.bin', sockets, fixture='wide', binary='runq-amx-emul', full=True, **auto)
+                self.assertEqual((data['runtime']['kernels_prefill'], data['build']['kernels']), ('amx-int8', 'amx'))
+                data = self.report('runq', 'int8.bin', sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                                   LLAMA_Q8_ACTIVATIONS='fp32', **auto)
+                self.assertIsNone(data['runtime']['kernels_prefill'])
+                self.assertNotEqual(data['build']['kernels'], 'amx')  # scalar, or avx512 on an AVX-512 host
+                data = self.report('run', 'fp32.bin', sockets, binary='run-amx-emul', full=True, **auto)
+                self.assertNotEqual(data['build']['kernels'], 'amx')
+                data = self.report('run', 'fp32.bin', sockets, binary='run-amx-emul', full=True, LLAMA_PRECISION='bf16',
+                                   **auto)
+                self.assertEqual((data['runtime']['kernels_prefill'], data['build']['kernels']), ('amx-bf16', 'amx'))
+
     def test_fp32_two_socket_batched_prefill_thread_counts_and_last_logits(self):
         knobs = {'LLAMA_PREFILL_GEMM': 'on'}
         tokens = [65 + (i * 5) % 19 for i in range(33)]
@@ -279,15 +296,12 @@ class TensorParallelTests(unittest.TestCase):
                 self.assert_agree(one, two, TP_CONFIG[5])
 
     def test_fp32_two_socket_batched_prefill_variants_are_bitwise_equal(self):
-        """The reduction forms and the join only change how the sockets synchronize, also for the M x dim exchange; and
-        a decode after a batched prefill reads the cache the batch wrote (greedy generation equals one socket's)."""
+        """The dispatch tree only changes how the members synchronize, also for the M x dim exchange; and a decode after a
+        batched prefill reads the cache the batch wrote (greedy generation equals one socket's)."""
         knobs = {'LLAMA_PREFILL_GEMM': 'on', 'LLAMA_PREFILL_BATCH': '4'}
         tokens = [65 + (i * 3) % 17 for i in range(13)]
         reference = self.probe('fp32', 'shared', 'batch', 2, tokens=tokens, **knobs)
-        for variant in ({'LLAMA_TP_REDUCE': 'barrier'}, {'LLAMA_TP_FUSED': '0'}, {'LLAMA_TEAM_JOIN': 'counter',
-                                                                                 'LLAMA_TEAM_FANOUT': '0'}):
-            with self.subTest(**variant):
-                self.assertEqual(reference, self.probe('fp32', 'shared', 'batch', 2, tokens=tokens, **knobs, **variant))
+        self.assertEqual(reference, self.probe('fp32', 'shared', 'batch', 2, tokens=tokens, **knobs, LLAMA_TEAM_FANOUT='0'))
         one = self.probe('fp32', 'unshared', 'generate', 1, **knobs)
         self.assertGreaterEqual(len(one.split()), 8)
         self.assertEqual(one, self.probe('fp32', 'unshared', 'generate', 2, **knobs))
@@ -351,79 +365,10 @@ class TensorParallelTests(unittest.TestCase):
         self.assertGreaterEqual(len(generated[0].split()), 8)
         self.assertEqual(generated[0], generated[1])
 
-    def test_packed4_decode_layout_agrees_with_the_row_layout(self):
-        """B7: LLAMA_FP32_LAYOUT=packed4 streams a second, four-rows-per-stream copy of the FP32 shards in decode (the shards
-        stay for the batched GEMM). Same arithmetic per row, so the logits agree to the kernel budget (the AVX-512 kernels
-        to the bit, which the cluster gate checks), for every thread count and scheduling mode, fused or not, with a
-        batched prefill in front of the decode, and for greedy generation."""
-        for name, vocab in (('shared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])):
-            rows = self.logits('fp32', name, None, 2)
-            for threads in (1, 3, 7):
-                for sched in ('static', 'dynamic', 'hybrid'):
-                    with self.subTest(fixture=name, threads=threads, sched=sched):
-                        self.assert_agree(rows, self.logits('fp32', name, None, 2, threads, LLAMA_GEMV_SCHED=sched,
-                                                            LLAMA_FP32_LAYOUT='packed4'), vocab)
-        for variant in ({'LLAMA_TP_FUSED': '0'}, {'LLAMA_TP_REDUCE': 'barrier'}):
-            with self.subTest(**variant):
-                self.assert_agree(self.logits('fp32', 'shared', None, 2),
-                                  self.logits('fp32', 'shared', None, 2, LLAMA_FP32_LAYOUT='packed4', **variant),
-                                  TP_CONFIG[5])
-        knobs = {'LLAMA_PREFILL_GEMM': 'on', 'LLAMA_PREFILL_BATCH': '4'}
-        tokens = [65 + (i * 3) % 17 for i in range(13)]
-        self.assert_agree(self.logits('fp32', 'shared', 'batch', 2, tokens=tokens, **knobs),
-                          self.logits('fp32', 'shared', 'batch', 2, tokens=tokens, LLAMA_FP32_LAYOUT='packed4', **knobs),
-                          TP_CONFIG[5])
-        generated = self.probe('fp32', 'unshared', 'generate', 2)
-        self.assertGreaterEqual(len(generated.split()), 8)
-        self.assertEqual(generated, self.probe('fp32', 'unshared', 'generate', 2, LLAMA_FP32_LAYOUT='packed4'))
-
-    def test_packed4_regions_and_validation(self):
-        data = self.report('run', 'fp32.bin', full=True, LLAMA_FP32_LAYOUT='packed4')
-        packed = [r for r in data['regions'] if r['role'] == 'packed']
-        self.assertEqual(sorted(r['socket'] for r in packed), [0, 1])
-        # Seven matrices per layer: the packed rows of each socket's shards, 16-column blocks, four rows per block row.
-        d, h, layers, heads, kvheads = TP_CONFIG[:5]
-        kv = d // heads * kvheads
-        pack = lambda rows, cols: rows // 4 * (-(-cols // 16)) * 64 * 4
-        line = lambda n: -(-n // 64) * 64
-        expected = 0
-        for _ in range(layers):
-            for size in (pack(d // 2, d), pack(kv // 2, d), pack(kv // 2, d), pack(d, d // 2), pack(h // 2, d),
-                         pack(d, h // 2), pack(h // 2, d)):
-                expected = line(expected) + size
-        for region in packed:
-            self.assertGreaterEqual(region['bytes'], expected)
-        self.assertGreater(data['memory_bytes']['packed_weights_peak'], 0)
-        # It composes with the BF16 copies (two packed regions per socket) and is refused for Q8 and bad values.
-        self.need('probe-fp32-amx-emul')
-        both = self.report('run', 'fp32.bin', binary='run-amx-emul', full=True, LLAMA_FP32_LAYOUT='packed4',
-                           LLAMA_PRECISION='bf16', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')
-        self.assertEqual(len([r for r in both['regions'] if r['role'] == 'packed']), 4)
-        for engine, extra, text in (('probe-int8', {'LLAMA_FP32_LAYOUT': 'packed4'}, b'applies to FP32 checkpoints'),
-                                    ('probe-fp32', {'LLAMA_FP32_LAYOUT': 'rowz'}, b'LLAMA_FP32_LAYOUT must be rows or packed4')):
-            model = self.fixtures['shared']/('int8.bin' if 'int8' in engine else 'fp32.bin')
-            result = subprocess.run([str(BUILD/engine), str(model), '65'], capture_output=True, timeout=60,
-                                    env=environment(2, 3, **extra))
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(text, result.stderr)
-
-    def test_fused_and_separate_reduction_are_bitwise_equal(self):
-        """The fused form (projection and reduction in one team job) only removes a dispatch: it must not change a bit."""
-        for precision, activations in (('fp32', None), ('int8', 'int8'), ('int8', 'fp32')):
-            extra = {'LLAMA_Q8_ACTIVATIONS': activations} if activations else {}
-            for threads in (1, 3, 7):
-                with self.subTest(precision=precision, activations=activations, threads=threads):
-                    fused = self.probe(precision, 'shared', None, 2, threads, LLAMA_TP_FUSED='1', **extra)
-                    separate = self.probe(precision, 'shared', None, 2, threads, LLAMA_TP_FUSED='0', **extra)
-                    self.assertEqual(fused, separate)
-
-    def test_reduction_join_and_dispatch_variants_are_bitwise_equal(self):
-        """The flag reduction against the two-barrier one, the flag join against the counter, and the dispatch tree
-        against the flat one only change how the members synchronize: not a bit of the output."""
-        variants = ({'LLAMA_TP_REDUCE': 'barrier', 'LLAMA_TEAM_JOIN': 'counter', 'LLAMA_TEAM_FANOUT': '0'},
-                    {'LLAMA_TP_REDUCE': 'flags', 'LLAMA_TEAM_JOIN': 'counter', 'LLAMA_TEAM_FANOUT': '0'},
-                    {'LLAMA_TP_REDUCE': 'barrier', 'LLAMA_TEAM_JOIN': 'flags', 'LLAMA_TEAM_FANOUT': '2'},
-                    {'LLAMA_TP_REDUCE': 'flags', 'LLAMA_TEAM_JOIN': 'flags', 'LLAMA_TEAM_FANOUT': '2'})
+    def test_dispatch_variants_are_bitwise_equal(self):
+        """The dispatch tree against the flat dispatch only changes how the members synchronize: not a bit of the
+        output."""
+        variants = ({'LLAMA_TEAM_FANOUT': '0'}, {'LLAMA_TEAM_FANOUT': '2'})
         for precision, activations in (('fp32', None), ('int8', 'int8'), ('int8', 'fp32')):
             extra = {'LLAMA_Q8_ACTIVATIONS': activations} if activations else {}
             for threads in (3, 7):
@@ -434,37 +379,24 @@ class TensorParallelTests(unittest.TestCase):
 
     def test_synchronization_knobs_are_validated(self):
         model = self.fixtures['shared']/'fp32.bin'
-        for name, message in (('LLAMA_TP_REDUCE', b'LLAMA_TP_REDUCE must be flags or barrier'),
-                              ('LLAMA_TEAM_JOIN', b'LLAMA_TEAM_JOIN must be flags or counter'),
-                              ('LLAMA_TEAM_FANOUT', b'LLAMA_TEAM_FANOUT must be 0 (flat) or a group size up to 64')):
-            result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
-                                    env=environment(2, 3, **{name: 'x'}))
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(message, result.stderr)
-
-    def test_fused_knob_is_validated(self):
-        model = self.fixtures['shared']/'fp32.bin'
         result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
-                                env=environment(2, 3, LLAMA_TP_FUSED='2'))
+                                env=environment(2, 3, LLAMA_TEAM_FANOUT='x'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b'LLAMA_TP_FUSED must be 0 or 1', result.stderr)
+        self.assertIn(b'LLAMA_TEAM_FANOUT must be 0 (flat) or a group size up to 64', result.stderr)
 
-    def test_gemv_scheduling_agrees_and_is_validated(self):
-        """Dynamic and hybrid row claiming against the static split, FP32 and Q8, on one and on two sockets, within the
-        fixture budget (an AVX-512 four-row group sums in a different order than a short tail group)."""
-        for precision, vocab in (('fp32', TP_CONFIG[5]), ('int8', TP_CONFIG[5])):
-            for sockets in (1, 2):
-                for threads in (3, 7):
-                    static = self.logits(precision, 'shared', None, sockets, threads, LLAMA_GEMV_SCHED='static')
-                    for mode in ('dynamic', 'hybrid', 'auto'):
-                        with self.subTest(precision=precision, sockets=sockets, threads=threads, mode=mode):
-                            self.assert_agree(static, self.logits(precision, 'shared', None, sockets, threads,
-                                                                  LLAMA_GEMV_SCHED=mode), vocab)
+    def test_retired_knobs_are_refused(self):
+        """A script that still sets a knob of a removed experimental path must not measure the default under the old label."""
         model = self.fixtures['shared']/'fp32.bin'
-        result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
-                                env=environment(1, 3, LLAMA_GEMV_SCHED='guided'))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b'LLAMA_GEMV_SCHED must be static, dynamic, hybrid or auto', result.stderr)
+        for name, value in (('LLAMA_FP32_LAYOUT', 'packed4'), ('LLAMA_TP_FUSED', '0'), ('LLAMA_TP_REDUCE', 'barrier'),
+                            ('LLAMA_TP_TRACE', '/dev/null'), ('LLAMA_TEAM_JOIN', 'counter'),
+                            ('LLAMA_GEMV_SCHED', 'dynamic'), ('LLAMA_ATTN_ROW_BLOCK', '4'),
+                            ('LLAMA_ATTN_TILED_QUERIES', '16'), ('LLAMA_ATTN_TILED_ORDER', 'longest'),
+                            ('LLAMA_ATTN_WORKSPACE_MIB', '1'), ('LLAMA_GEMM_KC', '512')):
+            with self.subTest(name=name):
+                result = subprocess.run([str(BUILD/'probe-fp32'), str(model), '1'], capture_output=True, timeout=60,
+                                        env=environment(2, 3, **{name: value}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(name.encode() + b' is no longer supported', result.stderr)
 
     def test_greedy_generation_is_identical(self):
         one = self.probe('fp32', 'unshared', 'generate', 1)
@@ -485,6 +417,16 @@ class TensorParallelTests(unittest.TestCase):
             else:
                 self.assertEqual(result.stdout, expected)
                 self.assertIn('"status": "completed"', report.read_text())
+
+    def test_two_sockets_imply_worker_teams(self):
+        """LLAMA_BACKEND unset and LLAMA_BACKEND=teams (still accepted) run the same teams: bitwise equal on two sockets."""
+        env = environment(2)
+        del env['LLAMA_BACKEND']
+        model = self.fixtures['shared']/'fp32.bin'
+        implied = subprocess.run([str(BUILD/'probe-fp32'), str(model), *map(str, TOKENS)], capture_output=True,
+                                 timeout=60, env=env)
+        self.assertEqual(implied.returncode, 0, implied.stderr.decode())
+        self.assertEqual(implied.stdout, self.probe('fp32', 'shared', None, 2))
 
     def test_kv_head_layout_is_bitwise_the_rows_layout(self):
         """E5.4: LLAMA_KV_LAYOUT=head ([kv_head][position][head_dim]) gives the very bytes of the rows layout, not merely
@@ -567,7 +509,7 @@ class TensorParallelTests(unittest.TestCase):
         model = self.one_kv/'fp32.bin'
         cases = [
             (model, environment(2), 'n_kv_heads=1'),
-            (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_BACKEND': 'omp'}, 'requires LLAMA_BACKEND=teams'),
+            (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_BACKEND': 'omp'}, 'the OpenMP backend was removed'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_SOCKETS': '3'}, 'LLAMA_SOCKETS must be 1 or 2'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_TOPOLOGY': 'virtual:1x3'}, 'allowed CPUs in only 1'),
             (self.fixtures['shared']/'fp32.bin', {**environment(2), 'LLAMA_PLACEMENT': 'hbm'}, 'virtual'),

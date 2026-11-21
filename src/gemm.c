@@ -7,6 +7,7 @@
  * microkernels and the VNNI packing helpers. The `amx` target attribute is used only in this file. */
 #include "gemm.h"
 #include "kernels.h"
+#include "testing.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -37,7 +38,7 @@ typedef struct {
   Micro micro;
 } GemmJob;
 
-/* Same expression as silu_gate in kernels_simd.c, so the SWIGLU epilogue rounds like the GEMV's. */
+/* Same expression as silu_gate in gemv.c, so the SWIGLU epilogue rounds like the GEMV's. */
 static float silu_gate(float value, float gate) {
   value *= (1.0f / (1.0f + expf(-value)));
   return value * gate;
@@ -268,7 +269,8 @@ static int cpu_has_amx(void) {
 #endif
 
 /* NULL when AMX can be used, else why not. Requests the kernel's tile-data permission on the first call; that must
- * happen before any worker thread executes a tile instruction, and kernels_init() is that point. */
+ * happen before any thread executes a tile instruction: kernels_init() for LLAMA_KERNELS=amx, kernels_select_amx_auto()
+ * under auto (the permission is process-wide, so workers started before it are covered). */
 const char *gemm_amx_unavailable(void) {
 #if !GEMM_AMX
   return "this build has no AMX support (it needs x86-64 and a compiler with the AMX intrinsics, GCC 11 or later)";
@@ -319,10 +321,6 @@ void gemm_amx_enable(int on) {
 
 int gemm_amx_active(void) {
   return amx_active;
-}
-
-int gemm_amx_compiled(void) {
-  return GEMM_AMX;
 }
 
 int gemm_amx_emulated(void) {
@@ -631,9 +629,7 @@ void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const flo
 int k_gemm_kc(void) {
 #if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
   if (kernels_avx512_active()) {
-    const char *value = getenv("LLAMA_GEMM_KC");
-    int kc = value && *value ? atoi(value) : DEFAULT_KC;
-    return kc >= 16 ? kc : DEFAULT_KC;
+    return DEFAULT_KC; /* the LLAMA_GEMM_KC sweep knob was removed (F5) */
   }
 #endif
   return 0; /* one block: ascending k, as the scalar GEMV sums */

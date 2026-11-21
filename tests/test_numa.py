@@ -269,6 +269,47 @@ class WorkerTests(unittest.TestCase):
             self.assertTrue(all(w['assigned'] == w['observed'] for w in data['workers']))
 
 
+class DefaultTests(unittest.TestCase):
+    """D2 §7: with LLAMA_SOCKETS and LLAMA_PLACEMENT unset, a node whose two sockets each have an allowed HBM node runs
+    on both sockets with the shards in HBM; anything else, or a knob that names a one-socket setup, keeps one socket."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        root = Path(cls.temp.name)
+        cls.flat = fx.flat(root / 'flat')
+        cls.cache = fx.cache(root / 'cache')
+        cls.no_numaperf = fx.flat(root / 'no-numaperf', numaperf=False)
+        cls.one = fx.build(root / 'one', packages=1, hbm=(1,))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def defaults(self, sysfs, **env):
+        base = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_')}
+        result = subprocess.run([str(BUILD/'numa_probe'), '--defaults', '1'], capture_output=True, text=True, timeout=30,
+                                env={**base, 'LLAMA_SYSFS_ROOT': str(sysfs), **env})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        return data['sockets'], data['placement']
+
+    def test_dual_socket_hbm_node_runs_both_sockets_from_hbm(self):
+        self.assertEqual(self.defaults(self.flat), (2, 'hbm'))
+        self.assertEqual(self.defaults(self.flat, LLAMA_BACKEND='teams', LLAMA_PLACEMENT='hbm'), (2, 'hbm'))
+        self.assertEqual(self.defaults(self.flat, LLAMA_SOCKETS='2'), (2, 'hbm'))
+
+    def test_one_socket_where_the_node_or_the_knobs_say_so(self):
+        for sysfs in (self.cache, self.no_numaperf, self.one):
+            with self.subTest(sysfs=sysfs.name):
+                self.assertEqual(self.defaults(sysfs), (1, 'file'))
+        for env, expected in (({'LLAMA_SOCKETS': '1'}, (1, 'file')),
+                              ({'LLAMA_PLACEMENT': 'ddr'}, (1, 'ddr')), ({'LLAMA_PLACEMENT': 'file'}, (1, 'file')),
+                              ({'LLAMA_TOPOLOGY': 'virtual:2x2'}, (1, 'file'))):
+            with self.subTest(env=env):
+                self.assertEqual(self.defaults(self.flat, **env), expected)
+
+
 class RealMachineTests(unittest.TestCase):
     def run_probe(self, *args):
         return subprocess.run([str(BUILD/'numa_probe'), *args], capture_output=True, text=True, timeout=30)

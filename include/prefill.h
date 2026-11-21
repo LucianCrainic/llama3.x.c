@@ -3,8 +3,10 @@
 
 #include "runtime.h"
 
-/* Shared policy/validation; numerical work stays in the precision engines. */
-void prefill_configure(Model *model);
+/* Shared policy/validation; numerical work stays in the precision engines. Reads LLAMA_PREFILL_BATCH, _GEMM and
+ * _LOGITS. With LLAMA_PREFILL_BATCH unset, the batch is `recommended` (the engine's D2 §7 value) where the batched GEMM
+ * runs (LLAMA_PREFILL_GEMM=on, or auto on AVX-512 or AMX), else 1: the per-row reference gains nothing from batching. */
+void prefill_configure(Model *model, int recommended);
 /* LLAMA_PRECISION (C5): fp32 (default) or bf16, the explicit BF16 mode for FP32 checkpoints. Returns 1 for bf16.
  * `quantized` is 1 for the Q8_0 engine, where bf16 is an error. Also enforces the mode guard: LLAMA_KERNELS=amx on an
  * FP32 checkpoint without bf16 is an error, because FP32 execution never changes precision silently. Call after

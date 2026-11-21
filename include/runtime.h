@@ -58,6 +58,8 @@ size_t checked_add(size_t a, size_t b);
 /* File bytes of a tensor: FP32 values, or Q8 values plus FP32 group scales (no padding). */
 size_t tensor_bytes(size_t count, int quantized, int gs);
 double monotonic_seconds(void);
+/* Fails when the environment sets a knob whose code path was removed. kernels_init() calls it. */
+void check_retired_knobs(void);
 
 /* Validation precedes pointer construction. The mapping owns no heap weights;
  * the caller owns `manifest` (manifest_free) once the call succeeds. */
@@ -93,6 +95,9 @@ typedef struct {
   const char *prefill_kernel; /* the batched prefill kernel in use, for the report (NULL when prefill_gemm is off) */
   int prefill_bf16; /* LLAMA_PRECISION=bf16 (C5): the batched GEMM runs on BF16-packed weights; decode is unchanged */
 } Model;
+/* The checkpoint format the engine (src/engine.c) reads, fixed per executable: 0 in run (FP32, src/run.c), 1 in runq
+ * (Q8_0, src/runq.c). */
+extern const int engine_q8;
 void engine_load(Model *model, const char *path);
 void engine_load_context(Model *model, const char *path, int context);
 float *engine_forward(Model *model, int token, int position);

@@ -78,8 +78,9 @@ typedef struct {
 } Shard;
 
 typedef struct {
-  int sockets, count, gs, quantized;
+  int sockets, count, gs, quantized, layers;
   Shard *t;
+  int *index; /* [role][layer + 1][socket]: the shard's place in t, or -1 (shards_find in constant time) */
   size_t region_bytes[2]; /* what each socket's weights region must hold, in 64-byte aligned order */
   size_t global_bytes;    /* the GLOBAL area (coordinator DDR) */
   size_t scratch_limit;   /* COLS block scratch in bytes (default 64 MiB; at least one source row is always read) */

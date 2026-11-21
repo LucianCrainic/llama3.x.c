@@ -3,6 +3,7 @@
 #include "kernels.h"
 #include "numa.h"
 #include "workers.h"
+#include "testing.h"
 #include <assert.h>
 #include <float.h>
 #include <math.h>
@@ -360,14 +361,12 @@ static void test_attention_batch(void) {
       }
 }
 
-/* E0: LLAMA_ATTN_ROW_BLOCK only regroups rows into tasks; every row is computed as before, so the batched result is
- * bitwise the same for any block size, with row counts the block does not divide, with several waves, and on both the
- * engine path and the portable driver. */
-static void test_attention_batch_row_block(void) {
+/* Waves: with room for only two rows of partials the batch runs in several waves whose row blocks are cut short; every
+ * row is computed as before, so the result is bitwise the one-wave result, on the engine path and the portable driver.
+ * (E0 also checked every row block 1..16; the block is fixed at 4 since F5.) */
+static void test_attention_batch_waves(void) {
   const int configs[][3] = {{8, 2, 64}, {6, 2, 40}, {4, 4, 128}};
   const int ms[] = {2, 7, 13, 32}, starts[] = {0, 31, 250};
-  const int blocks[] = {1, 2, 3, 4, 7, 16};
-  const int saved = k_attention_row_block();
   for (size_t c = 0; c < sizeof(configs) / sizeof(*configs); c++)
     for (size_t mi = 0; mi < sizeof(ms) / sizeof(*ms); mi++)
       for (size_t pi = 0; pi < sizeof(starts) / sizeof(*starts); pi++) {
@@ -382,32 +381,23 @@ static void test_attention_batch_row_block(void) {
         AttentionWork work;
         k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
         size_t full_capacity = work.capacity, one_row = (size_t)heads * work.max_chunks * (hd + 2);
-        for (int pass = 0; pass < 2; pass++) {
-          /* pass 1: room for only two rows, so the batch runs in several waves whose blocks are cut short */
-          work.capacity = pass ? (2 * one_row < full_capacity ? 2 * one_row : full_capacity) : full_capacity;
-          k_attention_set_row_block(4);
-          k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
-          k_attention_batch_portable(want_port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
-          for (size_t b = 0; b < sizeof(blocks) / sizeof(*blocks); b++) {
-            k_attention_set_row_block(blocks[b]);
-            memset(got, 0xAB, m * dim * sizeof(float));
-            memset(port, 0xAB, m * dim * sizeof(float));
-            k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
-            k_attention_batch_portable(port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
-            checks += 2;
-            if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
-              fprintf(stderr, "attention_batch row block [%s] heads=%d kv=%d hd=%d m=%d pos0=%d pass=%d block=%d: differs\n",
-                      current, heads, kv_heads, hd, m, pos0, pass, blocks[b]);
-            if (memcmp(port, want_port, m * dim * sizeof(float)) && failures++ < 20)
-              fprintf(stderr, "attention_batch portable row block [%s] heads=%d m=%d pos0=%d pass=%d block=%d: differs\n",
-                      current, heads, m, pos0, pass, blocks[b]);
-          }
-        }
+        k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+        k_attention_batch_portable(want_port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
+        work.capacity = 2 * one_row < full_capacity ? 2 * one_row : full_capacity;
+        memset(got, 0xAB, m * dim * sizeof(float));
+        memset(port, 0xAB, m * dim * sizeof(float));
+        k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
+        k_attention_batch_portable(port, q, kc, vc, &work, heads, kv_heads, hd, seq, pos0, m);
+        checks += 2;
+        if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
+          fprintf(stderr, "attention_batch waves [%s] heads=%d kv=%d hd=%d m=%d pos0=%d: differs\n", current, heads,
+                  kv_heads, hd, m, pos0);
+        if (memcmp(port, want_port, m * dim * sizeof(float)) && failures++ < 20)
+          fprintf(stderr, "attention_batch portable waves [%s] heads=%d m=%d pos0=%d: differs\n", current, heads, m, pos0);
         work.capacity = full_capacity;
         k_attention_free(&work);
         free(q), free(kc), free(vc), free(att), free(want), free(got), free(want_port), free(port);
       }
-  k_attention_set_row_block(saved);
 }
 
 /* ---- Shard kernels (B2): partial outputs, column slices, row slices and padded rows -------------------------------
@@ -592,70 +582,6 @@ static void test_partial(void) {
 typedef struct {
   int socket, failed;
 } TwoTeams;
-
-/* B7: the packed four-row layout. Packing, the STORE / ADD / PARTIAL epilogues, SWIGLU and QKV against double-precision
- * references and against the row layout on every instruction set; column counts that are not multiples of 16 exercise the zero padding of the last block. */
-static void test_packed4(void) {
-  const int shapes[][2] = {{16, 4}, {8, 4}, {37, 8}, {64, 12}, {96, 16}, {200, 20}, {1000, 8}, {2048, 16}};
-  for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
-    const int n = shapes[s][0], d = shapes[s][1];
-    for (int stride_extra = 0; stride_extra < 2; stride_extra++) {
-      const size_t ld = (size_t)n + (size_t)stride_extra * 5;
-      float *x = zeroed(n, sizeof(float)), *w = zeroed(d * ld, sizeof(float)), *w3 = zeroed(d * ld, sizeof(float));
-      float *out = zeroed(d, sizeof(float)), *rows_out = zeroed(d, sizeof(float)), *base = zeroed(d, sizeof(float));
-      float *wp = zeroed(k_pack4_floats(d, n), sizeof(float)), *w3p = zeroed(k_pack4_floats(d, n), sizeof(float));
-      float *k = zeroed(d, sizeof(float)), *v = zeroed(d, sizeof(float));
-      double *ref = zeroed(d, sizeof(double)), *mag = zeroed(d, sizeof(double)), *ref3 = zeroed(d, sizeof(double)),
-             *mag3 = zeroed(d, sizeof(double));
-      fill(x, n, 1.0f), fill(w, d * ld, 0.5f), fill(w3, d * ld, 0.5f), fill(base, d, 1.0f);
-      Pack4Job jobs[2] = {{wp, w, d, n, ld}, {w3p, w3, d, n, ld}};
-      k_pack4_many(jobs, 2);
-      /* The layout itself: [group][column block][row][16 floats], the last block zero-padded. */
-      checks++;
-      for (int r = 0; r < d; r++)
-        for (int j = 0; j < ((n + 15) / 16) * 16; j++) {
-          float want = j < n ? w[(size_t)r * ld + j] : 0.0f;
-          float got = wp[(size_t)(r / 4) * ((n + 15) / 16) * 64 + (size_t)(j / 16) * 64 + (size_t)(r % 4) * 16 + j % 16];
-          if (want != got && failures++ < 20)
-            fprintf(stderr, "pack4 [%s] n=%d row %d column %d: %g != %g\n", current, n, r, j, got, want);
-        }
-      for (int i = 0; i < d; i++)
-        for (int j = 0; j < n; j++) {
-          ref[i] += (double)w[(size_t)i * ld + j] * x[j];
-          mag[i] += fabs((double)w[(size_t)i * ld + j] * x[j]);
-          ref3[i] += (double)w3[(size_t)i * ld + j] * x[j];
-          mag3[i] += fabs((double)w3[(size_t)i * ld + j] * x[j]);
-        }
-      for (int kind = K_STORE; kind <= K_PARTIAL; kind++) {
-        const char *name = kind == K_STORE ? "p4.store" : kind == K_ADD ? "p4.add" : "p4.partial";
-        memcpy(out, base, d * sizeof(float));
-        memcpy(rows_out, base, d * sizeof(float));
-        k_matmul_p4(out, x, wp, n, d, kind);
-        k_matmul_ld(rows_out, x, w, ld, n, d, kind);
-        for (int i = 0; i < d; i++) {
-          double expected = (kind == K_ADD ? base[i] : 0.0) + ref[i];
-          check(name, out[i], expected, 2e-5 * (mag[i] + (kind == K_ADD ? fabs(base[i]) : 0.0)) + 1e-6);
-          /* Against the row layout: within the kernel budget everywhere. Bitwise equality is the AVX-512 kernels' property
-           * (the same operations on the same lanes, only other addresses), checked on the cluster; the scalar fallbacks are
-           * compiled loops whose floating-point contraction may differ by an ulp between the two layouts. */
-          check(name, out[i], rows_out[i], 2e-5 * (mag[i] + (kind == K_ADD ? fabs(base[i]) : 0.0)) + 1e-6);
-        }
-      }
-      k_matmul_swiglu_p4(out, x, wp, w3p, n, d);
-      for (int i = 0; i < d; i++)
-        check("p4.swiglu", out[i], silu(ref[i]) * ref3[i],
-              2e-5 * (mag[i] * (fabs(ref3[i]) + 1) + mag3[i] * (fabs(ref[i]) + 1)) + 1e-6);
-      k_matmul_qkv_p4(out, k, v, x, wp, w3p, wp, n, d, d);
-      for (int i = 0; i < d; i++) {
-        check("p4.qkv.q", out[i], ref[i], 2e-5 * mag[i] + 1e-6);
-        check("p4.qkv.k", k[i], ref3[i], 2e-5 * mag3[i] + 1e-6);
-        check("p4.qkv.v", v[i], ref[i], 2e-5 * mag[i] + 1e-6);
-      }
-      free(x), free(w), free(w3), free(out), free(rows_out), free(base), free(wp), free(w3p), free(k), free(v);
-      free(ref), free(mag), free(ref3), free(mag3);
-    }
-  }
-}
 
 /* The row-parallel forms of batched prefill are the serial row loops, bit for bit, on every instruction set, with and
  * without a worker team: one row, many rows, and an in-place RMSNorm. */
@@ -1043,7 +969,7 @@ static double matrix_seconds_long;                /* time of the long decode con
 static double worst_vs_reference, worst_vs_split; /* largest error of the variants flagged vs_split, printed at the end */
 
 /* One batched case: m rows at pos0..pos0+m-1 on `shape`, through every variant. budget_mib > 0 sets
- * LLAMA_ATTN_WORKSPACE_MIB for the workspace sizing instead of cutting the capacity by hand. */
+ * the workspace budget (k_attention_set_workspace_mib) for the sizing instead of cutting the capacity by hand. */
 static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mib) {
   int heads = shape.kv_heads * shape.group, kv_heads = shape.kv_heads, hd = shape.hd;
   int seq = pos0 + m, rows = seq + ATTN_GUARD_ROWS;
@@ -1060,15 +986,12 @@ static void attention_batch_case(AttnShape shape, int m, int pos0, int budget_mi
   for (int i = 0; i < m; i++)
     attention_reference(q + i * dim, kc, vc, heads, kv_heads, hd, pos0 + i, ref + i * dim, scores);
   char label[160];
-  if (budget_mib > 0) {
-    char value[16];
-    snprintf(value, sizeof(value), "%d", budget_mib);
-    setenv("LLAMA_ATTN_WORKSPACE_MIB", value, 1);
-  }
+  if (budget_mib > 0)
+    k_attention_set_workspace_mib(budget_mib);
   AttentionWork work;
   k_attention_init_rows(&work, heads, kv_heads, hd, seq, m, NULL);
   if (budget_mib > 0)
-    unsetenv("LLAMA_ATTN_WORKSPACE_MIB");
+    k_attention_set_workspace_mib(-1);
   if (attn_force_workers) {
     k_attention_free(&work);
     int by_threads = (attn_force_workers + kv_heads - 1) / kv_heads, by_length = (seq + 255) / 256;
@@ -1245,8 +1168,8 @@ static void test_attention_forced_plans(void) {
   attn_force_workers = 0;
 }
 
-/* E2 knobs: every block size matches the reference through the whole matrix harness, and the claim order of the tasks
- * (longest first or in plan order) changes nothing bit for bit, also with several waves and with the hook set. */
+/* Tiled attention on many-worker plans against the reference, and the task hook (the benchmark's path) changes nothing
+ * bit for bit, also with several waves. (E2 also swept the block size and the claim order; both fixed since F5.) */
 static atomic_long hook_tasks, hook_positions;
 static void count_task(void *ctx, const AttentionTaskInfo *info) {
   (void)ctx;
@@ -1254,16 +1177,12 @@ static void count_task(void *ctx, const AttentionTaskInfo *info) {
   atomic_fetch_add(&hook_positions, info->positions);
 }
 
-static void test_attention_tiled_knobs(void) {
-  const int queries[] = {1, 3, 4, 8, 16};
-  for (size_t i = 0; i < sizeof(queries) / sizeof(*queries); i++) {
-    k_attention_set_tiled(queries[i], 1);
-    attn_force_workers = 6;
-    attention_batch_case((AttnShape){2, 4, 64}, 13, 61, 0);
-    attention_batch_case((AttnShape){2, 2, 40}, 9, 33, 0);
-    attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
-    attn_force_workers = 0;
-  }
+static void test_attention_tiled_hook(void) {
+  attn_force_workers = 6;
+  attention_batch_case((AttnShape){2, 4, 64}, 13, 61, 0);
+  attention_batch_case((AttnShape){2, 2, 40}, 9, 33, 0);
+  attention_batch_case((AttnShape){2, 8, 64}, 5, 250, 0);
+  attn_force_workers = 0;
   const AttnShape shapes[] = {{2, 4, 64}, {2, 2, 128}, {2, 1, 40}};
   for (size_t sh = 0; sh < sizeof(shapes) / sizeof(*shapes); sh++) {
     int heads = shapes[sh].kv_heads * shapes[sh].group, kv_heads = shapes[sh].kv_heads, hd = shapes[sh].hd;
@@ -1284,15 +1203,12 @@ static void test_attention_tiled_knobs(void) {
     for (int pass = 0; pass < 2; pass++) {
       work.capacity = pass ? 3 * one_row : m * one_row; /* pass 1: waves of three rows */
       assert(kernels_attention_select("tiled", NULL));
-      k_attention_set_tiled(16, 1);
       k_attention_batch(want, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
-      k_attention_set_tiled(16, 0);
       memset(got, 0xAB, m * dim * sizeof(float));
       atomic_store(&hook_tasks, 0), atomic_store(&hook_positions, 0);
       k_attention_set_task_hook(count_task, NULL); /* the benchmark's path through the tasks */
       k_attention_batch(got, q, kc, vc, att, &work, heads, kv_heads, hd, seq, pos0, m);
       k_attention_set_task_hook(NULL, NULL);
-      k_attention_set_tiled(16, 1);
       /* every row sees pos0 + i + 1 positions and each of them is scored by one task per KV head */
       long visible = 0;
       for (int i = 0; i < m; i++)
@@ -1307,12 +1223,11 @@ static void test_attention_tiled_knobs(void) {
       assert(kernels_attention_select("split", NULL));
       checks++;
       if (memcmp(got, want, m * dim * sizeof(float)) && failures++ < 20)
-        fprintf(stderr, "tiled order [%s] hd=%d g=%d pass=%d: natural order changed the result\n", current, hd,
+        fprintf(stderr, "tiled hook [%s] hd=%d g=%d pass=%d: the hook changed the result\n", current, hd,
                 shapes[sh].group, pass);
     }
     free(work.partial), free(q), free(kc), free(vc), free(att), free(want), free(got);
   }
-  k_attention_set_tiled(16, 1);
 }
 
 /* E5: long single-row contexts through every decode variant (the chunk plan is at its 256-position chunks there), up to
@@ -1556,7 +1471,7 @@ static void test_attention_matrix(void) {
     }
   /* M = 256: a microbatch that spans several chunk plans. Prompts ending at 256/257 positions and warm contexts (the
    * reference is O(m * context), so each shape gets two of them), then the same wave split from the workspace budget
-   * the engine reads (LLAMA_ATTN_WORKSPACE_MIB) instead of a hand cut. */
+   * the engine sizes (k_attention_set_workspace_mib) instead of a hand cut. */
   if (!sparse) {
     attention_batch_case((AttnShape){2, 1, 64}, 256, 0, 0);
     attention_batch_case((AttnShape){2, 4, 64}, 256, 1, 0);
@@ -1603,16 +1518,15 @@ int main(int argc, char **argv) {
     rope_used = test_rope(rope[i]);
     test_attention();
     test_attention_batch();
-    test_attention_batch_row_block();
+    test_attention_batch_waves();
     test_attention_matrix();
     test_attention_decode_long();
     test_attention_head_layout(1);
     test_attention_batch_head_layout(1);
     test_attention_forced_plans();
     test_attention_empty_partial();
-    test_attention_tiled_knobs();
+    test_attention_tiled_hook();
     test_partial();
-    test_packed4();
     test_row_parallel();
     test_two_teams();
     test_attention_split();
@@ -1633,7 +1547,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "quantize [%s]: scales differ bitwise\n", current);
   }
   /* The same kernels on persistent worker teams. Odd sizes stress the range splitting, and every size runs
-   * against the same double-precision references as the OpenMP path. */
+   * against the same double-precision references as the serial path. */
   int team_sizes[8] = {1, 2, 3, 5, 7};
   size_t team_size_count = 5;
   const char *override = getenv("LLAMA_TEST_TEAMS"); /* e.g. "1,56" for a full socket on the cluster */
@@ -1666,8 +1580,12 @@ int main(int argc, char **argv) {
       test_attention_head_layout(0);
       test_attention_batch_head_layout(0);
       test_partial();
-      test_packed4();
       test_row_parallel();
+      k_gemv_force_hybrid(1); /* the hybrid split of large FP32 jobs, on these small matrices */
+      test_f32();
+      test_partial();
+      test_row_parallel();
+      k_gemv_force_hybrid(0);
       printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
       kernels_set_team(NULL);
       pool_stop();
