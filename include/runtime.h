@@ -64,6 +64,8 @@ void check_retired_knobs(void);
 /* Validation precedes pointer construction. The mapping owns no heap weights;
  * the caller owns `manifest` (manifest_free) once the call succeeds. */
 struct TensorManifest;
+void checkpoint_open(const char *path, int quantized, Config *config, int *shared, int *group_size, int *fd,
+                     size_t *bytes, struct TensorManifest *manifest);
 void checkpoint_map(const char *path, int quantized, Config *config, int *shared, int *group_size, int *fd,
                     float **data, size_t *bytes, struct TensorManifest *manifest);
 void rmsnorm(float *out, const float *x, const float *weight, int size);
@@ -80,7 +82,8 @@ typedef struct {
   size_t reserved_bytes, active_bytes, resident_bytes;
   int node;     /* the node both caches are bound to; -1 for heap or unbound memory */
   int verified; /* resident_bytes and the page counts come from a placement query */
-  int full;     /* that query covered every page of both caches rather than a sample */
+  int full;     /* that query fully covered its scope rather than sampling */
+  int active_prefix_only; /* query and resident_bytes cover the active page union */
   size_t pages_queried, pages_wrong_node, pages_missing;
 } KvStats;
 
@@ -100,12 +103,13 @@ typedef struct {
 extern const int engine_q8;
 void engine_load(Model *model, const char *path);
 void engine_load_context(Model *model, const char *path, int context);
+void engine_plan_context(Model *model, const char *path, int context);
 float *engine_forward(Model *model, int token, int position);
 /* Append count tokens at pos0; the caller must have populated the prefix [0,pos0).
  * count must be 1..engine_max_batch(), and the complete range must fit the context.
  * LAST returns vocab floats, ALL returns count*vocab floats in row order, NONE
  * returns NULL. Storage belongs to the model and is invalidated by the next forward.
- * ALL is available irrespective of the CLI policy; its storage is allocated lazily. */
+ * Planned placement admits ALL storage with LLAMA_PREFILL_LOGITS=all. Legacy placement allocates it lazily. */
 float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want);
 int engine_max_batch(const Model *model);
 /* Accounting for the first `position` cache positions; verify=1 also queries where the cache pages live. Fails when
@@ -165,6 +169,7 @@ typedef struct {
   size_t input_tokens, processed_tokens, output_tokens, forward_passes, decode_steps;
   size_t sampled_tokens, stop_tokens, turns;
   size_t prefill_microbatches, prefill_logits_rows;
+  uint64_t prefill_start_ns, prefill_end_ns, decode_start_ns, decode_end_ns; /* epoch markers for generate mode */
   double placement_populate_s, placement_verify_s, verify_excluded_s;
   double warm_s;        /* untimed --warm-context prefill (B7); excluded from prefill, TTFT and inference time */
   double weight_pack_s; /* BF16 packing at load (C5) */

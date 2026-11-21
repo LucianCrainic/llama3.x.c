@@ -1,6 +1,7 @@
 #include "app.h"
 #include "loader.h"
 #include "profile.h"
+#include "tp.h"
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -23,6 +24,7 @@ static void usage(void) {
         "  -t FLOAT          temperature >= 0 (default 1; 0 = greedy)\n"
         "  -p FLOAT          top-p in [0,1] (default .9; 0 or 1 disables)\n"
         "  -s, --seed INT    nonnegative seed (0 maps to RNG state 1)\n"
+        "  --plan-only      validate the placement plan without loading weights\n"
         "  --context-length INT  KV-cache capacity (default min(model context, 4096))\n"
         "  -n INT            maximum forward passes (default 4096; 0 = context)\n"
         "  -i, --prompt TEXT prompt (default empty; benchmark: Once upon a time)\n"
@@ -38,7 +40,7 @@ static void usage(void) {
         "                    is timed from a retained context of that length (generate mode only)\n"
         "  --no-text         suppress generated text and prompt echo\n"
         "  --log-level LEVEL error|warn|info|debug|trace\n"
-        "  --json PATH       write schema-v1 performance report to a file\n"
+        "  --json PATH       write schema-v2 performance report to a file\n"
         "  -h, --help        show this help\n",
         stderr);
 }
@@ -74,7 +76,7 @@ static void parse(int argc, char **argv) {
   /* Find report destination before validating options so CLI failures can be recorded. */
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--chat-template") || !strcmp(argv[i], "--benchmark") || !strcmp(argv[i], "--no-text") ||
-        !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
+        !strcmp(argv[i], "--plan-only") || !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h"))
       continue;
     if (!strcmp(argv[i], "--json") && i + 1 < argc)
       options.json = argv[i + 1];
@@ -82,6 +84,10 @@ static void parse(int argc, char **argv) {
   }
   for (int i = 2; i < argc; i++) {
     const char *flag = argv[i];
+    if (!strcmp(flag, "--plan-only")) {
+      options.plan_only = 1;
+      continue;
+    }
     if (!strcmp(flag, "--chat-template")) {
       options.chat_template = 1;
       continue;
@@ -264,6 +270,13 @@ static void kv_snapshot(KvStats *out, int *ready, int position) {
   *ready = 1;
 }
 
+static uint64_t epoch_ns(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now))
+    return 0;
+  return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
 static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n, int *position, int generation_limit,
                         int echo_prompt, double turn_start) {
   metrics.input_tokens += (size_t)n;
@@ -274,6 +287,9 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   }
   float *logits = NULL;
   metrics.inference_started = 1;
+  int mark = !strcmp(options.mode, "generate");
+  if (mark)
+    metrics.prefill_start_ns = epoch_ns();
   for (int i = 0; i < n && *position < options.steps;) {
     int count = n - i;
     if (count > engine_max_batch(&model))
@@ -309,6 +325,8 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
     metrics.stop_reason = "step_limit";
     return -1;
   }
+  if (mark)
+    metrics.prefill_end_ns = epoch_ns();
   if (!metrics.kv_prompt_ready) {
     double before = metrics.verify_excluded_s;
     kv_snapshot(&metrics.kv_prompt, &metrics.kv_prompt_ready, *position);
@@ -344,6 +362,8 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       break;
     }
     profile_stage = STAGE_DECODE;
+    if (mark && !metrics.decode_steps)
+      metrics.decode_start_ns = epoch_ns();
     double start = monotonic_seconds();
     logits = engine_forward(&model, next, (*position)++);
     metrics.decode_s += monotonic_seconds() - start;
@@ -400,6 +420,8 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
   start += metrics.warm_s; /* the warm-up is neither prefill nor time to first token */
   double excluded = metrics.verify_excluded_s;
   run_sequence(t, s, tokens, n, &pos, options.generation_length, !options.chat_template, start);
+  if (metrics.decode_start_ns)
+    metrics.decode_end_ns = epoch_ns();
   kv_position = pos;
   if (!options.no_text)
     putchar('\n');
@@ -472,6 +494,17 @@ int main(int argc, char **argv) {
   program_start = monotonic_seconds();
   atexit(finish);
   parse(argc, argv);
+  if (options.plan_only) {
+    engine_plan_context(&model, options.checkpoint, options.context);
+    if (!options.json) {
+      tp_placement_report(stdout);
+      putchar('\n');
+    }
+    engine_free(&model);
+    metrics.stop_reason = "plan_only";
+    metrics.completed = 1;
+    return 0;
+  }
   tokens_out = getenv("LLAMA_TOKENS_OUT");
   if (tokens_out && (!*tokens_out || !strcmp(options.mode, "chat")))
     fail(!*tokens_out ? "LLAMA_TOKENS_OUT must name a file" : "LLAMA_TOKENS_OUT applies to generate mode only");

@@ -70,6 +70,7 @@ typedef struct {
   ShardKind kind;
   int socket;
   int row0, rows, col0, cols; /* in the source tensor */
+  int tier;                   /* index of the planned HBM/DDR base for non-global shards */
   int alias;                  /* a ROWS shard of the tied classifier, which is also the embedding table */
   size_t q_offset, s_offset;  /* bytes from the start of the shard's area (socket region, or the global area) */
   void *q;                    /* values: F32 or int8, rows x cols, stride ld */
@@ -101,7 +102,11 @@ const Shard *shards_find(const ShardSet *set, TensorRole role, int layer, int so
 void shards_bind(ShardSet *set, void *const socket_base[2], void *global_base);
 /* Reads the shards of `socket` from the checkpoint into their bound places. `team` (the socket's team) splits the
  * reads and the column packing among its workers; NULL runs on the calling thread. GLOBAL shards load with socket 0. */
+void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, size_t bytes[2][2]);
+void shards_bind_placed(ShardSet *set, void *base[2][2], void *global_base);
+size_t shards_scratch_bytes(const ShardSet *set, int socket);
 struct Team;
+void shards_load_placed(ShardSet *set, int fd, int socket, struct Team *team, void *scratch);
 void shards_load(ShardSet *set, int fd, int socket, struct Team *team);
 
 #endif

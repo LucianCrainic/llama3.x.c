@@ -83,3 +83,36 @@ script cannot silently measure the default path under an old label. See [audit-2
 | `LLAMA_GEMV_SCHED` | finished sweep: FP32 GEMV is hybrid on jobs of 96 MiB or more and static below, Q8 is static (F5) |
 | `LLAMA_ATTN_ROW_BLOCK`, `LLAMA_ATTN_TILED_QUERIES`, `LLAMA_ATTN_TILED_ORDER` | finished E0/E2 sweeps: 4 rows per split task, 16 query vectors per tiled task, plan order (F5) |
 | `LLAMA_ATTN_WORKSPACE_MIB`, `LLAMA_GEMM_KC` | fixed at 32 MiB and the 1024 K block (F5) |
+
+## Planned placement
+
+On Linux Flat/Quadrant nodes, `LLAMA_PLACEMENT=hbm-only|ddr|hybrid` uses the same owned loader and startup planner.
+`hbm-only` binds all planned data to socket-local HBM, including an untied input embedding. Strict `ddr` binds the
+same arenas to DDR. Use `LLAMA_SOCKETS=1|2` explicitly for controlled comparisons. The `file` and `hbm` presets
+retain their legacy behavior. Setting `LLAMA_PLACEMENT_STRICT=0` on `ddr` selects the legacy fallback behavior.
+
+`hybrid` keeps work, logits, exchange, and norms in HBM and defaults untied embeddings, loader scratch, and packed
+prefill weights to DDR. The two layer controls accept `auto` or an exact count of initial layers in HBM:
+
+- `LLAMA_HYBRID_WEIGHTS_HBM_LAYERS`
+- `LLAMA_HYBRID_KV_HBM_LAYERS`
+
+`LLAMA_HYBRID_CLASSIFIER=auto|hbm|ddr` controls the original classifier and its tied embedding if applicable.
+`LLAMA_HYBRID_PACKED=hbm|ddr` applies only with packed prefill. Auto commits exact layer counts first, then prioritizes
+the classifier, original weights, and KV in that order. Each layer choice is symmetric across TP sockets.
+
+`LLAMA_HBM_BUDGET_GIB` defaults to 56 per socket. `LLAMA_DDR_BUDGET_GIB` optionally lowers the DDR ceiling. Both
+tiers account for rounded arena bytes and full configured KV capacity. Use `--plan-only` to print the plan as JSON
+without reading weight payloads, starting teams, or loading a tokenizer. With `--json PATH`, the plan is in the report's
+`placement_plan` field. Real executions record each arena's requested node and page-query result and verify active
+KV ranges. Use `python3 tools/check_placement.py REPORT --planned` to check that evidence. A nonzero
+`LLAMA_VERIFY_SAMPLES` permits stratified sampling. For active KV, at least the first and last page of every span
+are checked, even when that exceeds the requested sample count. Add `--allow-sampled` to accept sampled reports.
+
+Planned execution requiring every prompt position's logits must set `LLAMA_PREFILL_LOGITS=all` so the planner can
+admit its output buffers and any BF16 classifier pack. An explicit `LLAMA_TOPOLOGY=virtual:2x3` can exercise the
+same layouts and kernels without physical NUMA binding. Those reports carry `simulated: true`.
+
+The generate-mode report includes `phase_epoch_ns` for aligning interval counters with prefill and decode. The
+prefill window starts after any retained-context warm-up and ends before the prompt's KV verification. The decode
+window begins just before the first decode forward and ends before final KV verification and teardown.

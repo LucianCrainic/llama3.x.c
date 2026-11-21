@@ -18,7 +18,8 @@ ABS, REL = 2e-6, 2e-5   # the fixture tolerance of test_runtime.py
 
 def environment(sockets, threads=3, **extra):
     env = {**os.environ, 'LLAMA_BACKEND': 'teams', 'LLAMA_THREADS': str(threads), 'LLAMA_TP_CHECK': '1', **extra}
-    env.pop('LLAMA_TOPOLOGY', None)
+    if 'LLAMA_TOPOLOGY' not in extra:
+        env.pop('LLAMA_TOPOLOGY', None)
     env['LLAMA_SOCKETS'] = '1'  # explicit: unset means two sockets on a dual-socket HBM node
     if sockets == 2:
         env.update(LLAMA_SOCKETS='2', LLAMA_TOPOLOGY=f'virtual:2x{threads}')
@@ -67,6 +68,79 @@ class TensorParallelTests(unittest.TestCase):
             top = max(r1)
             # argmax agreement, allowing a tie within the tolerance
             self.assertGreaterEqual(r2[r1.index(top)], max(r2) - (abs_tol + rel_tol * abs(top)))
+
+    def test_tier_plans_preserve_logits(self):
+        for sockets in (1, 2):
+            for precision, activations, layout in (
+                ('fp32', 'int8', 'head'), ('fp32', 'int8', 'rows'),
+                ('int8', 'int8', 'head'), ('int8', 'fp32', 'rows'),
+            ):
+                knobs = dict(LLAMA_TOPOLOGY=f'virtual:{sockets}x3', LLAMA_KERNELS='scalar',
+                             LLAMA_PREFILL_GEMM='on', LLAMA_PREFILL_BATCH='3', LLAMA_PREFILL_LOGITS='all',
+                             LLAMA_Q8_ACTIVATIONS=activations, LLAMA_KV_LAYOUT=layout)
+                for method in (None, 'batch'):
+                    reference = self.probe(precision, 'unshared', method, sockets, **knobs)
+                    for placement in ('hbm-only', 'ddr', 'hybrid'):
+                        tier = {'LLAMA_PLACEMENT': placement}
+                        if placement == 'hybrid':
+                            tier.update(LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1', LLAMA_HYBRID_KV_HBM_LAYERS='1',
+                                        LLAMA_HYBRID_CLASSIFIER='ddr')
+                        with self.subTest(sockets=sockets, precision=precision, layout=layout, method=method,
+                                          placement=placement):
+                            self.assertEqual(reference, self.probe(precision, 'unshared', method, sockets,
+                                                                   **(knobs | tier)))
+
+    def test_tier_plans_preserve_packed_prefill(self):
+        for precision, knobs in (('fp32', {'LLAMA_PRECISION': 'bf16'}), ('int8', {})):
+            exe = f'probe-{precision}-amx-emul'
+            common = dict(LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_PREFILL_LOGITS='all', **knobs)
+            reference = self.probe(precision, 'wide', 'batch', 2, binary=exe, **common)
+            actual = self.probe(precision, 'wide', 'batch', 2, binary=exe, LLAMA_PLACEMENT='hybrid',
+                                LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1', LLAMA_HYBRID_KV_HBM_LAYERS='1',
+                                LLAMA_HYBRID_PACKED='ddr', **common)
+            self.assertEqual(reference, actual)
+
+    def test_planned_report_marks_prefill_and_decode_windows(self):
+        data = self.report('run', 'fp32.bin', full=True, fixture='unshared',
+                           LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='1')
+        phase = data['phase_epoch_ns']
+        self.assertLess(phase['prefill_start'], phase['prefill_end'])
+        self.assertLess(phase['prefill_end'], phase['decode_start'])
+        self.assertLess(phase['decode_start'], phase['decode_end'])
+        self.assertEqual(data['kv']['residency_scope'], 'active_prefix')
+        self.assertTrue(data['placement_plan']['simulated'])
+
+    def test_plan_only_checks_rounded_budget_and_spills(self):
+        report = Path(self.temp.name)/'tier-plan.json'
+        command = [str(BUILD/'run'), str(self.fixtures['unshared']/'fp32.bin'), '--plan-only', '--json', str(report)]
+
+        def plan(placement, **knobs):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15,
+                                    env=environment(2, LLAMA_PLACEMENT=placement, LLAMA_KERNELS='scalar', **knobs))
+            return result, json.loads(report.read_text())
+
+        result, report_data = plan('hbm-only')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report_data['stop_reason'], 'plan_only')
+        self.assertEqual(report_data['regions'], [])
+        placement = report_data['placement_plan']
+        self.assertTrue(placement['admitted'])
+        self.assertTrue(placement['simulated'])
+        self.assertEqual({arena['tier'] for arena in placement['arenas']}, {'hbm'})
+        charged = max(node['charged_bytes'] for node in placement['nodes'])
+        cap = str(charged / (1 << 30))
+        self.assertEqual(plan('hbm-only', LLAMA_HBM_BUDGET_GIB=cap)[0].returncode, 0)
+        result, report_data = plan('hbm-only', LLAMA_HBM_BUDGET_GIB=str((charged - 1) / (1 << 30)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('over its', result.stderr)
+        self.assertFalse(report_data['placement_plan']['admitted'])
+        result, report_data = plan('hybrid', LLAMA_HBM_BUDGET_GIB='0.001')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report_data['placement_plan']['classifier'], 'ddr')
+        self.assertEqual({arena['tier'] for arena in report_data['placement_plan']['arenas']}, {'hbm', 'ddr'})
+        result, _ = plan('hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must be auto or between 0 and 2', result.stderr)
 
     def test_fp32_logits_agree_with_one_socket(self):
         for name, vocab in [('shared', TP_CONFIG[5]), ('unshared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])]:

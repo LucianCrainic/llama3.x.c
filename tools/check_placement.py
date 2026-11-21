@@ -9,6 +9,7 @@ head with LLAMA_KV_LAYOUT=head, whose touched positions are a prefix of each hea
 Prints one PASS or FAIL line per check and exits non-zero if any failed. Reads only; never touches the engine.
 """
 import argparse
+from collections import Counter
 import json
 import sys
 from pathlib import Path
@@ -23,6 +24,8 @@ def main(argv=None):
     parser.add_argument('--weights-node', type=int)
     parser.add_argument('--embedding-node', type=int, help='node of an untied embedding region, if the model has one')
     parser.add_argument('--kv-node', type=int)
+    parser.add_argument('--planned', action='store_true', help='check every arena against the admitted placement plan')
+    parser.add_argument('--allow-sampled', action='store_true', help='accept sampled verification with --planned')
     parser.add_argument('--layers', type=int, default=0, help='layer count, for the resident <= reserved slack')
     args = parser.parse_args(argv)
     report = json.loads(Path(args.report).read_text())
@@ -45,6 +48,34 @@ def main(argv=None):
     def region_ok(region, node):
         return (region.get('node') == node and region.get('verified') == 'full' and (region.get('pages_queried') or 0) > 0
                 and region.get('pages_mismatched') == 0 and region.get('pages_missing') == 0)
+
+    if args.planned:
+        plan = report.get('placement_plan') or {}
+        check('physical plan admitted', plan.get('admitted') is True and plan.get('simulated') is False)
+
+        def arena_key(arena):
+            return tuple(arena.get(field) for field in ('socket', 'node', 'role', 'bytes'))
+
+        expected = Counter(map(arena_key, plan.get('arenas', [])))
+        actual = Counter(map(arena_key, regions))
+        check('region inventory matches plan', bool(expected) and actual == expected,
+              f'missing={list((expected - actual).elements())} unexpected={list((actual - expected).elements())}')
+        verification = {'full', 'sampled'} if args.allow_sampled else {'full'}
+        for region in regions:
+            verified = (region.get('node') is not None and region.get('verified') in verification
+                        and (region.get('pages_queried') or 0) > 0 and region.get('pages_mismatched') == 0
+                        and region.get('pages_missing') == 0)
+            check(f"socket {region.get('socket')} {region.get('role')} on node {region.get('node')}", verified)
+        kv = report.get('kv') or {}
+        for label, snapshot in (('final', kv), ('after prompt', kv.get('after_prompt') or {})):
+            check(f'{label}: active KV pages verified',
+                  snapshot.get('verified') is True and (args.allow_sampled or snapshot.get('full') is True)
+                  and snapshot.get('pages_wrong_node') == 0 and snapshot.get('pages_missing') == 0
+                  and (snapshot.get('pages_queried') or 0) > 0
+                  and snapshot['active_bytes'] <= snapshot['resident_bytes'])
+        teams = report.get('teams') or []
+        check('worker affinity', len(teams) == runtime.get('sockets')
+              and all(team.get('affinity_verified') is True for team in teams))
 
     for role, node in (('weights', args.weights_node), ('embedding', args.embedding_node)):
         if node is None:

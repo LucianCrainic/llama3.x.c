@@ -17,6 +17,7 @@ typedef struct {
   const int *cpus[2]; /* one CPU id per thread, in worker order; NULL = unpinned */
 } PoolConfig;
 
+void kernels_pool_config(PoolConfig *config);
 void pool_start(const PoolConfig *config); /* once, at load; fails on a bad configuration */
 void pool_stop(void);                      /* joins every worker; a no-op when called from a pool thread */
 Team *pool_team(int index);                /* NULL when not started */

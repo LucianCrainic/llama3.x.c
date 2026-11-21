@@ -176,8 +176,8 @@ size_t tensor_bytes(size_t count, int quantized, int gs) {
   return checked_add(count, checked_mul(count / (size_t)gs, sizeof(float)));
 }
 
-void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int *gs, int *fd, float **data,
-                    size_t *bytes, TensorManifest *manifest) {
+void checkpoint_open(const char *path, int quantized, Config *p, int *shared, int *gs, int *fd, size_t *bytes,
+                     TensorManifest *manifest) {
   _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(int32_t) == 4 && offsetof(Config, format) == 28,
                  "checkpoint ABI requires 32-bit int/float and seven packed ints");
   const uint32_t endian = 1;
@@ -303,8 +303,13 @@ void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int
   /* Validate allocation extents too, before making the read-only mapping. */
   checked_mul(checked_mul(checked_mul(l, (size_t)p->seq_len), kv), sizeof(float));
   checked_mul(checked_mul((size_t)p->n_heads, (size_t)p->seq_len), sizeof(float));
+}
+
+void checkpoint_map(const char *path, int quantized, Config *p, int *shared, int *gs, int *fd, float **data,
+                    size_t *bytes, TensorManifest *manifest) {
+  checkpoint_open(path, quantized, p, shared, gs, fd, bytes, manifest);
   *data = mmap(NULL, *bytes, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED)
     fail("cannot map checkpoint '%s' (%zu bytes): %s", path, *bytes, strerror(errno));
-  LOG(LOG_DEBUG, "mapped %zu checkpoint bytes; validated %zu", *bytes, needed);
+  LOG(LOG_DEBUG, "mapped %zu checkpoint bytes; validated %zu", *bytes, manifest->file_bytes);
 }

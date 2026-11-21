@@ -289,16 +289,10 @@ const char *kernels_backend_name(void) {
   return "teams";
 }
 
-void kernels_backend_init(void) {
+void kernels_pool_config(PoolConfig *config) {
   int sockets = tp_sockets_requested();
-  /* Discover the topology now, from the job's full allowed sets, before any worker is pinned: the report
-   * reads this cached result after the run. A failure is cached too and reported, not fatal here. */
-  const Topology *topology_result;
-  char topology_error[512];
-  numa_topology_try(&topology_result, topology_error, sizeof(topology_error));
-  if (backend_started)
-    return;
-  int threads = 0, available;
+  static int affinity[1024];
+  int threads = 0;
   const char *requested = getenv("LLAMA_THREADS");
   if (requested && *requested) {
     char *end;
@@ -307,51 +301,52 @@ void kernels_backend_init(void) {
       fail("LLAMA_THREADS must be an integer in 1..%d", TEAM_SUMMARY_THREADS);
     threads = (int)value;
   }
-  if (sockets == 2) { /* B5: one team per socket, on that socket's CPUs (virtual: unpinned) */
-    tp_check_topology("file");
-    const Topology *two = numa_topology();
-    PoolConfig config = {.teams = 2};
-    for (int s = 0; s < 2; s++) {
-      const SocketTopo *socket = &two->socket[s];
-      config.threads[s] = threads ? threads : socket->ncpus;
-      config.cpus[s] = socket->cpus;
-      if (socket->cpus && config.threads[s] > socket->ncpus) {
-        LOG(LOG_WARN, "LLAMA_THREADS=%d exceeds the %d CPUs of socket %d: its workers are not pinned", threads,
-            socket->ncpus, s);
-        config.cpus[s] = NULL;
-      }
+  int planned = placement_planned();
+  const Topology *topology = NULL;
+  const char *spec = getenv("LLAMA_TOPOLOGY");
+  if (sockets == 2 || planned || (spec && *spec)) {
+    topology = numa_topology();
+    if (topology->nsockets < sockets)
+      fail("this job has allowed CPUs in only %d socket(s), %d requested", topology->nsockets, sockets);
+  }
+  *config = (PoolConfig){.teams = sockets};
+  for (int s = 0; s < sockets; s++) {
+    int available;
+    const int *cpus;
+    if (topology) {
+      available = topology->socket[s].ncpus;
+      cpus = topology->socket[s].cpus;
+    } else {
+      int allowed = numa_affinity_cpus(affinity, 1024);
+      available = allowed > 0 ? allowed : (int)sysconf(_SC_NPROCESSORS_ONLN);
+      cpus = allowed > 0 ? affinity : NULL;
     }
-    pool_start(&config);
-    kernels_set_team(pool_team(0));
-    backend_started = 1;
-    LOG(LOG_DEBUG, "worker teams: %d + %d threads", config.threads[0], config.threads[1]);
+    if (available < 1)
+      available = 1;
+    config->threads[s] = threads ? threads : available;
+    if (config->threads[s] > available && (cpus || planned)) {
+      if (planned)
+        fail("LLAMA_THREADS=%d exceeds the %d allowed CPUs of socket %d", threads, available, s);
+      LOG(LOG_WARN, "LLAMA_THREADS=%d exceeds the %d allowed CPUs of socket %d: its workers are not pinned", threads,
+          available, s);
+      cpus = NULL;
+    }
+    config->cpus[s] = cpus;
+  }
+}
+
+void kernels_backend_init(void) {
+  if (backend_started)
     return;
-  }
-  static int affinity[1024];
-  const int *cpus;
-  const char *topology = getenv("LLAMA_TOPOLOGY");
-  if (topology && *topology) {
-    const SocketTopo *socket = &numa_topology()->socket[0]; /* one team on the first socket until B adds two */
-    available = socket->ncpus;
-    cpus = socket->cpus;
-  } else {
-    int allowed = numa_affinity_cpus(affinity, 1024);
-    available = allowed > 0 ? allowed : (int)sysconf(_SC_NPROCESSORS_ONLN);
-    cpus = allowed > 0 ? affinity : NULL;
-  }
-  if (available < 1)
-    available = 1;
-  if (!threads)
-    threads = available;
-  if (cpus && threads > available) {
-    LOG(LOG_WARN, "LLAMA_THREADS=%d exceeds the %d allowed CPUs: workers are not pinned", threads, available);
-    cpus = NULL;
-  }
-  PoolConfig config = {.teams = 1, .threads = {threads, 0}, .cpus = {cpus, NULL}};
+  /* Capture the job's original affinity before pool_start pins the calling thread. */
+  const Topology *topology;
+  char err[512];
+  numa_topology_try(&topology, err, sizeof(err));
+  PoolConfig config;
+  kernels_pool_config(&config);
   pool_start(&config);
   kernels_set_team(pool_team(0));
   backend_started = 1;
-  LOG(LOG_DEBUG, "worker team: %d threads, %s", threads, cpus ? "pinned" : "unpinned");
 }
 
 void kernels_backend_free(void) {

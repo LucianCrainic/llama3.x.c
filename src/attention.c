@@ -553,11 +553,15 @@ static size_t attention_rows_capacity(int n_heads, int head_dim, int max_chunks,
   return fit < 1 ? 1 : fit < want ? fit : want;
 }
 
-size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
-  int chunks = attention_max_chunks(n_kv_heads, seq_len, max_threads());
+size_t k_attention_bytes_rows_for(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows, int workers) {
+  int chunks = attention_max_chunks(n_kv_heads, seq_len, workers);
   return checked_mul(checked_mul(attention_rows_capacity(n_heads, head_dim, chunks, rows),
                                  attention_row_floats(n_heads, head_dim, chunks)),
                      sizeof(float));
+}
+
+size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
+  return k_attention_bytes_rows_for(n_heads, n_kv_heads, head_dim, seq_len, rows, max_threads());
 }
 
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len) {
