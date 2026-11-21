@@ -33,6 +33,8 @@ Decode tok/s (workload D, 86-token prompt, 128 generated tokens) and TTFT in sec
 cell: decode tok/s / TTFT s. Different nodes per column; engines are compared within a column only. vLLM on HBM is the **patched** variant (section 3).
 Notes: (a) the llama.cpp 2S Cache cell (19.3 / 5.707) is the out-of-the-box layout of the Cache set (112 threads, no interleave, by design not tuned), not the tuned layout of the Flat cells (section 7). (b) TTFT is each engine's own definition: llama3.x.c `time_to_first_token` (includes tokenisation and the first sample); llama.cpp 2048 / the `llama-bench` pp rate; vLLM the client-side latency to the first streamed token over HTTP.
 
+**Important: the vLLM "Flat HBM" rows use the patched vLLM, not stock.** The patched worker maps each rank's memory to the HBM node of its socket. Stock vLLM 0.34.0 never reaches HBM in Flat mode: its CPU worker rebinds memory to the NUMA node of its cores (DDR) and overrides `numactl --membind`. In the stock + membind control (job 5892201), 99.9% of decode reads came from DDR and decode ran at 24.7 tok/s, the same as the DDR row; the patched variant decodes at 40.5 tok/s (section 3).
+
 | Engine | Sockets | Flat HBM (node A) | Flat DDR (node B) | Cache (Cache node) |
 | --- | ---: | ---: | ---: | ---: |
 | llama3.x.c | 1 | 51.9 / 2.258 | 29.8 / 2.526 | 46.3 / 2.523 |
