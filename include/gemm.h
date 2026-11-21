@@ -120,6 +120,7 @@ typedef struct {
   int ldc;
   K8Weight w, w3;         /* n x k int8 values (row stride k) and n x (k / gs) scales; w3 for GEMM_SWIGLU */
   const int8_t *pw, *pw3; /* the same values packed by pack_s8_vnni; NULL unless AMX may be used */
+  const float *pws, *pws3; /* the scales transposed by pack_s8_scales_t; only k_gemm_q8_tiled reads them */
   int n;
   GemmKind kind;
 } GemmQ8Segment;
@@ -134,12 +135,33 @@ void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const Ge
 /* The backend k_gemm_q8 would choose (for logging and reports). */
 Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
 
+/* The pipelined AMX-INT8 kernel (LLAMA_Q8_GEMM=pipelined): the same Q8_0 arithmetic as the AMX chunk kernel, bitwise,
+ * on activations quantized straight into tile order and weight scales transposed at pack time, with the FP32 rescale of
+ * one 16-row half-step overlapped with the tile instructions of the next.
+ * Tile order of A (k % 64 == 0): row r, bytes [64 t, 64 t + 64) live at
+ *   ((r / 32 * 2 + r % 32 / 16) * (k / 64) + t) * 1024 + (r % 16) * 64,
+ * so a 32-row block is 32 * k contiguous bytes and every 16 x 64 tile is one 1 KiB load. Rows are padded to whole 32-row
+ * blocks. Scales stay dense [row][k / gs]. Transposed weight scales: st[(c / 32 * groups + g) * 32 + c % 32] for channel
+ * c and group g, channels padded to 32 with zeros (s8_scales_t_bytes). */
+void gemm_q8_init_env(void);              /* reads LLAMA_Q8_GEMM (kernels_init) */
+const char *k_gemm_q8_mode_name(void);    /* "chunk" or "pipelined" */
+int k_gemm_q8_tiled_active(void);         /* pipelined asked for and AMX active */
+size_t s8_scales_t_bytes(int rows, int cols, int gs);
+void pack_s8_scales_t(float *st, const float *s, int rows, int groups, int first_tile, int last_tile);
+/* k_quantize_rows with the int8 values in tile order (scales as k_quantize_rows); q holds whole 32-row blocks. */
+void k_quantize_rows_tiled(int8_t *q, float *s, const float *x, size_t ldx, int m, int n, int gs);
+/* k_gemm_q8 on tile-ordered activations; every segment needs pw/pws (and pw3/pws3 for GEMM_SWIGLU) and AMX. */
+void k_gemm_q8_tiled(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count);
+
 /* Packs many int8 matrices with the active worker team (or serially without one). */
 typedef struct {
   int8_t *dst;
   const int8_t *w;
   int rows, cols;
   size_t ld;
+  float *st;      /* when non-NULL, also the transposed scales of `s` (pack_s8_scales_t) */
+  const float *s; /* dense rows x groups scales */
+  int groups;
 } PackS8;
 void pack_s8_vnni_many(const PackS8 *jobs, int count);
 

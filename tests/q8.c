@@ -221,6 +221,68 @@ static int amx_usable(void) {
   return gemm_amx_unavailable() == NULL;
 }
 
+/* LLAMA_Q8_GEMM=pipelined: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
+ * transposed scales are the scales, and the pipelined kernel equals the AMX chunk kernel bit for bit, for every kind. */
+static void check_tiled(const Case *c) {
+  const int m = c->m, n = c->n, k = c->k, gs = c->gs, groups = k / gs, ldc = n + 3;
+  const size_t rows = up((size_t)m, 32);
+  int8_t *tq = zeroed(rows * k, 1);
+  float *ts = zeroed(rows * groups, 4);
+  for (size_t i = 0; i < rows * k; i++)
+    tq[i] = (int8_t)((int)(next() % 255) - 127); /* garbage in the padding rows */
+  k_quantize_rows_tiled(tq, ts, c->x, (size_t)k, m, k, gs);
+  for (int r = 0; r < m; r++) {
+    checks++;
+    if (memcmp(ts + (size_t)r * groups, c->xs + (size_t)r * groups, (size_t)groups * 4))
+      bad("k_quantize_rows_tiled", "scales differ from k_quantize_rows");
+    for (int t = 0; t < k / 64; t++) {
+      size_t at = ((size_t)r / 32 * 2 + (size_t)r % 32 / 16) * (size_t)(k / 64) * 1024 + (size_t)t * 1024 +
+                  (size_t)(r % 16) * 64;
+      checks++;
+      if (memcmp(tq + at, c->xq + (size_t)r * k + (size_t)t * 64, 64))
+        bad("k_quantize_rows_tiled", "int8 values are not k_quantize_rows' values in tile order");
+    }
+  }
+  float *st = zeroed(s8_scales_t_bytes(n, k, gs), 1), *st3 = zeroed(s8_scales_t_bytes(n, k, gs), 1);
+  for (size_t i = 0; i < s8_scales_t_bytes(n, k, gs) / 4; i++)
+    st[i] = st3[i] = NAN; /* every entry must be written, padding included */
+  int tiles = (n + 15) / 16;
+  pack_s8_scales_t(st, c->ws, n, groups, 0, tiles / 2); /* in two ranges, as a team splits it */
+  pack_s8_scales_t(st, c->ws, n, groups, tiles / 2, tiles);
+  pack_s8_scales_t(st3, c->ws3, n, groups, 0, tiles);
+  for (int j = 0; j < (int)up((size_t)n, 32); j++)
+    for (int g = 0; g < groups; g++) {
+      float want = j < n ? c->ws[(size_t)j * groups + g] : 0.0f, got = st[((size_t)(j / 32) * groups + g) * 32 + j % 32];
+      checks++;
+      if (memcmp(&got, &want, 4))
+        bad("pack_s8_scales_t", "transposed scale differs");
+    }
+  float *base = zeroed((size_t)m * ldc, 4), *want = zeroed((size_t)m * ldc, 4), *got = zeroed((size_t)m * ldc, 4);
+  for (size_t i = 0; i < (size_t)m * ldc; i++)
+    base[i] = uniform() * 3;
+  const GemmKind kinds[] = {GEMM_STORE, GEMM_ADD, GEMM_SWIGLU, GEMM_PARTIAL};
+  gemm_amx_enable(1);
+  for (int t = 0; t < 4; t++) {
+    GemmQ8Segment seg = {.ldc = ldc, .w = {c->wq, c->ws}, .w3 = {c->wq3, c->ws3}, .pw = c->packed,
+                         .pw3 = c->packed3, .pws = st, .pws3 = st3, .n = n, .kind = kinds[t]};
+    memcpy(want, base, (size_t)m * ldc * 4);
+    memcpy(got, base, (size_t)m * ldc * 4);
+    seg.c = want;
+    k_gemm_q8_backend_test(Q8_GEMM_AMX, c->xq, c->xs, m, k, gs, &seg, 1);
+    seg.c = got;
+    k_gemm_q8_tiled(tq, ts, m, k, gs, &seg, 1);
+    checks++;
+    if (memcmp(want, got, (size_t)m * ldc * 4)) {
+      char detail[160];
+      snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: pipelined differs from the chunk kernel", m, n,
+               k, gs, kinds[t]);
+      bad("k_gemm_q8_tiled", detail);
+    }
+  }
+  gemm_amx_enable(0);
+  free(tq), free(ts), free(st), free(st3), free(base), free(want), free(got);
+}
+
 static void run_matrix(const char *label) {
   const int ms[] = {1, 2, 3, 17, 33, 40}, ns[] = {1, 5, 16, 17, 33};
   const int gss[] = {2, 4, 32, 64, 128};
@@ -242,8 +304,10 @@ static void run_matrix(const char *label) {
             float *amx = check_backend(&c, Q8_GEMM_AMX, 0);
             amx_ran += amx != NULL;
             free(amx);
-            if (gs % 64 == 0)
+            if (gs % 64 == 0) {
               check_amx_dots(&c);
+              check_tiled(&c);
+            }
             /* The pick: AMX when active and gs % 64 == 0, the fallback otherwise, the result within budget either way.
              */
             gemm_amx_enable(1);
@@ -281,6 +345,7 @@ static void run_large(const char *label) {
     if (amx_usable()) {
       free(check_backend(&c, Q8_GEMM_AMX, 0));
       check_amx_dots(&c);
+      check_tiled(&c);
     }
     free_case(&c);
   }

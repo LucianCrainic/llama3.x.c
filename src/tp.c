@@ -32,6 +32,7 @@ typedef struct {
                                     socket, or the one-socket loader's run memory and packed store) */
   size_t work_size, packed_size;
   void **packed_at;     /* [layer * 7 + PACK_ROLES index]: the packed copy in `packed`, or NULL */
+  float **pscales_at;   /* the same index: LLAMA_Q8_GEMM=pipelined, the transposed scales after the packed copy */
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
   float *x, *xb, *hb, *q, *att, *rope; /* socket-local activations, in the work region */
@@ -53,6 +54,7 @@ struct Tp {
   Config c;
   int sockets; /* 1: the one-socket engine (tp_create_local); 2: tensor parallel over two sockets (tp_create) */
   int quantized, gs, check, fp32_activations;
+  int tiled; /* LLAMA_Q8_GEMM=pipelined on packed int8: activations quantized in tile order, scales transposed */
   /* One socket: the run state and packed copies live where the one-socket loader places them (A4, A5, C5). */
   RunMemory mem;
   PackedStore local_packed, local_cls;
@@ -493,6 +495,19 @@ static void *packed_copy(const TpSocket *sk, int layer, int index) {
   return sk->packed_at ? sk->packed_at[(size_t)layer * 7 + (size_t)index] : NULL;
 }
 
+/* Its transposed scales (LLAMA_Q8_GEMM=pipelined), or NULL. */
+static const float *packed_scales(const TpSocket *sk, int layer, int index) {
+  return sk->pscales_at ? sk->pscales_at[(size_t)layer * 7 + (size_t)index] : NULL;
+}
+
+/* The W8A8 product on this batch's quantized activations: tile order for the pipelined kernel, else rows. */
+static void gemm_q8(const Tp *tp, const int8_t *xq, const float *xs, int k, const GemmQ8Segment *seg, int count) {
+  if (tp->tiled)
+    k_gemm_q8_tiled(xq, xs, tp->bcount, k, tp->gs, seg, count);
+  else
+    k_gemm_q8(xq, xs, tp->bcount, k, tp->gs, seg, count);
+}
+
 /* One product on FP32 activations: the FP32 GEMM, or in BF16 mode the same segments on the packed copies (the
  * activations are converted to BF16 into the socket's panel, as in the one-socket C5 path). */
 static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda, int k, const GemmSegment *seg,
@@ -516,7 +531,7 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
  * `w` is a column shard (`packed` its packed copy, or NULL): FP32 products take the activations `a` (stride lda), W8A8
  * products the quantized rows `aq`/`as` (dense, stride k and k / gs). */
 static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, const int8_t *aq, const float *as, int k,
-                                const Shard *w, void *packed) {
+                                const Shard *w, void *packed, const float *pscales) {
   /* One socket adds the product straight into the residual (GEMM_ADD): no partial, no reduction. */
   int one = tp->sockets == 1;
   float *partial = one ? sk->x : exchange_partial(tp->exchange, sk->socket);
@@ -524,8 +539,9 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
     return 0;
   GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
   if (tp->quantized) {
-    GemmQ8Segment seg = {.c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .n = tp->c.dim, .kind = kind};
-    k_gemm_q8(aq, as, tp->bcount, k, tp->gs, &seg, 1);
+    GemmQ8Segment seg = {.c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales,
+                         .n = tp->c.dim, .kind = kind};
+    gemm_q8(tp, aq, as, k, &seg, 1);
   } else {
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
     gemm_f32_or_bf16(tp, sk, a, lda, k, &seg, 1, &packed, NULL);
@@ -545,7 +561,10 @@ static uint64_t hash_floats(const float *x, size_t n) {
 
 /* Quantizes `rows` rows of n values (stride ldx) of x for the next W8A8 product, exactly as the per-token path does it. */
 static void quantize_batch(const Tp *tp, int8_t *q, float *scales, const float *x, size_t ldx, int n) {
-  k_quantize_rows(q, scales, x, ldx, tp->bcount, n, tp->gs);
+  if (tp->tiled)
+    k_quantize_rows_tiled(q, scales, x, ldx, tp->bcount, n, tp->gs);
+  else
+    k_quantize_rows(q, scales, x, ldx, tp->bcount, n, tp->gs);
 }
 
 static void forward_batch(Tp *tp, int s) {
@@ -568,10 +587,13 @@ static void forward_batch(Tp *tp, int s) {
     if (q8) {
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
       GemmQ8Segment qkv[3] = {
-          {.c = sk->q, .ldc = ql, .w = q8_weight(wq), .pw = packed_copy(sk, l, 0), .n = ql, .kind = GEMM_STORE},
-          {.c = kd, .ldc = kvl, .w = q8_weight(wk), .pw = packed_copy(sk, l, 1), .n = kvl, .kind = GEMM_STORE},
-          {.c = vd, .ldc = kvl, .w = q8_weight(wv), .pw = packed_copy(sk, l, 2), .n = kvl, .kind = GEMM_STORE}};
-      SPROFILE(PHASE_QKV, k_gemm_q8(sk->xq, sk->xs, m, dim, gs, qkv, 3));
+          {.c = sk->q, .ldc = ql, .w = q8_weight(wq), .pw = packed_copy(sk, l, 0), .pws = packed_scales(sk, l, 0),
+           .n = ql, .kind = GEMM_STORE},
+          {.c = kd, .ldc = kvl, .w = q8_weight(wk), .pw = packed_copy(sk, l, 1), .pws = packed_scales(sk, l, 1),
+           .n = kvl, .kind = GEMM_STORE},
+          {.c = vd, .ldc = kvl, .w = q8_weight(wv), .pw = packed_copy(sk, l, 2), .pws = packed_scales(sk, l, 2),
+           .n = kvl, .kind = GEMM_STORE}};
+      SPROFILE(PHASE_QKV, gemm_q8(tp, sk->xq, sk->xs, dim, qkv, 3));
     } else {
       GemmSegment qkv[3] = {{.c = sk->q, .ldc = ql, .w = wq->q, .ldw = wq->ld, .n = ql, .kind = GEMM_STORE},
                             {.c = kd, .ldc = kvl, .w = wk->q, .ldw = wk->ld, .n = kvl, .kind = GEMM_STORE},
@@ -590,7 +612,8 @@ static void forward_batch(Tp *tp, int s) {
     if (q8)
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->xb, (size_t)ql, ql));
     SPROFILE(PHASE_WO, ok = project_batch_reduce(tp, sk, sk->xb, ql, sk->aq, sk->as, ql,
-                                                 shards_find(&tp->set, T_WO, l, s), packed_copy(sk, l, 3)));
+                                                 shards_find(&tp->set, T_WO, l, s), packed_copy(sk, l, 3),
+                                                 packed_scales(sk, l, 3)));
     if (!ok)
       return;
 
@@ -599,9 +622,9 @@ static void forward_batch(Tp *tp, int s) {
     if (q8) {
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->xq, sk->xs, sk->xb, (size_t)dim, dim));
       GemmQ8Segment up = {.c = sk->hb, .ldc = hidden_l, .w = q8_weight(w1), .w3 = q8_weight(w3),
-                          .pw = packed_copy(sk, l, 4), .pw3 = packed_copy(sk, l, 6), .n = hidden_l,
-                          .kind = GEMM_SWIGLU};
-      SPROFILE(PHASE_W1_W3, k_gemm_q8(sk->xq, sk->xs, m, dim, gs, &up, 1));
+                          .pw = packed_copy(sk, l, 4), .pw3 = packed_copy(sk, l, 6), .pws = packed_scales(sk, l, 4),
+                          .pws3 = packed_scales(sk, l, 6), .n = hidden_l, .kind = GEMM_SWIGLU};
+      SPROFILE(PHASE_W1_W3, gemm_q8(tp, sk->xq, sk->xs, dim, &up, 1));
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->hb, (size_t)hidden_l, hidden_l));
     } else {
       GemmSegment up = {.c = sk->hb, .ldc = hidden_l, .w = w1->q, .w3 = w3->q, .ldw = w1->ld, .n = hidden_l,
@@ -610,7 +633,8 @@ static void forward_batch(Tp *tp, int s) {
       SPROFILE(PHASE_W1_W3, gemm_f32_or_bf16(tp, sk, sk->xb, dim, dim, &up, 1, &p1, &p3));
     }
     SPROFILE(PHASE_W2, ok = project_batch_reduce(tp, sk, sk->hb, hidden_l, sk->aq, sk->as, hidden_l,
-                                                 shards_find(&tp->set, T_W2, l, s), packed_copy(sk, l, 5)));
+                                                 shards_find(&tp->set, T_W2, l, s), packed_copy(sk, l, 5),
+                                                 packed_scales(sk, l, 5)));
     if (!ok)
       return;
     if (sk->debug_hash)
@@ -814,13 +838,16 @@ static void verify_bound(NumaRegion *r, const char *mode) {
 
 /* ---- packed copies (D1) ------------------------------------------------------------------------------------------ */
 
-static size_t pack_bytes_of(const Tp *tp, const Shard *sh) {
-  return tp->pack == TP_PACK_BF16 ? bf16_vnni_elements(sh->rows, sh->cols) * sizeof(uint16_t)
-                                  : s8_vnni_bytes(sh->rows, sh->cols);
-}
-
 static size_t align_line(size_t n) {
   return (n + 63) / 64 * 64;
+}
+
+/* A packed copy: the VNNI tiles, and with LLAMA_Q8_GEMM=pipelined the transposed scales on the next cache line. */
+static size_t pack_bytes_of(const Tp *tp, const Shard *sh) {
+  if (tp->pack == TP_PACK_BF16)
+    return bf16_vnni_elements(sh->rows, sh->cols) * sizeof(uint16_t);
+  size_t tiles = s8_vnni_bytes(sh->rows, sh->cols);
+  return tp->tiled ? align_line(tiles) + s8_scales_t_bytes(sh->rows, sh->cols, tp->gs) : tiles;
 }
 
 /* What socket s's packed region must hold: its shard of every matrix of every layer, each on a cache line. */
@@ -854,6 +881,8 @@ static void plan_packing(Tp *tp) {
     TpSocket *sk = &tp->s[s];
     size_t count = (size_t)tp->c.n_layers * 7;
     sk->packed_at = memory_alloc(count, sizeof(void *), MEM_METADATA);
+    if (tp->tiled)
+      sk->pscales_at = memory_alloc(count, sizeof(float *), MEM_METADATA);
     if (tp->pack == TP_PACK_BF16)
       tp->bjobs[s] = memory_alloc(count, sizeof(PackBf16), MEM_METADATA);
     else
@@ -868,10 +897,17 @@ static void plan_packing(Tp *tp) {
         used += pack_bytes_of(tp, sh);
         size_t at = (size_t)l * 7 + (size_t)i;
         sk->packed_at[at] = dst;
-        if (tp->pack == TP_PACK_BF16)
+        if (tp->pack == TP_PACK_BF16) {
           tp->bjobs[s][at] = pack_bf16_job_from_shard((uint16_t *)dst, sh);
-        else
+        } else {
           tp->sjobs[s][at] = pack_s8_job_from_shard((int8_t *)dst, sh);
+          if (tp->tiled) {
+            PackS8 *job = &tp->sjobs[s][at];
+            job->st = sk->pscales_at[at] = (float *)(dst + align_line(s8_vnni_bytes(sh->rows, sh->cols)));
+            job->s = sh->s;
+            job->groups = sh->cols / tp->gs;
+          }
+        }
       }
     if (used > sk->packed_size)
       fail("socket %d packed region holds %zu bytes, %zu needed", s, sk->packed_size, used);
@@ -931,6 +967,7 @@ static Tp *tp_new(const Config *p, int sockets, int quantized, int gs, int fp32_
   tp->quantized = quantized;
   tp->fp32_activations = fp32_activations;
   tp->gs = quantized ? gs : 0;
+  tp->tiled = pack == TP_PACK_INT8 && gs % 64 == 0 && k_gemm_q8_tiled_active();
   return tp;
 }
 
@@ -1271,6 +1308,7 @@ void tp_free(Tp *tp) {
     region_release(&sk->packed);
     region_release(&sk->packed_cls);
     memory_free(sk->packed_at);
+    memory_free(sk->pscales_at);
     memory_free(tp->bjobs[s]);
     memory_free(tp->sjobs[s]);
     if (sk->panel.base)

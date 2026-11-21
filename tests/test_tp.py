@@ -267,6 +267,37 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIsNone(data['runtime']['kernels_prefill'])
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
 
+    def test_amx_int8_pipelined_kernel_is_bitwise_the_chunk_kernel(self):
+        """LLAMA_Q8_GEMM=pipelined (tile-order activations, transposed weight scales, overlapped rescale) gives bitwise
+        the logits of the default chunk kernel, on one and two sockets, all positions, batches that end mid-block; it is
+        reported in build.q8_gemm, packs the transposed scales, and refuses other values."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        for prompt in (5, 33):
+            tokens = [65 + (i * 7) % 20 for i in range(prompt)]
+            for batch in (2, 5, 32):
+                for sockets in (1, 2):
+                    with self.subTest(prompt=prompt, batch=batch, sockets=sockets):
+                        args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                        chunk = self.probe('int8', 'wide', 'batch', sockets, **args)
+                        pipelined = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='pipelined', **args)
+                        self.assertEqual(len(chunk), prompt * TP_WIDE_CONFIG[5] * 4)
+                        self.assertEqual(chunk, pipelined)
+        for sockets in (1, 2):
+            reports = {mode: self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul',
+                                         full=True, LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_Q8_GEMM=mode)
+                       for mode in ('chunk', 'pipelined')}
+            self.assertEqual(reports['chunk']['build']['q8_gemm'], 'chunk')
+            self.assertEqual(reports['pipelined']['build']['q8_gemm'], 'pipelined')
+            self.assertGreater(reports['pipelined']['memory_bytes']['packed_weights_peak'],
+                               reports['chunk']['memory_bytes']['packed_weights_peak'])
+        directory = self.fixtures['wide']
+        result = subprocess.run([str(BUILD/'runq-amx-emul'), str(directory/'int8.bin'), '-z',
+                                 str(directory/'tokenizer.bin'), '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                timeout=60, env=environment(1, LLAMA_Q8_GEMM='bogus'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LLAMA_Q8_GEMM must be chunk or pipelined', result.stderr)
+
     def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
         """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the
         explicit BF16 mode takes AMX-BF16. The emulated-tile binaries emulate no AVX-512, so `auto` starts from the scalar
