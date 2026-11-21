@@ -1,5 +1,7 @@
 # Attention profile (E0): validation record
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 **Status: run (2026-11-18).** Provenance, gates and gaps of phase E0. Results: [attention-profile.md](attention-profile.md).
 Evidence file names are relative to the job's results directory (`E0/` holds the phase's files; `phase-results.txt`, `environment.txt` and
 `flat-mode.json` sit beside it).
@@ -41,7 +43,7 @@ The tables of the results document are the output of `tools/summarize_attention_
 record: the cross-check (17.30 s against 22.42 s), the row-block ratios against rows per task 4 (0.70 / 0.82 / 1.00 / 1.15 / 1.24), the H6 ratios, the thread
 scaling ratios, and the per-FLOP counter figures (instructions 5.57e11 over 5 passes of 549.8 GFLOP = 0.203 per FLOP; l1d.replacement 31.79, l2 miss
 6.06 and l3-miss loads 0.0001 per KFLOP). They agree with `E0/summary.md`. Counters cover the whole launch, so they include start-up, which is
-small against five passes of 0.54 s (about 0.8 GB of HBM reads per pass against 70 GB streamed, and 7.7e7 cycles of start-up on the idle socket).
+small against five passes of 0.54 s (about 0.4 GB of HBM reads per pass (†) against 70 GB streamed, and 7.7e7 cycles of start-up on the idle socket).
 
 ## Deviations from the plan
 

@@ -17,7 +17,11 @@ import campaign_tables  # noqa: E402
 LABEL = re.compile(r'^(?P<model>.+?)-(?P<precision>fp32|bf16|int8|w8a32)-(?P<backend>omp|teams)-'
                    r'(?P<placement>file|ddr|hbm)-s(?P<sockets>[12])-t(?P<threads>\d+)(?:-m(?P<m>\d+))?'
                    r'(?:-p(?P<prompt>\d+))?(?:-c(?P<ctx>\d+))?(?:-k(?P<kernel>[a-z0-9_]+))?(?:-x(?P<tag>[a-z0-9_]+))?-(?P<rep>\d+)$')
-CAS_LINE = 64  # bytes per uncore CAS
+# Bytes per uncore CAS count. DDR (ddr_cas_rd) counts 64-byte lines. HBM (hbm_cas_rd, uncore_type_14) counts 32-byte
+# units, not 64: calibrated in job 5892172 (see docs/xengine-results-validation.md); earlier versions used 64 B for HBM
+# and overstated HBM bytes by 2x.
+DDR_CAS_BYTES = 64
+HBM_CAS_BYTES = 32
 SMALL_REGION = 16 << 20  # regions below this are not placement-verified
 
 
@@ -128,8 +132,8 @@ def summarize(root):
         perf = paths[0].with_suffix('.perf.csv')
         if perf.exists():
             totals = perf_traffic(perf)
-            hbm = f"{totals.get('hbm_cas_rd', 0) * CAS_LINE / 1e9:.1f}"
-            ddr = f"{totals.get('ddr_cas_rd', 0) * CAS_LINE / 1e9:.1f}"
+            hbm = f"{totals.get('hbm_cas_rd', 0) * HBM_CAS_BYTES / 1e9:.1f}"
+            ddr = f"{totals.get('ddr_cas_rd', 0) * DDR_CAS_BYTES / 1e9:.1f}"
             upi = f"{sum(v for e, v in totals.items() if 'upi' in e) / 1e6:.0f}"
         lines.append('| ' + ' | '.join([
             label, str(len(reports)), info['sockets'], placement_status(first), thp, info['m'] or '-', kernel,

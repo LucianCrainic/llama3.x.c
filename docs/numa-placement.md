@@ -1,5 +1,7 @@
 # One-socket placement: engine-owned memory against the staged baseline
 
+> **Correction (2026-11-21):** HBM byte figures derived from `hbm_cas_rd` counts were computed at 64 B per count; the counter counts 32 B (calibrated in job 5892172, see [xengine-results-validation.md](xengine-results-validation.md)). Affected figures below are halved and marked †.
+
 **Status: run (9 November 2026); the long-context point is covered by the B7 campaign (17 November 2026).** Job 5713411 on the Flat-mode node, tree 52d35c1, 31 minutes, exit 0, 107 reports,
 no failed run. The sections below carry the measured numbers; the 8192-token point of this job is invalid (cut at 4096 tokens by the engine's default step
 cap, fixed in 16b7332); the same configuration was measured in B7, see below. Provenance and gates go in
@@ -61,14 +63,13 @@ pages queried):
 
 | Configuration (8B FP32) | HBM read GB | DDR read GB | UPI rx data flits (M) |
 | --- | ---: | ---: | ---: |
-| `file-shm-hbm` | 12416 | 19.7 | 314 |
-| `anon-hbm` | 12437 | 18.1 | 26 |
-| `anon-hbm-thp` | 12429 | 18.5 | 28 |
-| `anon-ddr` | 10.4 | 6242 | 40 |
-| `remote-hbm` | 12576 | 33.1 | **890,339** |
+| `file-shm-hbm` | 6208 † | 19.7 | 314 |
+| `anon-hbm` | 6219 † | 18.1 | 26 |
+| `anon-hbm-thp` | 6215 † | 18.5 | 28 |
+| `anon-ddr` | 5.2 † | 6242 | 40 |
+| `remote-hbm` | 6288 † | 33.1 | **890,339** |
 
-The counters are as `perf` reports them over the whole process (loading, prefill and decode); read them as ratios between configurations. The HBM figure is about twice what
-one pass per token would read, which is unexplained and does not affect the comparison: owned HBM reads HBM and almost nothing from DDR or across UPI, owned DDR reads only DDR,
+The counters are as `perf` reports them over the whole process (loading, prefill and decode); read them as ratios between configurations. The HBM figures (†) are about 207-210 times the 30 GB weight set for the whole process (6208/30 and 6288/30), which also includes loading and prefill; the excess is unexplained and does not affect the comparison: owned HBM reads HBM and almost nothing from DDR or across UPI, owned DDR reads only DDR,
 and the remote control moves the same HBM volume across UPI (34,000 times the flits of local HBM).
 
 ## Modeled against measured

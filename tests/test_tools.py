@@ -350,7 +350,7 @@ class CampaignSummaryTests(unittest.TestCase):
         self.assertIn('11.00 [10.00-12.00]', row)       # prefill: median with the full range
         self.assertIn('4.20 [4.00-4.40]', row)          # decode
         self.assertIn('w1_w3 50%, qkv 20%, wo 10%', row)
-        self.assertIn('| 96.0 |', row.replace('96.0', '96.0'))  # 1.5e9 CAS * 64 B
+        self.assertIn('| 48.0 |', row)  # 1.5e9 hbm_cas_rd * 32 B (ddr 2e6 * 64 B = 0.1 GB)
         self.assertIn('failed', rows['8b-fp32-omp-hbm-s2-t112'])
         self.assertIn('ddr (MISMATCH)', rows['8b-fp32-omp-ddr-s1-t56'])
         self.assertIn('| - |', rows['1b-fp32-omp-file-s1-t4'])   # v1 report: no runtime object
