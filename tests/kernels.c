@@ -1437,10 +1437,23 @@ static void test_attention_batch_head_layout(int with_forced) {
  * within a BF16 budget (Q, K, P and V are rounded to BF16; values in [-1, 1]). It runs wherever AMX can be enabled: the
  * hardware tiles, or their software model in test-kernels-emul, with the AVX-512 softmax at the avx512/amx levels and
  * the portable one at the scalar level. Shapes cover every query-head group up to 32 (one row per task), head sizes
- * 32..256, microbatches that end mid-block and warm contexts that start mid-block. */
+ * 32..256, microbatches that end mid-block and warm contexts that start mid-block.
+ * It is also partition-invariant, bitwise: each KV head run as its own call (one KV head, its query heads: a socket's
+ * shard under tensor parallelism) gives that head's slice of the all-heads result, and a team of any size gives the
+ * serial result (team != NULL: the caller's team, restored afterwards). Key blocks start at position 0 whatever the
+ * call, and each output row is one task's (KV head x query block), so neither the split nor the thread count moves a
+ * rounding. */
 static double worst_amx;
 
-static void test_attention_amx(void) {
+static void amx_attention_run(float *out, const float *q, const float *kc, const float *vc, float *att, int heads,
+                              int kv, int hd, int seq, int pos0, int m) {
+  AttentionWork work;
+  k_attention_init_rows(&work, heads, kv, hd, seq, m, NULL);
+  k_attention_batch_layout(out, q, kc, vc, att, &work, heads, kv, hd, seq, pos0, m, (size_t)hd, (size_t)seq * hd);
+  k_attention_free(&work);
+}
+
+static void test_attention_amx(struct Team *team) {
   if (gemm_amx_unavailable())
     return;
   int was = gemm_amx_active();
@@ -1469,6 +1482,37 @@ static void test_attention_amx(void) {
                                    (size_t)seq * hd);
           k_attention_free(&work);
         }
+        /* partition invariance: per KV head (a socket's shard), and serial against the team */
+        const int group = shapes[s].group, ldl = group * hd;
+        float *qs = zeroed((size_t)m * ldl, 4), *part = zeroed((size_t)m * dim, 4);
+        assert(kernels_attention_select("amx", NULL));
+        for (int g = 0; kv > 1 && g < kv; g++) {
+          for (int r = 0; r < m; r++)
+            memcpy(qs + (size_t)r * ldl, q + (size_t)r * dim + (size_t)g * ldl, (size_t)ldl * sizeof(float));
+          amx_attention_run(part, qs, kc + (size_t)g * seq * hd, vc + (size_t)g * seq * hd, att, group, 1, hd, seq,
+                            pos0, m);
+          int same = 1;
+          for (int r = 0; r < m; r++)
+            same &=
+                !memcmp(part + (size_t)r * ldl, got + (size_t)r * dim + (size_t)g * ldl, (size_t)ldl * sizeof(float));
+          checks++;
+          if (!same && failures++ < 20)
+            fprintf(stderr,
+                    "attention amx [%s]: KV head %d alone differs from the all-heads call (kv=%d group=%d hd=%d m=%d "
+                    "pos0=%d)\n",
+                    current, g, kv, group, hd, m, pos0);
+        }
+        if (team) {
+          kernels_set_team(NULL);
+          amx_attention_run(part, q, kc, vc, att, heads, kv, hd, seq, pos0, m);
+          kernels_set_team(team);
+          checks++;
+          if (memcmp(part, got, (size_t)m * dim * sizeof(float)) && failures++ < 20)
+            fprintf(stderr,
+                    "attention amx [%s]: the team differs from the serial run (kv=%d group=%d hd=%d m=%d pos0=%d)\n",
+                    current, kv, group, hd, m, pos0);
+        }
+        free(qs), free(part);
         assert(kernels_attention_select("split", NULL));
         double worst = 0;
         for (size_t i = 0; i < (size_t)m * dim; i++) {
@@ -1583,7 +1627,7 @@ int main(int argc, char **argv) {
     test_row_parallel();
     test_two_teams();
     test_attention_split();
-    test_attention_amx();
+    test_attention_amx(NULL);
     rng = seed; /* identical inputs for every instruction set */
     ran[i] = 1;
     printf("kernels: %s %s\n", current, failures == before ? "ok" : "FAILED");
@@ -1633,7 +1677,7 @@ int main(int argc, char **argv) {
       test_attention_matrix();
       test_attention_head_layout(0);
       test_attention_batch_head_layout(0);
-      test_attention_amx();
+      test_attention_amx(pool_team(0));
       test_partial();
       test_row_parallel();
       k_gemv_force_hybrid(1); /* the hybrid split of large FP32 jobs, on these small matrices */
