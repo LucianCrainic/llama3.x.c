@@ -99,6 +99,8 @@ xe_require_env() {
     ARTIFACTS=${ARTIFACTS:-'<ARTIFACTS>'}
     PROMPTS_DIR=${PROMPTS_DIR:-'<PROMPTS_DIR>'}
     UPERF=${UPERF:-'<UPERF>'}
+    LLAMACPP_BIN=${LLAMACPP_BIN:-'<LLAMACPP_BIN>'}
+    GGUF=${GGUF:-'<GGUF>'}
     VLLM_SIF=${VLLM_SIF:-'<VLLM_SIF>'}
     VLLM_MODEL=${VLLM_MODEL:-'<VLLM_MODEL>'}
     VLLM_PATCHED_WORKER=${VLLM_PATCHED_WORKER:-'<VLLM_PATCHED_WORKER>'}
@@ -110,6 +112,10 @@ xe_require_env() {
       fi
     done
     for value in $ENGINES; do
+      if [[ $value == llamacpp ]]; then
+        : "${LLAMACPP_BIN:?LLAMACPP_BIN (llama.cpp build bin directory) required for llamacpp}"
+        : "${GGUF:?GGUF (Q8_0 model file) required for llamacpp}"
+      fi
       if [[ $value == vllm ]]; then
         : "${VLLM_SIF:?VLLM_SIF (Apptainer image of vLLM 0.34.0 CPU) required for vllm}"
         : "${VLLM_MODEL:?VLLM_MODEL (directory of the W8A8 checkpoint) required for vllm}"
@@ -236,6 +242,14 @@ xe_perf_group_for_rep() {
 
 # ---- one cell ------------------------------------------------------------------------------------------------------
 CELL_TODO=
+# xe_relabel WL: a second cell of the same repeat under another workload name (the cell function calls it, then
+# xe_execute_cell again).
+xe_relabel() {
+  CELL_WL=$1
+  CELL_LABEL="$CELL_ENGINE-s$CELL_S-$CELL_MEM${CELL_VARIANT:+-$CELL_VARIANT}-$CELL_WL-r$CELL_REP"
+  CELL_DIR="$OUT/runs/$CELL_LABEL"
+}
+
 # xe_run_cell ENGINE S MEM WL REP: sets the cell globals and hands over to run_<engine>_cell.
 xe_run_cell() {
   CELL_ENGINE=$1 CELL_S=$2 CELL_MEM=$3 CELL_WL=$4 CELL_REP=$5 CELL_VARIANT=${6:-}
@@ -243,7 +257,7 @@ xe_run_cell() {
   CELL_DIR="$OUT/runs/$CELL_LABEL"
   CELL_PERF_GROUP=$(xe_perf_group_for_rep "$CELL_REP")
   CELL_ENV=() CELL_CMD=() CELL_CHECK=() CELL_ANCHORS=()
-  CELL_PERF_ATTACH=
+  CELL_PERF_ATTACH= CELL_RSS_TRIGGER_KB=
   CELL_VERSION= CELL_CONFIG= CELL_GEN= CELL_PROC= CELL_LOAD_PATTERN= CELL_TODO=
   "run_${CELL_ENGINE}_cell" "$CELL_S" "$CELL_MEM" "$CELL_WL" "$CELL_REP"
 }
@@ -305,14 +319,28 @@ xe_perf_events() {
 # repeats in XE_PLACEMENT_REPS, summarises /proc/PID/numa_maps (end of load) and runs numastat -p about XE_MIDRUN_S later
 # (a run that is already over is noted). It runs on the last CPU so it does not steal a worker's core on one-socket runs.
 xe_sampler() {
-  local d=$1 pid=$2 mode=$3 target=$2
+  local d=$1 pid=$2 mode=$3 target=$2 i rss
   if [[ -n ${XE_HELPER_CPU:-} ]]; then taskset -cp "$XE_HELPER_CPU" "$BASHPID" > /dev/null 2>&1 || true; fi
-  [[ -n $CELL_LOAD_PATTERN ]] || return 0
-  until [[ -r $d/stderr ]] && grep -qF -- "$CELL_LOAD_PATTERN" "$d/stderr"; do
-    kill -0 "$pid" 2> /dev/null || return 0
-    sleep 0.02
-  done
-  xe_now_ns > "$d/load_end_seen_ns"
+  if [[ -n $CELL_LOAD_PATTERN ]]; then
+    until [[ -r $d/stderr ]] && grep -qF -- "$CELL_LOAD_PATTERN" "$d/stderr"; do
+      kill -0 "$pid" 2> /dev/null || return 0
+      sleep 0.02
+    done
+    xe_now_ns > "$d/load_end_seen_ns"
+  elif [[ -n $CELL_RSS_TRIGGER_KB ]]; then
+    # No load log (llama-bench): the weights are resident once VmRSS passes the trigger; 3 s later the run is under way.
+    for ((i = 0; i < 1200; i++)); do
+      kill -0 "$pid" 2> /dev/null || return 0
+      target=$pid
+      if [[ $mode == wrap ]]; then target=$(pgrep -n -x "$CELL_PROC" || true); fi
+      rss=$(awk '/^VmRSS/ { print $2 }' "/proc/${target:-0}/status" 2> /dev/null || true)
+      if [[ -n $rss && $rss -ge $CELL_RSS_TRIGGER_KB ]]; then break; fi
+      sleep 0.1
+    done
+    sleep 3
+  else
+    return 0
+  fi
   xe_in_list "$CELL_REP" $XE_PLACEMENT_REPS || return 0
   if [[ $mode == wrap ]]; then target=$(pgrep -n -x "$CELL_PROC" || true); fi
   [[ -n $target ]] || return 0
@@ -536,16 +564,152 @@ run_c_cell() {
   xe_execute_cell
 }
 
-# ---- llama.cpp: section to be filled in with its verified command line ----------------------------------------------------
-# Placeholder only: the estimate follows the plan (section 8); the run function records the cell as not implemented.
+# ---- llama.cpp v1.0.0 (llama-bench, Q8_0 GGUF, AMX extra buffer) --------------------------------------------------------
+# One llama-bench invocation per workload and repeat (-r 3 inside it, -o json), so the repeat's perf group covers one
+# invocation (load, warm-up, 3 timed repetitions). P = -p 2048 -n 0; D = -p 0 -n 128 -d 86; L = -p 0 -n 128 -d 8192 plus a
+# separate cell LP = -p 8192 -n 0 (the 8192 prefill, comparable to the other engines' L TTFT). llama-bench uses random
+# tokens (decision D4: dense cost depends on length only). Weights are staged in tmpfs on node 0 and loaded with -lm none
+# (re-allocated under the run's memory policy), no --numa, strict CPU mask. The binary needs the gcc-toolset libstdc++ at
+# run time: the command sources it in its own bash and exec's, so the perf started by this shell keeps a clean environment
+# (sourcing the toolset makes the sudo perf call fail) and llama-bench runs as the user (tail --pid pattern, as for c).
+# Per configuration (llamacpp_begin_config): one llama-completion -v run (greedy, 32 tokens) records the "AMX" buffer line,
+# system_info and a sanity text. Env: LLAMACPP_BIN (bin dir), GGUF, LLAMACPP_ENABLE (toolset enable script, default
+# /opt/rh/gcc-toolset-14/enable), LLAMACPP_VERSION, LLAMACPP_COMMON (flags), LLAMACPP_THREADS_1S (56), and per tier the 2S
+# knobs LLAMACPP_2S_HBM_NUMACTL / _THREADS / _MASK / _FLAGS and LLAMACPP_2S_DDR_* (defaults = the smoke baseline: all 112
+# cores, memory interleaved over the two HBM nodes 2,3 or the two DDR nodes 0,1). Cache node: no membind.
+LCPP_MASK_S0=0x00ffffffffffffff
+LCPP_MASK_2S=0xffffffffffffffffffffffffffff
+LCPP_STAGED=
+LCPP_SANITY_PROMPT='The capital of France is Paris. The capital of Italy is'
+
+# lcpp_config S MEM: sets LCPP_NUMACTL (array), LCPP_THREADS, LCPP_MASK, LCPP_FLAGS (array of extra flags).
+lcpp_config() {
+  local s=$1 mem=$2 words=''
+  LCPP_FLAGS=()
+  if [[ $s == 1 ]]; then
+    LCPP_THREADS=${LLAMACPP_THREADS_1S:-56}
+    LCPP_MASK=$LCPP_MASK_S0
+    case $mem in
+      hbm) words='--cpunodebind=0 --membind=2' ;;
+      ddr) words='--cpunodebind=0 --membind=0' ;;
+      cache) words='--cpunodebind=0' ;;
+    esac
+  else
+    local prefix=''
+    case $mem in
+      hbm) prefix=LLAMACPP_2S_HBM words='--cpunodebind=0,1 --interleave=2,3' ;;
+      ddr) prefix=LLAMACPP_2S_DDR words='--cpunodebind=0,1 --interleave=0,1' ;;
+      cache) prefix=LLAMACPP_2S_CACHE words='--cpunodebind=0,1' ;;
+    esac
+    local v_numactl=${prefix}_NUMACTL v_threads=${prefix}_THREADS v_mask=${prefix}_MASK v_flags=${prefix}_FLAGS
+    words=${!v_numactl:-$words}
+    LCPP_THREADS=${!v_threads:-112}
+    LCPP_MASK=${!v_mask:-$LCPP_MASK_2S}
+    # shellcheck disable=SC2206  # a word list
+    LCPP_FLAGS=(${!v_flags:-})
+  fi
+  # shellcheck disable=SC2206  # a word list
+  LCPP_NUMACTL=(numactl $words)
+}
+
+# lcpp_wrap CMD...: LCPP_RUN, the command in a bash that sources the toolset and exec's (the pid stays that of llama-bench).
+lcpp_wrap() {
+  LCPP_RUN=(bash -c 'source "$0"; exec "$@"' "${LLAMACPP_ENABLE:-/opt/rh/gcc-toolset-14/enable}" "$@")
+}
+
+# Seconds: load 20 s, then (warm-up + 3 repetitions) x test. pp2048 about 4.6 s (445 tok/s), tg128 about 4 s (25-42 tok/s),
+# the depth prefill of every repetition is untimed (8192 tokens about 18 s, 86 tokens 0.2 s).
 llamacpp_estimate_s() {
   local run
-  case $3 in P) run=6 ;; D) run=14 ;; L) run=45 ;; esac
-  echo $((${XE_LLAMACPP_LOAD_S:-15} + run + 2))
+  case $3 in P) run=19 ;; D) run=18 ;; L) run=95 ;; LP) run=80 ;; esac
+  echo $((${XE_LCPP_LOAD_S:-20} + run + 2))
 }
-run_llamacpp_cell() {
-  CELL_TODO='llama.cpp section not filled in yet (command line pending)'
+
+llamacpp_prepare() {
+  if dry_run; then
+    need_shm
+    LCPP_STAGED=$shm/llama-3.1-8b-instruct-q8_0.gguf
+    printf 'PREP  llamacpp: stage the GGUF in tmpfs under numactl --membind=0 -> %s; llama-bench and llama-completion from LLAMACPP_BIN\n' "$LCPP_STAGED"
+    return 0
+  fi
+  local b
+  for b in llama-bench llama-completion; do
+    [[ -x $LLAMACPP_BIN/$b ]] || {
+      echo "llamacpp_prepare: missing $LLAMACPP_BIN/$b" >&2
+      return 1
+    }
+  done
+  need_shm
+  LCPP_STAGED=$shm/llama-3.1-8b-instruct-q8_0.gguf
+  numactl --membind=0 cp "$GGUF" "$LCPP_STAGED" || return 1
+  printf 'llama.cpp gguf sha256 %s\n' "$(sha256sum "$LCPP_STAGED" | cut -d' ' -f1)" >> "$OUT/environment.txt"
+}
+
+llamacpp_environment() {
+  lcpp_wrap "$LLAMACPP_BIN/llama-bench" --version
+  printf 'llama.cpp %s: %s\n' "${LLAMACPP_VERSION:-v1.0.0}" "$("${LCPP_RUN[@]}" 2>&1 | tr '\n' ' ')"
+}
+
+llamacpp_describe_config() {
+  lcpp_config "$1" "$2"
+  printf 'CONFIG-NOTE llamacpp s%s %s: numactl %s, threads %s, mask %s, extra flags %s; one llama-completion -v sanity run per config\n' \
+    "$1" "$2" "${LCPP_NUMACTL[*]:1}" "$LCPP_THREADS" "$LCPP_MASK" "${LCPP_FLAGS[*]-none}"
+}
+
+# One llama-completion run per configuration: greedy, 32 tokens, -v for the load log (the AMX buffer line) and system_info.
+llamacpp_begin_config() {
+  local s=$1 mem=$2 d rc=0
+  lcpp_config "$s" "$mem"
+  d="$OUT/llamacpp-config-s$s-$mem"
+  mkdir -p "$d"
+  lcpp_wrap "${LCPP_NUMACTL[@]}" "$LLAMACPP_BIN/llama-completion" -m "$LCPP_STAGED" -p "$LCPP_SANITY_PROMPT" -n 32 -no-cnv -fa on \
+    -lm none -t "$LCPP_THREADS" -C "$LCPP_MASK" --cpu-strict 1 --temp 0 --top-k 1 -s 1 --ignore-eos -v
+  printf '%s\n' "${LCPP_RUN[*]}" > "$d/sanity-cmd.txt"
+  "${LCPP_RUN[@]}" < /dev/null > "$d/sanity.stdout" 2> "$d/sanity.stderr" || rc=$?
+  grep -E 'AMX' "$d/sanity.stderr" > "$d/amx-lines.txt" || true
+  grep -m1 'system_info' "$d/sanity.stderr" > "$d/system_info.txt" || true
+  if [[ $rc -eq 0 ]] && grep -q 'AMX_INT8 = 1' "$d/system_info.txt" && grep -q 'AMX' "$d/amx-lines.txt" && [[ -s $d/sanity.stdout ]]; then
+    record_result "sanity-llamacpp-s$s-$mem" PASS
+  else
+    record_result "sanity-llamacpp-s$s-$mem" FAIL "exit=$rc or no AMX_INT8 / AMX buffer line / output"
+  fi
+  return 0
+}
+
+llamacpp_finalize() {
+  "$PYTHON" "$XE_CELL_PY" llamacpp-report "$CELL_DIR" 2> /dev/null
+}
+
+# lcpp_cell WL NPROMPT NGEN DEPTH: builds and executes one cell (lcpp_config was called).
+lcpp_cell() {
+  local np=$2 ng=$3 depth=$4
+  lcpp_wrap "${LCPP_NUMACTL[@]}" "$LLAMACPP_BIN/llama-bench" -m "${LCPP_STAGED:-<staged gguf>}" \
+    ${LLAMACPP_COMMON:--fa on -ctk f16 -ctv f16 -b 2048 -ub 512 -lm none --repack 1 --cpu-strict 1} -C "$LCPP_MASK" -t "$LCPP_THREADS" \
+    ${LCPP_FLAGS[@]+"${LCPP_FLAGS[@]}"} -p "$np" -n "$ng" -d "$depth" -r 3 -o json
+  CELL_CMD=("${LCPP_RUN[@]}")
+  CELL_GEN=$ng
+  CELL_VERSION=${LLAMACPP_VERSION:-v1.0.0 (b1b770d90)}
+  CELL_CONFIG="threads=$LCPP_THREADS mask=$LCPP_MASK numactl='${LCPP_NUMACTL[*]:1}' flags='${LCPP_FLAGS[*]-}' n_prompt=$np n_gen=$ng depth=$depth reps=3 random_tokens weights=q8_0 kv=f16 no_numa"
+  CELL_PROC=llama-bench
+  CELL_RSS_TRIGGER_KB=8000000
+  CELL_ANCHORS=("teardown_assumed_s=${XE_LCPP_TEARDOWN_S:-0.25}")
+  CELL_CHECK=("$PYTHON" "$XE_CELL_PY" check-llamacpp "$CELL_DIR" --n-prompt "$np" --n-gen "$ng" --depth "$depth" --threads "$LCPP_THREADS" --reps 3)
   xe_execute_cell
+}
+
+run_llamacpp_cell() {
+  lcpp_config "$1" "$2"
+  case $3 in
+    P) lcpp_cell P 2048 0 0 ;;
+    D) lcpp_cell D 0 128 86 ;;
+    L)
+      lcpp_cell L 0 128 8192
+      # the 8192-token prefill as a cell of its own, same repeat (perf group), workload LP
+      xe_relabel LP
+      CELL_ENV=() CELL_CMD=() CELL_CHECK=() CELL_ANCHORS=()
+      lcpp_cell LP 8192 0 0
+      ;;
+  esac
 }
 
 # ---- vLLM 0.34.0 CPU backend (Apptainer image, RedHatAI W8A8 checkpoint) ------------------------------------------------

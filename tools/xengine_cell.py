@@ -13,6 +13,10 @@ Subcommands (all stdlib only, so they run on any node):
       tokens, the socket count, and the memory placement of every region. Prints PASS/FAIL lines, exit 1 on any FAIL.
   assemble OUT [--campaign K=V ...]
       Merges OUT/runs/*/cell.json into OUT/manifest.json.
+  llamacpp-report DIR
+      Turns the JSON that llama-bench printed (DIR/stdout) into DIR/report.json (its first entry, plus a status).
+  check-llamacpp DIR --n-prompt P --n-gen G --depth D --threads T --reps R
+      Verifies a llama-bench report: shape of the test, thread count, number of repetitions, strict CPU mask, no mmap.
   vllm-report DIR
       Turns DIR/client.jsonl (one measured request of tools/xengine_vllm_client.py) into DIR/report.json.
   check-vllm DIR --generation G --prompt-tokens N
@@ -49,6 +53,16 @@ relative to the moment it sent the request, and the wall clock when the request 
   first_token_ns    = request send + t_first_token (the first streamed token)
   decode_end_ns     = request send + last token arrival;  end_ns = client process exit
   wall_time is taken right after the request returns, so the edges are good to a few ms.
+llama.cpp (derive_markers_llamacpp): llama-bench prints no load log and no per-token hooks. One invocation is a warm-up
+run plus R timed repetitions (-r R), each preceded by an untimed depth prefill (-d). All it reports are the
+repetitions' times (samples_ns). The rule is conservative: only the LAST repetition is placed, working backwards from
+process exit:
+  window_end   = end_ns - teardown_assumed_s   (anchor from the job, default 0.25 s: freeing the model and exit)
+  window_start = window_end - samples_ns[-1]
+  pp test (-p N -n 0):  prefill_start_ns = window_start, first_token_ns = window_end (prefill window; decode_end absent)
+  tg test (-n G):       first_token_ns = window_start (start of the timed decode), decode_end_ns = window_end
+  load_start_ns = launch_ns. Both windows lie inside a steady-state phase of the same kind as the repetitions before them,
+  so a misjudged teardown of a few tenths of a second moves the window along the plateau, not out of it.
 Perf clock: `perf -I` stamps are seconds since counting started. The start is not known to better than the perf start-up
 time (tens to hundreds of ms), but perf stops within one `tail` poll (0.1 s) of the engine's exit, so the clock is lined
 up at the end: perf_t0_ns = end_ns - last perf time stamp + half the poll period (system-wide perf; zero for the
@@ -141,7 +155,26 @@ def derive_markers_vllm(anchors, report, perf_csv=None):
     return m
 
 
-MARKER_DERIVERS = {'c': derive_markers_c, 'vllm': derive_markers_vllm}  # llama.cpp registers its deriver here
+def derive_markers_llamacpp(anchors, report, perf_csv=None):
+    launch = int(anchors['launch_ns'])
+    end = int(anchors['end_ns'])
+    m = {'load_start_ns': launch, 'end_ns': end, 'prefill_start_ns': None, 'first_token_ns': None, 'decode_end_ns': None}
+    r = report or {}
+    samples = r.get('samples_ns') or []
+    if samples:
+        td = float(anchors.get('teardown_assumed_s', 0.25))
+        wend = end - td * NS
+        wstart = wend - samples[-1]
+        m['anchor'] = 'process_exit_minus_teardown'
+        m['teardown_assumed_s'] = td
+        if r.get('n_gen', 0) > 0:
+            m['first_token_ns'], m['decode_end_ns'] = int(wstart), int(wend)
+        else:
+            m['prefill_start_ns'], m['first_token_ns'] = int(wstart), int(wend)
+    return m
+
+
+MARKER_DERIVERS = {'c': derive_markers_c, 'vllm': derive_markers_vllm, 'llamacpp': derive_markers_llamacpp}
 
 
 def perf_clock(anchors, markers, perf_csv):
@@ -261,6 +294,45 @@ def check_vllm(report, generation, prompt_tokens):
     return [(bool(ok), name, str(detail)) for ok, name, detail in res]
 
 
+def parse_bench_json(text):
+    start = text.find('[')
+    return json.loads(text[start:]) if start >= 0 else []
+
+
+def cmd_llamacpp_report(args):
+    d = Path(args.dir)
+    try:
+        entries = parse_bench_json((d/'stdout').read_text())
+    except (OSError, ValueError):
+        return 1
+    if not entries:
+        return 1
+    r = entries[0]
+    r['status'] = 'completed' if r.get('samples_ns') else 'failed'
+    (d/'report.json').write_text(json.dumps(r) + '\n')
+    return 0
+
+
+def check_llamacpp(report, n_prompt, n_gen, depth, threads, reps):
+    if not isinstance(report, dict):
+        return [(False, 'report present', 'no report.json')]
+    res = [(report.get('n_prompt') == n_prompt and report.get('n_gen') == n_gen and report.get('n_depth') == depth,
+            'test shape', 'n_prompt=%s n_gen=%s n_depth=%s expected %s/%s/%s' % (
+                report.get('n_prompt'), report.get('n_gen'), report.get('n_depth'), n_prompt, n_gen, depth)),
+           (report.get('n_threads') == threads, 'threads', report.get('n_threads')),
+           (len(report.get('samples_ns') or []) == reps, 'repetitions', len(report.get('samples_ns') or [])),
+           (report.get('cpu_strict') is True, 'strict CPU mask', report.get('cpu_strict')),
+           (report.get('load_mode') == 'none', 'weights loaded without mmap', report.get('load_mode'))]
+    return [(bool(ok), n, str(dt)) for ok, n, dt in res]
+
+
+def cmd_check_llamacpp(args):
+    res = check_llamacpp(load_json(Path(args.dir)/'report.json'), args.n_prompt, args.n_gen, args.depth, args.threads, args.reps)
+    for ok, name, detail in res:
+        print('PASS' if ok else 'FAIL', name, '' if ok else detail)
+    return 0 if all(ok for ok, _, _ in res) else 1
+
+
 def cmd_vllm_report(args):
     d = Path(args.dir)
     records = [json.loads(ln) for ln in (d/'client.jsonl').read_text().splitlines() if ln.strip()] \
@@ -370,6 +442,14 @@ def main(argv=None):
     p.add_argument('--generation', type=int, required=True)
     p.add_argument('--prompt-tokens', type=int, required=True)
     p.set_defaults(fn=cmd_check_c)
+    p = sub.add_parser('llamacpp-report')
+    p.add_argument('dir')
+    p.set_defaults(fn=cmd_llamacpp_report)
+    p = sub.add_parser('check-llamacpp')
+    p.add_argument('dir')
+    for name in ('n-prompt', 'n-gen', 'depth', 'threads', 'reps'):
+        p.add_argument('--' + name, type=int, required=True)
+    p.set_defaults(fn=cmd_check_llamacpp)
     p = sub.add_parser('vllm-report')
     p.add_argument('dir')
     p.set_defaults(fn=cmd_vllm_report)

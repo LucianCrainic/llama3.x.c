@@ -170,7 +170,20 @@ def read_vllm_phases(report):
     return out
 
 
-PHASE_READERS = {'c': read_c_phases, 'vllm': read_vllm_phases}  # llama.cpp and vLLM readers register here
+def read_llamacpp_phases(report):
+    """One llama-bench entry (average of its -r repetitions): pp (n_prompt > 0, n_gen = 0) is the prefill phase, TTFT =
+    n_prompt / avg_ts; tg (n_gen > 0, after n_depth untimed context tokens) is the decode phase, TPOT = 1 / avg_ts. The tg
+    timing covers all n_gen tokens (llama-bench has no separate first token), so decode tokens = n_gen here."""
+    avg_s = report['avg_ns'] / 1e9
+    if report.get('n_gen', 0) > 0:
+        n = report['n_gen']
+        return {'decode': {'tokens': n, 'seconds': avg_s, 'tok_s': report['avg_ts'], 'tpot_s': 1 / report['avg_ts'],
+                           'e2e_s': avg_s, 'tpot_uniform_s': avg_s / n}}
+    n = report['n_prompt']
+    return {'prefill': {'tokens': n, 'seconds': avg_s, 'tok_s': report['avg_ts'], 'ttft_s': n / report['avg_ts']}}
+
+
+PHASE_READERS = {'c': read_c_phases, 'vllm': read_vllm_phases, 'llamacpp': read_llamacpp_phases}  # llama.cpp and vLLM readers register here
 
 
 def phase_windows(markers):

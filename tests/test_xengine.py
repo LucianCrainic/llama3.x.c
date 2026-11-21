@@ -279,6 +279,66 @@ class VllmTests(unittest.TestCase):
             self.assertAlmostEqual(rows[1]['tpot_uniform_s'], (127*0.025 + 0.001)/127, places=6)
 
 
+def bench_entry(n_prompt=0, n_gen=128, depth=86, samples=(4.4e9, 4.3e9, 4.2e9)):
+    avg = sum(samples)/len(samples)
+    work = n_gen or n_prompt
+    return {'n_prompt': n_prompt, 'n_gen': n_gen, 'n_depth': depth, 'n_threads': 56, 'cpu_strict': True, 'load_mode': 'none',
+            'avg_ns': avg, 'avg_ts': work/avg*1e9, 'samples_ns': list(samples), 'status': 'completed'}
+
+
+class LlamaCppTests(unittest.TestCase):
+    def test_markers_place_the_last_repetition_before_exit(self):
+        m = cell.derive_markers_llamacpp({'launch_ns': str(T0), 'end_ns': str(END), 'teardown_assumed_s': '0.25'}, bench_entry())
+        self.assertAlmostEqual((END - m['decode_end_ns'])/1e9, 0.25, places=6)
+        self.assertAlmostEqual((m['decode_end_ns'] - m['first_token_ns'])/1e9, 4.2, places=6)
+        self.assertIsNone(m['prefill_start_ns'])
+        pp = cell.derive_markers_llamacpp({'launch_ns': str(T0), 'end_ns': str(END)}, bench_entry(2048, 0, 0))
+        self.assertIsNone(pp['decode_end_ns'])
+        self.assertAlmostEqual((pp['first_token_ns'] - pp['prefill_start_ns'])/1e9, 4.2, places=6)
+        self.assertEqual(summ.phase_windows(pp).keys(), {'prefill'})
+        self.assertEqual(summ.phase_windows(m).keys(), {'decode'})
+
+    def test_reader_report_and_checks(self):
+        tg = summ.read_llamacpp_phases(bench_entry())
+        self.assertEqual(list(tg), ['decode'])
+        self.assertAlmostEqual(tg['decode']['tpot_s'], 1/tg['decode']['tok_s'])
+        pp = summ.read_llamacpp_phases(bench_entry(2048, 0, 0))
+        self.assertAlmostEqual(pp['prefill']['ttft_s'], 2048/pp['prefill']['tok_s'])
+        self.assertTrue(all(o for o, _, _ in cell.check_llamacpp(bench_entry(), 0, 128, 86, 56, 3)))
+        self.assertFalse(all(o for o, _, _ in cell.check_llamacpp(bench_entry(), 0, 128, 8192, 56, 3)))
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d/'stdout').write_text('noise\n' + json.dumps([bench_entry()]))
+            self.assertEqual(cell.main(['llamacpp-report', str(d)]), 0)
+            self.assertEqual(json.loads((d/'report.json').read_text())['status'], 'completed')
+
+    def test_matrix_and_overrides(self):
+        text, a = TestCaseHelper.cells('A', ENGINES='llamacpp')
+        self.assertEqual(len(a), 2*4*3)  # {1S, 2S} x {P, D, L, LP} x 3 repeats
+        self.assertIn('llamacpp-s2-hbm-LP-r3', a)
+        self.assertIn('--cpunodebind=0,1 --interleave=2,3', text)
+        self.assertIn('-t 112', text)
+        text, _ = TestCaseHelper.cells('A', ENGINES='llamacpp', LLAMACPP_2S_HBM_NUMACTL='--cpunodebind=0,1 --interleave=all',
+                                       LLAMACPP_2S_HBM_THREADS='96', LLAMACPP_2S_HBM_FLAGS='-b 1024')
+        self.assertIn('--interleave=all', text)
+        self.assertIn('-t 96 -b 1024', text)
+        text, c = TestCaseHelper.cells('cache', ENGINES='llamacpp')
+        cmds = '\n'.join(ln for ln in text.splitlines() if ln.strip().startswith('cmd:'))
+        self.assertNotIn('--membind', cmds)
+        self.assertIn('numactl --cpunodebind=0,1 ', cmds)
+        text, _ = TestCaseHelper.cells('B', ENGINES='llamacpp')
+        self.assertIn('numactl --cpunodebind=0 --membind=0 ', text)
+
+
+class TestCaseHelper:
+    @staticmethod
+    def cells(role, **env):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = sbatch({'OUT': str(Path(tmp)/'out'), 'NODE_ROLE': role, **env})
+            assert result.returncode == 0, result.stderr
+            return result.stdout, [ln.split()[1] for ln in result.stdout.splitlines() if ln.startswith('CELL ')]
+
+
 class CheckTests(unittest.TestCase):
     def test_check_c(self):
         ok = cell.check_c(report(), 1, 'hbm', 128, 86)
@@ -374,7 +434,7 @@ class DryRunTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(msg, result.stderr)
             result = sbatch({'OUT': str(Path(tmp)/'o2'), 'NODE_ROLE': 'A', 'ENGINES': 'llamacpp'})
-            self.assertIn('not filled in yet', result.stdout)
+            self.assertNotIn('not filled in yet', result.stdout)
             self.assertEqual(sbatch({'OUT': tmp, 'NODE_ROLE': 'A'}).returncode, 1)  # OUT exists
 
 
