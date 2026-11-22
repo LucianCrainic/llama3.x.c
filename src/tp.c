@@ -544,19 +544,21 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
   k_gemm_bf16(a, lda, tp->bcount, k, b, count, &sk->panel);
 }
 
-static int batch_reduce_interleaved(void) {
+/* LLAMA_TP_BATCH_REDUCE: 0 barrier, 1 wo (Wo interleaved, W2 barrier), 2 interleaved (both). */
+static int batch_reduce_mode(void) {
   static int mode = -1;
   if (mode < 0) {
     const char *value = getenv("LLAMA_TP_BATCH_REDUCE");
-    if (value && *value && strcmp(value, "interleaved") && strcmp(value, "barrier"))
-      fail("LLAMA_TP_BATCH_REDUCE must be interleaved or barrier");
-    mode = !(value && !strcmp(value, "barrier"));
+    if (value && *value && strcmp(value, "interleaved") && strcmp(value, "wo") && strcmp(value, "barrier"))
+      fail("LLAMA_TP_BATCH_REDUCE must be interleaved, wo or barrier");
+    mode = !value || !*value || !strcmp(value, "interleaved") ? 2 : !strcmp(value, "wo") ? 1 : 0;
   }
   return mode;
 }
 
 const char *tp_batch_reduce_name(void) {
-  return batch_reduce_interleaved() ? "interleaved" : "barrier";
+  static const char *const names[] = {"barrier", "wo", "interleaved"};
+  return names[batch_reduce_mode()];
 }
 
 /* LLAMA_TP_BATCH_REDUCE=interleaved: the reduction of a W8A8 Wo/W2 partial runs inside the projection's team job. Every
@@ -697,7 +699,7 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
   if (tp->quantized) {
     GemmQ8Segment seg = {
         .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
-    if (!one && batch_reduce_interleaved()) {
+    if (!one && batch_reduce_mode() > (slot == TP_W2_MM)) {
       project_interleaved(tp, sk, aq, as, k, &seg, slot);
       return !workers_aborted();
     }
@@ -1295,10 +1297,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     }
   tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
   /* The interleaved reduction flags blocks of 32 rows x 16 or 32 channels in the per-element flag array. */
-  if (batch_reduce_interleaved() &&
+  if (batch_reduce_mode() &&
       (long long)((p->dim + 15) / 16) * ((tp->rows + 31) / 32) > exchange_block_capacity(tp->exchange))
-    fail("LLAMA_TP_BATCH_REDUCE=interleaved: %d x %d blocks exceed the exchange flags", (p->dim + 15) / 16,
-         (tp->rows + 31) / 32);
+    fail("LLAMA_TP_BATCH_REDUCE=%s: %d x %d blocks exceed the exchange flags", tp_batch_reduce_name(),
+         (p->dim + 15) / 16, (tp->rows + 31) / 32);
   if (tp->rows > 1)
     LOG(LOG_INFO, "two-socket batch capacity %d rows: work region %.1f MiB and exchange %.1f MiB per socket", tp->rows,
         (double)work_bytes(tp) / (1 << 20), (double)tp_exchange_bytes(p, tp->rows) / (1 << 20));

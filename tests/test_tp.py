@@ -306,8 +306,8 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIn('LLAMA_Q8_GEMM must be pipelined or chunk', result.stderr)
 
     def test_interleaved_batch_reduction_is_bitwise_the_barrier_one(self):
-        """LLAMA_TP_BATCH_REDUCE=interleaved (the default: each stored block of the two-socket W8A8 Wo/W2 partials is
-        added into the residual during the projection) gives bitwise the logits of the barrier reduction (the way back),
+        """LLAMA_TP_BATCH_REDUCE=interleaved (each stored block of the two-socket W8A8 Wo/W2 partials is added into the
+        residual during the projection) and =wo (Wo only) give bitwise the logits of the barrier reduction,
         on the portable and the AMX kernels (pipelined and chunk), all positions, batches that end mid-block and thread
         counts that split the blocks unevenly; LLAMA_TP_CHECK holds; it is reported in build.tp_batch_reduce and refuses
         other values."""
@@ -324,10 +324,12 @@ class TensorParallelTests(unittest.TestCase):
                                     LLAMA_PREFILL_LOGITS='all', LLAMA_TP_CHECK='1', **knobs)
                         barrier = self.probe('int8', fixture, 'batch', 2, threads, LLAMA_TP_BATCH_REDUCE='barrier', **args)
                         interleaved = self.probe('int8', fixture, 'batch', 2, threads, **args)
+                        self.assertEqual(barrier, self.probe('int8', fixture, 'batch', 2, threads,
+                                                             LLAMA_TP_BATCH_REDUCE='wo', **args))
                         self.assertEqual(len(barrier), len(tokens) * (TP_WIDE_CONFIG if fixture == 'wide' else
                                                                       TP_ODD_CONFIG if fixture == 'odd' else TP_CONFIG)[5] * 4)
                         self.assertEqual(barrier, interleaved)
-        for mode in ('interleaved', 'barrier'):
+        for mode in ('interleaved', 'wo', 'barrier'):
             data = self.report('runq', 'int8.bin', full=True, LLAMA_PREFILL_BATCH='4', LLAMA_TP_BATCH_REDUCE=mode)
             self.assertEqual(data['build']['tp_batch_reduce'], mode)
         self.assertEqual(self.report('runq', 'int8.bin', full=True)['build']['tp_batch_reduce'], 'interleaved')
@@ -336,7 +338,7 @@ class TensorParallelTests(unittest.TestCase):
                                  'A', '-t', '0'], capture_output=True, text=True, timeout=60,
                                 env=environment(2, LLAMA_TP_BATCH_REDUCE='bogus'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('LLAMA_TP_BATCH_REDUCE must be interleaved or barrier', result.stderr)
+        self.assertIn('LLAMA_TP_BATCH_REDUCE must be interleaved, wo or barrier', result.stderr)
 
     def test_amx_bf16_attention_on_one_and_two_sockets(self):
         """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
