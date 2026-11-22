@@ -563,9 +563,11 @@ const char *tp_batch_reduce_name(void) {
  * worker flags each block of the partial it stored (GemmQ8Hooks.stored) and, between its compute units, adds up to
  * INTERLEAVE_BUDGET of its own stored blocks whose peer block is stored too (residual += p0 + p1, the operand order of
  * exchange_reduce_add, so the residual is bitwise the barrier form's), prefetching the next one; after its range it
- * waits for and adds the rest. The cross-socket reads then spread over the projection instead of competing for the UPI
- * links all at once after it (Wo add 21 ms per 2048-token prefill, job 5892710). */
-enum { INTERLEAVE_BUDGET = 2 };
+ * waits for and adds the rest. A block becomes a candidate only INTERLEAVE_LAG blocks after the worker stored it, so
+ * the peer has usually stored it too and one flag read suffices (lags 0-16 measured, job 5897997: 4 adds and reads
+ * least). The cross-socket reads then spread over the projection instead of competing for the UPI links all at once
+ * after it (Wo add 21 ms per 2048-token prefill, job 5892710). */
+enum { INTERLEAVE_BUDGET = 2, INTERLEAVE_LAG = 4 };
 
 typedef struct {
   Exchange *e;
@@ -574,7 +576,8 @@ typedef struct {
   const float *p0, *p1;
   GemmQ8Hooks hooks;
   int timed;                /* LLAMA_PROFILE: the worker whose range starts at block 0 records its share */
-  double add, wait, finish; /* seconds adding, waiting for peer blocks after the range; when its range was done */
+  double check, add, wait, finish; /* seconds checking peer flags during the range, adding, waiting for peer blocks
+                                    * after the range; when its range was done */
 } Interleave;
 
 static void interleave_rect(const Interleave *iv, int t, int *m0, int *mb, int *n0, int *nc) {
@@ -620,9 +623,16 @@ static int interleave_turn(void *ctx, int first, int next, int done, int final) 
   int timed = iv->timed && first == 0;
   double start = timed ? monotonic_seconds() : 0.0;
   if (!final) {
-    for (int i = 0; i < INTERLEAVE_BUDGET && next < done && exchange_block_ready(iv->e, iv->socket, next); i++)
+    for (int i = 0; i < INTERLEAVE_BUDGET && next < done - INTERLEAVE_LAG; i++) {
+      double c0 = timed ? monotonic_seconds() : 0.0;
+      int ready = exchange_block_ready(iv->e, iv->socket, next);
+      if (timed)
+        iv->check += monotonic_seconds() - c0;
+      if (!ready)
+        break;
       interleave_add(iv, next++);
-    if (next < done && exchange_block_ready(iv->e, iv->socket, next))
+    }
+    if (next < done - INTERLEAVE_LAG && exchange_block_ready(iv->e, iv->socket, next))
       interleave_prefetch(iv, next);
     if (timed)
       iv->add += monotonic_seconds() - start;
@@ -665,6 +675,7 @@ static void project_interleaved(Tp *tp, TpSocket *sk, const int8_t *aq, const fl
   if (profile_enabled) {
     double end = monotonic_seconds(), *x = tp->xmat[sk->socket][profile_stage][slot == TP_W2_MM];
     tp->prof[sk->socket][profile_stage][slot] += end - start;
+    x[0] += iv.check;
     x[1] += iv.wait;
     x[2] += iv.add;
     x[3] += iv.finish > 0.0 ? end - iv.finish : 0.0;
@@ -1360,7 +1371,10 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
  * including its reduction, wo_mm/w2_mm the leader's own share of the projection (batched: the whole GEMM, its reduction
  * apart in the `exchange` line), so the slowest member's lateness shows up as `straggler`. The exchange components are
  * the leader's: straggler (waiting for the socket's last partial write), peer (waiting for the other socket), add,
- * close (final barrier) and buffer (waiting for a free partial buffer). */
+ * close (final barrier) and buffer (waiting for a free partial buffer). With LLAMA_TP_BATCH_REDUCE=interleaved the
+ * batched wo_mm/w2_mm are the whole fused job and the `exchange` line holds the leader's flag checks (in place of
+ * straggler), its waits for peer blocks after its range (peer), its adds (add) and its wait for the rest of the team
+ * (close). */
 static void log_profile(const Tp *tp) {
   static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm",   "quantize", "qkv",
                                               "rope",      "kv_store",   "attention", "wo",       "w1_w3",
