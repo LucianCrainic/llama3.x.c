@@ -85,6 +85,7 @@ struct Tp {
    * stage, as deltas of the exchange's running totals; forward passes per stage. */
   double prof[SOCKETS][STAGE_COUNT][TP_SLOTS];
   double xch[SOCKETS][STAGE_COUNT][5], xch_last[SOCKETS][5];
+  double xmat[SOCKETS][STAGE_COUNT][2][5]; /* the batched exchange components of Wo ([0]) and W2 ([1]) apart */
   size_t tokens[STAGE_COUNT];
   Command command;
   int token, pos, want_logits, loader_fd;
@@ -547,13 +548,14 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
  * `w` is a column shard (`packed` its packed copy, or NULL): FP32 products take the activations `a` (stride lda), W8A8
  * products the quantized rows `aq`/`as` (dense, stride k and k / gs). */
 static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, const int8_t *aq, const float *as, int k,
-                                const Shard *w, void *packed, const float *pscales) {
+                                const Shard *w, void *packed, const float *pscales, int slot) {
   /* One socket adds the product straight into the residual (GEMM_ADD): no partial, no reduction. */
   int one = tp->sockets == 1;
   float *partial = one ? sk->x : exchange_partial(tp->exchange, sk->socket);
   if (!partial)
     return 0;
   GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
+  double start = profile_enabled ? monotonic_seconds() : 0.0;
   if (tp->quantized) {
     GemmQ8Segment seg = {
         .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
@@ -562,8 +564,21 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
     gemm_f32_or_bf16(tp, sk, a, lda, k, &seg, 1, &packed, NULL);
   }
-  if (!one)
+  if (profile_enabled)
+    tp->prof[sk->socket][profile_stage][slot] += monotonic_seconds() - start;
+  if (!one) {
+    /* LLAMA_PROFILE: this socket's coordinator is the exchange leader, so the components it just added are this
+     * reduction's. */
+    double before[5], after[5];
+    if (profile_enabled)
+      exchange_timing_detail(tp->exchange, sk->socket, before);
     reduce(tp, sk, sk->x, tp->bcount * tp->c.dim);
+    if (profile_enabled) {
+      exchange_timing_detail(tp->exchange, sk->socket, after);
+      for (int i = 0; i < 5; i++)
+        tp->xmat[sk->socket][profile_stage][slot == TP_W2_MM][i] += after[i] - before[i];
+    }
+  }
   return !workers_aborted();
 }
 
@@ -657,7 +672,7 @@ static void forward_batch(Tp *tp, int s) {
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->xb, (size_t)ql, ql));
     SPROFILE(PHASE_WO,
              ok = project_batch_reduce(tp, sk, sk->xb, ql, sk->aq, sk->as, ql, shards_find(&tp->set, T_WO, l, s),
-                                       packed_copy(sk, l, 3), packed_scales(sk, l, 3)));
+                                       packed_copy(sk, l, 3), packed_scales(sk, l, 3), TP_WO_MM));
     if (!ok)
       return;
 
@@ -684,7 +699,7 @@ static void forward_batch(Tp *tp, int s) {
     }
     SPROFILE(PHASE_W2, ok = project_batch_reduce(tp, sk, sk->hb, hidden_l, sk->aq, sk->as, hidden_l,
                                                  shards_find(&tp->set, T_W2, l, s), packed_copy(sk, l, 5),
-                                                 packed_scales(sk, l, 5)));
+                                                 packed_scales(sk, l, 5), TP_W2_MM));
     if (!ok)
       return;
     if (sk->debug_hash)
@@ -1206,13 +1221,14 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
 }
 
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
- * including its reduction, wo_mm/w2_mm the leader's own share of the projection, so the slowest member's lateness shows up
- * as `straggler`. The exchange components are the leader's: straggler (waiting for the socket's last partial write), peer
- * (waiting for the other socket), add, close (final barrier) and buffer (waiting for a free partial buffer). */
+ * including its reduction, wo_mm/w2_mm the leader's own share of the projection (batched: the whole GEMM, its reduction
+ * apart in the `exchange` line), so the slowest member's lateness shows up as `straggler`. The exchange components are
+ * the leader's: straggler (waiting for the socket's last partial write), peer (waiting for the other socket), add,
+ * close (final barrier) and buffer (waiting for a free partial buffer). */
 static void log_profile(const Tp *tp) {
-  static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
-                                              "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
-                                              "wo_mm",     "w2_mm"};
+  static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm",   "quantize", "qkv",
+                                              "rope",      "kv_store",   "attention", "wo",       "w1_w3",
+                                              "w2",        "classifier", "wo_mm",     "w2_mm"};
   static const char *const xnames[5] = {"straggler", "peer", "add", "close", "buffer"};
   for (int stage = 0; stage < STAGE_COUNT; stage++) {
     if (!tp->tokens[stage])
@@ -1228,6 +1244,14 @@ static void log_profile(const Tp *tp) {
       for (int i = 0; i < 5 && used < sizeof(line); i++)
         used += (size_t)snprintf(line + used, sizeof(line) - used, " x_%s=%.3f", xnames[i],
                                  tp->xch[s][stage][i] * 1e3 / (double)tp->tokens[stage]);
+      LOG(LOG_INFO, "%s", line);
+      if (stage != STAGE_PREFILL)
+        continue;
+      used = (size_t)snprintf(line, sizeof(line), "tp prefill socket %d exchange (ms/token):", s);
+      for (int m = 0; m < 2; m++)
+        for (int i = 0; i < 4 && used < sizeof(line); i++)
+          used += (size_t)snprintf(line + used, sizeof(line) - used, " %s_%s=%.4f", m ? "w2" : "wo", xnames[i],
+                                   tp->xmat[s][stage][m][i] * 1e3 / (double)tp->tokens[stage]);
       LOG(LOG_INFO, "%s", line);
     }
   }
