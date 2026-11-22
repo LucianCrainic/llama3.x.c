@@ -27,6 +27,12 @@ way for llama3.x.c on one socket) and gives nothing for prefill. HBM power is no
 at 339-366 W per active socket for every engine and tier, so energy per token follows tokens per second (decode on one socket:
 10.96 J/token on HBM against 21.03 on DDR for llama3.x.c, both sockets counted).
 
+**Note (2026-11-21, after the prefill-gap work, [prefill-gap.md](prefill-gap.md) section 7).** vLLM's prefill lead is measured at lower logit
+fidelity than llama3.x.c's. A Hugging Face FP32 model with the RedHatAI checkpoint's GPTQ weights and vLLM's per-token int8 inputs, BF16 norms,
+embedding and LM head (fake-quantized, **modelled**, job 5892436) is at rms 0.395 against the FP32 logits of prompt-2048 and fails the rms ≤ 0.2
+gate that llama3.x.c's W8A8 is held to. The same model of llama3.x.c's Q8_0 gs=64 scheme is at 0.123, and the engine itself measures 0.137 on its batched prefill (job 5892459). The cause is the per-token input
+quantization: the same GPTQ weights with FP32 inputs give 0.146. vLLM's own logits were not captured, so this accuracy comparison is modelled; the tables below compare speed only.
+
 ## Headline
 
 Decode tok/s (workload D, 86-token prompt, 128 generated tokens) and TTFT in seconds (2048-token prompt), median of 3, **measured**. Each
