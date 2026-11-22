@@ -58,6 +58,20 @@
 | 5892460 | hbm13 | `pg-hfbatch` (develop's probe, 08d934c's `compare_engines.py`) | 684489b | HF gate of develop on the batched path (`--batch-b 256`) | pass, the same numbers as its per-token path |
 | 5892461 | hbm14 | `pg-tools` | 9bac1ab | `tests/test_tools.py` on hardware, socket 0 (9bac1ab changes only `tools/compare_engines.py` and its test) | 48 OK (4 skipped), including the new `--both-paths` test |
 | 5892445 | hbm13 | `pg-clamp` | - | -128 values per tensor type in the RedHatAI checkpoint | 300,231 values in 289,767 of 1,376,256 rows; every one of the 224 quantized tensors holds some (section 7 of the results) |
+| 5892710 | hbm13 | `wo-diag` | d8948d2 | Wo/W2 stage A: profiled P2048 2S x3, D 2S, P 1S; UPI and HBM counters, P/S/D 2S x3 | section 10 diagnosis; TTFT P 1S 1.285, 2S 0.801 |
+| 5892713 | hbm13 | `upi-cal` | - | UPI flit calibration: a socket-1 CPU reads 8.53 GB held on node 0 | 1.23e9 data flits: 6.93 B per flit |
+| 5897940 | hbm13 | `wo-b` | d1b45bf, 66bae9a | bitwise sha256, 1S/2S, 2048-all and 8192-last; barrier/interleaved breakdown and whole-run UPI | identical in all 12 cells |
+| 5897941 | hbm13 | `pg-final` (5 repeats) | d1b45bf, 66bae9a | first A/B | superseded by 5898023 |
+| 5897997 | hbm13 | `wo-tune` (4 repeats, wip tree `repo-wobwip`: 66bae9a plus `WIP_LAG` and `WIP_PF`) | 66bae9a+wip | add lag 0-16, with and without the flag-line prefetch | lag 4 without the flag prefetch adds least (16.0 ms on Wo); committed as 9f54e92 |
+| 5898022 | hbm13 | `wo-b` | d1b45bf, 9f54e92 | bitwise sha256 as 5897940; profiled breakdown and whole-run UPI | identical in all 12 cells |
+| 5898023 | hbm13 | `pg-final` (5 repeats) | d1b45bf, 9f54e92 | A/B P/L/D x 1S/2S: develop, barrier, interleaved; profiled P per config | decode flat; P/L inside the bimodal spread (section 10) |
+| 5898024 | hbm13 | `wo-tune` (10 repeats) | 9f54e92 | barrier against interleaved: profiled breakdown, unprofiled P TTFT | section 10 breakdown table |
+| 5898025 | hbm13 | `wo-test` | 9f54e92 | hardware `make test` (socket 0); the interleaved tp tests on ThreadSanitizer builds (gcc-toolset-14) | rc 0; 0 race reports |
+| 5898028 | hbm13 | `upi-window` | 9f54e92 | UPI over the prefill window, barrier and interleaved, 5 repeats | 2.97 / 2.79 → 3.30 / 4.52 GB |
+| 5898029 | hbm13 | `ab2s` (15 repeats) | d1b45bf, 9f54e92 | P and L at 2S: develop, barrier, interleaved | section 10 TTFT table |
+| 5898041 | hbm13 | `ab2s` (15 repeats) | d1b45bf, 2da8e3c | P and L at 2S: develop, wo, interleaved; paired and per-mode statistics | section 10 TTFT table |
+| 5898042 | hbm13 | `bimodal` (16 runs) | 2da8e3c (`barrier`) | sha256 of `wo`; the bimodality capture | `wo` identical to develop; section 10 |
+| 5898043 | hbm13 | `upi-window` | 2da8e3c | UPI over the prefill window: barrier, wo, interleaved, 5 repeats | section 10 UPI table |
 
 ## Gates
 
@@ -74,6 +88,9 @@
 | Importer unit test | `tests/test_reference.py ReferenceTests.test_w8a8_import`: stored int8 and scales equal the checkpoint's; logits against the dequantized HF model within argmax ≥ 0.9, rms < 0.05; a `float-quantized` checkpoint is rejected | job 5892418: errored before its checks (deviation 7). Job 5892427 (c426ca2 version, socket 0): OK. Job 5892438 (75daab3 version, with a planted -128 that must arrive as -127): OK. Locally, the test needs torch, which the local Python lacks | pass |
 | Local suites (macOS, no AVX-512 or AMX hardware: scalar, AVX-512 and AMX emulation) | `make test` | c571ce5: C tests 0 failures. Python: `test_runtime` 40 OK, `test_numa` 28 OK (4 skipped), `test_tp` 30 OK at 522d940 and the new default-path test OK at c571ce5, `test_tools` 47 OK, `test_xengine` pass | pass |
 | Merge gate: hardware `make test` on hbm14, socket 0, engine knobs unset, plus ThreadSanitizer | rc 0, no test failure | job 5892433 (c571ce5): fail, deviation 9. Job 5892458 (08d934c): `make test` rc 0, every suite OK; ThreadSanitizer kernel test 0 races. 9bac1ab (tools only): `test_tools` 48 OK on hardware, job 5892461 | pass (`make test`); ThreadSanitizer Q8 test pending, job 5892707 |
+| Bitwise `LLAMA_TP_BATCH_REDUCE` (section 10) | sha256 of the logits as for the bitwise fixes, develop d1b45bf against `interleaved`, `wo` and `barrier`, 1S and 2S | identical: jobs 5897940 (66bae9a), 5898022 (9f54e92), 5898042 (2da8e3c, `wo`) | pass; the HF gate is not needed |
+| Interleaved reduction, local | `tests/q8.c` hooks check (every block stored and handed once, product bitwise); `test_tp` interleaved and `wo` bitwise to barrier on the portable and emulated AMX kernels | `test-q8` 17,817,798 checks and `test-q8-emul` 57,004,704 checks, 0 failures; `test_tp` test OK, and it fails when one block's add is perturbed | pass |
+| Merge gate, `perf/wo-2s-split` | hardware `make test`, socket 0, engine knobs unset; ThreadSanitizer two-socket tp tests | job 5898025 (9f54e92): rc 0, every suite OK; 0 race reports. Final tree: TBD-WOTEST | TBD-WOTEST-RESULT |
 
 ## Deviations
 
@@ -107,3 +124,6 @@
 10. **The Hugging Face gates of jobs 5892395, 5892418 and 5892438 judged the per-token path only.** Their harness called `compare_engines.py` without `--batch-b`, so the probe ran every position per token: the decode GEMV and the decode attention. AMX-BF16 attention and the vector exponential act only in the batched prefill, so those gates did not see fixes 4 and 7, and their numbers are decode-path accuracy. The batched rerun (jobs 5892459 and 5892460) is what the default flip rests on, and it passes. The same split explains the first RedHatAI import: its -128 values broke the per-token VNNI GEMV (rms 0.76-0.84), while the batched AMX path is exact for them (0.339-0.394). `compare_engines.py --both-paths M` (9bac1ab) now judges both paths against one reference and passes only when both pass; the gate harness uses it.
 11. **The ThreadSanitizer Q8 test of the rerun gate** (5892458) produced no output for 2 h 10 min before the job's 4 h limit stopped it; `make test` and the sanitized kernel test had finished. The test prints only at its end, so a slow run and a hang look the same here. Job 5892707 runs it alone with a 12 h limit, timing the unsanitized test first.
 12. **Merge condition.** The branch was merged into `develop` locally on the passing `make test` of job 5892458 (coordinator decision). The ThreadSanitizer Q8 test (job 5892707) blocks any push of that merge: if it reports a race, or does not finish within its 12 h limit, the result is reported and the fix goes on a new branch.
+13. **Wo/W2 interleaved reduction: the 5-repeat A/B could not resolve the gain** (job 5898023). Two-socket TTFT is bimodal by about 60-80 ms per process run, and the mode fractions change between jobs. The decision rests on two 15-repeat jobs (5898029, 5898041), read as paired diffs within each repeat and as medians within each mode (section 10).
+14. **Whole-run UPI counts** (jobs 5892710, 5897940, 5898022) include the model load, in which socket 1 reads its shards from the node-0 copy in `/dev/shm`. Subtracting the 86-token run leaves noise of about ±2 GB: one barrier run read 0.63 GB, below the 2.06 GB payload. The prefill-window counts (jobs 5898028, 5898043) replace them.
+15. **The bimodality capture** (job 5898042) slowed every run by its sampling (0.92-1.05 s), and only one of 16 runs fell in the slow mode. Its phase diff is a lead for the next task, not a result.

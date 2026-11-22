@@ -160,7 +160,7 @@ Supporting profiles (one run each, 3-repeat jobs):
 | final per-channel RTN | 5892421 rtn | 1 / 2 | 37.4 / 71.8 | 40.0 / 25.7 | 59.8 / 114.1 | 45.2 / 71.3 |
 | final per-channel RedHatAI import (`int8-rh-v4.bin`) | 5892421 rh | 1 / 2 | 37.0 / 69.3 | 39.3 / 31.0 | 59.1 / 114.0 | 45.8 / 55.9 |
 
-Wo on two sockets stays at about 23 TOP/s in all three configurations of job 5892439 (develop 18.9, gs64 22.6, per-channel 23.2; 25-32 in the supporting runs), while every other matrix about doubles from one socket to two. The phase includes the exchange and sum of the row-parallel partial outputs, so the reduction, not the kernel, sets that rate. W2 has the same reduction but four times the work per exchanged byte, so the exchange costs it less. A column split of Wo is the next GEMM lever (section 9, follow-up 3).
+Wo on two sockets stays at about 23 TOP/s in all three configurations of job 5892439 (develop 18.9, gs64 22.6, per-channel 23.2; 25-32 in the supporting runs), while every other matrix about doubles from one socket to two. The phase includes the exchange and sum of the row-parallel partial outputs, so the reduction, not the kernel, sets that rate. W2 has the same reduction but four times the work per exchanged byte, so the exchange costs it less. Section 10 splits that phase: the kernel scales (48 TOP/s), and the add and the wait for the other socket make up the rest; the interleaved reduction raises Wo to 38.5 TOP/s in situ.
 
 ## 4. Attention seconds per phase (measured, job 5892399, instrumented tree `repo-f8a7wip`)
 
@@ -336,13 +336,14 @@ Notes on the import:
 | `LLAMA_PREFILL_BATCH` (W8A8, AMX-INT8) | 256 | 1024 (capped at the context) | `LLAMA_PREFILL_BATCH=256` | bitwise for M 128-2048 (5892402) | 1.822 → 1.675 s | default |
 | Fixes 2, 3, 5, 6 (no knob) | - | always | - | bitwise (5892371, 5892393) | -0.32, -0.07 s | default |
 | Per-channel format (fix 9) | - | file format 4 | use a version 3 file | HF gate fails on both paths: RTN batched 0.342-0.394 (5892459), per token 0.336-0.385 (5892418); RedHatAI import batched 0.333-0.404 (5892459) | 1.312 → 0.908 s (5892439) | opt-in through the model file, not a default |
+| `LLAMA_TP_BATCH_REDUCE` (2S W8A8 prefill) | barrier | `interleaved` (Wo and W2) | `barrier`; `wo` interleaves Wo only | bitwise to develop, 1S and 2S, 2048-all and 8192-last (5898022, 5898042) | 2S P paired -30 ms median (30 pairs), L -161 to -175 ms (5898029, 5898041) | default (section 10) |
 | K/V prefetch in the pipelined kernel (`LLAMA_Q8_PF`, wip) | - | dropped | - | bitwise | slower: 1.688 → 1.801 / 1.882 s (5892400) | not committed |
 
 ## 9. Follow-ups
 
 1. **Attention**: key blocks of 64 or 128 positions, to halve the online-softmax rescales and the PV adds, and a vector FP32→BF16 Q convert (0.023 s of 0.187 s).
 2. **BF16 K/V cache** with a BF16 decode kernel, to drop the FP32 cache (section 6): -128 KiB per token on one socket, plus a decode gate.
-3. **Wo on two sockets** (section 3) stays at about 23 TOP/s in all three configurations; every other matrix scales. It is the next GEMM lever: split Wo by columns so that the reduction of its row-parallel output disappears or shrinks (the Wo/W2 reduction work on `develop` measured that exchange).
+3. **Wo on two sockets** (section 3): done on `perf/wo-2s-split`, section 10. Wo reached 38.5 TOP/s in situ. The remaining lever there is the sequence-parallel residual, modelled at -24 ms at P 2S.
 4. **GEMM, gs=64**: the kernel is at 21-33 TOP/s in situ against 54 on the L2-resident prototype. The next steps are:
    - B-panel reuse across the M blocks of a pass (vLLM's L2 grouping);
    - one dispatch per layer for QKV.
@@ -350,3 +351,113 @@ Notes on the import:
    - per-group activation scales over the full-K int32 path, e.g. groups of 512, which keep most of the speed;
    - SmoothQuant-style smoothing folded into the norms, then a re-quantization;
    - a mixed format with W2 at gs=64 (modelled rms 0.30, still failing on its own).
+
+## 10. Two-socket Wo/W2: the reduction interleaved with the projection (branch `perf/wo-2s-split`)
+
+Commits d8948d2 (profiling), 66bae9a, 9f54e92 and 2da8e3c, on `develop` d1b45bf. The validation rows are in [the validation record](prefill-gap-validation.md), jobs 5892710-5898043.
+
+### Diagnosis (measured, job 5892710, d8948d2)
+
+The Wo/W2 phase of P2048 at 2S, split into its parts. Values are ms per prefill (64 calls of M=1024), medians of the 6 socket-runs of 3 profiled runs:
+
+| Matrix | Kernel | Add | Closing barrier | Dispatch | Wait for the other socket |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Wo | 46 | 21 | 1.2 | 0.4 | 11 (0.4-66) |
+| W2 | 140 | 21 | 16 | 0.4 | 10 (0-51) |
+
+- **The kernel scales.** Wo's kernel runs 48 TOP/s across both sockets, 2.1x the one-socket Wo (98 ms). The in-situ 23 TOP/s of section 3 is the kernel, plus an add about half the kernel's time, plus waiting for the other socket.
+- **Where the wait comes from.** It is skew from the phases before the synchronisation point. Socket 1 waits for socket 0 at Wo, and socket 0 waits for socket 1 at W2. This tracks per-socket differences in QKV, quantize, rope and W13.
+- **UPI traffic.** Counted P minus S over the whole run: 2.85 / 4.07 GB per direction. The flit size, 6.93 B, is calibrated in job 5892713. The exchanged payload is 2.06 GB per direction (derived), and the add moves it at about 51 GB/s.
+
+### Options (modelled)
+
+The P 2S TTFT was 0.801 s. One socket is unaffected.
+
+| Option | Cross-socket bytes per call | Syncs per Wo | Saving |
+| --- | --- | --- | --- |
+| Column split (Wo by output rows) | 10.2 vs 16 MiB | 2 vs 1 | -7 ms; needs a second Wo copy. Dropped |
+| Reduce-scatter with the residual, then FP32 all-gather | 16 MiB | 2 | 0 |
+| Sequence-parallel residual (int8 all-gather after the norm) | -56% per layer | 6 per layer | -24 ms; large refactor. Follow-up |
+| Overlap with W13's start | - | - | blocked: the RMSNorm before W13 needs whole reduced rows |
+| Interleave the add into the Wo/W2 GEMM per block | 16 MiB | 0 extra | -30 to -59 ms (hides add + closing barrier). Chosen |
+
+### What changed
+
+`LLAMA_TP_BATCH_REDUCE` has three values: `interleaved` (the default), `wo` (Wo only) and `barrier` (the way back). It acts on the two-socket batched W8A8 path only. Decode and one socket are untouched.
+
+How the interleaved mode works:
+- The Q8 GEMM gets hooks (`GemmQ8Hooks`, one-pass and K-blocked). Every worker flags each 32-row block of the partial it stores.
+- Between its compute units, the worker adds up to 2 of its own blocks whose peer block is flagged too. A block becomes a candidate 4 blocks after the worker stored it, and the next one is prefetched.
+- After its range, the worker waits for and adds the rest.
+- The add is the barrier form's `residual += p0 + p1`, so the logits are bitwise.
+
+### Results
+
+**Bitwise (measured, jobs 5898022 and 5898042, 9f54e92 / 2da8e3c).** The logits sha256 of develop, `interleaved`, `wo` and `barrier` are identical: 1S and 2S, all 2048 positions of prompt-2048 and the last of prompt-8192. The Hugging Face gate is therefore not needed.
+
+**Where the time went (measured, job 5898024, 9f54e92).** P2048 2S, ms per prefill, medians of the 20 socket-runs of 10 profiled runs. In the interleaved mode the kernel is the phase minus the leader's checks, waits, adds and close (derived).
+
+| Matrix | Mode | Phase | Kernel | Flag checks | Wait for peer | Add | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wo | barrier | 82.9 | 45.1 | - | 8.6 | 22.4 | 3.9 |
+| Wo | interleaved | 68.6 | about 40 | 1.2 | 5.0 | 15.9 | 6.5 |
+| W2 | barrier | 195.6 | 145.4 | - | 13.7 | 26.8 | 7.5 |
+| W2 | interleaved | 187.4 | about 139 | 0.2 | 8.9 | 20.0 | 18.9 |
+
+In-situ rates on socket 0's counters (job 5898023):
+- Wo: 22.2 (develop) → 38.5 TOP/s.
+- W2: 49.7 → 46.7 TOP/s.
+- Other matrices: unchanged.
+
+**The add is not hidden.** Each block's add costs about 3.5 µs on the worker that computed it, against about 10 µs of compute per block. The lag and prefetch sweep (job 5897997) left it at 16-20 ms per matrix. The interleaving removes the UPI-saturating add phase after the GEMM, the second dispatch and the barriers, but not the add work. On W2 the team's closing wait grows (7.5 → 18.9 ms) and takes back most of its add saving.
+
+**TTFT (measured, 15 interleaved repeats, P and L at 2S).** Two-socket runs are bimodal, so the numbers are paired diffs within a repeat against develop, plus medians within each mode:
+
+| Job | Config | P paired median / mean | P faster | P fast mode: n, median | P slow mode: n, median | L median (paired median) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5898029 | develop | - | - | 10, 0.782 | 5, 0.840 | 3.929 |
+| 5898029 | barrier | +0.8 / -2.3 ms | 6/15 | 10, 0.779 | 5, 0.840 | 3.924 (+3.8 ms) |
+| 5898029 | interleaved | -32.0 / -42.6 ms | 12/15 | 12, 0.746 | 3, 0.802 | 3.758 (-175 ms) |
+| 5898041 | develop | - | - | 11, 0.781 | 4, 0.843 | 4.038 |
+| 5898041 | wo | -19.3 / -2.6 ms | 8/15 | 7, 0.758 | 8, 0.826 | 3.793 (-202 ms) |
+| 5898041 | interleaved | +4.6 / -12.4 ms | 7/15 | 7, 0.747 | 8, 0.821 | 3.785 (-161 ms) |
+
+The mode split is per configuration: develop at 0.81 s, the interleaved modes at 0.785 s.
+
+- **Both jobs together, interleaved against develop:** paired median -30.0 ms, mean -27.5 ms, faster in 19 of 30.
+  - The modelled saving was -30 to -59 ms. The low end of the measurement reaches the model's low end and is above the 15 ms flag threshold.
+  - Each mode's median is lower than develop's: fast -35 ms in both jobs, slow -38 and -22 ms.
+  - The fraction of runs in the slow mode moved for it in 5898029 (3 vs 5 of 15) and against it in 5898041 (8 vs 4). Pooled it is 11/30 vs 9/30, within the run-to-run spread.
+- **L:** -161 to -175 ms (4.3%); 12-13 of 15 pairs faster.
+- **`wo` against `interleaved`:** at P, `wo` is the worse of the two in both modes (fast 0.758 vs 0.747); at L they tie (3.793 vs 3.785). `interleaved` stays the default.
+- **5 repeats were not enough** (job 5898023): P 2S was 0.778 / 0.792 / 0.781 for develop / barrier / interleaved, and L read +2.7%. Both are inside the bimodal spread.
+
+**Decode** (job 5898023, 5 repeats) is flat. It takes no new code. 2S: develop 98.5, barrier 97.2, interleaved 97.9 tok/s. 1S: 51.28, 51.21, 51.13.
+
+**UPI bytes rise** (measured over the prefill window, perf stat -I 20, 5 repeats each, 2da8e3c, job 5898043). GB per direction, socket 0 to 1 / socket 1 to 0:
+
+| Mode | Socket 0 → 1 | Socket 1 → 0 |
+| --- | ---: | ---: |
+| barrier | 2.77 | 2.97 |
+| wo | 3.46 | 3.64 |
+| interleaved | 3.55 | 4.95 |
+
+The payload is 2.15 GB per direction. The traffic is now spread over the GEMMs, so the links are not the bound. The extra bytes are not attributed. The hypothesis is that reading a block soon after the peer stored it pulls lines out of the peer's caches, and that the hardware prefetchers fetch neighbouring lines the peer will still rewrite.
+
+### Skew and the bimodality (not fixed here)
+
+The 0.4-66 ms waits for the other socket come from per-socket speed differences between synchronisation points, mostly W13 and quantize/rope on one socket.
+
+The bimodality, an ~60-80 ms switch per process run, was captured in job 5898042: 16 profiled `barrier` runs with per-socket cycles/ref-cycles over the prefill window, numastat and AnonHugePages samples. The instrumentation slowed every run (0.92-1.05 s), and only one run fell in the slow mode, so this is a lead, not a finding. In that run:
+- W13 is +41 ms on both sockets.
+- Quantize is +41 ms on socket 1; rope +10-12 ms on both; QKV +8 ms on socket 0.
+- The core clock is not lower (cycles/ref-cycles +0.02).
+- Every sampled run held 16.7 GB of huge pages and 7.9 GB on each HBM node.
+
+Hypothesis: a per-run memory-side state (uncore/mesh clock or HBM) slows both sockets' bandwidth-heavy phases together. It is not core frequency, THP or a one-socket placement. That is the next task: uncore clock counters per run, and the mode against run order.
+
+### Follow-ups
+
+- **Sequence-parallel residual:** each socket owns half the residual rows; reduce-scatter of W2, int8 all-gather after each norm. Modelled -24 ms at P 2S, 6 synchronisation points per layer.
+- **Hiding the add for real:** a few helper cores per socket would add blocks while the others compute. Modelled -15 ms on Wo and -28 ms on W2 at the cost of 5-12% of the GEMM cores.
+- **The 2S bimodality** above.
