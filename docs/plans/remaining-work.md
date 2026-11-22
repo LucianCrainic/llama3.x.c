@@ -1,5 +1,9 @@
 # Remaining work: local code first, then the cluster
 
+> **Newer status:** the work of 21–22 November 2026 (cross-engine comparison, prefill gap, two-socket Wo/W2 reduction) and
+> its open items are in [../status-2026-11-22.md](../status-2026-11-22.md). This file covers the plan of 8 November; only
+> K3 below is still open from it.
+
 Written 8 November 2026 from the phase documents and the tree at `21de4c8` (`develop`). The phase documents stay the
 source of truth for design; this file only lists what is still open, splits it into work that needs no cluster (§1) and
 work that does (§2), and fixes the order. Update it, not the milestone prose, when an item closes.
