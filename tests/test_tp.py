@@ -305,6 +305,39 @@ class TensorParallelTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('LLAMA_Q8_GEMM must be pipelined or chunk', result.stderr)
 
+    def test_interleaved_batch_reduction_is_bitwise_the_barrier_one(self):
+        """LLAMA_TP_BATCH_REDUCE=interleaved (the default: each stored block of the two-socket W8A8 Wo/W2 partials is
+        added into the residual during the projection) gives bitwise the logits of the barrier reduction (the way back),
+        on the portable and the AMX kernels (pipelined and chunk), all positions, batches that end mid-block and thread
+        counts that split the blocks unevenly; LLAMA_TP_CHECK holds; it is reported in build.tp_batch_reduce and refuses
+        other values."""
+        self.need('probe-int8-amx-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        cases = [('shared', None, {'LLAMA_PREFILL_GEMM': 'on'}), ('odd', None, {'LLAMA_PREFILL_GEMM': 'on'}),
+                 ('wide', 'probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx'}),
+                 ('wide', 'probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx', 'LLAMA_Q8_GEMM': 'chunk'})]
+        for fixture, binary, knobs in cases:
+            for batch in (3, 32):
+                for threads in (2, 5):
+                    with self.subTest(fixture=fixture, knobs=knobs, batch=batch, threads=threads):
+                        args = dict(tokens=tokens, binary=binary, LLAMA_PREFILL_BATCH=str(batch),
+                                    LLAMA_PREFILL_LOGITS='all', LLAMA_TP_CHECK='1', **knobs)
+                        barrier = self.probe('int8', fixture, 'batch', 2, threads, LLAMA_TP_BATCH_REDUCE='barrier', **args)
+                        interleaved = self.probe('int8', fixture, 'batch', 2, threads, **args)
+                        self.assertEqual(len(barrier), len(tokens) * (TP_WIDE_CONFIG if fixture == 'wide' else
+                                                                      TP_ODD_CONFIG if fixture == 'odd' else TP_CONFIG)[5] * 4)
+                        self.assertEqual(barrier, interleaved)
+        for mode in ('interleaved', 'barrier'):
+            data = self.report('runq', 'int8.bin', full=True, LLAMA_PREFILL_BATCH='4', LLAMA_TP_BATCH_REDUCE=mode)
+            self.assertEqual(data['build']['tp_batch_reduce'], mode)
+        self.assertEqual(self.report('runq', 'int8.bin', full=True)['build']['tp_batch_reduce'], 'interleaved')
+        directory = self.fixtures['shared']
+        result = subprocess.run([str(BUILD/'runq'), str(directory/'int8.bin'), '-z', str(directory/'tokenizer.bin'), '-i',
+                                 'A', '-t', '0'], capture_output=True, text=True, timeout=60,
+                                env=environment(2, LLAMA_TP_BATCH_REDUCE='bogus'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LLAMA_TP_BATCH_REDUCE must be interleaved or barrier', result.stderr)
+
     def test_amx_bf16_attention_on_one_and_two_sockets(self):
         """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
         from its work region. The kernel is partition-invariant, bitwise (tests/kernels.c: one KV head per call against

@@ -97,6 +97,18 @@ void exchange_rows_done(Exchange *exchange, int socket, int r0, int r1);
 void exchange_reduce_add_flags(Exchange *exchange, int socket, int worker, int workers, float *residual, int elements,
                                ReduceStamps *stamps);
 void exchange_reduce_finish(Exchange *exchange, int socket);
+/* Block form (the two-socket batched Wo/W2, interleaved with the projection; tp.c): the flags count stored blocks of
+ * the partial instead of rows, numbered as the producer's GEMM numbers them (both sockets use the same numbering). A
+ * worker that stored blocks [b0, b1) of its socket's partial calls exchange_blocks_done; exchange_block_ready
+ * (non-blocking) and exchange_block_wait (0 on abort) tell whether the PEER stored block b of this generation;
+ * exchange_buffers gives this generation's partials of socket 0 and socket 1, for the add residual += p0 + p1 (the
+ * operand order of the other forms). exchange_reduce_finish closes the generation as in the flag form. Blocks must not
+ * exceed exchange_block_capacity. */
+int exchange_block_capacity(const Exchange *exchange);
+void exchange_blocks_done(Exchange *exchange, int socket, int b0, int b1);
+int exchange_block_ready(const Exchange *exchange, int socket, int b);
+int exchange_block_wait(const Exchange *exchange, int socket, int b);
+void exchange_buffers(const Exchange *exchange, int socket, const float **p0, const float **p1);
 /* Process-wide and irreversible in production (it is workers_abort): every wait loop of the exchange and of the
  * team barriers returns, and the results of the generation in flight are garbage. */
 void exchange_abort(Exchange *exchange);

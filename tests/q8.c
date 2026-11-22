@@ -8,10 +8,11 @@
  */
 #include "gemm.h"
 #include "kernels.h"
-#include "workers.h"
 #include "testing.h"
+#include "workers.h"
 #include <assert.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -221,6 +222,63 @@ static int amx_usable(void) {
   return gemm_amx_unavailable() == NULL;
 }
 
+/* GemmQ8Hooks (the two-socket interleaved reduction): every block is stored exactly once, handed to turn only after it
+ * was stored, each exactly once, all by the end of the product; the product stays bitwise k_gemm_q8(_tiled)'s. */
+typedef struct {
+  int blocks;
+  _Atomic int *stored, *used;
+  _Atomic int bad;
+  GemmQ8Hooks hooks;
+} HookLog;
+
+static void hook_stored(void *ctx, int t0, int t1) {
+  HookLog *log = ctx;
+  for (int t = t0; t < t1; t++)
+    if (t < 0 || t >= log->blocks || atomic_fetch_add(&log->stored[t], 1))
+      log->bad = 1;
+}
+
+static int hook_turn(void *ctx, int first, int next, int done, int final) {
+  HookLog *log = ctx;
+  (void) final;
+  if (next < first || done < next)
+    log->bad = 1;
+  for (int t = next; t < done; t++)
+    if (t < 0 || t >= log->blocks || !atomic_load(&log->stored[t]) || atomic_fetch_add(&log->used[t], 1))
+      log->bad = 1;
+  return done;
+}
+
+static void check_interleaved(const Case *c, const int8_t *xq, const float *xs, const float *st, int tiled) {
+  const int m = c->m, n = c->n, ldc = n + 3;
+  float *want = zeroed((size_t)m * ldc, 4), *got = zeroed((size_t)m * ldc, 4);
+  GemmQ8Segment seg = {
+      .c = want, .ldc = ldc, .w = {c->wq, c->ws}, .pw = c->packed, .pws = st, .n = n, .kind = GEMM_PARTIAL};
+  if (tiled)
+    k_gemm_q8_tiled(xq, xs, m, c->k, c->gs, &seg, 1);
+  else
+    k_gemm_q8(xq, xs, m, c->k, c->gs, &seg, 1);
+  int blocks = (n + 15) / 16 * ((m + 31) / 32); /* an upper bound for either chunk width */
+  HookLog log = {.blocks = blocks,
+                 .stored = zeroed((size_t)blocks, sizeof(_Atomic int)),
+                 .used = zeroed((size_t)blocks, sizeof(_Atomic int))};
+  log.hooks = (GemmQ8Hooks){.stored = hook_stored, .turn = hook_turn, .ctx = &log};
+  seg.c = got;
+  k_gemm_q8_interleaved(xq, xs, m, c->k, c->gs, &seg, tiled, &log.hooks);
+  int total = (n + log.hooks.chunk_n - 1) / log.hooks.chunk_n * log.hooks.mblocks;
+  for (int t = 0; t < blocks; t++)
+    if (atomic_load(&log.stored[t]) != (t < total) || atomic_load(&log.used[t]) != (t < total))
+      log.bad = 1;
+  checks += 2;
+  char detail[160];
+  snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d tiled=%d", m, n, c->k, c->gs, tiled);
+  if (log.hooks.mblocks != (m + 31) / 32 || log.bad)
+    bad("k_gemm_q8_interleaved: blocks not stored and handed exactly once", detail);
+  if (memcmp(want, got, (size_t)m * ldc * 4))
+    bad("k_gemm_q8_interleaved: product differs", detail);
+  free(want), free(got), free((void *)log.stored), free((void *)log.used);
+}
+
 /* LLAMA_Q8_GEMM=pipelined: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
  * transposed scales are the scales, and the pipelined kernel equals the AMX chunk kernel bit for bit, for every kind.
  */
@@ -303,6 +361,8 @@ static void check_tiled(const Case *c) {
       bad("k_gemm_q8_tiled", detail);
     }
   }
+  check_interleaved(c, tq, ts, st, 1);
+  check_interleaved(c, c->xq, c->xs, NULL, 0);
   gemm_amx_enable(0);
   free(tq), free(ts), free(st), free(st3), free(base), free(want), free(got);
 }
@@ -320,6 +380,7 @@ static void run_matrix(const char *label) {
           Case c;
           make_case(&c, ms[i], ns[j], k, gs);
           check_quantize(&c);
+          check_interleaved(&c, c.xq, c.xs, NULL, 0);
           float *portable = check_backend(&c, Q8_GEMM_PORTABLE, 0);
           float *avx = check_backend(&c, Q8_GEMM_AVX512, 0);
           avx_ran += avx != NULL;
@@ -382,6 +443,7 @@ static void run_large(const char *label) {
     Case c;
     make_case(&c, shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3]);
     check_quantize(&c);
+    check_interleaved(&c, c.xq, c.xs, NULL, 0);
     free(check_backend(&c, Q8_GEMM_PORTABLE, 0));
     free(check_backend(&c, Q8_GEMM_AVX512, 0));
     if (amx_usable()) {

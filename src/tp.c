@@ -544,6 +544,133 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
   k_gemm_bf16(a, lda, tp->bcount, k, b, count, &sk->panel);
 }
 
+static int batch_reduce_interleaved(void) {
+  static int mode = -1;
+  if (mode < 0) {
+    const char *value = getenv("LLAMA_TP_BATCH_REDUCE");
+    if (value && *value && strcmp(value, "interleaved") && strcmp(value, "barrier"))
+      fail("LLAMA_TP_BATCH_REDUCE must be interleaved or barrier");
+    mode = !(value && !strcmp(value, "barrier"));
+  }
+  return mode;
+}
+
+const char *tp_batch_reduce_name(void) {
+  return batch_reduce_interleaved() ? "interleaved" : "barrier";
+}
+
+/* LLAMA_TP_BATCH_REDUCE=interleaved: the reduction of a W8A8 Wo/W2 partial runs inside the projection's team job. Every
+ * worker flags each block of the partial it stored (GemmQ8Hooks.stored) and, between its compute units, adds up to
+ * INTERLEAVE_BUDGET of its own stored blocks whose peer block is stored too (residual += p0 + p1, the operand order of
+ * exchange_reduce_add, so the residual is bitwise the barrier form's), prefetching the next one; after its range it
+ * waits for and adds the rest. The cross-socket reads then spread over the projection instead of competing for the UPI
+ * links all at once after it (Wo add 21 ms per 2048-token prefill, job 5892710). */
+enum { INTERLEAVE_BUDGET = 2 };
+
+typedef struct {
+  Exchange *e;
+  int socket, m, n, ld;
+  float *residual;
+  const float *p0, *p1;
+  GemmQ8Hooks hooks;
+  int timed;                /* LLAMA_PROFILE: the worker whose range starts at block 0 records its share */
+  double add, wait, finish; /* seconds adding, waiting for peer blocks after the range; when its range was done */
+} Interleave;
+
+static void interleave_rect(const Interleave *iv, int t, int *m0, int *mb, int *n0, int *nc) {
+  *m0 = t % iv->hooks.mblocks * 32;
+  *n0 = t / iv->hooks.mblocks * iv->hooks.chunk_n;
+  *mb = iv->m - *m0 < 32 ? iv->m - *m0 : 32;
+  *nc = iv->n - *n0 < iv->hooks.chunk_n ? iv->n - *n0 : iv->hooks.chunk_n;
+}
+
+static void interleave_add(const Interleave *iv, int t) {
+  int m0, mb, n0, nc;
+  interleave_rect(iv, t, &m0, &mb, &n0, &nc);
+  for (int r = 0; r < mb; r++) {
+    size_t at = (size_t)(m0 + r) * (size_t)iv->ld + (size_t)n0;
+    float *x = iv->residual + at;
+    const float *a = iv->p0 + at, *b = iv->p1 + at;
+    for (int c = 0; c < nc; c++)
+      x[c] += a[c] + b[c];
+  }
+}
+
+/* The peer's block and the residual's, toward this core's caches, while the next compute unit runs. */
+static void interleave_prefetch(const Interleave *iv, int t) {
+  int m0, mb, n0, nc;
+  interleave_rect(iv, t, &m0, &mb, &n0, &nc);
+  const float *peer = iv->socket ? iv->p0 : iv->p1;
+  for (int r = 0; r < mb; r++) {
+    size_t at = (size_t)(m0 + r) * (size_t)iv->ld + (size_t)n0;
+    for (int c = 0; c < nc; c += 16) {
+      __builtin_prefetch(peer + at + c, 0, 3);
+      __builtin_prefetch(iv->residual + at + c, 1, 3);
+    }
+  }
+}
+
+static void interleave_stored(void *ctx, int t0, int t1) {
+  const Interleave *iv = ctx;
+  exchange_blocks_done(iv->e, iv->socket, t0, t1);
+}
+
+static int interleave_turn(void *ctx, int first, int next, int done, int final) {
+  Interleave *iv = ctx;
+  int timed = iv->timed && first == 0;
+  double start = timed ? monotonic_seconds() : 0.0;
+  if (!final) {
+    for (int i = 0; i < INTERLEAVE_BUDGET && next < done && exchange_block_ready(iv->e, iv->socket, next); i++)
+      interleave_add(iv, next++);
+    if (next < done && exchange_block_ready(iv->e, iv->socket, next))
+      interleave_prefetch(iv, next);
+    if (timed)
+      iv->add += monotonic_seconds() - start;
+    return next;
+  }
+  for (; next < done; next++) {
+    double t0 = timed ? monotonic_seconds() : 0.0;
+    if (!exchange_block_wait(iv->e, iv->socket, next))
+      return next;
+    double t1 = timed ? monotonic_seconds() : 0.0;
+    if (next + 1 < done && exchange_block_ready(iv->e, iv->socket, next + 1))
+      interleave_prefetch(iv, next + 1);
+    interleave_add(iv, next);
+    if (timed) {
+      iv->wait += t1 - t0;
+      iv->add += monotonic_seconds() - t1;
+    }
+  }
+  if (timed)
+    iv->finish = monotonic_seconds();
+  return next;
+}
+
+/* The two-socket W8A8 Wo/W2 with the interleaved reduction; the GEMM's team job is the whole reduction. */
+static void project_interleaved(Tp *tp, TpSocket *sk, const int8_t *aq, const float *as, int k, GemmQ8Segment *seg,
+                                int slot) {
+  Interleave iv = {.e = tp->exchange,
+                   .socket = sk->socket,
+                   .m = tp->bcount,
+                   .n = seg->n,
+                   .ld = seg->ldc,
+                   .residual = sk->x,
+                   .hooks = {.stored = interleave_stored, .turn = interleave_turn},
+                   .timed = profile_enabled};
+  iv.hooks.ctx = &iv;
+  exchange_buffers(tp->exchange, sk->socket, &iv.p0, &iv.p1);
+  double start = profile_enabled ? monotonic_seconds() : 0.0;
+  k_gemm_q8_interleaved(aq, as, tp->bcount, k, tp_group(tp, k), seg, tp->tiled, &iv.hooks);
+  exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
+  if (profile_enabled) {
+    double end = monotonic_seconds(), *x = tp->xmat[sk->socket][profile_stage][slot == TP_W2_MM];
+    tp->prof[sk->socket][profile_stage][slot] += end - start;
+    x[1] += iv.wait;
+    x[2] += iv.add;
+    x[3] += iv.finish > 0.0 ? end - iv.finish : 0.0;
+  }
+}
+
 /* The partial product of this socket's K slice for all rows, into the exchange buffer, then the reduction into x.
  * `w` is a column shard (`packed` its packed copy, or NULL): FP32 products take the activations `a` (stride lda), W8A8
  * products the quantized rows `aq`/`as` (dense, stride k and k / gs). */
@@ -559,6 +686,10 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
   if (tp->quantized) {
     GemmQ8Segment seg = {
         .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
+    if (!one && batch_reduce_interleaved()) {
+      project_interleaved(tp, sk, aq, as, k, &seg, slot);
+      return !workers_aborted();
+    }
     gemm_q8(tp, aq, as, k, &seg, 1);
   } else {
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
@@ -1152,6 +1283,11 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
       region_mark_populated(&tp->s[s].exchange);
     }
   tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
+  /* The interleaved reduction flags blocks of 32 rows x 16 or 32 channels in the per-element flag array. */
+  if (batch_reduce_interleaved() &&
+      (long long)((p->dim + 15) / 16) * ((tp->rows + 31) / 32) > exchange_block_capacity(tp->exchange))
+    fail("LLAMA_TP_BATCH_REDUCE=interleaved: %d x %d blocks exceed the exchange flags", (p->dim + 15) / 16,
+         (tp->rows + 31) / 32);
   if (tp->rows > 1)
     LOG(LOG_INFO, "two-socket batch capacity %d rows: work region %.1f MiB and exchange %.1f MiB per socket", tp->rows,
         (double)work_bytes(tp) / (1 << 20), (double)tp_exchange_bytes(p, tp->rows) / (1 << 20));

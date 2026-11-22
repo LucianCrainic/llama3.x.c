@@ -525,6 +525,31 @@ void exchange_reduce_finish(Exchange *e, int socket) {
   atomic_store_explicit(&e->consumed[socket].value, e->issued[socket], memory_order_release);
 }
 
+int exchange_block_capacity(const Exchange *e) {
+  return e->elements_max;
+}
+
+void exchange_blocks_done(Exchange *e, int socket, int b0, int b1) {
+  exchange_rows_done(e, socket, b0, b1);
+}
+
+int exchange_block_ready(const Exchange *e, int socket, int b) {
+  int peer = exchange_check_socket(e, socket);
+  return (int)(atomic_load_explicit(&e->flags[peer][b], memory_order_acquire) - e->issued[socket]) >= 0;
+}
+
+int exchange_block_wait(const Exchange *e, int socket, int b) {
+  int peer = exchange_check_socket(e, socket);
+  return wait_rows(e->flags[peer], b, b + 1, e->issued[socket]);
+}
+
+void exchange_buffers(const Exchange *e, int socket, const float **p0, const float **p1) {
+  exchange_check_socket(e, socket);
+  unsigned g = e->issued[socket];
+  *p0 = e->buffer[0][g & 1];
+  *p1 = e->buffer[1][g & 1];
+}
+
 void exchange_abort(Exchange *e) {
   (void)e;
   workers_abort();
