@@ -1169,6 +1169,7 @@ typedef struct {
   int blocks[GEMM_MAX_SEGMENTS]; /* blocks of each segment: channel chunks x row blocks */
   int tiled;                     /* xq in tile order: the pipelined AMX kernel */
   int kgroups;                   /* groups per K-block (tiled; = groups: one block) */
+  GemmQ8Hooks *hooks;            /* interleaved work (one segment), or NULL */
 } Q8GemmJob;
 
 /* acc[mb][32] (+)= the tiled sums of groups [g0, g1) of activation rows [m0, m0 + mb) against channels [n0, n0 + nc).
@@ -1308,6 +1309,8 @@ static void q8_gemm_blocks_kblocked(const Q8GemmJob *job, int first, int last) {
       fail("cannot allocate the K-blocked GEMM accumulators");
     q8_kb_floats = need;
   }
+  GemmQ8Hooks *hooks = job->hooks;
+  int next = first, upto = first; /* blocks [first, upto) are stored */
   for (int p0 = first; p0 < last; p0 += Q8_KB_PIECE) {
     const int p1 = last - p0 < Q8_KB_PIECE ? last : p0 + Q8_KB_PIECE;
     memset(q8_kb_buffer, 0, (size_t)(p1 - p0) * 2 * (size_t)per * sizeof(float));
@@ -1329,9 +1332,17 @@ static void q8_gemm_blocks_kblocked(const Q8GemmJob *job, int first, int last) {
         q8_sums_tiled(job, seg->pw, seg->pws, n0, nc, m0, mb, acc, g0, g1);
         if (seg->kind == GEMM_SWIGLU)
           q8_sums_tiled(job, seg->pw3, seg->pws3, n0, nc, m0, mb, gate, g0, g1);
+        if (hooks)
+          next = hooks->turn(hooks->ctx, first, next, upto, 0);
       }
     }
+    if (hooks) {
+      hooks->stored(hooks->ctx, p0, p1);
+      upto = p1;
+    }
   }
+  if (hooks)
+    hooks->turn(hooks->ctx, first, next, last, 1);
 }
 
 /* Blocks [first, last) of the whole product. The blocks of all segments form one list (segment, then channel chunk,
@@ -1348,14 +1359,21 @@ static void q8_gemm_blocks(const void *p, int unused, int first, int last) {
   const int chunk_n = job->backend == Q8_GEMM_AMX ? 32 : 16;
   const int mblocks = (job->m + Q8_MB - 1) / Q8_MB;
   _Alignas(64) float acc[Q8_MB * 32], gate[Q8_MB * 32];
-  int s = 0, base = 0;
+  GemmQ8Hooks *hooks = job->hooks;
+  int s = 0, base = 0, next = first;
   for (int t = first; t < last; t++) {
     while (t >= base + job->blocks[s])
       base += job->blocks[s++];
     const GemmQ8Segment *seg = &job->segment[s];
     int chunk = (t - base) / mblocks, n0 = chunk * chunk_n, nc = seg->n - n0 < chunk_n ? seg->n - n0 : chunk_n;
     q8_gemm_block(job, seg, n0, nc, ((t - base) % mblocks) * Q8_MB, acc, gate);
+    if (hooks) {
+      hooks->stored(hooks->ctx, t, t + 1);
+      next = hooks->turn(hooks->ctx, first, next, t + 1, 0);
+    }
   }
+  if (hooks)
+    hooks->turn(hooks->ctx, first, next, last, 1);
 }
 
 Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count) {
@@ -1374,9 +1392,9 @@ Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count) {
 }
 
 static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs, int m, int k, int gs,
-                        const GemmQ8Segment *segments, int count, int tiled) {
-  if (count < 1 || count > GEMM_MAX_SEGMENTS)
-    fail("GEMM needs 1..%d segments, got %d", GEMM_MAX_SEGMENTS, count);
+                        const GemmQ8Segment *segments, int count, int tiled, GemmQ8Hooks *hooks) {
+  if (count < 1 || count > GEMM_MAX_SEGMENTS || (hooks && count != 1))
+    fail("GEMM needs 1..%d segments (1 with interleaved work), got %d", GEMM_MAX_SEGMENTS, count);
   if (gs <= 0 || k % gs)
     fail("Q8 GEMM: K=%d is not a multiple of the group size %d", k, gs);
   for (int s = 0; s < count; s++)
@@ -1400,7 +1418,8 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
                    .count = count,
                    .backend = backend,
                    .tiled = tiled,
-                   .kgroups = k / gs};
+                   .kgroups = k / gs,
+                   .hooks = hooks};
   if (tiled && gs <= Q8_KBLOCK && k > Q8_KBLOCK) /* K-blocks of whole groups (per-channel: one group, one pass) */
     job.kgroups = Q8_KBLOCK / gs;
   const int chunk_n = backend == Q8_GEMM_AMX ? 32 : 16, mblocks = (m + Q8_MB - 1) / Q8_MB;
@@ -1410,16 +1429,25 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
     job.blocks[s] = (segments[s].n + chunk_n - 1) / chunk_n * mblocks;
     total += job.blocks[s];
   }
+  if (hooks) {
+    hooks->mblocks = mblocks;
+    hooks->chunk_n = chunk_n;
+  }
   kernels_parallel_segments(1, &total, q8_gemm_blocks, &job);
 }
 
 void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count) {
-  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count, 0);
+  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count, 0, NULL);
 }
 
 void k_gemm_q8_tiled(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments,
                      int count) {
-  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count, 1);
+  q8_gemm_run(k_gemm_q8_pick(gs, segments, count), xq, xs, m, k, gs, segments, count, 1, NULL);
+}
+
+void k_gemm_q8_interleaved(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segment,
+                           int tiled, GemmQ8Hooks *hooks) {
+  q8_gemm_run(k_gemm_q8_pick(gs, segment, 1), xq, xs, m, k, gs, segment, 1, tiled, hooks);
 }
 
 static int q8_pipelined = 1;
@@ -1451,7 +1479,7 @@ int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float 
     return 0;
   if (backend != Q8_GEMM_PORTABLE && gs % 64)
     return 0;
-  q8_gemm_run(backend, xq, xs, m, k, gs, segments, count, 0);
+  q8_gemm_run(backend, xq, xs, m, k, gs, segments, count, 0, NULL);
   return 1;
 }
 

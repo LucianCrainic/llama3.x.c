@@ -85,6 +85,7 @@ struct Tp {
    * stage, as deltas of the exchange's running totals; forward passes per stage. */
   double prof[SOCKETS][STAGE_COUNT][TP_SLOTS];
   double xch[SOCKETS][STAGE_COUNT][5], xch_last[SOCKETS][5];
+  double xmat[SOCKETS][STAGE_COUNT][2][5]; /* the batched exchange components of Wo ([0]) and W2 ([1]) apart */
   size_t tokens[STAGE_COUNT];
   Command command;
   int token, pos, want_logits, loader_fd;
@@ -543,27 +544,185 @@ static void gemm_f32_or_bf16(const Tp *tp, TpSocket *sk, const float *a, int lda
   k_gemm_bf16(a, lda, tp->bcount, k, b, count, &sk->panel);
 }
 
+/* LLAMA_TP_BATCH_REDUCE: 0 barrier, 1 wo (Wo interleaved, W2 barrier), 2 interleaved (both). */
+static int batch_reduce_mode(void) {
+  static int mode = -1;
+  if (mode < 0) {
+    const char *value = getenv("LLAMA_TP_BATCH_REDUCE");
+    if (value && *value && strcmp(value, "interleaved") && strcmp(value, "wo") && strcmp(value, "barrier"))
+      fail("LLAMA_TP_BATCH_REDUCE must be interleaved, wo or barrier");
+    mode = !value || !*value || !strcmp(value, "interleaved") ? 2 : !strcmp(value, "wo") ? 1 : 0;
+  }
+  return mode;
+}
+
+const char *tp_batch_reduce_name(void) {
+  static const char *const names[] = {"barrier", "wo", "interleaved"};
+  return names[batch_reduce_mode()];
+}
+
+/* LLAMA_TP_BATCH_REDUCE=interleaved: the reduction of a W8A8 Wo/W2 partial runs inside the projection's team job. Every
+ * worker flags each block of the partial it stored (GemmQ8Hooks.stored) and, between its compute units, adds up to
+ * INTERLEAVE_BUDGET of its own stored blocks whose peer block is stored too (residual += p0 + p1, the operand order of
+ * exchange_reduce_add, so the residual is bitwise the barrier form's), prefetching the next one; after its range it
+ * waits for and adds the rest. A block becomes a candidate only INTERLEAVE_LAG blocks after the worker stored it, so
+ * the peer has usually stored it too and one flag read suffices (lags 0-16 measured, job 5897997: 4 adds and reads
+ * least). The cross-socket reads then spread over the projection instead of competing for the UPI links all at once
+ * after it (Wo add 21 ms per 2048-token prefill, job 5892710). */
+enum { INTERLEAVE_BUDGET = 2, INTERLEAVE_LAG = 4 };
+
+typedef struct {
+  Exchange *e;
+  int socket, m, n, ld;
+  float *residual;
+  const float *p0, *p1;
+  GemmQ8Hooks hooks;
+  int timed;                /* LLAMA_PROFILE: the worker whose range starts at block 0 records its share */
+  double check, add, wait, finish; /* seconds checking peer flags during the range, adding, waiting for peer blocks
+                                    * after the range; when its range was done */
+} Interleave;
+
+static void interleave_rect(const Interleave *iv, int t, int *m0, int *mb, int *n0, int *nc) {
+  *m0 = t % iv->hooks.mblocks * 32;
+  *n0 = t / iv->hooks.mblocks * iv->hooks.chunk_n;
+  *mb = iv->m - *m0 < 32 ? iv->m - *m0 : 32;
+  *nc = iv->n - *n0 < iv->hooks.chunk_n ? iv->n - *n0 : iv->hooks.chunk_n;
+}
+
+static void interleave_add(const Interleave *iv, int t) {
+  int m0, mb, n0, nc;
+  interleave_rect(iv, t, &m0, &mb, &n0, &nc);
+  for (int r = 0; r < mb; r++) {
+    size_t at = (size_t)(m0 + r) * (size_t)iv->ld + (size_t)n0;
+    float *x = iv->residual + at;
+    const float *a = iv->p0 + at, *b = iv->p1 + at;
+    for (int c = 0; c < nc; c++)
+      x[c] += a[c] + b[c];
+  }
+}
+
+/* The peer's block and the residual's, toward this core's caches, while the next compute unit runs. */
+static void interleave_prefetch(const Interleave *iv, int t) {
+  int m0, mb, n0, nc;
+  interleave_rect(iv, t, &m0, &mb, &n0, &nc);
+  const float *peer = iv->socket ? iv->p0 : iv->p1;
+  for (int r = 0; r < mb; r++) {
+    size_t at = (size_t)(m0 + r) * (size_t)iv->ld + (size_t)n0;
+    for (int c = 0; c < nc; c += 16) {
+      __builtin_prefetch(peer + at + c, 0, 3);
+      __builtin_prefetch(iv->residual + at + c, 1, 3);
+    }
+  }
+}
+
+static void interleave_stored(void *ctx, int t0, int t1) {
+  const Interleave *iv = ctx;
+  exchange_blocks_done(iv->e, iv->socket, t0, t1);
+}
+
+static int interleave_turn(void *ctx, int first, int next, int done, int final) {
+  Interleave *iv = ctx;
+  int timed = iv->timed && first == 0;
+  double start = timed ? monotonic_seconds() : 0.0;
+  if (!final) {
+    for (int i = 0; i < INTERLEAVE_BUDGET && next < done - INTERLEAVE_LAG; i++) {
+      double c0 = timed ? monotonic_seconds() : 0.0;
+      int ready = exchange_block_ready(iv->e, iv->socket, next);
+      if (timed)
+        iv->check += monotonic_seconds() - c0;
+      if (!ready)
+        break;
+      interleave_add(iv, next++);
+    }
+    if (next < done - INTERLEAVE_LAG && exchange_block_ready(iv->e, iv->socket, next))
+      interleave_prefetch(iv, next);
+    if (timed)
+      iv->add += monotonic_seconds() - start;
+    return next;
+  }
+  for (; next < done; next++) {
+    double t0 = timed ? monotonic_seconds() : 0.0;
+    if (!exchange_block_wait(iv->e, iv->socket, next))
+      return next;
+    double t1 = timed ? monotonic_seconds() : 0.0;
+    if (next + 1 < done && exchange_block_ready(iv->e, iv->socket, next + 1))
+      interleave_prefetch(iv, next + 1);
+    interleave_add(iv, next);
+    if (timed) {
+      iv->wait += t1 - t0;
+      iv->add += monotonic_seconds() - t1;
+    }
+  }
+  if (timed)
+    iv->finish = monotonic_seconds();
+  return next;
+}
+
+/* The two-socket W8A8 Wo/W2 with the interleaved reduction; the GEMM's team job is the whole reduction. */
+static void project_interleaved(Tp *tp, TpSocket *sk, const int8_t *aq, const float *as, int k, GemmQ8Segment *seg,
+                                int slot) {
+  Interleave iv = {.e = tp->exchange,
+                   .socket = sk->socket,
+                   .m = tp->bcount,
+                   .n = seg->n,
+                   .ld = seg->ldc,
+                   .residual = sk->x,
+                   .hooks = {.stored = interleave_stored, .turn = interleave_turn},
+                   .timed = profile_enabled};
+  iv.hooks.ctx = &iv;
+  exchange_buffers(tp->exchange, sk->socket, &iv.p0, &iv.p1);
+  double start = profile_enabled ? monotonic_seconds() : 0.0;
+  k_gemm_q8_interleaved(aq, as, tp->bcount, k, tp_group(tp, k), seg, tp->tiled, &iv.hooks);
+  exchange_reduce_finish(tp->exchange, sk->socket); /* the join above: every add of this generation is done */
+  if (profile_enabled) {
+    double end = monotonic_seconds(), *x = tp->xmat[sk->socket][profile_stage][slot == TP_W2_MM];
+    tp->prof[sk->socket][profile_stage][slot] += end - start;
+    x[0] += iv.check;
+    x[1] += iv.wait;
+    x[2] += iv.add;
+    x[3] += iv.finish > 0.0 ? end - iv.finish : 0.0;
+  }
+}
+
 /* The partial product of this socket's K slice for all rows, into the exchange buffer, then the reduction into x.
  * `w` is a column shard (`packed` its packed copy, or NULL): FP32 products take the activations `a` (stride lda), W8A8
  * products the quantized rows `aq`/`as` (dense, stride k and k / gs). */
 static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, const int8_t *aq, const float *as, int k,
-                                const Shard *w, void *packed, const float *pscales) {
+                                const Shard *w, void *packed, const float *pscales, int slot) {
   /* One socket adds the product straight into the residual (GEMM_ADD): no partial, no reduction. */
   int one = tp->sockets == 1;
   float *partial = one ? sk->x : exchange_partial(tp->exchange, sk->socket);
   if (!partial)
     return 0;
   GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
+  double start = profile_enabled ? monotonic_seconds() : 0.0;
   if (tp->quantized) {
     GemmQ8Segment seg = {
         .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
+    if (!one && batch_reduce_mode() > (slot == TP_W2_MM)) {
+      project_interleaved(tp, sk, aq, as, k, &seg, slot);
+      return !workers_aborted();
+    }
     gemm_q8(tp, aq, as, k, &seg, 1);
   } else {
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
     gemm_f32_or_bf16(tp, sk, a, lda, k, &seg, 1, &packed, NULL);
   }
-  if (!one)
+  if (profile_enabled)
+    tp->prof[sk->socket][profile_stage][slot] += monotonic_seconds() - start;
+  if (!one) {
+    /* LLAMA_PROFILE: this socket's coordinator is the exchange leader, so the components it just added are this
+     * reduction's. */
+    double before[5], after[5];
+    if (profile_enabled)
+      exchange_timing_detail(tp->exchange, sk->socket, before);
     reduce(tp, sk, sk->x, tp->bcount * tp->c.dim);
+    if (profile_enabled) {
+      exchange_timing_detail(tp->exchange, sk->socket, after);
+      for (int i = 0; i < 5; i++)
+        tp->xmat[sk->socket][profile_stage][slot == TP_W2_MM][i] += after[i] - before[i];
+    }
+  }
   return !workers_aborted();
 }
 
@@ -657,7 +816,7 @@ static void forward_batch(Tp *tp, int s) {
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->xb, (size_t)ql, ql));
     SPROFILE(PHASE_WO,
              ok = project_batch_reduce(tp, sk, sk->xb, ql, sk->aq, sk->as, ql, shards_find(&tp->set, T_WO, l, s),
-                                       packed_copy(sk, l, 3), packed_scales(sk, l, 3)));
+                                       packed_copy(sk, l, 3), packed_scales(sk, l, 3), TP_WO_MM));
     if (!ok)
       return;
 
@@ -684,7 +843,7 @@ static void forward_batch(Tp *tp, int s) {
     }
     SPROFILE(PHASE_W2, ok = project_batch_reduce(tp, sk, sk->hb, hidden_l, sk->aq, sk->as, hidden_l,
                                                  shards_find(&tp->set, T_W2, l, s), packed_copy(sk, l, 5),
-                                                 packed_scales(sk, l, 5)));
+                                                 packed_scales(sk, l, 5), TP_W2_MM));
     if (!ok)
       return;
     if (sk->debug_hash)
@@ -1137,6 +1296,11 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
       region_mark_populated(&tp->s[s].exchange);
     }
   tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
+  /* The interleaved reduction flags blocks of 32 rows x 16 or 32 channels in the per-element flag array. */
+  if (batch_reduce_mode() &&
+      (long long)((p->dim + 15) / 16) * ((tp->rows + 31) / 32) > exchange_block_capacity(tp->exchange))
+    fail("LLAMA_TP_BATCH_REDUCE=%s: %d x %d blocks exceed the exchange flags", tp_batch_reduce_name(),
+         (p->dim + 15) / 16, (tp->rows + 31) / 32);
   if (tp->rows > 1)
     LOG(LOG_INFO, "two-socket batch capacity %d rows: work region %.1f MiB and exchange %.1f MiB per socket", tp->rows,
         (double)work_bytes(tp) / (1 << 20), (double)tp_exchange_bytes(p, tp->rows) / (1 << 20));
@@ -1206,13 +1370,17 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
 }
 
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
- * including its reduction, wo_mm/w2_mm the leader's own share of the projection, so the slowest member's lateness shows up
- * as `straggler`. The exchange components are the leader's: straggler (waiting for the socket's last partial write), peer
- * (waiting for the other socket), add, close (final barrier) and buffer (waiting for a free partial buffer). */
+ * including its reduction, wo_mm/w2_mm the leader's own share of the projection (batched: the whole GEMM, its reduction
+ * apart in the `exchange` line), so the slowest member's lateness shows up as `straggler`. The exchange components are
+ * the leader's: straggler (waiting for the socket's last partial write), peer (waiting for the other socket), add,
+ * close (final barrier) and buffer (waiting for a free partial buffer). With LLAMA_TP_BATCH_REDUCE=interleaved the
+ * batched wo_mm/w2_mm are the whole fused job and the `exchange` line holds the leader's flag checks (in place of
+ * straggler), its waits for peer blocks after its range (peer), its adds (add) and its wait for the rest of the team
+ * (close). */
 static void log_profile(const Tp *tp) {
-  static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm", "quantize", "qkv", "rope",
-                                              "kv_store",  "attention",  "wo",      "w1_w3",    "w2",  "classifier",
-                                              "wo_mm",     "w2_mm"};
+  static const char *const names[TP_SLOTS] = {"embedding", "rope_table", "rmsnorm",   "quantize", "qkv",
+                                              "rope",      "kv_store",   "attention", "wo",       "w1_w3",
+                                              "w2",        "classifier", "wo_mm",     "w2_mm"};
   static const char *const xnames[5] = {"straggler", "peer", "add", "close", "buffer"};
   for (int stage = 0; stage < STAGE_COUNT; stage++) {
     if (!tp->tokens[stage])
@@ -1228,6 +1396,14 @@ static void log_profile(const Tp *tp) {
       for (int i = 0; i < 5 && used < sizeof(line); i++)
         used += (size_t)snprintf(line + used, sizeof(line) - used, " x_%s=%.3f", xnames[i],
                                  tp->xch[s][stage][i] * 1e3 / (double)tp->tokens[stage]);
+      LOG(LOG_INFO, "%s", line);
+      if (stage != STAGE_PREFILL)
+        continue;
+      used = (size_t)snprintf(line, sizeof(line), "tp prefill socket %d exchange (ms/token):", s);
+      for (int m = 0; m < 2; m++)
+        for (int i = 0; i < 4 && used < sizeof(line); i++)
+          used += (size_t)snprintf(line + used, sizeof(line) - used, " %s_%s=%.4f", m ? "w2" : "wo", xnames[i],
+                                   tp->xmat[s][stage][m][i] * 1e3 / (double)tp->tokens[stage]);
       LOG(LOG_INFO, "%s", line);
     }
   }

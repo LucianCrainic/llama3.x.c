@@ -32,6 +32,11 @@ int tp_hbm_pair(void);
 /* The sockets of the topology the pool must be built for (kernels_backend_init), or fails with the reason. */
 int tp_check_topology(const char *placement);
 
+/* LLAMA_TP_BATCH_REDUCE validated, resolved once per process: "interleaved" (the default) adds each stored block of the
+ * two-socket batched W8A8 Wo and W2 partials into the residual while the projection still runs, "wo" does so for Wo
+ * only, "barrier" reduces after the whole projection (the way back). Bitwise the same residual in every mode. */
+const char *tp_batch_reduce_name(void);
+
 /* Plans the shards, reserves and loads the regions, and starts the socket-1 coordinator. The pool must hold two
  * teams. `quantized` selects the Q8_0 path with group size gs; fp32_activations is W8A32 (LLAMA_Q8_ACTIVATIONS=fp32).
  */

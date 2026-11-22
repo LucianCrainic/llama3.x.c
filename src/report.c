@@ -4,6 +4,7 @@
 #include "loader.h"
 #include "numa.h"
 #include "profile.h"
+#include "tp.h"
 #include "workers.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -358,6 +359,8 @@ void write_report(void) {
   string(f, kernels_name() ? k_gemm_q8_mode_name() : NULL);
   fputs(",\n    \"swiglu_exp\": ", f);
   string(f, kernels_name() ? k_gemm_swiglu_exp_name() : NULL);
+  fputs(",\n    \"tp_batch_reduce\": ", f);
+  string(f, tp_batch_reduce_name());
   fputs(",\n    \"amx_permission\": ", f);
   string(f, gemm_amx_permission());
   fputs("\n  },\n  \"parameters\": {\n    \"mode\": ", f);

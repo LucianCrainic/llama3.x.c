@@ -160,6 +160,24 @@ void k_rmsnorm_quantize_rows_tiled(int8_t *q, float *s, float *xb, const float *
 /* k_gemm_q8 on tile-ordered activations; every segment needs pw/pws (and pw3/pws3 for GEMM_SWIGLU) and AMX. */
 void k_gemm_q8_tiled(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segments, int count);
 
+/* Work interleaved with one segment's product (the two-socket batched Wo/W2 reduction in tp.c). The product is a list
+ * of blocks: block t covers rows [t % mblocks * 32, +32) and channels [t / mblocks * chunk_n, +chunk_n), clipped to m
+ * and n (both set by the GEMM before it starts). Every worker owns a contiguous range [first, last) of blocks and
+ * stores them in ascending order; after each block's epilogue (a K-blocked product: each piece's) it calls stored(ctx,
+ * t0, t1) for the blocks just stored, and after every unit of compute turn(ctx, first, next, done, 0), which may use
+ * blocks [next, done) (stored, not yet used) and returns the new `next`. After its range it calls turn(ctx, first,
+ * next, last, 1), which must use every remaining block. The product's own results are bitwise those of
+ * k_gemm_q8(_tiled). */
+typedef struct {
+  void (*stored)(void *ctx, int t0, int t1);
+  int (*turn)(void *ctx, int first, int next, int done, int final);
+  void *ctx;
+  int mblocks, chunk_n; /* set by the GEMM */
+} GemmQ8Hooks;
+/* k_gemm_q8 (tiled = 0) or k_gemm_q8_tiled (tiled = 1) on one segment, with interleaved work. */
+void k_gemm_q8_interleaved(const int8_t *xq, const float *xs, int m, int k, int gs, const GemmQ8Segment *segment,
+                           int tiled, GemmQ8Hooks *hooks);
+
 /* Packs many int8 matrices with the active worker team (or serially without one). */
 typedef struct {
   int8_t *dst;
