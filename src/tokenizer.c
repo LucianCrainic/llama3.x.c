@@ -246,9 +246,9 @@ static void encode_ranked(Tokenizer *t, const char *text, int bos, int eos, int 
 #endif
 
 void tokenizer_check_model(const Tokenizer *t, const Config *p) {
-  if (p->format == 3 && (!t->version || t->bos_id != p->bos_id || t->eos_id != p->eos_id || t->eot_id != p->eot_id ||
+  if (p->format >= 3 && (!t->version || t->bos_id != p->bos_id || t->eos_id != p->eos_id || t->eot_id != p->eot_id ||
                          t->eom_id != p->eom_id))
-    fail("version 3 model requires a versioned tokenizer with matching special IDs");
+    fail("version %d model requires a versioned tokenizer with matching special IDs", p->format);
 }
 int tokenizer_stop(const Tokenizer *t, int token) {
   return token == t->eos_id || token == t->eot_id || token == t->eom_id;

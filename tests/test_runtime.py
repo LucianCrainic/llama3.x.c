@@ -461,8 +461,10 @@ class RuntimeTests(unittest.TestCase):
         # E5: group is built; it is recorded, and runs split where AVX-512 is not active
         _, data = self.execute('run', env={'LLAMA_ATTN_DECODE': 'group'})
         self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('tiled', 'group'))
-        for knob, value, message in (('LLAMA_ATTN', 'amx', 'LLAMA_ATTN must be tiled or split'),
-                                     ('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled or split'),
+        # Prefill gap fix 7: amx is built; it is recorded, and runs tiled where AMX is not active
+        _, data = self.execute('run', env={'LLAMA_ATTN': 'amx'})
+        self.assertEqual((data['build']['attention'], data['build']['attention_decode']), ('amx', 'split'))
+        for knob, value, message in (('LLAMA_ATTN', 'bogus', 'LLAMA_ATTN must be tiled, split or amx'),
                                      ('LLAMA_ATTN_TILED_QUERIES', '8', 'LLAMA_ATTN_TILED_QUERIES is no longer supported'),
                                      ('LLAMA_ATTN_TILED_ORDER', 'natural', 'LLAMA_ATTN_TILED_ORDER is no longer supported'),
                                      ('LLAMA_ATTN_DECODE', 'bogus', 'LLAMA_ATTN_DECODE must be split or group')):
@@ -612,8 +614,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(data['build']['kernels'], 'amx')
         layers, d, h, kv = self.WIDE[2], self.WIDE[0], self.WIDE[1], self.WIDE[0] // self.WIDE[3] * self.WIDE[4]
         pad = lambda rows, cols: -(-rows // 16) * 16 * (-(-cols // 64) * 64)
+        scales_t = lambda rows, cols: -(-rows // 32) * 32 * (cols // 64) * 4  # the pipelined kernel's transposed scales
+        both = lambda rows, cols: pad(rows, cols) + scales_t(rows, cols)
         self.assertEqual(data['memory_bytes']['packed_weights_peak'],
-                         layers * (pad(d, d) * 2 + pad(kv, d) * 2 + pad(h, d) * 2 + pad(d, h)))
+                         layers * (both(d, d) * 2 + both(kv, d) * 2 + both(h, d) * 2 + both(d, h)))
         self.assertIsNotNone(data['timing_seconds']['weight_pack'])
         result, data = run('fp32')
         self.assertIn('W8A32 prefill uses avx512', result.stderr)

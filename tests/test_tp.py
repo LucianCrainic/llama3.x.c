@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from fixtures import CONFIG, TP_CONFIG, TP_ODD_CONFIG, TP_WIDE_CONFIG, create
+from fixtures import CONFIG, TP_CONFIG, TP_ODD_CONFIG, TP_WIDE_CONFIG, create, upgrade_v3
 
 BUILD = Path(sys.argv.pop(1)).resolve()
 TOKENS = [65, 66, 67, 68, 69, 70, 71]
@@ -37,6 +37,9 @@ class TensorParallelTests(unittest.TestCase):
         }
         cls.fixtures['gs16'] = create(root/'gs16', config=TP_CONFIG, gs=16)
         cls.fixtures['wide'] = create(root/'wide', config=TP_WIDE_CONFIG, gs=64)
+        # per-channel INT8 (version 4): one scale per output channel, the same weights as `wide`
+        cls.fixtures['wide-pc'] = upgrade_v3(create(root/'wide-pc', config=TP_WIDE_CONFIG, gs=0), config=TP_WIDE_CONFIG,
+                                             gs=0, int8_version=4)
         cls.one_kv = create(root/'one-kv', shared=True)
 
     @classmethod
@@ -240,7 +243,10 @@ class TensorParallelTests(unittest.TestCase):
         """D1 (AMX-INT8): int8 shard copies per socket for the tile kernel (group size 64), W8A8, against one socket at the
         same rung and against the per-token reference."""
         self.need('probe-int8-amx-emul')
-        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        # the GEMM's budget: AMX-BF16 attention and the vector SwiGLU exponential (W8A8 defaults, judged by the W8A8
+        # gate) stay on their ways back
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all',
+                 'LLAMA_ATTN': 'tiled', 'LLAMA_SWIGLU_EXP': 'libm'}
         for prompt in (5, 33):
             tokens = [65 + (i * 7) % 20 for i in range(prompt)]
             reference = self.logits('int8', 'wide', None, 1, tokens=tokens)
@@ -266,6 +272,160 @@ class TensorParallelTests(unittest.TestCase):
                            LLAMA_PREFILL_BATCH='4', LLAMA_Q8_ACTIVATIONS='fp32')
         self.assertIsNone(data['runtime']['kernels_prefill'])
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
+
+    def test_amx_int8_pipelined_kernel_is_bitwise_the_chunk_kernel(self):
+        """LLAMA_Q8_GEMM=pipelined (the default: tile-order activations, transposed weight scales, overlapped rescale)
+        gives bitwise the logits of the chunk kernel (LLAMA_Q8_GEMM=chunk, the way back), on one and two sockets, all
+        positions, batches that end mid-block; it is reported in build.q8_gemm, packs the transposed scales, and refuses
+        other values."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        for prompt in (5, 33):
+            tokens = [65 + (i * 7) % 20 for i in range(prompt)]
+            for batch in (2, 5, 32):
+                for sockets in (1, 2):
+                    with self.subTest(prompt=prompt, batch=batch, sockets=sockets):
+                        args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                        chunk = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
+                        pipelined = self.probe('int8', 'wide', 'batch', sockets, **args)
+                        self.assertEqual(len(chunk), prompt * TP_WIDE_CONFIG[5] * 4)
+                        self.assertEqual(chunk, pipelined)
+        for sockets in (1, 2):
+            reports = {mode: self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul',
+                                         full=True, LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_Q8_GEMM=mode)
+                       for mode in ('chunk', 'pipelined')}
+            self.assertEqual(reports['chunk']['build']['q8_gemm'], 'chunk')
+            self.assertEqual(reports['pipelined']['build']['q8_gemm'], 'pipelined')
+            self.assertGreater(reports['pipelined']['memory_bytes']['packed_weights_peak'],
+                               reports['chunk']['memory_bytes']['packed_weights_peak'])
+        directory = self.fixtures['wide']
+        result = subprocess.run([str(BUILD/'runq-amx-emul'), str(directory/'int8.bin'), '-z',
+                                 str(directory/'tokenizer.bin'), '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                timeout=60, env=environment(1, LLAMA_Q8_GEMM='bogus'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LLAMA_Q8_GEMM must be pipelined or chunk', result.stderr)
+
+    def test_amx_bf16_attention_on_one_and_two_sockets(self):
+        """LLAMA_ATTN=amx (BF16 tile products, prefill only): each socket packs its own KV heads into the BF16 copy carved
+        from its work region. The kernel is partition-invariant, bitwise (tests/kernels.c: one KV head per call against
+        all heads, any team against serial), but two sockets are not bitwise one socket: the row-parallel Wo/W2 partial
+        sums are added across sockets, which moves FP32 values by an ulp (tiled attention: 1S against 2S 4.8e-7 on this
+        fixture, hardware job 5892453), and such an ulp can flip one BF16 rounding of a Q or P element in the next layer.
+        By the triangle inequality |amx 1S - amx 2S| <= |amx 1S - tiled 1S| + |tiled 1S - tiled 2S| + |tiled 2S - amx 2S|,
+        i.e. twice the AMX-against-tiled budget plus the fixture tolerance, so two sockets are held to that budget below.
+        So that the envelope cannot hide a partitioning bug, most rows must stay sharp: the median over rows of each
+        row's worst |difference| / (fixture tolerance) is at most 1 (measured on hardware: 1S against 2S max 2.7e-3 on
+        row 1, every other row within 7.2e-7, job 5892455). Against the tiled
+        attention the logits stay within a noise budget: this sinusoidal fixture amplifies rounding (the BF16 GEMM alone
+        moves its logits by rms 0.03, max 0.14; AMX attention by rms 0.05, max 0.26), so the budget is twice that, and
+        the kernel itself is held to 0.03 in tests/kernels.c. The report names the variant. Decode is untouched (the
+        knob acts on batched prefill)."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        for batch in (5, 32):
+            with self.subTest(batch=batch):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                amx = [self.logits('int8', 'wide', 'batch', s, LLAMA_ATTN='amx', **args) for s in (1, 2)]
+                tiled = self.logits('int8', 'wide', 'batch', 1, LLAMA_ATTN='tiled', **args)  # the pre-fix-7 default
+                for other in (tiled, amx[1]):
+                    diff = [abs(a - b) for a, b in zip(other, amx[0])]
+                    self.assertLessEqual(max(diff), 0.5)
+                    self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+                vocab = TP_WIDE_CONFIG[5]
+                worst = sorted(max(abs(a - b) / (ABS + REL * abs(a)) for a, b in
+                                   zip(amx[0][r * vocab:(r + 1) * vocab], amx[1][r * vocab:(r + 1) * vocab]))
+                               for r in range(len(amx[0]) // vocab))
+                self.assertLessEqual(worst[len(worst) // 2], 1.0, 'most rows of two sockets must match one socket')
+        for sockets in (1, 2):
+            data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                               LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_ATTN='amx')
+            self.assertEqual(data['build']['attention'], 'amx')
+
+    def test_w8a8_defaults_take_amx_attention_and_vector_exp(self):
+        """The W8A8 defaults of prefill-gap fixes 4 and 7, with no knob set: runq's batched prefill runs AMX-BF16
+        attention where AMX is active and the vector SwiGLU exponential where AVX-512 runs (the hardware build; on a
+        host without AVX-512 the emulated-AMX probe keeps libm). The default path equals LLAMA_ATTN=amx bitwise and stays
+        within a budget of the ways back (LLAMA_ATTN=tiled, LLAMA_SWIGLU_EXP=libm) on one and two sockets. The budget is
+        this fixture's measured AMX-attention noise (rms 0.05, max 0.25, above) scaled by the headroom the W8A8 gate
+        leaves the 8B defaults: rms limit 0.2 over the worst default rms 0.147 and max limit 16 over max 9.4 (job
+        5892385, docs/prefill-gap.md), i.e. rms 0.068 and max 0.43; argmax agreement >= 0.9 as in the gate."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        vocab = TP_WIDE_CONFIG[5]
+        for sockets in (1, 2):
+            for batch in (5, 32):
+                with self.subTest(sockets=sockets, batch=batch):
+                    args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                    default = self.logits('int8', 'wide', 'batch', sockets, **args)
+                    amx = self.logits('int8', 'wide', 'batch', sockets, LLAMA_ATTN='amx', **args)
+                    self.assertEqual(default.tobytes(), amx.tobytes())
+                    back = self.logits('int8', 'wide', 'batch', sockets, LLAMA_ATTN='tiled', LLAMA_SWIGLU_EXP='libm',
+                                       **args)
+                    diff = [abs(a - b) for a, b in zip(default, back)]
+                    max_budget = 0.25 * 16 / 9.4
+                    self.assertLessEqual(max(diff), max_budget)
+                    self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.05 * 0.2 / 0.147)
+                    # argmax agreement >= 0.9, counting a near-tie (within the max budget) of this random fixture's
+                    # 128k-entry rows as agreement, the convention of assert_agree
+                    rows, agree = len(back) // vocab, 0
+                    for r in range(rows):
+                        d, b = default[r * vocab:(r + 1) * vocab], back[r * vocab:(r + 1) * vocab]
+                        agree += b[d.index(max(d))] >= max(b) - max_budget
+                    self.assertGreaterEqual(agree / rows, 0.9)
+            build = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul', full=True,
+                                LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')['build']
+            self.assertEqual((build['attention'], build['swiglu_exp']), ('amx', 'vector'))
+
+    def test_per_channel_int8_checkpoint(self):
+        """Fix 9 (docs/prefill-gap.md): a version 4 checkpoint holds one scale per output channel, so every product is
+        one group over its whole (per-socket) input and activations get one scale per token. The batched prefill equals
+        the per-token path on the same attention and SwiGLU exponential (LLAMA_ATTN=tiled, LLAMA_SWIGLU_EXP=libm: the
+        W8A8 defaults round attention to BF16 in prefill only, moving this fixture by up to 0.31, hardware job
+        5892453); two sockets agree with one within the W8A8 noise (each socket quantizes its own Wo/W2 input slice, as a
+        tensor-parallel rank does); on the AMX tile model the pipelined kernel (its full-K path) equals the chunk kernel
+        bitwise; the report names format 4 and group size 0."""
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        all_logits = {'LLAMA_PREFILL_LOGITS': 'all', 'LLAMA_PREFILL_BATCH': '32', 'LLAMA_ATTN': 'tiled',
+                      'LLAMA_SWIGLU_EXP': 'libm'}
+        batched = {}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets):
+                per_token = self.logits('int8', 'wide-pc', None, sockets, tokens=tokens)
+                batched[sockets] = self.logits('int8', 'wide-pc', 'batch', sockets, tokens=tokens, **all_logits)
+                self.assert_agree(per_token, batched[sockets], TP_WIDE_CONFIG[5])
+        diff = [abs(a - b) for a, b in zip(batched[1], batched[2])]
+        self.assertLessEqual(max(diff), 0.5)
+        self.assertLessEqual((sum(d * d for d in diff) / len(diff)) ** 0.5, 0.1)
+        self.need('probe-int8-amx-emul')
+        amx = {'LLAMA_KERNELS': 'amx', **all_logits}
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets, kernel='pipelined'):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', **amx)
+                chunk = self.logits('int8', 'wide-pc', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
+                pipelined = self.logits('int8', 'wide-pc', 'batch', sockets, **args)
+                self.assertEqual(chunk.tobytes(), pipelined.tobytes())
+                self.assert_agree(batched[sockets], chunk, TP_WIDE_CONFIG[5], abs_tol=0.05, rel_tol=0.02)
+            data = self.report('runq', 'int8.bin', sockets, fixture='wide-pc', binary='runq-amx-emul', full=True,
+                               LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')
+            self.assertEqual((data['model']['checkpoint_format'], data['model']['quantization_group_size']), (4, 0))
+            self.assertEqual(data['runtime']['kernels_prefill'], 'amx-int8')
+
+    def test_per_channel_header_is_validated(self):
+        """Version 4 must say group size 0, and version 3 may not: a mislabelled file fails at load."""
+        source = (self.fixtures['wide-pc']/'int8.bin').read_bytes()
+        for version, gs, message in ((4, 64, b'must have group size zero'), (3, 0, b'unsupported INT8 group size 0')):
+            with self.subTest(version=version, gs=gs):
+                data = bytearray(source)
+                data[4:8] = version.to_bytes(4, 'little')
+                data[44:48] = gs.to_bytes(4, 'little')
+                path = Path(self.temp.name)/f'bad-{version}-{gs}.bin'
+                path.write_bytes(data)
+                result = subprocess.run([str(BUILD/'probe-int8'), str(path), '65'], capture_output=True,
+                                        env=environment(1))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
     def test_auto_kernels_take_amx_for_w8a8_and_bf16_only(self):
         """D2 §7 under LLAMA_KERNELS=auto: W8A8 batched prefill runs AMX-INT8; W8A32 and plain FP32 never take AMX; the

@@ -75,6 +75,8 @@ void kernels_init(void) {
     fail("LLAMA_KERNELS must be auto, scalar, avx512 or amx");
   }
   kernels_attention_init_env();
+  gemm_q8_init_env();
+  gemm_swiglu_init_env();
   LOG(LOG_DEBUG, "compute kernels: %s, attention %s, decode attention %s, K/V layout %s", kernels_name(),
       kernels_attention_name(), kernels_attention_decode_name(), kernels_kv_layout_name());
 }

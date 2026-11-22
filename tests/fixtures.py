@@ -18,7 +18,9 @@ def floats(n, phase):
 
 
 def create(root, shared=True, zero=False, stop=None, seq_len=None, config=None, gs=2):
-    """`config` is (dim, hidden, layers, heads, kv_heads, vocab, seq); `gs` the Q8_0 group size (it must divide dim and hidden)."""
+    """`config` is (dim, hidden, layers, heads, kv_heads, vocab, seq); `gs` the Q8_0 group size (it must divide dim and hidden).
+    gs=0 quantizes every matrix row as one group (per-channel INT8): upgrade_v3(..., gs=0, int8_version=4) then gives
+    the version 4 header it needs."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     d, h, layers, heads, kvheads, v, seq = config or CONFIG
@@ -62,10 +64,12 @@ def create(root, shared=True, zero=False, stop=None, seq_len=None, config=None, 
         header = struct.pack('<Ii7iBi', 0x616b3432, 2, d, h, layers, heads, kvheads, v, seq, int(shared), gs)
         f.write(header + bytes(256-len(header)))
         f.write(norms.tobytes()*2 + array.array('f', [1]*d).tobytes())
-        for w in weights:
+        for index, w in enumerate(weights):
             q, scales = array.array('b'), array.array('f')
-            for i in range(0, len(w), gs):
-                block = w[i:i+gs]
+            # per-channel: one group per row, the matrix input width (hidden for the W2 block, dim for the rest)
+            group = gs or (h if 1 + 5*layers <= index < 1 + 6*layers else d)
+            for i in range(0, len(w), group):
+                block = w[i:i+group]
                 scale = max(map(abs, block))/127
                 scales.append(scale)
                 q.extend(round(x/scale) if scale else 0 for x in block)
@@ -79,17 +83,17 @@ def create(root, shared=True, zero=False, stop=None, seq_len=None, config=None, 
     return root
 
 
-def upgrade_v3(root, *, epsilon=1e-5, theta=500000., scaling=False, config=None, gs=2):
-    """Upgrade an already generated legacy fixture without ML dependencies."""
+def upgrade_v3(root, *, epsilon=1e-5, theta=500000., scaling=False, config=None, gs=2, int8_version=3):
+    """Upgrade an already generated legacy fixture without ML dependencies (int8_version=4 with gs=0: per-channel)."""
     root = Path(root)
     cfg = config or CONFIG
     d, h, layers, heads, kvheads, vocab, seq = cfg
     base = vocab - 10  # the ten special tokens end the vocabulary (128000 for the 128010-token default)
     fp = (root/'fp32.bin').read_bytes()
     shared = struct.unpack_from('<i', fp, 20)[0] > 0
-    def header(precision, gs):
+    def header(precision, gs, version=3):
         data = bytearray(256)
-        struct.pack_into('<9I', data, 0, 0x616b3432, 3, *cfg)
+        struct.pack_into('<9I', data, 0, 0x616b3432, version, *cfg)
         struct.pack_into('<3I2fI3f3I4i', data, 36, precision, shared, gs, epsilon, theta,
                          int(scaling), 32., 1., 4., 8192, seq, d//heads, base, base + 1, base + 9, base + 8)
         data[100:116] = b'synthetic-phase2'
@@ -99,7 +103,7 @@ def upgrade_v3(root, *, epsilon=1e-5, theta=500000., scaling=False, config=None,
     payload = fp[28:before_tables] + fp[before_tables+seq*(d//heads)*4:]
     (root/'fp32.bin').write_bytes(header(0, 0) + payload)
     quant = (root/'int8.bin').read_bytes()
-    (root/'int8.bin').write_bytes(header(1, gs) + quant[256:])
+    (root/'int8.bin').write_bytes(header(1, gs, int8_version) + quant[256:])
     original = (root/'tokenizer.bin').read_bytes()
     data = bytearray(struct.pack('<4I7iI', 0x336b6f74, 2, vocab, base, 24,
                                 base, base + 1, base + 9, base + 8, base + 6, base + 7, 0))

@@ -441,6 +441,38 @@ class CompareEnginesTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=120)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_both_paths_judges_per_token_and_batched(self):
+        """--both-paths M judges config B against --logits-a on the per-token path and on the batched prefill at
+        microbatch M, and passes only when both do: a knob that acts on one path cannot slip through a gate run on the
+        other (prefill-gap phase 2). Without --logits-a, or with --batch-b, it is refused."""
+        tokens = '65,66,67,68,69,70,71'
+        probe, model = str(BUILD/'probe-int8'), str(self.fixture/'int8.bin')
+        reference = Path(self.temp.name)/'per-token.f32'
+        reference.write_bytes(subprocess.run([probe, model, *tokens.split(',')], capture_output=True, timeout=120,
+                                             check=True).stdout)
+        base = [sys.executable, str(TOOLS/'compare_engines.py'), '--probe', probe, '--checkpoint', model, '--tokens', tokens,
+                '--logits-a', str(reference), '--both-paths', '4']
+        result = subprocess.run(base + ['--max-abs', '16', '--rms-max', '0.2', '--argmax-min', '0.5'], capture_output=True,
+                                text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(data['passed'])
+        self.assertEqual((sorted(data['paths']), data['paths']['batch']['batch'], data['paths']['per_token']['batch']),
+                         (['batch', 'per_token'], 4, None))
+        self.assertTrue(data['paths']['per_token']['summary']['bitwise'])  # the reference is the per-token run itself
+        self.assertEqual([len(p['comparisons']) for p in data['paths'].values()], [7, 7])
+        result = subprocess.run(base + ['--max-abs', '0', '--bitwise'], capture_output=True, text=True, timeout=120)
+        data = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0 if data['paths']['batch']['summary']['bitwise'] else 1)
+        self.assertTrue(data['paths']['per_token']['passed'])
+        for bad in (['--batch-b', '4'], ['--last-only']):
+            result = subprocess.run(base + bad, capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('--both-paths', result.stderr)
+        result = subprocess.run([sys.executable, str(TOOLS/'compare_engines.py'), '--probe', probe, '--checkpoint', model,
+                                 '--tokens', tokens, '--both-paths', '4'], capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_teams_backend_agrees_within_the_budget(self):
         result, data = self.compare('fp32', '--env-b', 'LLAMA_BACKEND=teams', '--env-b', 'LLAMA_THREADS=3')
         self.assertEqual(result.returncode, 0, result.stderr)

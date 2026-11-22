@@ -106,7 +106,9 @@ def validate_model(model):
         raise ValueError("tied embedding metadata disagrees with output weights")
 
 
-def version3_header(model, precision, group_size):
+def version3_header(model, precision, group_size, version=3):
+    """The 256-byte v3 header; version 4 is the same header for per-channel INT8 (group_size 0: one scale per output
+    channel of each matrix, the row of its embedding or classifier)."""
     p = model.params
     scaling = p.rope_scaling or {}
     kind = scaling.get("rope_type", scaling.get("type", "default"))
@@ -124,7 +126,7 @@ def version3_header(model, precision, group_size):
         if not -1 <= value < p.vocab_size:
             raise ValueError("invalid EOT/EOM metadata")
     header = bytearray(256)
-    struct.pack_into("<9I", header, 0, 0x616b3432, 3, p.dim, p.hidden_dim, p.n_layers,
+    struct.pack_into("<9I", header, 0, 0x616b3432, version, p.dim, p.hidden_dim, p.n_layers,
                      p.n_heads, p.n_kv_heads or p.n_heads, p.vocab_size, p.max_seq_len)
     struct.pack_into("<3I2fI3f3I4i", header, 36, precision,
                      int(torch.equal(model.tok_embeddings.weight, model.output.weight)), group_size,
@@ -272,15 +274,18 @@ def version1_export(model, filepath):
 def version2_export(model, filepath, group_size=64, version=2):
     """
     Export the model weights in Q8_0 into .bin file to be read from C.
+    version 4 is per-channel INT8: every matrix is quantized with one scale per output channel (row), i.e. Q8_0 with
+    the group spanning the whole row, and the header stores group size 0.
     That is:
     - quantize all weights to symmetric int8, in range [-127, 127]
     - all other tensors (the rmsnorm params) are kept and exported in fp32
     - quantization is done in groups of group_size to reduce the effects of any outliers
     """
-    if group_size <= 0 or group_size > 131071:
+    per_channel = version == 4
+    if not per_channel and (group_size <= 0 or group_size > 131071):
         raise ValueError("group size must be 1..131071")
     # let's first do some validation for this export type
-    while model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
+    while not per_channel and model.params.dim % group_size != 0 or model.layers[0].feed_forward.w1.weight.shape[0] % group_size != 0:
         group_size //= 2
         print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
     weights = [
@@ -299,7 +304,7 @@ def version2_export(model, filepath, group_size=64, version=2):
     for i, w in enumerate(weights):
         if w.numel() % 4:
             raise ValueError(f"weight {i} requires aligned FP32 scales (element count must be divisible by 4)")
-        assert (
+        assert per_channel or (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
 
@@ -331,9 +336,9 @@ def version2_export(model, filepath, group_size=64, version=2):
     pad = 256 - out_file.tell()  # pad rest with zeros; tell returns current pos
     assert pad >= 0
     out_file.write(b"\0" * pad)
-    if version == 3:
+    if version in (3, 4):
         out_file.seek(0)
-        out_file.write(version3_header(model, 1, group_size))
+        out_file.write(version3_header(model, 1, 0 if per_channel else group_size, version))
     # now that the header is done, let's write out the model
 
     # first let's write out all the params that we are keeping in fp32: the norms
@@ -347,15 +352,20 @@ def version2_export(model, filepath, group_size=64, version=2):
     # note we skip classifier weights, which are shared with the embedding
     ew = []
     for i, w in enumerate(weights):
-        # quantize this weight
-        q, s, err = quantize_q80(w, group_size)
+        imported = getattr(w, "q8_import", None)  # (int8 values, one scale per row) of an imported W8A8 checkpoint
+        if imported is not None and not per_channel:
+            raise ValueError("an imported per-channel W8A8 checkpoint exports as per-channel INT8 only (--per-channel)")
+        # quantize this weight, or keep the imported values and scales exactly
+        q, s, err = (imported[0], imported[1], 0.0) if imported is not None else \
+            quantize_q80(w, w.shape[1] if per_channel else group_size)
         # save the int8 weights to file
         serialize_int8(out_file, q)  # save the tensor in int8
         serialize_fp32(out_file, s)  # save scale factors
         # logging
         ew.append((err, w.shape))
         print(
-            f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to Q8_0 with max error {err}"
+            f"{i+1}/{len(weights)} {'imported' if imported is not None else 'quantized'} {tuple(w.shape)} to "
+            f"{'per-channel INT8' if per_channel else 'Q8_0'} with max error {err}"
         )
 
     # print the highest error across all weights, should be very small, e.g. O(~0.001)
@@ -616,26 +626,94 @@ def load_hf_model(model_path):
     hc = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
     if getattr(hc, "quantization_config", None):
         raise ValueError("external quantization formats cannot be imported; provide original FP32/FP16/BF16 weights")
+    check_hf_architecture(hc)
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path, config=hc, torch_dtype=torch.float32,
+        local_files_only=True, attn_implementation="eager", trust_remote_code=False)
+    return model_from_hf(hc, hf_model.state_dict(), model_path)
+
+
+def check_hf_architecture(hc):
     if hc.model_type != "llama" or hc.hidden_act != "silu" or getattr(hc, "attention_bias", False) or getattr(hc, "mlp_bias", False):
         raise ValueError("only bias-free text-only Llama with SwiGLU is supported")
     if (getattr(hc, "head_dim", None) or hc.hidden_size // hc.num_attention_heads) != hc.hidden_size // hc.num_attention_heads:
         raise ValueError("independent head_dim is not supported")
     if getattr(hc, "partial_rotary_factor", 1.0) != 1.0:
         raise ValueError("partial rotary embeddings are not supported")
-    hf_model = AutoModelForCausalLM.from_pretrained(model_path, config=hc, torch_dtype=torch.float32,
-        local_files_only=True, attn_implementation="eager", trust_remote_code=False)
-    hf_dict = hf_model.state_dict()
 
+
+def load_hf_w8a8(model_path):
+    """Imports a compressed-tensors W8A8 checkpoint (llm-compressor `int-quantized`: int8 weights with one scale per
+    output channel, dynamic per-token symmetric int8 activations, e.g. RedHatAI's GPTQ/SmoothQuant exports) for a
+    per-channel INT8 (version 4) export. The quantized linears keep their int8 values and scales exactly (the scales
+    widened to FP32; an int8 -128, outside the engine's [-127, 127], becomes -127 and is counted); the tensors it leaves unquantized (embedding, norms, an ignored lm_head) load as FP32, and the
+    export quantizes the embedding and classifier per channel like an RTN export. The engine quantizes activations per
+    token at run time, which is the checkpoint's own activation scheme."""
+    from transformers import AutoConfig
+    from safetensors import safe_open
+
+    if not Path(model_path).is_dir():
+        raise ValueError("W8A8 import requires a local snapshot directory")
+    hc = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
+    qc = getattr(hc, "quantization_config", None)
+    qc = qc if isinstance(qc, dict) else (qc.to_dict() if qc is not None else None)
+    if not qc or qc.get("quant_method") != "compressed-tensors" or qc.get("format") != "int-quantized":
+        raise ValueError("--hf-w8a8 needs a compressed-tensors int-quantized checkpoint")
+    groups = list(qc.get("config_groups", {}).values())
+    want_w = dict(num_bits=8, type="int", symmetric=True, strategy="channel", dynamic=False)
+    want_a = dict(num_bits=8, type="int", symmetric=True, strategy="token", dynamic=True)
+    if len(groups) != 1 or groups[0].get("targets") != ["Linear"] or \
+            any(groups[0]["weights"].get(k) != v for k, v in want_w.items()) or groups[0]["weights"].get("group_size") or \
+            any((groups[0].get("input_activations") or {}).get(k) != v for k, v in want_a.items()) or \
+            groups[0].get("output_activations") or qc.get("kv_cache_scheme"):
+        raise ValueError("only int8 per-channel symmetric weights with dynamic per-token symmetric int8 activations "
+                         "(and no KV cache or output quantization) can be imported")
+    if set(qc.get("ignore") or []) - {"lm_head"}:
+        raise ValueError("only lm_head may be left unquantized")
+    check_hf_architecture(hc)
+    tensors = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        with safe_open(str(shard), "pt") as f:
+            for name in f.keys():
+                tensors[name] = f.get_tensor(name)
+    hf_dict, clamped = {}, [0, 0]  # int8 values of -128 set to -127, rows holding one
+    for name, t in tensors.items():
+        if name.endswith(".weight_scale"):
+            continue
+        scale = tensors.get(name[: -len(".weight")] + ".weight_scale") if name.endswith(".weight") else None
+        if scale is None:
+            if t.dtype == torch.int8:
+                raise ValueError(f"int8 tensor {name} has no weight_scale")
+            hf_dict[name] = t.float()
+            continue
+        if t.dtype != torch.int8 or tuple(scale.shape) != (t.shape[0], 1):
+            raise ValueError(f"{name}: expected int8 values with one scale per row")
+        # The engine's int8 range is [-127, 127] (its VNNI kernels negate weights); GPTQ exports may use -128
+        # (llm-compressor's symmetric int8 range). Those values become -127: one quantum, counted and reported.
+        low = t == -128
+        if low.any():
+            clamped[0] += int(low.sum())
+            clamped[1] += int(low.any(1).sum())
+            t = t.clamp(min=-127)
+        s = scale.float().view(-1)
+        w = t.float() * s[:, None]
+        w.q8_import = (t, s)
+        hf_dict[name] = w
+    if clamped[0]:
+        print(f"W8A8 import: {clamped[0]} int8 values of -128 in {clamped[1]} rows set to -127 (the engine's range)")
+    return model_from_hf(hc, hf_dict, model_path)
+
+
+def model_from_hf(hc, hf_dict, model_path):
     # convert LlamaConfig to ModelArgs
     config = ModelArgs()
-    config.dim = hf_model.config.hidden_size
-    config.n_layers = hf_model.config.num_hidden_layers
-    config.n_heads = hf_model.config.num_attention_heads
-    config.n_kv_heads = hf_model.config.num_key_value_heads
-    config.vocab_size = hf_model.config.vocab_size
-    config.hidden_dim = hf_model.config.intermediate_size
-    config.norm_eps = hf_model.config.rms_norm_eps
-    config.max_seq_len = hf_model.config.max_position_embeddings
+    config.dim = hc.hidden_size
+    config.n_layers = hc.num_hidden_layers
+    config.n_heads = hc.num_attention_heads
+    config.n_kv_heads = hc.num_key_value_heads
+    config.vocab_size = hc.vocab_size
+    config.hidden_dim = hc.intermediate_size
+    config.norm_eps = hc.rms_norm_eps
+    config.max_seq_len = hc.max_position_embeddings
 
     config.rope_theta = hc.rope_theta
     config.rope_scaling = hc.rope_scaling
@@ -664,41 +742,54 @@ def load_hf_model(model_path):
     model.tok_embeddings.weight = nn.Parameter(hf_dict["model.embed_tokens.weight"])
     model.norm.weight = nn.Parameter(hf_dict["model.norm.weight"])
 
-    # huggingface permutes WQ and WK, this function reverses it
+    # huggingface permutes WQ and WK, this function reverses it (rows, so an imported matrix's int8 rows and per-row
+    # scales move with them)
+    def permute_rows(w, n_heads, dim1, dim2):
+        return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
+
     def permute_reverse(w, n_heads=config.n_heads, dim1=config.dim, dim2=config.dim):
-        return (
-            w.view(n_heads, 2, dim1 // n_heads // 2, dim2)
-            .transpose(1, 2)
-            .reshape(dim1, dim2)
-        )
+        out = permute_rows(w, n_heads, dim1, dim2)
+        imported = getattr(w, "q8_import", None)
+        if imported is not None:
+            out.q8_import = (permute_rows(imported[0], n_heads, dim1, dim2),
+                             permute_rows(imported[1].view(-1, 1), n_heads, dim1, 1).reshape(-1))
+        return out
+
+    real_parameter = nn.Parameter
+
+    def keep_import(t):  # nn.Parameter does not carry attributes of the tensor it wraps
+        p = real_parameter(t)
+        if getattr(t, "q8_import", None) is not None:
+            p.q8_import = t.q8_import
+        return p
 
     for layer in model.layers:
         i = layer.layer_id
-        layer.attention_norm.weight = nn.Parameter(
+        layer.attention_norm.weight = keep_import(
             hf_dict[f"model.layers.{i}.input_layernorm.weight"]
         )
-        layer.attention.wq.weight = nn.Parameter(
+        layer.attention.wq.weight = keep_import(
             permute_reverse(hf_dict[f"model.layers.{i}.self_attn.q_proj.weight"])
         )
-        layer.attention.wk.weight = nn.Parameter(
+        layer.attention.wk.weight = keep_import(
             permute_reverse(hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"], config.n_kv_heads, config.dim // config.n_heads * config.n_kv_heads)
         )
-        layer.attention.wv.weight = nn.Parameter(
+        layer.attention.wv.weight = keep_import(
             hf_dict[f"model.layers.{i}.self_attn.v_proj.weight"]
         )
-        layer.attention.wo.weight = nn.Parameter(
+        layer.attention.wo.weight = keep_import(
             hf_dict[f"model.layers.{i}.self_attn.o_proj.weight"]
         )
-        layer.ffn_norm.weight = nn.Parameter(
+        layer.ffn_norm.weight = keep_import(
             hf_dict[f"model.layers.{i}.post_attention_layernorm.weight"]
         )
-        layer.feed_forward.w1.weight = nn.Parameter(
+        layer.feed_forward.w1.weight = keep_import(
             hf_dict[f"model.layers.{i}.mlp.gate_proj.weight"]
         )
-        layer.feed_forward.w2.weight = nn.Parameter(
+        layer.feed_forward.w2.weight = keep_import(
             hf_dict[f"model.layers.{i}.mlp.down_proj.weight"]
         )
-        layer.feed_forward.w3.weight = nn.Parameter(
+        layer.feed_forward.w3.weight = keep_import(
             hf_dict[f"model.layers.{i}.mlp.up_proj.weight"]
         )
 
@@ -782,10 +873,15 @@ if __name__ == "__main__":
         "--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32"
     )
     parser.add_argument("--int8", action="store_true", help="Q8_0 payload for version 3")
+    parser.add_argument("--per-channel", action="store_true",
+                        help="with --int8: one scale per output channel instead of groups of 64 (writes version 4)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
     group.add_argument("--hf", type=str, help="huggingface model path")
+    group.add_argument("--hf-w8a8", type=str,
+                       help="compressed-tensors W8A8 snapshot (per-channel int8 weights, per-token int8 activations): "
+                            "imported exactly as per-channel INT8 (needs --int8 --per-channel)")
     args = parser.parse_args()
     dtype = {"fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
@@ -795,17 +891,24 @@ if __name__ == "__main__":
         model = load_meta_model(args.meta_llama)
     elif args.hf:
         model = load_hf_model(args.hf)
+    elif args.hf_w8a8:
+        if not (args.int8 and args.per_channel):
+            parser.error("--hf-w8a8 requires --int8 --per-channel")
+        model = load_hf_w8a8(args.hf_w8a8)
 
     if model is None:
         parser.error("Can't load input model!")
 
     # export
+    if args.per_channel and not args.int8:
+        parser.error("--per-channel requires --int8")
     if args.int8:
         if args.version != 3:
-            parser.error("--int8 requires --version 3")
+            parser.error("--int8 requires --version 3 (--per-channel writes version 4 itself)")
         validate_model(model)
-        version3_header(model, 1, 64)
-        version2_export(model, args.filepath, version=3)
+        version = 4 if args.per_channel else 3
+        version3_header(model, 1, 0 if args.per_channel else 64, version)
+        version2_export(model, args.filepath, version=version)
     else:
         if args.dtype != "fp32" and args.version != -1:
             parser.error("C checkpoints require --dtype fp32 (or --int8)")

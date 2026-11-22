@@ -29,7 +29,9 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_KERNELS` | `auto`, `scalar`, `avx512`, `amx` | instruction set; `auto` picks AVX-512 when available, and AMX for batched prefill where it can run: AMX-INT8 for `runq` W8A8, AMX-BF16 with `LLAMA_PRECISION=bf16` (never for plain FP32); `amx` keeps AVX-512 for everything but the prefill GEMMs |
 | `LLAMA_PRECISION` (`run` only) | `fp32`, `bf16` | `bf16` runs batched prefill on BF16-packed weights, on AMX where it can run (needs a batch of 2 or more, the default on AVX-512); decode stays FP32 |
 | `LLAMA_Q8_ACTIVATIONS` (`runq` only) | `int8`, `fp32` | W8A8 (Q8_0 rule) or W8A32; W8A32 never uses the batched GEMM |
-| `LLAMA_ATTN` | `tiled`, `split` | batched prefill attention (`tiled` falls back to `split` without AVX-512) |
+| `LLAMA_SWIGLU_EXP` (`runq` only) | `vector`, `libm` | exponential of the batched W8A8 GEMM's SwiGLU epilogue: `vector` (default) is the AVX-512 polynomial of the attention kernels (about 2 ulp; not bitwise against the per-token GEMV, judged by the W8A8 gate); `libm` is `expf` per element, the previous default and the way back ([prefill-gap.md](prefill-gap.md)) |
+| `LLAMA_Q8_GEMM` (`runq` only) | `pipelined`, `chunk` | AMX-INT8 batched GEMM kernel: `pipelined` (default) quantizes the activations straight into tile order, packs the weight scales transposed (6% more packed bytes) and overlaps each group's FP32 rescale with the next tile instructions; bitwise equal to `chunk`, the previous kernel, kept as the way back (decision table in [prefill-gap.md](prefill-gap.md)) |
+| `LLAMA_ATTN` | `tiled`, `split`, `amx` | batched prefill attention; default `amx` for W8A8 (`runq`), `tiled` otherwise; `LLAMA_ATTN=tiled` is the way back for W8A8 (`tiled` falls back to `split` without AVX-512); `amx` is flash attention with AMX-BF16 tile products (Q, K, P, V in BF16, FP32 online softmax; not bitwise, judged by the W8A8 gate; falls back to `tiled` without AMX; each socket keeps a persistent BF16 copy of its K/V, packed once per position, in its work region: 2 x local KV heads x head_dim x 2 bytes per position and layer, half the FP32 cache (8B: 128 KiB per token on one socket, 64 KiB per token and socket on two); decode still reads the FP32 cache; [prefill-gap.md](prefill-gap.md)) |
 | `LLAMA_ATTN_DECODE` | `split`, `group` | decode attention |
 | `LLAMA_KV_LAYOUT` | `head`, `rows` | K/V cache layout: `head` is `[kv_head][position][head_dim]` per layer (default since E5.4), `rows` is `[position][kv_head][head_dim]`; results are bitwise equal, `head` is faster at long contexts |
 
@@ -37,7 +39,7 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 
 | Variable | Values | Meaning |
 | --- | --- | --- |
-| `LLAMA_PREFILL_BATCH` | M | prompt tokens per forward pass (capped at the context). Default where the batched GEMM runs: 128 for FP32 on one socket, 64 on two, 256 for W8A8 and BF16; otherwise (scalar kernels, `LLAMA_PREFILL_GEMM=off`, W8A32) 1, token by token |
+| `LLAMA_PREFILL_BATCH` | M | prompt tokens per forward pass (capped at the context). Default where the batched GEMM runs: 128 for FP32 on one socket, 64 on two, 1024 for W8A8 on AMX-INT8, 256 for the other W8A8 kernels and BF16; otherwise (scalar kernels, `LLAMA_PREFILL_GEMM=off`, W8A32) 1, token by token |
 | `LLAMA_PREFILL_GEMM` | `auto`, `on`, `off` | batched GEMM (`auto`: on where AVX-512 or AMX runs) or the per-row reference |
 | `LLAMA_PREFILL_LOGITS` | `last`, `all` | logits of the last prompt row only, or every row (diagnostic) |
 

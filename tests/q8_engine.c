@@ -80,6 +80,10 @@ int main(int argc, char **argv) {
   const char *wide = argv[1], *narrow = argv[2];
   const size_t bytes = 0;
   (void)bytes;
+  /* The budgets below are the GEMM's: keep the W8A8 defaults that change other rounding (AMX-BF16 attention, the
+   * vector SwiGLU exponential; both judged by the W8A8 gate) on their ways back. */
+  setenv("LLAMA_ATTN", "tiled", 1);
+  setenv("LLAMA_SWIGLU_EXP", "libm", 1);
 
   Run reference = forward_all(wide, "scalar", "off", "int8", 1, 1);
   check(!reference.gemm, "the per-token reference used the GEMM");

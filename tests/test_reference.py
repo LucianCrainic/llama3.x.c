@@ -55,6 +55,68 @@ class ReferenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "external quantization"):
                 export.load_hf_model(td)
 
+    def test_w8a8_import(self):
+        """--hf-w8a8 (prefill-gap fix 9): a compressed-tensors checkpoint with int8 per-channel weights and dynamic
+        per-token activations exports as per-channel INT8 (version 4) with its int8 values and scales unchanged, the Q/K
+        rows un-permuted together with their scales; the engine follows the dequantized Transformers model."""
+        from safetensors.torch import save_file
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            torch.manual_seed(11)
+            cfg = LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                              num_key_value_heads=1, vocab_size=512, max_position_embeddings=2048, rms_norm_eps=1e-5,
+                              rope_theta=500000., tie_word_embeddings=False, bos_token_id=1, eos_token_id=2)
+            hf = LlamaForCausalLM(cfg).eval()
+            tensors, quantized = {}, {}
+            for name, value in hf.state_dict().items():
+                value = value.detach().to(torch.bfloat16)
+                if name.endswith('_proj.weight'):
+                    scale = (value.float().abs().amax(1, keepdim=True) / 127).to(torch.bfloat16)
+                    q = torch.round(value.float() / scale.float()).clamp(-127, 127).to(torch.int8)
+                    q[0] //= 2  # a row whose largest value is not 127: a re-quantization would change it
+                    q[1, 3] = -128  # llm-compressor's int8 range includes -128; the engine's ends at -127
+                    tensors[name], tensors[name[:-len('weight')] + 'weight_scale'] = q, scale
+                    quantized[name] = (q.clamp(min=-127), scale.float())
+                else:
+                    tensors[name] = value
+            save_file(tensors, str(root/'model.safetensors'))
+            config = cfg.to_dict()
+            config['quantization_config'] = {
+                'quant_method': 'compressed-tensors', 'format': 'int-quantized', 'ignore': ['lm_head'],
+                'kv_cache_scheme': None, 'config_groups': {'group_0': {
+                    'targets': ['Linear'], 'output_activations': None,
+                    'weights': {'num_bits': 8, 'type': 'int', 'symmetric': True, 'strategy': 'channel',
+                                'dynamic': False, 'group_size': None},
+                    'input_activations': {'num_bits': 8, 'type': 'int', 'symmetric': True, 'strategy': 'token',
+                                          'dynamic': True, 'group_size': None}}}}
+            (root/'config.json').write_text(json.dumps(config))
+            with contextlib.redirect_stdout(io.StringIO()):
+                model = export.load_hf_w8a8(root)
+                export.version2_export(model, root/'pc.bin', version=4)
+            raw = (root/'pc.bin').read_bytes()
+            d, L, V, h = 256, 2, 512, 512
+            self.assertEqual(struct.unpack('<i', raw[4:8])[0], 4)
+            at = 256 + 4 * (2 * L * d + d) + V * d + V * 4  # header, norms, the embedding's int8 values and scales
+            q, s = quantized['model.layers.0.self_attn.q_proj.weight']
+            unpermute = lambda t, cols: t.view(4, 2, d // 8, cols).transpose(1, 2).reshape(d, cols)
+            self.assertEqual(raw[at:at + d * d], unpermute(q, d).numpy().tobytes())
+            self.assertEqual(raw[at + d * d:at + d * d + 4 * d], unpermute(s, 1).reshape(-1).numpy().tobytes())
+            # the reference: Transformers with the dequantized weights
+            with torch.no_grad():
+                for name, param in hf.named_parameters():
+                    if name in quantized:
+                        param.copy_(quantized[name][0].float() * quantized[name][1])
+                    else:
+                        param.copy_(param.to(torch.bfloat16).float())
+            tokens = [65 + i % 20 for i in range(17)]
+            record, _, _ = compare(hf, root/'pc.bin', tokens, 'int8')
+            self.assertGreaterEqual(record['argmax_agreement'], 0.9, record)
+            self.assertLess(record['rms'], 0.05, record)
+            bad = dict(config, quantization_config=dict(config['quantization_config'], format='float-quantized'))
+            (root/'config.json').write_text(json.dumps(bad))
+            with self.assertRaisesRegex(ValueError, 'int-quantized'):
+                export.load_hf_w8a8(root)
+
     def test_rope(self):
         for factor in (8., 32.):
             config = LlamaConfig(hidden_size=256, num_attention_heads=2, rope_theta=500000., max_position_embeddings=131072,

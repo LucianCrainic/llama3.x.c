@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 /* One model per CLI process. */
-static int GS;               /* Q8: the checkpoint's group size; 0 for FP32 */
+static int GS;               /* Q8: the checkpoint's group size; 0 for FP32 and for per-channel INT8 (format 4) */
 static int fp32_activations; /* Q8: LLAMA_Q8_ACTIVATIONS=fp32 multiplies dequantized weights by FP32 activations (W8A32)
                                 instead of quantizing activations (the default W8A8 Q8_0 rule) */
 static int bf16_mode;        /* FP32: LLAMA_PRECISION=bf16 (C5) */
@@ -96,23 +96,32 @@ static void configure_fp32(Model *model, Transformer *t) {
  * 64. */
 static void configure_q8(Model *model) {
   prefill_configure(model, fp32_activations ? 1 : 256);
-  if (!fp32_activations && model->prefill_gemm && GS % 64 == 0)
+  /* Per-channel INT8 (GS 0): each product's group is its per-socket input width, whole 64-byte k-steps when dim and
+   * hidden_dim are multiples of 128 (one or two sockets). */
+  const Config *c = &model->config;
+  int gs64 = GS ? GS % 64 == 0 : c->dim % 128 == 0 && c->hidden_dim % 128 == 0;
+  if (!fp32_activations && model->prefill_gemm && gs64)
     kernels_select_amx_auto();
   if (fp32_activations) {
     model->prefill_gemm = 0;
     if (kernels_amx_active())
       LOG(LOG_INFO, "W8A32 prefill uses avx512: the per-row kernel, never AMX-INT8");
   } else if (model->prefill_gemm) {
-    if (kernels_amx_active() && GS % 64 == 0) {
+    if (kernels_amx_active() && gs64) {
       model->prefill_kernel = "amx-int8";
-    } else if (kernels_avx512_active() && GS % 64 == 0) {
+      /* 1024 rows per pass on AMX-INT8 (prefill-gap fix 8: bitwise any M; the M sweep of job 5892402 put 1024 fastest
+       * at 2048 and 8192 tokens, one and two sockets): each weight matrix streams from memory once per 1024 rows. */
+      const char *batch = getenv("LLAMA_PREFILL_BATCH");
+      if (!batch || !*batch)
+        model->max_batch = c->seq_len < 1024 ? c->seq_len : 1024;
+    } else if (kernels_avx512_active() && gs64) {
       model->prefill_kernel = "avx512-q8";
     } else {
       model->prefill_kernel = "portable-q8";
       if (kernels_avx512_active())
         LOG(LOG_INFO, "W8A8 batched prefill: group size %d is not a multiple of 64, using the portable Q8 GEMM", GS);
     }
-    if (kernels_amx_active() && GS % 64)
+    if (kernels_amx_active() && !gs64)
       LOG(LOG_INFO, "AMX-INT8 needs a group size that is a multiple of 64 (this checkpoint has %d): falling back", GS);
   }
 }
@@ -133,6 +142,8 @@ void engine_load_context(Model *model, const char *path, int context) {
     if (activations && *activations && strcmp(activations, "int8") && strcmp(activations, "fp32"))
       fail("LLAMA_Q8_ACTIVATIONS must be int8 or fp32");
     fp32_activations = activations && !strcmp(activations, "fp32");
+    if (!fp32_activations)
+      kernels_attention_prefer_amx();
   }
   read_checkpoint(path, t);
   model->config = t->config;

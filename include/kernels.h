@@ -45,6 +45,9 @@ int kernels_select_amx_auto(void);
  * variant with kernels_attention_select (testing.h). */
 const char *kernels_attention_name(void);
 const char *kernels_attention_decode_name(void);
+/* W8A8 engines (runq) prefer LLAMA_ATTN=amx when LLAMA_ATTN is unset (prefill-gap fix 7: it passes the W8A8 gate and
+ * is faster on one and two sockets); amx runs tiled where AMX is not active. FP32 and BF16 keep tiled. */
+void kernels_attention_prefer_amx(void);
 /* K/V cache layout (E5.4). kernels_init reads LLAMA_KV_LAYOUT=rows|head (default head since E5.4). rows: a layer's cache is
  * [position][kv_head][head_dim]; head: [kv_head][position][head_dim] with room for seq_len positions per head (the same
  * bytes). Engines address the cache through the helpers at the end of this header; the results are bitwise the same in
@@ -129,7 +132,19 @@ typedef struct {
   int max_chunks, n_heads, head_dim, workers;
   int external;    /* partial was supplied by the caller (a placement region) and is not freed here */
   size_t capacity; /* floats in partial; batched attention processes as many rows per wave as fit */
+  uint16_t *kv_bf16; /* LLAMA_ATTN=amx, batched: the BF16 K/V tile operands, after the partials (else NULL) */
+  /* LLAMA_ATTN=amx with a persistent BF16 copy (k_attention_set_kv_bf16): one copy per layer, keyed by the layer's key
+   * cache pointer, packed incrementally (positions [0, kv_valid) of a slot are current). */
+  uint16_t *kv_cache_bf16;
+  size_t kv_layer_elems;
+  int kv_layers, kv_used;
+  const float *kv_key[256];
+  int kv_valid[256];
 } AttentionWork;
+/* Bytes of the persistent BF16 K/V copy of `layers` layers for LLAMA_ATTN=amx (0 when not selected), and its setup. */
+size_t k_attention_kv_bf16_bytes(int n_kv_heads, int head_dim, int seq_len, int layers);
+void k_attention_set_kv_bf16(AttentionWork *work, uint16_t *memory, int n_kv_heads, int head_dim, int seq_len,
+                             int layers);
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
