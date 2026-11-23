@@ -454,7 +454,9 @@ The bimodality, an ~60-80 ms switch per process run, was captured in job 5898042
 - The core clock is not lower (cycles/ref-cycles +0.02).
 - Every sampled run held 16.7 GB of huge pages and 7.9 GB on each HBM node.
 
-Hypothesis: a per-run memory-side state (uncore/mesh clock or HBM) slows both sockets' bandwidth-heavy phases together. It is not core frequency, THP or a one-socket placement. That is the next task: uncore clock counters per run, and the mode against run order.
+Hypothesis at the time: a per-run memory-side state (uncore/mesh clock or HBM) slows both sockets' bandwidth-heavy phases together. It is not core frequency, THP or a one-socket placement.
+
+**Update (23–24 November, [bimodality.md](bimodality.md)):** the memory-side hypothesis is ruled out. Slow runs have the same uncore clock, miss latency and HBM/UPI bytes. They retire +18–28% instructions at the same L1/L2 traffic, so they spin longer at barriers while one worker or more is late. Preemption, daemons, interrupts and 4 KiB pages are ruled out too. One socket shows the same split (1.30 against 1.45 s).
 
 ### Follow-ups
 
