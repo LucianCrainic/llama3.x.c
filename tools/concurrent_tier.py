@@ -31,6 +31,7 @@ import xengine_summary as xs  # noqa: E402  (the perf csv parser and the byte fa
 
 DDR_CAS, HBM_CAS = 64, 32
 CORES = 56
+TSC_GHZ = 1.9  # reference-cycle rate of the Xeon Max 9480 (turbostat TSC_MHz 1900)
 BYTES_TOKEN_GS64 = 36.9e9  # per socket per decoded token, 70B Q8 gs64, 2-socket tensor parallel (task statement)
 GS_FACTOR = {64: 1.0, 32: 1.125 / 1.0625}
 
@@ -273,6 +274,7 @@ def burst_counters(burst, upi_flit_bytes):
             'ddr_bytes': tot['ddr'] * DDR_CAS, 'hbm_bytes': tot['hbm'] * HBM_CAS,
             'upi_rx_bytes': tot['upi_rx'] * upi_flit_bytes, 'upi_tx_bytes': tot['upi_tx'] * upi_flit_bytes,
             'pkg_j': tot['pkg_j'], 'ram_j': tot['ram_j'],
+            'freq_ghz': tot['cycles'] / tot['ref_cycles'] * TSC_GHZ if tot['ref_cycles'] else None,
             'pkg_w': sum(r['s'][s]['pkg_j'] for r in interior) / idt if idt else 0.0,
             'ram_w': sum(r['s'][s]['ram_j'] for r in interior) / idt if idt else 0.0,
             'burst_s': dur, 'intervals': len(burst),
@@ -374,6 +376,9 @@ def aggregate(windows):
             e['counter_ddr_gbps'] = med_min_max([v['ddr_bytes'] / v['burst_s'] / 1e9 for v in per.values()])
             e['upi_gbps'] = med_min_max([(v['upi_rx_bytes'] + v['upi_tx_bytes']) / v['burst_s'] / 1e9 for v in per.values()])
             e['pkg_w'] = med_min_max([v['pkg_w'] for v in per.values()])
+            e['pkg_w0'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 0])
+            e['ram_w0'] = med_min_max([w['counters']['ram_w'] for w in cw if w['socket'] == 0])
+            e['freq_ghz'] = med_min_max([w['counters']['freq_ghz'] for w in cw if w['socket'] == 0 and w['counters']['freq_ghz']])
             e['ram_w'] = med_min_max([v['ram_w'] for v in per.values()])
             ratios_h = [w['counter_ratio']['hbm'] for w in cw if w['counter_ratio']['hbm'] is not None]
             ratios_d = [w['counter_ratio']['ddr'] for w in cw if w['counter_ratio']['ddr'] is not None]
@@ -537,9 +542,10 @@ def tables(agg, windows, idle):
         for ch, cd, h, d, c, n, e in rows:
             v = agg.get((e['name'].replace('e1-', 'e1v-'), page, 1))
             body.append((ch, cd, h, d, c, n, mm(v['volume_gbps']) if v else '-', mm(v['common_hbm_gbps']) if v else '-',
-                         mm(v['common_ddr_gbps']) if v else '-'))
+                         mm(v['common_ddr_gbps']) if v else '-', mm(e.get('freq_ghz'), 2),
+                         f'{e["pkg_w0"]["median"]:.0f}' if e.get('pkg_w0') else '-'))
         md.append(table(['HBM cores', 'DDR cores', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps', 'fixed-volume run: total volume / total time',
-                         'fixed-volume run: HBM GB/s over the common interval', 'DDR GB/s over the common interval'], body))
+                         'fixed-volume run: HBM GB/s over the common interval', 'DDR GB/s over the common interval', 'core GHz (counters)', 'package W per socket'], body))
         best = max(rows, key=lambda r: r[6]['combined_gbps']['median'])
         e = best[6]
         gain = e['combined_gbps']['median'] / ref['combined_gbps']['median'] - 1 if ref else float('nan')
@@ -623,18 +629,20 @@ def tables(agg, windows, idle):
         md.append('Windows outside +-5% (run, config, socket, tier, counter/computed):\n')
         md.append(table(['run', 'config', 'socket', 'tier', 'ratio'], [(a, b, c, d, f'{e:.3f}') for a, b, c, d, e in bad[:60]]))
         md.append('')
-    md.append('## Power and energy (RAPL package and DRAM energy, interior intervals of each window, both sockets for a one-socket run)\n')
-    md.append(f'Idle baseline (quiet interval before the first window; package W, DRAM W): socket 0 {idle.get(0)}, socket 1 {idle.get(1)}.\n')
+    md.append('## Power and energy of socket 0 (RAPL package and DRAM energy over the interior intervals of each one-socket window)\n')
+    ip = idle.get(0)
+    md.append(f'Quiet interval before the first window of each process (the worker teams spin): package {ip[0] if ip else None} W, '
+              f'DRAM {ip[1] if ip else None} W.\n')
     rows = []
-    for name in ('e1-cd0', 'e1-cd56', 'e1-cd8', 'e1-cd16', 'e1-cd28'):
+    for name in ('e1-cd0', 'e1-cd56', 'e1-cd4', 'e1-cd8', 'e1-cd16', 'e1-cd28'):
         e = agg.get((name, '2m', 1))
-        if e and e.get('pkg_w') and idle.get(0) and idle[0][0]:
+        if e and e.get('pkg_w0') and ip and ip[0]:
             gbs = e['combined_gbps']['median']
-            idle_total = sum((idle[s][0] or 0) + (idle[s][1] or 0) for s in (0, 1))
-            total = e['pkg_w']['median'] + e['ram_w']['median']
-            rows.append((name, f'{gbs:.0f}', f'{e["pkg_w"]["median"]:.0f}', f'{e["ram_w"]["median"]:.0f}', f'{total / gbs:.3f}', f'{(total - idle_total) / gbs:.3f}'))
+            total = e['pkg_w0']['median'] + e['ram_w0']['median']
+            rows.append((name, f'{gbs:.0f}', f'{e["pkg_w0"]["median"]:.0f}', f'{e["ram_w0"]["median"]:.0f}', f'{total / gbs:.3f}',
+                         f'{(total - ip[0] - ip[1]) / gbs:.3f}', mm(e.get('freq_ghz'), 2)))
     if rows:
-        md.append(table(['config (2m)', 'GB/s per socket', 'package W (node)', 'DRAM W (node)', 'J/GB (node power / one-socket GB/s)', 'J/GB above idle'], rows))
+        md.append(table(['config (2m)', 'GB/s', 'package W', 'DRAM W', 'J/GB (package + DRAM)', 'J/GB above the quiet baseline', 'core GHz'], rows))
     return '\n'.join(md)
 
 

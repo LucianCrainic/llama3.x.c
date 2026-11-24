@@ -13,7 +13,7 @@
 # analysis are tools/concurrent_tier.py.
 #
 # Required: ROOT (staged tree), OUT (new directory), PYTHON. Optional:
-#   STAGES   stages in order (default smoke): smoke base e1 e2 e3 e4 e5 e5hbm e6 lat freq rep rep-e5
+#   STAGES   (lists such as STAGES, PAGES, PRIOR may use '+' for spaces) stages in order (default smoke): smoke base e1 e2 e3 e4 e5 e5hbm e6 lat freq rep rep-e5
 #            smoke  one pass over a handful of configurations, one and two sockets, both page sizes (counter format, placement,
 #                   JSON); base  HBM-only and DDR-only sweeps (cores x streams x prefetch distance, hint, non-temporal), picks
 #                   BEST_*;  e1 split teams;  e2 shared cores;  e3 page-interleaved regions;  e4 both sockets at the best
@@ -42,11 +42,16 @@ REGION_MIB=${REGION_MIB:-20480}
 INTER_MIB=${INTER_MIB:-32768}
 PRIOR=${PRIOR:-}
 BEST_ENV=${BEST_ENV:-}
+# sbatch --export cannot carry spaces: lists may be given with '+' instead.
+STAGES=${STAGES//+/ }
+PAGES=${PAGES//+/ }
+PRIOR=${PRIOR//+/ }
 job_begin
 # Fixed explicit map: S0 = cores 0-55, DDR node 0, HBM node 2; S1 = cores 56-111, DDR node 1, HBM node 3.
 TOPOLOGY='explicit:0/2/0,1/3/1'
-# DDR CAS reads count 64-byte lines, HBM CAS reads 32-byte units (job 5892172); UPI data flits; RAPL package and DRAM energy.
-MEM_EVENTS='uncore_imc/event=0x05,umask=0xcf,name=ddr_cas_rd/,uncore_type_14/event=0x05,umask=0xcf,name=hbm_cas_rd/,unc_upi_rxl_flits.all_data,unc_upi_txl_flits.all_data,power/energy-pkg/,power/energy-ram/'
+# DDR CAS reads count 64-byte lines, HBM CAS reads 32-byte units (job 5892172); UPI data flits; RAPL package and DRAM energy;
+# unhalted and reference cycles (the average core frequency of the window).
+MEM_EVENTS='uncore_imc/event=0x05,umask=0xcf,name=ddr_cas_rd/,uncore_type_14/event=0x05,umask=0xcf,name=hbm_cas_rd/,unc_upi_rxl_flits.all_data,unc_upi_txl_flits.all_data,power/energy-pkg/,power/energy-ram/,cycles,ref-cycles'
 mkdir -p "$OUT/raw" "$OUT/cfg"
 failures=0
 BIN=stream-bench
