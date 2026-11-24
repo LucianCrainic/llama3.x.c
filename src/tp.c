@@ -946,6 +946,16 @@ static void zero_span(const void *p, int worker, int workers) {
   memset((char *)z->data + lo, 0, hi - lo);
 }
 
+/* The KV table of the legacy placements: layer l's caches are `l * seq_len * kv_dim` floats into one region per cache (the
+ * socket's own region on two sockets, the run memory on one). It is built on the main thread, like the table of a plan,
+ * because the engine's allocation counters are not thread-safe. */
+static void kv_table_legacy(Tp *tp, TpSocket *sk, float *k, float *v) {
+  size_t layer_floats = (size_t)tp->c.seq_len * tp->kv_dim_local;
+  sk->kv_layers = memory_alloc((size_t)tp->c.n_layers, sizeof(KvLayer), MEM_METADATA);
+  for (int l = 0; l < tp->c.n_layers; l++)
+    sk->kv_layers[l] = (KvLayer){k + (size_t)l * layer_floats, v + (size_t)l * layer_floats, NULL};
+}
+
 /* Carves the socket's activations out of its work region and sizes the attention work from its team. Runs on the
  * socket's coordinator, so the pages are first written by the socket that uses them. */
 static void setup_socket(Tp *tp, int s) {
@@ -997,15 +1007,9 @@ static void setup_socket(Tp *tp, int s) {
   if (used > sk->work_size)
     fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work_size, used);
   k_attention_init_rows(&sk->attention, hl, kl, p->head_dim, p->seq_len, tp->rows, attention_memory);
-  /* The KV table: where each layer's caches are, whatever the placement. Legacy placement is one contiguous region per
-   * cache (the socket's own region, or the one-socket run memory); a plan built its table in tp_create_planned. */
+  /* The KV table (kv_layers) was built on the main thread before this ran (kv_table_legacy, or tp_create_planned): the
+   * coordinators of the two sockets must not touch the engine's allocation counters. */
   size_t layer_floats = (size_t)p->seq_len * tp->kv_dim_local;
-  if (!tp->plan.mode) {
-    float *k = S == 2 ? sk->kv_k.data : runmem_cache(&tp->mem, 0), *v = S == 2 ? sk->kv_v.data : runmem_cache(&tp->mem, 1);
-    sk->kv_layers = memory_alloc((size_t)p->n_layers, sizeof(KvLayer), MEM_METADATA);
-    for (int l = 0; l < p->n_layers; l++)
-      sk->kv_layers[l] = (KvLayer){k + (size_t)l * layer_floats, v + (size_t)l * layer_floats, NULL};
-  }
   if (kv_bf16)
     k_attention_set_kv_bf16(&sk->attention, kv_bf16, kl, p->head_dim, p->seq_len, p->n_layers);
   else if (kv_bf16_bytes && tp->plan.mode) {
@@ -1318,6 +1322,7 @@ Tp *tp_create_local(const Config *p, const TensorManifest *m, const WeightStore 
     runmem_seal(&tp->mem);
     sk->work_data = runmem_alloc(&tp->mem, sk->work_size, 1);
   }
+  kv_table_legacy(tp, sk, runmem_cache(&tp->mem, 0), runmem_cache(&tp->mem, 1));
   setup_socket(tp, 0);
   tp->logits = memory_alloc((size_t)p->vocab_size, sizeof(float), MEM_ACTIVATION);
   if (pack == TP_PACK_BF16)
@@ -1386,6 +1391,7 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
     region_mark_populated(&sk->kv_k);
     region_mark_populated(&sk->kv_v);
     region_mark_populated(&sk->work);
+    kv_table_legacy(tp, sk, sk->kv_k.data, sk->kv_v.data);
   }
   if (tp->set.global_bytes)
     region_reserve(&tp->global, tp->set.global_bytes, 0, placement_node(mode, &topology->socket[0], 1), ROLE_EMBEDDING,
