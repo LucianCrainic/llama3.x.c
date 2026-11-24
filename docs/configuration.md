@@ -113,6 +113,14 @@ KV ranges. Use `python3 tools/check_placement.py REPORT --planned` to check that
 `LLAMA_VERIFY_SAMPLES` permits stratified sampling. For active KV, at least the first and last page of every span
 are checked, even when that exceeds the requested sample count. Add `--allow-sampled` to accept sampled reports.
 
+With `LLAMA_ATTN=amx` (the W8A8 default on AMX hosts) the persistent BF16 copy of K and V is planned as its own arenas
+(role `kv.bf16`, one copy per layer, half the size of the layer's FP32 caches), in the tier of the layer's caches
+(`LLAMA_HYBRID_KV_HBM_LAYERS` places both), charged to the same budgets, verified over its active prefix with the caches,
+and reported as `placement_plan.kv_bf16_layer_bytes` and `kv.bf16_copy`. `scripts/hbm-ddr.sbatch` applies the engine's own
+defaults; `KERNELS`, `PREFILL_BATCH`, `ATTN`, `ATTN_DECODE`, `KV_LAYOUT`, `PREFILL_LOGITS`, `THP` select a value and
+`LEGACY=1` restores the AVX-512, M = 64, tiled-attention settings of the first pilot. Design and checks:
+`docs/hbm-ddr-placement.md`.
+
 Planned execution requiring every prompt position's logits must set `LLAMA_PREFILL_LOGITS=all` so the planner can
 admit its output buffers and any BF16 classifier pack. An explicit `LLAMA_TOPOLOGY=virtual:2x3` can exercise the
 same layouts and kernels without physical NUMA binding. Those reports carry `simulated: true`.
