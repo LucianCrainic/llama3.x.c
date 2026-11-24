@@ -108,8 +108,7 @@ trees. The ratio (2.7–4.7x) is indicative, not a paired measurement.
 
 ## 5. Follow-ups
 
-1. **Decode at gs32 stays portable.** The VNNI decode GEMV (`src/gemv.c`, the Q8 rung) also requires `gs % 64 == 0`.
-   The same half-step idea applies: two 32-byte halves of one 64-byte VNNI load, with a scale per half.
+1. ~~**Decode at gs32 stays portable.**~~ Done: the VNNI pair kernel, §6.
 2. **Hugging Face gate for the gs32 file** on both paths (batched and per token), as for every model file
    ([prefill-gap.md](prefill-gap.md)). The weights are llama.cpp's, so this measures the GGUF quantization, not the kernel.
 3. **The 70B comparison** repacks its Q8_0 GGUF to gs32 in the same way (branch `codex/70b-engine-comparison`). Its
@@ -120,3 +119,37 @@ trees. The ratio (2.7–4.7x) is indicative, not a paired measurement.
 
 Scripts (not in the repository): `repack_q8_gguf.py` (a generic version of the 70B branch's `repack_q8.py`;
 sha256 of the 8B output `68a6ac94…c48cbda0`, 9,034,809,600 bytes) and `gs32-ab.sbatch`.
+
+## 6. Decode GEMV at gs32 (24 November)
+
+`dots_q8_pair_body` in `src/gemv.c` runs W8A8 decode at gs32 when `n % 64 == 0`; other widths stay portable. One
+64-byte `vpdpbusd` covers two groups: int32 lane i accumulates bytes 4i..4i+3, so lanes 0-7 hold group g's dot and
+lanes 8-15 group g + 1's. The activation and weight scales are spread the same way
+(`_mm512_mask_mov_ps(set1(s[g]), 0xff00, set1(s[g + 1]))`), and each lane is rescaled with the gs64 expression
+`fma(cvt(dot) * xscale, wscale, acc)`. The loop is the gs64 one with one scale pair per 64 bytes instead of one scale.
+
+Tests: `test_q8` in `tests/kernels.c` gains gs32 shapes (and n = 96, which stays portable), and `test_partial_q8`
+covers gs32 with a padded K split. Swapping the two scale halves fails it by whole units. The engine test
+`test_vnni_gemv_gs32_pairs` compares per-token decode on the `wide-gs32` fixture against the portable path with the
+§3 flip contract: at 2S the first difference is one int8 activation in layer 1's QKV input at position 0, with
+x * 127 / amax = -7.499987, one step from the tie. Gate 5913493: make test rc 0, TSAN 0 races.
+
+A/B 5913494 (hbm14), 8B gs32 file, old tree 4d13eb9 (portable GEMV) against 9ce517c, 5 interleaved reps of decode D:
+
+| S | Configuration | Decode tok/s | TTFT s |
+| ---: | --- | ---: | ---: |
+| 1 | gs32 portable GEMV | 24.57 [24.49-24.83] | 0.13 |
+| 1 | gs32 VNNI pair | 48.04 [47.97-48.14] | 0.13 |
+| 1 | gs64 VNNI (reference) | 51.07 [50.92-51.19] | 0.12 |
+| 2 | gs32 portable GEMV | 47.79 [47.64-47.90] | 0.10 |
+| 2 | gs32 VNNI pair | 91.16 [91.04-91.94] | 0.10 |
+| 2 | gs64 VNNI (reference) | 97.23 [96.75-98.13] | 0.09 |
+
+Decode at gs32 is 1.96x (1S) and 1.91x (2S) faster, and runs at 0.94 of gs64. The remaining gap is the larger scale
+stream (two floats per 64 weight bytes instead of one) and the extra blend per load; decode is bandwidth bound, so
+the GEMV now streams the weights at nearly the gs64 rate.
+
+Numerics, per-token logits over the first 128 ids of the 2048 prompt: new against old has rms 0.066 (1S) and 0.063
+(2S), logit rms 2.75, argmax the same at 128/128. For scale, the old tree's own 1S against 2S differs by rms 0.073
+(max 2.74), also from rounding flips, so the change is within the flip noise W8A8 already has between socket counts.
+Greedy text for 48 tokens is identical.

@@ -99,7 +99,9 @@ static void test_f32(void) {
 
 /* Returns the quantized activations so callers can compare instruction sets. */
 static void test_q8(int8_t *quantized_out, float *scales_out) {
-  const int shapes[][3] = {{64, 5, 16}, {192, 7, 32}, {256, 4, 64}, {4096, 9, 64}, {512, 3, 128}, {64, 2, 4}};
+  /* gs 32 with n % 64 == 0 takes the VNNI pair kernel; {96, 5, 32} does not (n % 64), and stays portable. */
+  const int shapes[][3] = {{64, 5, 16},   {192, 7, 32}, {256, 4, 64},  {4096, 9, 64},
+                           {512, 3, 128}, {64, 2, 4},   {4096, 9, 32}, {96, 5, 32}};
   size_t offset = 0, scale_offset = 0;
   for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
     int n = shapes[s][0], d = shapes[s][1], gs = shapes[s][2], groups = n / gs;
@@ -489,7 +491,7 @@ static void test_partial_f32(void) {
 }
 
 static void test_partial_q8(void) {
-  const int gss[] = {4, 16, 64, 128};
+  const int gss[] = {4, 16, 32, 64, 128};
   const int n = 512, d = 7, half = n / 2;
   for (size_t g = 0; g < sizeof(gss) / sizeof(*gss); g++) {
     int gs = gss[g], groups = n / gs, hg = half / gs;

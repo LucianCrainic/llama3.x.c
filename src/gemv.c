@@ -138,6 +138,35 @@ Q8_INLINE void dots_q8_body(const int8_t *wq, const float *ws, size_t n, size_t 
     out[r] = _mm512_reduce_add_ps(acc[r]);
 }
 
+/* W8A8 with VNNI at gs = 32 (the Q8_0 GGUF block): one 64-byte load spans a pair of groups, so int32 lanes 0-7 hold
+ * group g's dot and lanes 8-15 group g + 1's. The scales are spread the same way (two adjacent floats, lanes 0-7 and
+ * 8-15), and each lane is rescaled as in dots_q8_body. n % 64 == 0. */
+Q8_INLINE void dots_q8_pair_body(const int8_t *wq, const float *ws, size_t n, size_t ld, const int rows,
+                                 const int8_t *xq, const float *xs, float *out) {
+  const __m512i zero = _mm512_setzero_si512();
+  const size_t ahead = q8_ahead(rows, n, 0);
+  __m512 acc[BLOCK];
+  for (int r = 0; r < rows; r++)
+    acc[r] = _mm512_setzero_ps();
+  size_t scale_ld = ld / 32;
+#define Q8_PAIR(p) _mm512_mask_mov_ps(_mm512_set1_ps((p)[0]), 0xff00, _mm512_set1_ps((p)[1]))
+  for (size_t off = 0, g = 0; off < n; off += 64, g += 2) {
+    __m512i xv = _mm512_loadu_si512((const void *)(xq + off));
+    __m512i ax = _mm512_abs_epi8(xv);
+    __mmask64 negative = _mm512_movepi8_mask(xv);
+    __m512 xscale = Q8_PAIR(xs + g);
+    for (int r = 0; r < rows; r++) {
+      _mm_prefetch((const char *)(wq + r * ld + off + ahead), _MM_HINT_T0);
+      __m512i wv = _mm512_loadu_si512((const void *)(wq + r * ld + off));
+      __m512i dot = _mm512_dpbusd_epi32(zero, ax, _mm512_mask_sub_epi8(wv, negative, zero, wv));
+      acc[r] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(dot), xscale), Q8_PAIR(ws + r * scale_ld + g), acc[r]);
+    }
+  }
+#undef Q8_PAIR
+  for (int r = 0; r < rows; r++)
+    out[r] = _mm512_reduce_add_ps(acc[r]);
+}
+
 /* W8A32: weights are widened in registers and multiplied by FP32 activations;
  * each group's partial sum is scaled once. Two partial sums per row hide FMA
  * latency. gs % 16 == 0. */
@@ -186,6 +215,11 @@ Q8_INLINE void dots_q8f_body(const int8_t *wq, const float *ws, size_t n, size_t
                                            const float *xs, int gs, float *out) {                                      \
     dots_q8_body(wq, ws, n, ld, rows, xq, xs, gs, out);                                                                \
   }                                                                                                                    \
+  AVX512 static void dots_q8p_avx512_##rows(const int8_t *wq, const float *ws, size_t n, size_t ld, const int8_t *xq,  \
+                                            const float *xs, int gs, float *out) {                                     \
+    (void)gs;                                                                                                          \
+    dots_q8_pair_body(wq, ws, n, ld, rows, xq, xs, out);                                                               \
+  }                                                                                                                    \
   AVX512 static void dots_q8f_avx512_##rows(const int8_t *wq, const float *ws, size_t n, size_t ld, const float *x,    \
                                             int gs, float *out) {                                                      \
     dots_q8f_body(wq, ws, n, ld, rows, x, gs, out);                                                                    \
@@ -200,6 +234,8 @@ typedef void (*DotsQ8Fn)(const int8_t *, const float *, size_t, size_t, const in
 typedef void (*DotsQ8fFn)(const int8_t *, const float *, size_t, size_t, const float *, int, float *);
 static const DotsQ8Fn dots_q8_avx512[BLOCK + 1] = {NULL, dots_q8_avx512_1, dots_q8_avx512_2, dots_q8_avx512_3,
                                                    dots_q8_avx512_4};
+static const DotsQ8Fn dots_q8p_avx512[BLOCK + 1] = {NULL, dots_q8p_avx512_1, dots_q8p_avx512_2, dots_q8p_avx512_3,
+                                                    dots_q8p_avx512_4};
 static const DotsQ8fFn dots_q8f_avx512[BLOCK + 1] = {NULL, dots_q8f_avx512_1, dots_q8f_avx512_2, dots_q8f_avx512_3,
                                                      dots_q8f_avx512_4};
 
@@ -406,6 +442,10 @@ static void q8_dots(K8Weight w, size_t ld, int row, int rows, const K8Input *x, 
   if (kernels_isa == KERNELS_AVX512) {
     if (x->q && gs % 64 == 0) {
       dots_q8_avx512[rows](wq, ws, (size_t)n, ld, x->q, x->s, gs, out);
+      return;
+    }
+    if (x->q && gs == 32 && n % 64 == 0) {
+      dots_q8p_avx512[rows](wq, ws, (size_t)n, ld, x->q, x->s, gs, out);
       return;
     }
     if (!x->q && gs % 16 == 0) {
