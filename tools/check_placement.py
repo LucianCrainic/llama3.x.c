@@ -73,6 +73,15 @@ def main(argv=None):
                   and snapshot.get('pages_wrong_node') == 0 and snapshot.get('pages_missing') == 0
                   and (snapshot.get('pages_queried') or 0) > 0
                   and snapshot['active_bytes'] <= snapshot['resident_bytes'])
+        copies = [a for a in plan.get('arenas', []) if a.get('role') == 'kv.bf16']
+        if copies:  # LLAMA_ATTN=amx: the persistent BF16 K/V copy is planned, verified above and reported with the caches
+            for label, snapshot in (('final', kv), ('after prompt', kv.get('after_prompt') or {})):
+                copy = snapshot.get('bf16_copy') or {}
+                check(f'{label}: BF16 K/V copy reported',
+                      copy.get('reserved_bytes') == sum(a['bytes'] for a in copies)
+                      and 0 < copy.get('active_bytes', 0) <= copy.get('reserved_bytes', 0)
+                      and copy.get('active_bytes', 0) <= (copy.get('resident_bytes') or 0),
+                      str(copy))
         teams = report.get('teams') or []
         check('worker affinity', len(teams) == runtime.get('sockets')
               and all(team.get('affinity_verified') is True for team in teams))
