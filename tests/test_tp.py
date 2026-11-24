@@ -904,6 +904,277 @@ class TensorParallelTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr.decode())
                 self.assertIn(text, result.stderr.decode())
 
+    # ---- the merge of the planned placement with the memory users added on develop (docs/hbm-ddr-placement.md) ------
+
+    def plan(self, binary, fixture, filename, sockets=2, **knobs):
+        """--plan-only under a planned placement on the virtual topology: (result, parsed report)."""
+        report = Path(self.temp.name)/f'plan-{binary}-{fixture}-{sockets}.json'
+        report.unlink(missing_ok=True)
+        result = subprocess.run([str(BUILD/binary), str(self.fixtures[fixture]/filename), '--plan-only', '--json',
+                                 str(report)], capture_output=True, text=True, timeout=30,
+                                env=environment(sockets, **knobs))
+        return result, (json.loads(report.read_text()) if report.exists() else None)
+
+    @staticmethod
+    def arenas(report, role=None):
+        return [a for a in report['placement_plan']['arenas'] if role is None or a['role'] == role]
+
+    def test_planned_bf16_kv_copy_has_arenas_in_both_budgets(self):
+        """Hazard 1: the persistent BF16 K/V copy of LLAMA_ATTN=amx is an arena of its own (role kv.bf16), tiered per layer
+        with the caches, counted in the charge of the node it sits on, and left out of the work region."""
+        self.need('runq-amx-emul')
+        amx = dict(LLAMA_KERNELS='amx', LLAMA_ATTN='amx', LLAMA_PREFILL_BATCH='4')
+        cfg = TP_WIDE_CONFIG  # dim, hidden, layers, heads, kv_heads, vocab, seq
+        hd, kl = cfg[0] // cfg[3], cfg[4] // 2
+        layer_bytes = 2 * kl * ((cfg[6] + 31) // 32) * 32 * hd * 2
+        for placement, knobs, hbm_layers in (('hbm-only', {}, 2), ('ddr', {}, 0),
+                                             ('hybrid', dict(LLAMA_HYBRID_KV_HBM_LAYERS='1'), 1),
+                                             ('hybrid', dict(LLAMA_HYBRID_KV_HBM_LAYERS='0'), 0),
+                                             ('hybrid', dict(LLAMA_HYBRID_KV_HBM_LAYERS='2'), 2)):
+            with self.subTest(placement=placement, hbm_layers=hbm_layers):
+                result, report = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT=placement, **amx, **knobs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                plan = report['placement_plan']
+                self.assertEqual(plan['kv_bf16_layer_bytes'], layer_bytes)
+                copies = self.arenas(report, 'kv.bf16')
+                for socket in (0, 1):
+                    mine = {a['tier']: a for a in copies if a['socket'] == socket}
+                    self.assertEqual({t: a['bytes'] for t, a in mine.items()},
+                                     {t: n * layer_bytes for t, n in (('hbm', hbm_layers), ('ddr', 2 - hbm_layers)) if n})
+                    kv = {a['tier']: a['bytes'] for a in self.arenas(report, 'kv.k') if a['socket'] == socket}
+                    for tier, arena in mine.items():  # the copy sits where its layers' caches sit
+                        self.assertEqual(arena['bytes'] // layer_bytes, kv[tier] // plan['kv_layer_bytes'])
+                # every node is charged exactly the rounded arenas on it, the BF16 copy included
+                for node in plan['nodes']:
+                    rounded = sum(a['rounded_bytes'] for a in self.arenas(report)
+                                  if a['socket'] == node['socket'] and a['tier'] == node['tier'])
+                    self.assertEqual(node['charged_bytes'], rounded)
+                # the work region no longer carries it: the same plan with the copy off has the same work arenas
+                _, plain = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT=placement,
+                                     **{**amx, 'LLAMA_ATTN': 'amx', 'LLAMA_KERNELS': 'amx'}, **knobs)
+                self.assertEqual([a['bytes'] for a in self.arenas(plain, 'work')],
+                                 [a['bytes'] for a in self.arenas(report, 'work')])
+        # both budgets: dropping the copy's rounded bytes from a node's charge as its budget must refuse the plan
+        result, report = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT='hybrid',
+                                   LLAMA_HYBRID_KV_HBM_LAYERS='1', **amx)
+        hbm = max(n['charged_bytes'] for n in report['placement_plan']['nodes'] if n['tier'] == 'hbm')
+        copy = max(a['rounded_bytes'] for a in self.arenas(report, 'kv.bf16') if a['tier'] == 'hbm')
+        self.assertGreater(copy, 0)
+        for budget, ok in ((hbm, True), (hbm - copy, False)):
+            result, _ = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT='hbm-only',
+                                  LLAMA_HBM_BUDGET_GIB=str(budget / (1 << 30)), **amx)
+            if ok:
+                continue
+            self.assertNotEqual(result.returncode, 0)
+        ddr = max(n['charged_bytes'] for n in report['placement_plan']['nodes'] if n['tier'] == 'ddr')
+        copy = max(a['rounded_bytes'] for a in self.arenas(report, 'kv.bf16') if a['tier'] == 'ddr')
+        result, _ = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT='hybrid',
+                              LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_DDR_BUDGET_GIB=str((ddr - copy) / (1 << 30)), **amx)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('over its', result.stderr)
+        # without LLAMA_ATTN=amx there is no copy and no arena
+        _, tiled = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_PLACEMENT='hbm-only', LLAMA_KERNELS='amx',
+                             LLAMA_ATTN='tiled')
+        self.assertEqual(self.arenas(tiled, 'kv.bf16'), [])
+        self.assertEqual(tiled['placement_plan']['kv_bf16_layer_bytes'], 0)
+
+    def test_planned_bf16_kv_copy_follows_its_layer_across_tiers(self):
+        """Hazard 1, results: each layer's BF16 copy lives in the tier of its caches; every split gives the logits of the
+        unplanned run bitwise (the copy is keyed by the layer's cache, not by the order the layers first run in), and
+        the report carries the copy."""
+        self.need('probe-int8-amx-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        amx = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_KERNELS='amx', LLAMA_ATTN='amx',
+                   LLAMA_PREFILL_LOGITS='all', LLAMA_PREFILL_BATCH='5')
+        for sockets in (1, 2):
+            amx['LLAMA_TOPOLOGY'] = f'virtual:{sockets}x3'
+            reference = self.probe('int8', 'wide', 'batch', sockets, **amx)
+            for kv in ('0', '1', '2'):
+                for layout in ('head', 'rows'):
+                    with self.subTest(sockets=sockets, kv_hbm_layers=kv, layout=layout):
+                        actual = self.probe('int8', 'wide', 'batch', sockets, LLAMA_PLACEMENT='hybrid',
+                                            LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1', LLAMA_HYBRID_KV_HBM_LAYERS=kv,
+                                            LLAMA_KV_LAYOUT=layout, **amx)
+                        if layout == 'head':
+                            self.assertEqual(reference, actual)
+                        else:  # the rows layout is its own reference
+                            self.assertEqual(self.probe('int8', 'wide', 'batch', sockets, LLAMA_KV_LAYOUT=layout, **amx),
+                                             actual)
+        data = self.report('runq', 'int8.bin', fixture='wide', binary='runq-amx-emul', full=True, LLAMA_KERNELS='amx',
+                           LLAMA_ATTN='amx', LLAMA_PREFILL_BATCH='4', LLAMA_PLACEMENT='hybrid',
+                           LLAMA_HYBRID_KV_HBM_LAYERS='1', prompt='ABCDEFGHIJ')
+        copy = data['kv']['bf16_copy']
+        plan = data['placement_plan']
+        self.assertEqual(copy['reserved_bytes'], 2 * 2 * plan['kv_bf16_layer_bytes'])
+        self.assertGreater(copy['active_bytes'], 0)
+        self.assertLessEqual(copy['active_bytes'], copy['reserved_bytes'])
+
+    def test_per_channel_checkpoint_is_planned_and_run(self):
+        """Hazard 2: a format 4 checkpoint (gs 0) is planned without dividing by the group size: the work arena holds two
+        scales per padded row (one per product input), all three placements are admitted, and the planned runs equal the
+        unplanned ones bitwise, on one and two sockets, on the scalar kernels and on the AMX tile model."""
+        cfg = TP_WIDE_CONFIG
+        for binary, kernels in (('runq', 'scalar'), ('runq-amx-emul', 'amx')):
+            self.need(binary)
+            for placement in ('hbm-only', 'ddr', 'hybrid'):
+                with self.subTest(binary=binary, placement=placement):
+                    result, report = self.plan(binary, 'wide-pc', 'int8.bin', LLAMA_PLACEMENT=placement,
+                                               LLAMA_KERNELS=kernels, LLAMA_PREFILL_BATCH='32')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(report['placement_plan']['admitted'])
+                    work = self.arenas(report, 'work')[0]['bytes']
+                    _, gs64 = self.plan(binary, 'wide', 'int8.bin', LLAMA_PLACEMENT=placement, LLAMA_KERNELS=kernels,
+                                        LLAMA_PREFILL_BATCH='32')
+                    # (dim/gs + slice/gs) scales per padded row of 32 for gs 64, against 2 for per-channel
+                    groups = cfg[0] // 64 + max(cfg[0], cfg[1]) // 2 // 64
+                    self.assertEqual(self.arenas(gs64, 'work')[0]['bytes'] - work, 32 * (groups - 2) * 4)
+        probes = dict(tokens=[65 + (i * 7) % 20 for i in range(33)], LLAMA_PREFILL_LOGITS='all', LLAMA_PREFILL_BATCH='8')
+        for sockets in (1, 2):
+            for binary, extra in (('probe-int8', {'LLAMA_KERNELS': 'scalar'}),
+                                  ('probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx'})):
+                self.need(binary)
+                extra = dict(extra, LLAMA_TOPOLOGY=f'virtual:{sockets}x3')
+                packed = dict(LLAMA_HYBRID_PACKED='hbm' if sockets == 2 else 'ddr') if 'amx' in binary else {}
+                reference = self.probe('int8', 'wide-pc', 'batch', sockets, binary=binary, **probes, **extra)
+                for tier in (dict(LLAMA_PLACEMENT='hbm-only'), dict(LLAMA_PLACEMENT='ddr'),
+                             dict(LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1',
+                                  LLAMA_HYBRID_KV_HBM_LAYERS='1', **packed)):
+                    with self.subTest(sockets=sockets, binary=binary, **tier):
+                        self.assertEqual(reference, self.probe('int8', 'wide-pc', 'batch', sockets, binary=binary,
+                                                               **probes, **extra, **tier))
+
+    def test_hybrid_packed_tier_with_every_group_size(self):
+        """Hazard 3: LLAMA_HYBRID_PACKED=hbm|ddr plans and runs the AMX-INT8 packed copies (and their transposed scale
+        streams) of group size 64, group size 32 (half tiles) and per-channel files: the packed arena sits on the
+        requested tier with the same size in both, and the logits equal the unplanned run bitwise."""
+        self.need('probe-int8-amx-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        for fixture in ('wide', 'wide-gs32', 'wide-pc'):
+            sizes = {}
+            for tier in ('hbm', 'ddr'):
+                result, report = self.plan('runq-amx-emul', fixture, 'int8.bin', LLAMA_PLACEMENT='hybrid',
+                                           LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_HYBRID_PACKED=tier, LLAMA_KERNELS='amx',
+                                           LLAMA_PREFILL_BATCH='32')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                packed = self.arenas(report, 'packed')
+                self.assertEqual({a['tier'] for a in packed}, {tier})
+                self.assertGreater(min(a['bytes'] for a in packed), 0)
+                sizes[tier] = sorted(a['bytes'] for a in packed)
+            self.assertEqual(sizes['hbm'], sizes['ddr'], fixture)
+            for sockets in (1, 2):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='8',
+                            LLAMA_PREFILL_LOGITS='all', LLAMA_TOPOLOGY=f'virtual:{sockets}x3')
+                reference = self.probe('int8', fixture, 'batch', sockets, **args)
+                for tier in ('hbm', 'ddr'):
+                    with self.subTest(fixture=fixture, sockets=sockets, packed=tier):
+                        self.assertEqual(reference, self.probe('int8', fixture, 'batch', sockets,
+                                                               LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_PACKED=tier,
+                                                               LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1',
+                                                               LLAMA_HYBRID_KV_HBM_LAYERS='1', **args))
+
+    def test_fused_norm_quantizer_runs_with_a_split_kv_region(self):
+        """Hazard 4: the fused RMSNorm + tile-order quantizer (develop) and the KV accessor (the branch) are both in the
+        batched prefill loop. With the caches split over two tiers the pipelined (fused) and chunk (unfused) kernels give
+        the same logits bitwise, as the unplanned fused run does."""
+        self.need('probe-int8-amx-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        for fixture in ('wide', 'wide-gs32', 'wide-pc'):
+            for sockets in (1, 2):
+                args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='8',
+                            LLAMA_PREFILL_LOGITS='all', LLAMA_TOPOLOGY=f'virtual:{sockets}x3')
+                split = dict(LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1')
+                with self.subTest(fixture=fixture, sockets=sockets):
+                    fused = self.probe('int8', fixture, 'batch', sockets, **args)
+                    self.assertEqual(fused, self.probe('int8', fixture, 'batch', sockets, **split, **args))
+                    self.assertEqual(fused, self.probe('int8', fixture, 'batch', sockets, LLAMA_Q8_GEMM='chunk',
+                                                       **split, **args))
+        source = (Path(__file__).resolve().parent.parent/'src/tp.c').read_text()
+        body = source[source.index('static void forward_batch('):source.index('One slice of a region, zeroed')]
+        self.assertEqual(body.count('norm_quantize_batch(tp, sk, s, norm_weight('), 2)  # attention and FFN norms
+        self.assertIn('KvLayer cache = kv_layer(sk, l);', body)
+
+    def test_no_raw_kv_indexing_outside_the_kv_table(self):
+        """Hazard 5: every K/V cache access goes through kv_layer(); the per-socket key/value pointers are gone, and
+        the only place that turns a layer number into an offset is the table's construction."""
+        import re
+        source = (Path(__file__).resolve().parent.parent/'src/tp.c').read_text()
+        self.assertEqual(re.findall(r'\b(?:key|value)_cache\b', source), [])
+        self.assertEqual(len(re.findall(r'kv_layer\(sk, l\)', source)), 3)  # per-token fp32, per-token q8, batched
+        lines = source.splitlines()
+        offsets = [i + 1 for i, line in enumerate(lines)
+                   if re.search(r'\bl \* layer_floats|\(tier == HBM \? l : l - cut\)', line)]
+        self.assertEqual(len(offsets), 3, offsets)  # the legacy table, and the planned one for K/V and the BF16 copy
+        for use in re.finditer(r'sk->kv_layers\[', source):
+            line = source.count('\n', 0, use.start()) + 1
+            self.assertTrue(any(abs(line - o) < 12 for o in offsets) or 'kv_layers[0]' in lines[line - 1]
+                            or 'kv_layers[l]' in lines[line - 1] or 'kv_layers[layer]' in lines[line - 1], lines[line - 1])
+
+    def test_planned_split_kv_prefault_and_exchange(self):
+        """Hazard 6: the planned path creates what develop's legacy path creates: the team writes every KV arena (both
+        tiers) at setup, the exchange arena has the interleaved reduction's flags and each socket's size, and the
+        interleaved and barrier reductions agree bitwise under a split plan. Each `plan.mode` guard of tp.c is listed."""
+        self.need('probe-int8-amx-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        split = dict(LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1')
+        args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='8',
+                    LLAMA_PREFILL_LOGITS='all', **split)
+        runs = {mode: self.probe('int8', 'wide', 'batch', 2, LLAMA_TP_BATCH_REDUCE=mode, **args)
+                for mode in ('barrier', 'wo', 'interleaved')}
+        self.assertEqual(runs['barrier'], runs['wo'])
+        self.assertEqual(runs['barrier'], runs['interleaved'])
+        whole = {k: v for k, v in args.items() if not k.startswith('LLAMA_HYBRID')} | dict(LLAMA_PLACEMENT='hbm-only')
+        self.assertEqual(runs['barrier'], self.probe('int8', 'wide', 'batch', 2, LLAMA_TP_BATCH_REDUCE='interleaved',
+                                                     **whole))
+        result, report = self.plan('runq-amx-emul', 'wide', 'int8.bin', LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='32',
+                                   **split)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exchange = self.arenas(report, 'exchange')
+        self.assertEqual([a['bytes'] for a in exchange], [3 * 32 * TP_WIDE_CONFIG[0] * 4] * 2)
+        source = (Path(__file__).resolve().parent.parent/'src/tp.c').read_text()
+        guards = [line.strip() for line in source.splitlines() if 'tp->plan.mode' in line]
+        # setup_socket (legacy 2S work memset; BF16 copy carve; legacy KV table; planned BF16 slots; planned KV spans),
+        # work_bytes (the copy is counted in the work region only without a plan), CMD_SETUP (the plan's zeroing),
+        # tp_create_planned (mode), its verification loop (twice), tp_all_logits (admission), tp_kv_stats, tp_free (x2).
+        self.assertEqual(guards, [
+            'if (S == 2 && !tp->plan.mode)',
+            'if (kv_bf16_bytes && !tp->plan.mode)',
+            'if (!tp->plan.mode) {',
+            'else if (kv_bf16_bytes && tp->plan.mode) {',
+            'if (tp->plan.mode) {',
+            'return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, 0, !tp->plan.mode);',
+            'if (tp->plan.mode) {',
+            'tp->plan.mode = placement_mode();',
+            'verify_bound(r, tp->plan.mode);',
+            'verify_bound(r, tp->plan.mode);',
+            'if (tp->plan.mode)',
+            'if (tp->plan.mode) {',
+            'if (tp->sockets == 1 && !tp->plan.mode) {',
+            'if (!tp->plan.mode) {',
+        ])
+
+    def test_hbm_ddr_script_follows_engine_defaults(self):
+        """Hazard 7: scripts/hbm-ddr.sbatch forces no kernel, batch, attention, layout or page knob unless asked; LEGACY=1
+        and the named options bring the old values back."""
+        script = Path(__file__).resolve().parent.parent/'scripts/hbm-ddr.sbatch'
+        base = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_')}
+        base.update(ROOT='.', OUT=str(Path(self.temp.name)/'hbm-ddr-out'), CHECKPOINT='c', TOKENIZER='t', DRY_RUN='1')
+
+        def knobs(**extra):
+            result = subprocess.run(['bash', str(script)], env={**base, **extra}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return dict(line.split('=', 1) for line in result.stdout.splitlines())
+
+        default = knobs()
+        for name in ('KERNELS', 'PREFILL_BATCH', 'PREFILL_LOGITS', 'KV_LAYOUT', 'ATTN', 'ATTN_DECODE', 'THP'):
+            self.assertNotIn(f'LLAMA_{name}', default)
+        self.assertEqual(knobs(LEGACY='1'), {**default, 'LLAMA_KERNELS': 'avx512', 'LLAMA_PREFILL_BATCH': '64',
+                                             'LLAMA_PREFILL_LOGITS': 'last', 'LLAMA_KV_LAYOUT': 'head',
+                                             'LLAMA_ATTN': 'tiled', 'LLAMA_ATTN_DECODE': 'split', 'LLAMA_THP': 'off'})
+        mixed = knobs(LEGACY='1', KERNELS='amx', PREFILL_BATCH='1024')
+        self.assertEqual((mixed['LLAMA_KERNELS'], mixed['LLAMA_PREFILL_BATCH'], mixed['LLAMA_ATTN']),
+                         ('amx', '1024', 'tiled'))
+        self.assertEqual(knobs(ATTN='amx')['LLAMA_ATTN'], 'amx')
+
 
 if __name__ == '__main__':
     unittest.main()
