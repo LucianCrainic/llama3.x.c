@@ -344,7 +344,10 @@ Notes on the import:
 1. **Attention**: key blocks of 64 or 128 positions, to halve the online-softmax rescales and the PV adds, and a vector FP32→BF16 Q convert (0.023 s of 0.187 s).
 2. **BF16 K/V cache** with a BF16 decode kernel, to drop the FP32 cache (section 6): -128 KiB per token on one socket, plus a decode gate.
 3. **Wo on two sockets** (section 3): done on `perf/wo-2s-split`, section 10. Wo reached 38.5 TOP/s in situ. The remaining lever there is the sequence-parallel residual, modelled at -24 ms at P 2S.
-4. **GEMM, gs=64**: the kernel is at 21-33 TOP/s in situ against 54 on the L2-resident prototype. The next steps are:
+4. **GEMM, gs=64**: the kernel is at 21-33 TOP/s in situ against 54 on the L2-resident prototype. Update of 24
+   November: [gs64-gemm.md](gs64-gemm.md) found the activation slice re-read from LLC per channel chunk at M = 1024 and
+   fixed it (row block outer, plus a skewed tile store): 27-38 TOP/s at 1S, TTFT -8 to -10%, bitwise. The earlier
+   ideas were:
    - B-panel reuse across the M blocks of a pass (vLLM's L2 grouping);
    - one dispatch per layer for QKV.
 5. **Fix 9 accuracy.** The per-token input quantization is what fails the gate (section 7). Options, none tried:
