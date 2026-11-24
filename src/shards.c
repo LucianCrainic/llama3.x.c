@@ -318,6 +318,40 @@ void shards_bind(ShardSet *set, void *const socket_base[2], void *global_base) {
   }
 }
 
+/* Reassign offsets within each socket's per-tier arena. The embedding keeps its separate global area. */
+void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, size_t bytes[2][2]) {
+  memset(bytes, 0, sizeof(size_t) * 4);
+  for (int i = 0; i < set->count; i++) {
+    Shard *sh = &set->t[i];
+    if (sh->kind == SHARD_GLOBAL)
+      continue;
+    if (sh->kind == SHARD_COPY)
+      sh->tier = norm_tier;
+    else if (sh->src->role == T_WCLS)
+      sh->tier = classifier_tier;
+    else
+      sh->tier = sh->src->layer < hbm_layers ? 0 : 1;
+    size_t *next = &bytes[sh->socket][sh->tier];
+    sh->q_offset = align_up(*next);
+    *next = checked_add(sh->q_offset, value_bytes(sh));
+    if (sh->src->dtype == DT_Q8) {
+      sh->s_offset = align_up(*next);
+      *next = checked_add(sh->s_offset, scale_bytes(sh));
+    }
+  }
+}
+
+void shards_bind_placed(ShardSet *set, void *base[2][2], void *global_base) {
+  for (int i = 0; i < set->count; i++) {
+    Shard *sh = &set->t[i];
+    char *area = sh->kind == SHARD_GLOBAL ? global_base : base[sh->socket][sh->tier];
+    if (!area || (uintptr_t)area % SHARD_ALIGN)
+      fail("planned shard area is missing or unaligned");
+    sh->q = area + sh->q_offset;
+    sh->s = sh->src->dtype == DT_Q8 ? (float *)(area + sh->s_offset) : NULL;
+  }
+}
+
 /* One contiguous read: file range to destination. */
 typedef struct {
   size_t src;
@@ -409,7 +443,32 @@ static void check_status(const int *status, int workers, const char *what) {
     }
 }
 
-void shards_load(ShardSet *set, int fd, int socket, Team *team) {
+static size_t source_row_bytes(const Shard *sh) {
+  return tensor_bytes((size_t)sh->src->cols, sh->src->dtype == DT_Q8, sh->src->group_size);
+}
+
+static int load_block_rows(const ShardSet *set, const Shard *sh, size_t row_bytes) {
+  size_t block = set->scratch_limit / row_bytes;
+  return block<1 ? 1 : block>(size_t) sh->rows ? sh->rows : (int)block;
+}
+
+size_t shards_scratch_bytes(const ShardSet *set, int socket) {
+  if (set->sockets == 1)
+    return 0;
+  size_t peak = 0;
+  for (int i = 0; i < set->count; i++) {
+    const Shard *sh = &set->t[i];
+    if (sh->kind == SHARD_COLS && sh->socket == socket) {
+      size_t row_bytes = source_row_bytes(sh);
+      size_t bytes = checked_mul((size_t)load_block_rows(set, sh, row_bytes), row_bytes);
+      if (bytes > peak)
+        peak = bytes;
+    }
+  }
+  return peak;
+}
+
+void shards_load_placed(ShardSet *set, int fd, int socket, Team *team, void *scratch) {
   int workers = team ? team_size(team) : 1;
   /* shards_load runs on the coordinator of one socket, possibly while the other socket's coordinator loads too, so it
    * avoids the engine's global accounting and uses plain allocations. */
@@ -417,13 +476,15 @@ void shards_load(ShardSet *set, int fd, int socket, Team *team) {
 
   /* Contiguous shards first: one read of the values and one of the scales each, split among the workers. */
   Piece *pieces = calloc((size_t)set->count * 2, sizeof(Piece));
+  if (!status || !pieces)
+    fail("cannot allocate shard read descriptors");
   int count = 0;
   size_t total = 0;
   double start = monotonic_seconds();
   for (int i = 0; i < set->count; i++) {
     const Shard *sh = &set->t[i];
     int mine = sh->kind == SHARD_GLOBAL ? socket == 0 : sh->socket == socket;
-    if (!mine || sh->kind == SHARD_COLS)
+    if (!mine || (sh->kind == SHARD_COLS && set->sockets > 1))
       continue;
     const TensorDesc *t = sh->src;
     size_t elem = t->dtype == DT_Q8 ? 1 : sizeof(float);
@@ -449,7 +510,7 @@ void shards_load(ShardSet *set, int fd, int socket, Team *team) {
   start = monotonic_seconds();
   for (int i = 0; i < set->count; i++) {
     const Shard *sh = &set->t[i];
-    if (sh->kind != SHARD_COLS || sh->socket != socket)
+    if (sh->kind != SHARD_COLS || sh->socket != socket || set->sockets == 1)
       continue;
     const TensorDesc *t = sh->src;
     size_t elem = t->dtype == DT_Q8 ? 1 : sizeof(float);
@@ -457,13 +518,12 @@ void shards_load(ShardSet *set, int fd, int socket, Team *team) {
     job.row_value_bytes = checked_mul((size_t)t->cols, elem);
     job.row_scale_bytes = t->dtype == DT_Q8 ? checked_mul((size_t)(t->cols / t->group_size), sizeof(float)) : 0;
     size_t row_bytes = job.row_value_bytes + job.row_scale_bytes;
-    size_t block = set->scratch_limit / row_bytes;
-    job.block_rows = block<1 ? 1 : block>(size_t) sh->rows ? sh->rows : (int)block;
+    job.block_rows = load_block_rows(set, sh, row_bytes);
     size_t scratch_bytes = (size_t)job.block_rows * row_bytes;
     if (scratch_bytes > set->scratch_peak[socket])
       set->scratch_peak[socket] = scratch_bytes;
-    job.scratch = malloc(scratch_bytes);
-    if (!status || !job.scratch)
+    job.scratch = scratch ? scratch : malloc(scratch_bytes);
+    if (!job.scratch)
       fail("cannot allocate %zu bytes of shard load scratch", scratch_bytes);
     memset(status, 0, (size_t)workers * sizeof(int));
     if (team)
@@ -471,8 +531,13 @@ void shards_load(ShardSet *set, int fd, int socket, Team *team) {
     else
       cols_pack(&job, 0, 1);
     check_status(status, workers, "a column shard");
-    free(job.scratch);
+    if (!scratch)
+      free(job.scratch);
   }
   set->cols_seconds[socket] += monotonic_seconds() - start;
   free(status);
+}
+
+void shards_load(ShardSet *set, int fd, int socket, Team *team) {
+  shards_load_placed(set, fd, socket, team, NULL);
 }

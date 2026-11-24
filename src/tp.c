@@ -25,8 +25,14 @@ typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FOR
 static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W3};
 
 typedef struct {
+  float *k, *v;
+} KvLayer;
+
+typedef struct {
   int socket;
   Team *team;
+  KvLayer *kv_layers;
+  void *load_scratch;
   NumaRegion weights, kv_k, kv_v, work, exchange, packed, packed_cls;
   void *work_data, *packed_data; /* where the activations and the packed copies are carved from (a region of this
                                     socket, or the one-socket loader's run memory and packed store) */
@@ -50,6 +56,43 @@ typedef struct {
   float *as;
 } TpSocket;
 
+enum { HBM, DDR, TIERS };
+typedef enum {
+  A_WEIGHTS_HBM,
+  A_WEIGHTS_DDR,
+  A_K_HBM,
+  A_K_DDR,
+  A_V_HBM,
+  A_V_DDR,
+  A_WORK,
+  A_EXCHANGE,
+  A_EMBED,
+  A_LOGITS,
+  A_PACK,
+  A_PACK_CLS,
+  A_LOAD_SCRATCH,
+  A_COUNT
+} Arena;
+
+typedef struct {
+  size_t bytes, rounded;
+  int tier, node, thp;
+  RegionRole role;
+} ArenaPlan;
+
+typedef struct {
+  const char *mode;
+  int sockets, simulated, admitted, weights_layers, kv_layers, classifier, packed;
+  int threads[SOCKETS], node[SOCKETS][TIERS];
+  size_t budget[SOCKETS][TIERS], free_bytes[SOCKETS][TIERS], charge[SOCKETS][TIERS], job_cap;
+  size_t kv_layer_bytes, work_bytes[SOCKETS], panel_bytes;
+  size_t logits_bytes;
+  ArenaPlan arena[SOCKETS][A_COUNT];
+} PlacementPlan;
+
+/* The report outlives the model. Keep only the size and placement metadata. */
+static PlacementPlan placement_summary;
+
 struct Tp {
   Config c;
   int sockets; /* 1: the one-socket engine (tp_create_local); 2: tensor parallel over two sockets (tp_create) */
@@ -60,6 +103,9 @@ struct Tp {
   PackedStore local_packed, local_cls;
   ShardSet set;
   NumaRegion global;
+  PlacementPlan plan;
+  NumaRegion arenas[SOCKETS][A_COUNT];
+  int batch_logits_rows;
   TpSocket s[SOCKETS];
   Exchange *exchange;
   float *logits;
@@ -350,6 +396,13 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   return 1;
 }
 
+static KvLayer kv_layer(const TpSocket *sk, int layer, size_t floats_per_layer) {
+  if (sk->kv_layers)
+    return sk->kv_layers[layer];
+  size_t offset = (size_t)layer * floats_per_layer;
+  return (KvLayer){sk->key_cache + offset, sk->value_cache + offset};
+}
+
 static void forward_fp32(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
   const Config *p = &tp->c;
@@ -359,19 +412,19 @@ static void forward_fp32(Tp *tp, int s) {
   SPROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, sk->rope));
   for (int l = 0; l < p->n_layers; l++) {
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
-    size_t layer = (size_t)l * p->seq_len * kvl;
+    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
     int head_layout = kernels_kv_layout_head();
-    float *k = head_layout ? sk->kstage : sk->key_cache + layer + (size_t)pos * kvl,
-          *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
+    float *k = head_layout ? sk->kstage : cache.k + (size_t)pos * kvl,
+          *v = head_layout ? sk->vstage : cache.v + (size_t)pos * kvl;
     const float *wq = shards_find(&tp->set, T_WQ, l, s)->q, *wk = shards_find(&tp->set, T_WK, l, s)->q,
                 *wv = shards_find(&tp->set, T_WV, l, s)->q;
     SPROFILE(PHASE_QKV, k_matmul_qkv(sk->q, k, v, sk->xb, wq, wk, wv, dim, dim / S, kvl));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     if (head_layout)
-      SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
-               k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
-    SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
-                                             &sk->attention, hl, kl, hd, p->seq_len, pos));
+      SPROFILE(PHASE_KV_STORE, k_kv_store(cache.k, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
+               k_kv_store(cache.v, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
+    SPROFILE(PHASE_ATTENTION,
+             k_attention_kv(sk->xb, sk->q, cache.k, cache.v, sk->att, &sk->attention, hl, kl, hd, p->seq_len, pos));
     if (!project_residual(tp, s, PHASE_WO, TP_WO_MM, shards_find(&tp->set, T_WO, l, s), sk->xb, NULL, dim / S))
       return;
 
@@ -417,19 +470,19 @@ static void forward_q8(Tp *tp, int s) {
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
     K8Input in;
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
-    size_t layer = (size_t)l * p->seq_len * kvl;
+    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
     int head_layout = kernels_kv_layout_head();
-    float *k = head_layout ? sk->kstage : sk->key_cache + layer + (size_t)pos * kvl,
-          *v = head_layout ? sk->vstage : sk->value_cache + layer + (size_t)pos * kvl;
+    float *k = head_layout ? sk->kstage : cache.k + (size_t)pos * kvl,
+          *v = head_layout ? sk->vstage : cache.v + (size_t)pos * kvl;
     K8Weight wq = q8_weight(shards_find(&tp->set, T_WQ, l, s)), wk = q8_weight(shards_find(&tp->set, T_WK, l, s)),
              wv = q8_weight(shards_find(&tp->set, T_WV, l, s));
     SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / S, kvl, gs));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     if (head_layout)
-      SPROFILE(PHASE_KV_STORE, k_kv_store(sk->key_cache + layer, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
-               k_kv_store(sk->value_cache + layer, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
-    SPROFILE(PHASE_ATTENTION, k_attention_kv(sk->xb, sk->q, sk->key_cache + layer, sk->value_cache + layer, sk->att,
-                                             &sk->attention, hl, kl, hd, p->seq_len, pos));
+      SPROFILE(PHASE_KV_STORE, k_kv_store(cache.k, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
+               k_kv_store(cache.v, v, (size_t)kvl, pos, 1, kl, hd, p->seq_len));
+    SPROFILE(PHASE_ATTENTION,
+             k_attention_kv(sk->xb, sk->q, cache.k, cache.v, sk->att, &sk->attention, hl, kl, hd, p->seq_len, pos));
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->xb, dim / S));
     if (!project_residual(tp, s, PHASE_WO, TP_WO_MM, shards_find(&tp->set, T_WO, l, s), sk->xb, &in, dim / S))
       return;
@@ -767,8 +820,8 @@ static void forward_batch(Tp *tp, int s) {
   SPROFILE(PHASE_ROPE_TABLE, rope_tables(tp, sk));
   for (int l = 0; l < p->n_layers; l++) {
     norm_quantize_batch(tp, sk, s, norm_weight(tp, T_RMS_ATT, l, s));
-    size_t layer = (size_t)l * p->seq_len * kvl;
-    float *kc = sk->key_cache + layer, *vc = sk->value_cache + layer;
+    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
+    float *kc = cache.k, *vc = cache.v;
     int head_layout = kernels_kv_layout_head();
     float *kd = head_layout ? sk->kstage : kc + (size_t)pos0 * kvl,
           *vd = head_layout ? sk->vstage : vc + (size_t)pos0 * kvl;
@@ -899,7 +952,7 @@ static void setup_socket(Tp *tp, int s) {
   /* The socket that uses the work region writes all of it once, so every page exists on its own node and the page query
    * can verify the region like the others (a fresh mapping is zero already; this only makes the pages exist). One
    * socket's run memory was zeroed by its team when it was sealed (runmem_seal), or comes zeroed from the heap. */
-  if (S == 2)
+  if (S == 2 && !tp->plan.mode)
     memset(sk->work_data, 0, sk->work_size);
   char *cursor = sk->work_data;
   size_t used = 0;
@@ -939,9 +992,7 @@ static void setup_socket(Tp *tp, int s) {
   if (used > sk->work_size)
     fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work_size, used);
   k_attention_init_rows(&sk->attention, hl, kl, p->head_dim, p->seq_len, tp->rows, attention_memory);
-  if (kv_bf16)
-    k_attention_set_kv_bf16(&sk->attention, kv_bf16, kl, p->head_dim, p->seq_len, p->n_layers);
-  if (S == 2) {
+  if (S == 2 && !tp->plan.mode) {
     sk->key_cache = sk->kv_k.data;
     sk->value_cache = sk->kv_v.data;
   }
@@ -961,27 +1012,32 @@ static void setup_socket(Tp *tp, int s) {
 
 /* ---- region sizes -------------------------------------------------------------------------------------------- */
 
-static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs, int rows) {
+static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs, int rows, int workers) {
   int hl = p->n_heads / sockets, kl = p->n_kv_heads / sockets;
   size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / sockets;
   size_t bytes = 64 * 16; /* alignment of each buffer */
-  bytes += (size_t)rows * (size_t)(2 * p->dim + p->hidden_dim / sockets + p->dim / sockets + 2 * p->head_dim) *
-           sizeof(float);
-  bytes += (size_t)hl * p->seq_len * sizeof(float);
+  size_t d = (size_t)p->dim, hidden = (size_t)p->hidden_dim, head = (size_t)p->head_dim;
+  size_t floats_per_row = checked_add(checked_mul(2, d), checked_add(hidden / sockets, d / sockets));
+  floats_per_row = checked_add(floats_per_row, checked_mul(2, head));
   if (kernels_kv_layout_head()) /* the K/V row buffers of LLAMA_KV_LAYOUT=head */
-    bytes += 2 * (size_t)rows * (size_t)kl * (size_t)p->head_dim * sizeof(float);
+    floats_per_row = checked_add(floats_per_row, checked_mul(2 * (size_t)kl, head));
+  size_t scores = checked_mul((size_t)hl, (size_t)p->seq_len);
+  size_t floats = checked_add(checked_mul((size_t)rows, floats_per_row), scores);
+  bytes = checked_add(bytes, checked_mul(floats, sizeof(float)));
   if (quantized) { /* xq, xs, aq, as, for whole 32-row blocks */
     size_t padded = ((size_t)rows + 31) / 32 * 32;
-    size_t groups = gs ? (size_t)p->dim / gs + slice / gs : 2; /* per-channel (gs 0): one scale per row each */
-    bytes += padded * ((size_t)p->dim + slice + groups * sizeof(float));
+    size_t groups = gs ? checked_add(d / (size_t)gs, slice / (size_t)gs) : 2; /* per-channel (gs 0): one scale per row each */
+    size_t scales = checked_mul(groups, sizeof(float));
+    bytes = checked_add(bytes, checked_mul(padded, checked_add(checked_add(d, slice), scales)));
   }
-  bytes += k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, rows) + 64;
-  bytes += k_attention_kv_bf16_bytes(kl, p->head_dim, p->seq_len, p->n_layers) + 64;
+  size_t att = workers ? k_attention_bytes_rows_for(hl, kl, p->head_dim, p->seq_len, rows, workers)
+                       : k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, rows);
+  bytes = checked_add(bytes, checked_add(att, 64));
   return bytes;
 }
 
 size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
-  return work_bytes_for(p, SOCKETS, quantized, gs, rows);
+  return work_bytes_for(p, SOCKETS, quantized, gs, rows, 0);
 }
 
 size_t tp_exchange_bytes(const Config *p, int rows) {
@@ -989,17 +1045,25 @@ size_t tp_exchange_bytes(const Config *p, int rows) {
 }
 
 static size_t work_bytes(const Tp *tp) {
-  return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows);
+  return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, 0);
 }
 
 static void socket_command(Tp *tp, int socket) {
   switch (tp->command) {
   case CMD_SETUP:
+    if (tp->plan.mode) {
+      const Arena touch[] = {A_WORK, A_LOGITS, A_LOAD_SCRATCH};
+      for (size_t i = 0; i < sizeof(touch) / sizeof(*touch); i++) {
+        NumaRegion *r = &tp->arenas[socket][touch[i]];
+        if (r->data)
+          memset(r->data, 0, r->logical_bytes);
+      }
+    }
     setup_socket(tp, socket);
     tp->s[socket].leader_cpu = cpu_current();
     break;
   case CMD_LOAD:
-    shards_load(&tp->set, tp->loader_fd, socket, tp->s[socket].team);
+    shards_load_placed(&tp->set, tp->loader_fd, socket, tp->s[socket].team, tp->s[socket].load_scratch);
     break;
   case CMD_PACK:
     if (tp->pack == TP_PACK_BF16)
@@ -1056,7 +1120,7 @@ static void verify_bound(NumaRegion *r, const char *mode) {
 /* ---- packed copies (D1) ------------------------------------------------------------------------------------------ */
 
 static size_t align_line(size_t n) {
-  return (n + 63) / 64 * 64;
+  return checked_add(n, 63) & ~(size_t)63;
 }
 
 /* A packed copy: the VNNI tiles, and with the tiled Q8 kernel the transposed scales on the next cache line. */
@@ -1072,7 +1136,7 @@ static size_t packed_region_bytes(const Tp *tp, int s) {
   size_t total = 0;
   for (int l = 0; l < tp->c.n_layers; l++)
     for (int i = 0; i < 7; i++)
-      total = align_line(total) + pack_bytes_of(tp, shards_find(&tp->set, PACK_ROLES[i], l, s));
+      total = checked_add(align_line(total), pack_bytes_of(tp, shards_find(&tp->set, PACK_ROLES[i], l, s)));
   return total;
 }
 
@@ -1111,7 +1175,7 @@ static void plan_packing(Tp *tp) {
         const Shard *sh = shards_find(&tp->set, PACK_ROLES[i], l, s);
         used = align_line(used);
         char *dst = (char *)sk->packed_data + used;
-        used += pack_bytes_of(tp, sh);
+        used = checked_add(used, pack_bytes_of(tp, sh));
         size_t at = (size_t)l * 7 + (size_t)i;
         sk->packed_at[at] = dst;
         if (tp->pack == TP_PACK_BF16) {
@@ -1255,6 +1319,7 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   tp->check = check && !strcmp(check, "1");
   shards_plan(&tp->set, m, p, SOCKETS, gs);
   const char *mode = placement_mode();
+  placement_record(mode);
   tp_check_topology(mode);
   const Topology *topology = numa_topology();
   int kvl = p->head_dim * p->n_kv_heads / SOCKETS;
@@ -1371,6 +1436,415 @@ Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, i
   return tp;
 }
 
+static const char *tier_name(int tier) {
+  return tier == HBM ? "hbm" : "ddr";
+}
+
+static const char *setting(const char *name) {
+  const char *value = getenv(name);
+  return value && *value ? value : NULL;
+}
+
+static int layer_setting(const char *name, int layers) {
+  const char *value = setting(name);
+  if (!value || !strcmp(value, "auto"))
+    return -1;
+  char *end;
+  long number = strtol(value, &end, 10);
+  if (strspn(value, "0123456789") != strlen(value) || *end || number < 0 || number > layers)
+    fail("%s must be auto or between 0 and %d", name, layers);
+  return (int)number;
+}
+
+static int tier_setting(const char *name, int fallback, int allow_auto) {
+  const char *value = setting(name);
+  if (!value || (allow_auto && !strcmp(value, "auto")))
+    return fallback;
+  if (!strcmp(value, "hbm"))
+    return HBM;
+  if (!strcmp(value, "ddr"))
+    return DDR;
+  fail("%s must be hbm or ddr%s", name, allow_auto ? " or auto" : "");
+}
+
+static size_t ddr_budget(void) {
+  const char *value = setting("LLAMA_DDR_BUDGET_GIB");
+  if (!value)
+    return SIZE_MAX;
+  char *end;
+  double gib = strtod(value, &end);
+  if (*end || !(gib > 0) || gib > 1 << 20)
+    fail("LLAMA_DDR_BUDGET_GIB must be a positive number of GiB");
+  return (size_t)(gib * (double)(1 << 30));
+}
+
+static size_t node_free_bytes(int node) {
+  if (node < 0)
+    return 0;
+  char path[128], line[256];
+  snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return 0;
+  size_t bytes = 0;
+  while (fgets(line, sizeof(line), f)) {
+    char *key = strstr(line, "MemFree:");
+    if (key) {
+      bytes = checked_mul((size_t)strtoull(key + 8, NULL, 10), 1024);
+      break;
+    }
+  }
+  fclose(f);
+  return bytes;
+}
+
+static size_t job_memory_limit(void) {
+#ifdef __linux__
+  FILE *f = fopen("/proc/self/cgroup", "r");
+  if (!f)
+    return 0;
+  char line[1024], path[1200];
+  size_t limit = 0;
+  while (fgets(line, sizeof(line), f)) {
+    char *controllers = strchr(line, ':');
+    char *group = controllers ? strchr(controllers + 1, ':') : NULL;
+    if (!group || group[1] != '/')
+      continue;
+    *group++ = 0;
+    const char *controller = controllers + 1;
+    int unified = !*controller;
+    if (!unified && strcmp(controller, "memory"))
+      continue;
+    group[strcspn(group, "\n")] = 0;
+    for (;;) {
+      snprintf(path, sizeof(path), "/sys/fs/cgroup%s%s/%s", unified ? "" : "/memory", group,
+               unified ? "memory.max" : "memory.limit_in_bytes");
+      FILE *cap = fopen(path, "r");
+      unsigned long long bytes = 0;
+      if (cap) {
+        if (fscanf(cap, "%llu", &bytes) == 1 && bytes && bytes < SIZE_MAX && (!limit || bytes < limit))
+          limit = (size_t)bytes;
+        fclose(cap);
+      }
+      char *slash = strrchr(group, '/');
+      if (!slash || !group[0])
+        break;
+      *slash = 0;
+    }
+  }
+  fclose(f);
+  return limit;
+#else
+  return 0;
+#endif
+}
+
+static void arena_plan(PlacementPlan *plan, int s, Arena arena, int tier, size_t bytes, RegionRole role, int thp) {
+  int node = plan->node[s][tier];
+  size_t rounded = 0;
+  if (bytes && (region_round(bytes, region_alignment(node, thp), &rounded) || rounded > PTRDIFF_MAX))
+    fail("planned socket %d %s arena exceeds the addressable size", s, region_role_name(role));
+  plan->arena[s][arena] =
+      (ArenaPlan){.bytes = bytes, .rounded = rounded, .tier = tier, .node = node, .role = role, .thp = thp};
+  plan->charge[s][tier] = checked_add(plan->charge[s][tier], rounded);
+}
+
+static void placement_layout(Tp *tp) {
+  PlacementPlan *plan = &tp->plan;
+  int ddr_only = !strcmp(plan->mode, "ddr"), hbm_only = !strcmp(plan->mode, "hbm-only");
+  int hot = ddr_only ? DDR : HBM, cold = hbm_only ? HBM : DDR;
+  int thp = region_thp_default();
+  size_t weight_bytes[SOCKETS][TIERS];
+  shards_place(&tp->set, plan->weights_layers, plan->classifier, hot, weight_bytes);
+  memset(plan->charge, 0, sizeof(plan->charge));
+  for (int s = 0; s < plan->sockets; s++) {
+    for (int t = 0; t < TIERS; t++) {
+      int layers = t == HBM ? plan->kv_layers : tp->c.n_layers - plan->kv_layers;
+      size_t kv_bytes = checked_mul(plan->kv_layer_bytes, (size_t)layers);
+      arena_plan(plan, s, A_WEIGHTS_HBM + t, t, weight_bytes[s][t], ROLE_WEIGHTS, thp);
+      arena_plan(plan, s, A_K_HBM + t, t, kv_bytes, ROLE_KV_K, thp);
+      arena_plan(plan, s, A_V_HBM + t, t, kv_bytes, ROLE_KV_V, thp);
+    }
+    arena_plan(plan, s, A_WORK, hot, checked_add(align_line(plan->work_bytes[s]), plan->panel_bytes), ROLE_WORK, 0);
+    arena_plan(plan, s, A_EXCHANGE, hot, plan->sockets == 2 ? tp_exchange_bytes(&tp->c, tp->rows) : 0, ROLE_EXCHANGE,
+               0);
+    arena_plan(plan, s, A_EMBED, cold, s ? 0 : tp->set.global_bytes, ROLE_EMBEDDING, thp);
+    arena_plan(plan, s, A_LOGITS, hot, s ? 0 : plan->logits_bytes, ROLE_LOGITS, 0);
+    size_t packed = tp->pack == TP_PACK_NONE ? 0 : packed_region_bytes(tp, s);
+    arena_plan(plan, s, A_PACK, plan->packed, packed, ROLE_PACKED, thp);
+    size_t packed_cls =
+        tp->pack == TP_PACK_BF16 && tp->batch_logits_rows ? pack_bytes_of(tp, shards_find(&tp->set, T_WCLS, -1, s)) : 0;
+    arena_plan(plan, s, A_PACK_CLS, plan->packed, packed_cls, ROLE_PACKED, thp);
+    arena_plan(plan, s, A_LOAD_SCRATCH, cold, shards_scratch_bytes(&tp->set, s), ROLE_SCRATCH, 0);
+  }
+}
+
+static int tier_fits(const PlacementPlan *plan, int tier) {
+  for (int s = 0; s < plan->sockets; s++)
+    if (plan->charge[s][tier] > plan->budget[s][tier])
+      return 0;
+  return 1;
+}
+
+/* The HBM charge is monotonic in either layer prefix, including rounded arena boundaries. */
+static void largest_prefix(Tp *tp, int *prefix) {
+  int lo = 0, hi = tp->c.n_layers;
+  while (lo < hi) {
+    *prefix = lo + (hi - lo + 1) / 2;
+    placement_layout(tp);
+    if (tier_fits(&tp->plan, HBM))
+      lo = *prefix;
+    else
+      hi = *prefix - 1;
+  }
+  *prefix = lo;
+}
+
+static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
+  PlacementPlan *plan = &tp->plan;
+  const Topology *topology = numa_topology();
+  int hybrid = !strcmp(plan->mode, "hybrid"), ddr = !strcmp(plan->mode, "ddr");
+  plan->sockets = pool->teams;
+  plan->simulated = topology->classification == CLASS_VIRTUAL;
+  if (setting("LLAMA_TOPOLOGY_ALLOW_FAR_HBM") && !strcmp(setting("LLAMA_TOPOLOGY_ALLOW_FAR_HBM"), "1"))
+    fail("planned placement requires socket-local NUMA nodes");
+  if (!plan->simulated) {
+    char err[512];
+    if ((!ddr && numa_check_placement(topology, pool->teams, "hbm", err, sizeof(err))) ||
+        ((ddr || hybrid) && numa_check_placement(topology, pool->teams, "ddr", err, sizeof(err))))
+      fail("%s", err);
+  }
+  if (!placement_strict(plan->mode))
+    fail("LLAMA_PLACEMENT=%s requires strict placement", plan->mode);
+  plan->job_cap = plan->simulated ? 0 : job_memory_limit();
+  size_t cap[TIERS] = {placement_hbm_budget(), ddr_budget()};
+  for (int s = 0; s < plan->sockets; s++) {
+    const SocketTopo *socket = &topology->socket[s];
+    plan->node[s][HBM] = socket->hbm_node;
+    plan->node[s][DDR] = socket->ddr_node;
+    for (int t = 0; t < TIERS; t++) {
+      size_t total = t == HBM ? socket->hbm_bytes : socket->ddr_bytes;
+      plan->budget[s][t] = !total || cap[t] < total ? cap[t] : total;
+      plan->free_bytes[s][t] = node_free_bytes(plan->node[s][t]);
+    }
+    plan->threads[s] = pool->threads[s];
+    plan->work_bytes[s] = work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, pool->threads[s]);
+  }
+  plan->kv_layer_bytes = checked_mul((size_t)tp->c.seq_len, checked_mul((size_t)tp->kv_dim_local, sizeof(float)));
+  if (tp->pack == TP_PACK_BF16) {
+    int hidden = tp->c.hidden_dim / tp->sockets;
+    plan->panel_bytes = k_gemm_bf16_panel_bytes(tp->rows, hidden > tp->c.dim ? hidden : tp->c.dim);
+  }
+  tp->batch_logits_rows = model->prefill_logits == LOGITS_ALL ? model->max_batch : 0;
+  plan->logits_bytes =
+      checked_mul(checked_mul((size_t)tp->c.vocab_size, 1 + (size_t)tp->batch_logits_rows), sizeof(float));
+
+  int layers = tp->c.n_layers;
+  int weights = hybrid ? layer_setting("LLAMA_HYBRID_WEIGHTS_HBM_LAYERS", layers) : ddr ? 0 : layers;
+  int kv = hybrid ? layer_setting("LLAMA_HYBRID_KV_HBM_LAYERS", layers) : ddr ? 0 : layers;
+  int classifier = hybrid ? tier_setting("LLAMA_HYBRID_CLASSIFIER", -1, 1) : ddr ? DDR : HBM;
+  plan->packed = hybrid ? tier_setting("LLAMA_HYBRID_PACKED", DDR, 0) : ddr ? DDR : HBM;
+  if (hybrid && tp->pack == TP_PACK_NONE && setting("LLAMA_HYBRID_PACKED"))
+    fail("LLAMA_HYBRID_PACKED requires a packed prefill kernel");
+  plan->weights_layers = weights < 0 ? 0 : weights;
+  plan->kv_layers = kv < 0 ? 0 : kv;
+  plan->classifier = classifier < 0 ? HBM : classifier;
+  if (classifier < 0) {
+    placement_layout(tp);
+    if (!tier_fits(plan, HBM))
+      plan->classifier = DDR;
+  }
+  if (weights < 0)
+    largest_prefix(tp, &plan->weights_layers);
+  if (kv < 0)
+    largest_prefix(tp, &plan->kv_layers);
+  placement_layout(tp);
+  placement_summary = *plan;
+  size_t peak = 0;
+  for (int s = 0; s < plan->sockets; s++)
+    for (int t = 0; t < TIERS; t++) {
+      size_t charge = plan->charge[s][t], budget = plan->budget[s][t];
+      if (charge > budget)
+        fail("socket %d node %d needs %zu bytes of %s (%zu over its %zu-byte budget)", s, plan->node[s][t], charge,
+             tier_name(t), charge - budget, budget);
+      peak = checked_add(peak, charge);
+      if (plan->free_bytes[s][t] && charge > plan->free_bytes[s][t])
+        LOG(LOG_WARN, "socket %d %s plan reserves %zu bytes with %zu currently free", s, tier_name(t), charge,
+            plan->free_bytes[s][t]);
+    }
+  if (plan->job_cap && peak > plan->job_cap)
+    fail("placement plan needs %zu bytes, above the cgroup memory limit %zu", peak, plan->job_cap);
+  plan->admitted = 1;
+  placement_summary = *plan;
+  LOG(LOG_INFO, "%s plan: %d of %d weight layers and %d KV layers in HBM, classifier=%s, packed=%s", plan->mode,
+      plan->weights_layers, layers, plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed));
+  for (int s = 0; s < plan->sockets; s++)
+    LOG(LOG_INFO, "socket %d: HBM %zu of %zu bytes, DDR %zu of %zu bytes", s, plan->charge[s][HBM],
+        plan->budget[s][HBM], plan->charge[s][DDR], plan->budget[s][DDR]);
+}
+
+void tp_placement_report(FILE *f) {
+  const PlacementPlan *plan = &placement_summary;
+  if (!plan->mode) {
+    fputs("null", f);
+    return;
+  }
+  fprintf(f,
+          "{\"mode\":\"%s\",\"admitted\":%s,\"simulated\":%s,\"weights_hbm_layers\":%d,\"kv_hbm_layers\":%d,"
+          "\"classifier\":\"%s\",\"packed\":\"%s\",\"cgroup_limit_bytes\":%zu,\"nodes\":[",
+          plan->mode, plan->admitted ? "true" : "false", plan->simulated ? "true" : "false", plan->weights_layers,
+          plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed), plan->job_cap);
+  for (int s = 0; s < plan->sockets; s++)
+    for (int t = 0; t < TIERS; t++)
+      fprintf(f,
+              "%s{\"socket\":%d,\"threads\":%d,\"tier\":\"%s\",\"node\":%d,\"budget_bytes\":%zu,"
+              "\"charged_bytes\":%zu,\"free_bytes_at_plan\":%zu}",
+              s || t ? "," : "", s, plan->threads[s], tier_name(t), plan->node[s][t], plan->budget[s][t],
+              plan->charge[s][t], plan->free_bytes[s][t]);
+  fputs("],\"arenas\":[", f);
+  int printed = 0;
+  for (int s = 0; s < plan->sockets; s++)
+    for (int i = 0; i < A_COUNT; i++) {
+      const ArenaPlan *a = &plan->arena[s][i];
+      if (a->bytes)
+        fprintf(f,
+                "%s{\"socket\":%d,\"tier\":\"%s\",\"node\":%d,\"role\":\"%s\",\"bytes\":%zu,"
+                "\"rounded_bytes\":%zu}",
+                printed++ ? "," : "", s, tier_name(a->tier), a->node, region_role_name(a->role), a->bytes, a->rounded);
+    }
+  fputs("]}", f);
+}
+
+static void placement_reserve(Tp *tp) {
+  for (int s = 0; s < tp->sockets; s++)
+    for (int i = 0; i < A_COUNT; i++) {
+      const ArenaPlan *a = &tp->plan.arena[s][i];
+      char err[512];
+      if (a->bytes && region_reserve_try(&tp->arenas[s][i], a->bytes, s, a->node, a->role, a->thp, err, sizeof(err))) {
+        for (int j = 0; j < tp->sockets; j++)
+          for (int k = 0; k < A_COUNT; k++)
+            region_release(&tp->arenas[j][k]);
+        fail("placement reservation failed: %s", err);
+      }
+    }
+}
+
+Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
+                      TpPack pack, int plan_only) {
+  PoolConfig pool;
+  kernels_pool_config(&pool);
+  const Config *p = &model->config;
+  int sockets = pool.teams;
+  Tp *tp = tp_new(p, sockets, quantized, gs, fp32_activations, model->prefill_gemm ? model->max_batch : 1, pack);
+  tp->plan.mode = placement_mode();
+  tp->loader_fd = fd;
+  tp->kv_dim_local = p->head_dim * (p->n_kv_heads / sockets);
+  metrics.sockets = sockets;
+  if (sockets == 2 && checked_mul((size_t)tp->rows, (size_t)p->dim) > INT_MAX)
+    fail("the two-socket exchange exceeds INT_MAX elements");
+  const char *check = setting("LLAMA_TP_CHECK");
+  if (check && strcmp(check, "0") && strcmp(check, "1"))
+    fail("LLAMA_TP_CHECK must be 0 or 1");
+  tp->check = sockets == 2 && check && !strcmp(check, "1");
+  shards_plan(&tp->set, m, p, sockets, gs);
+  placement_plan(tp, model, &pool);
+  if (plan_only)
+    return tp;
+
+  kernels_backend_init();
+  placement_reserve(tp);
+  void *weight_bases[SOCKETS][TIERS] = {{0}};
+  NumaRegion *exchange_regions[SOCKETS] = {0};
+  for (int s = 0; s < sockets; s++) {
+    TpSocket *sk = &tp->s[s];
+    NumaRegion *a = tp->arenas[s];
+    sk->team = pool_team(s);
+    sk->socket = s;
+    sk->work_data = a[A_WORK].data;
+    sk->work_size = tp->plan.work_bytes[s];
+    sk->load_scratch = a[A_LOAD_SCRATCH].data;
+    sk->packed_data = a[A_PACK].data;
+    sk->packed_size = a[A_PACK].logical_bytes;
+    if (tp->plan.panel_bytes)
+      sk->panel =
+          (AlignedBuffer){.data = (char *)sk->work_data + align_line(sk->work_size), .bytes = tp->plan.panel_bytes};
+    sk->kv_layers = memory_alloc((size_t)p->n_layers, sizeof(KvLayer), MEM_METADATA);
+    int cut = tp->plan.kv_layers;
+    for (int l = 0; l < p->n_layers; l++) {
+      int tier = l < cut ? HBM : DDR;
+      size_t at = (size_t)(tier == HBM ? l : l - cut) * tp->plan.kv_layer_bytes;
+      sk->kv_layers[l] =
+          (KvLayer){(float *)((char *)a[A_K_HBM + tier].data + at), (float *)((char *)a[A_V_HBM + tier].data + at)};
+    }
+    for (int t = 0; t < TIERS; t++)
+      weight_bases[s][t] = a[A_WEIGHTS_HBM + t].data;
+    exchange_regions[s] = &a[A_EXCHANGE];
+    if (a[A_EXCHANGE].data)
+      memset(a[A_EXCHANGE].data, 0, a[A_EXCHANGE].logical_bytes);
+    if (tp->check) {
+      sk->debug = memory_alloc((size_t)p->n_layers * p->dim, sizeof(float), MEM_ACTIVATION);
+      sk->debug_hash = memory_alloc((size_t)p->n_layers, sizeof(uint64_t), MEM_ACTIVATION);
+    }
+  }
+  tp->logits = tp->arenas[0][A_LOGITS].data;
+  if (tp->batch_logits_rows)
+    tp->batch_logits = tp->logits + p->vocab_size;
+  shards_bind_placed(&tp->set, weight_bases, tp->arenas[0][A_EMBED].data);
+  if (sockets == 2) {
+    tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
+    if (profile_enabled)
+      exchange_set_timing(tp->exchange, 1);
+    if (pthread_create(&tp->thread, NULL, coordinator_main, tp))
+      fail("cannot start the coordinator thread of socket 1");
+    tp->started = 1;
+  }
+  run_both(tp, CMD_SETUP);
+  for (int s = 0; s < sockets; s++)
+    if (!tp->plan.simulated && (!team_affinity_verified(tp->s[s].team) || tp->s[s].leader_cpu != pool.cpus[s][0]))
+      fail("socket %d worker team or coordinator affinity could not be verified", s);
+
+  double start = monotonic_seconds();
+  run_both(tp, CMD_LOAD);
+  metrics.placement_populate_s = monotonic_seconds() - start;
+  if (pack != TP_PACK_NONE) {
+    start = monotonic_seconds();
+    plan_packing(tp);
+    run_both(tp, CMD_PACK);
+    if (tp->arenas[0][A_PACK_CLS].data) {
+      for (int s = 0; s < sockets; s++) {
+        tp->s[s].cls_bf16 = tp->arenas[s][A_PACK_CLS].data;
+        tp->bjobs[s][0] = pack_bf16_job_from_shard(tp->s[s].cls_bf16, shards_find(&tp->set, T_WCLS, -1, s));
+      }
+      run_both(tp, CMD_PACK_CLS);
+      tp->cls_ready = 1;
+    }
+    metrics.weight_pack_s = monotonic_seconds() - start;
+    metrics.weight_packed = 1;
+  }
+  start = monotonic_seconds();
+  for (int s = 0; s < sockets; s++)
+    for (int i = 0; i < A_COUNT; i++) {
+      NumaRegion *r = &tp->arenas[s][i];
+      if (!r->mapping_base)
+        continue;
+      region_mark_populated(r);
+      if (i == A_LOAD_SCRATCH) {
+        verify_bound(r, tp->plan.mode);
+        region_release(r);
+        tp->s[s].load_scratch = NULL;
+        continue;
+      }
+      if (i >= A_K_HBM && i <= A_V_DDR)
+        continue; /* K/V pages are checked once the prefix has been written. */
+      if (i <= A_WEIGHTS_DDR || i == A_EMBED || i == A_PACK || i == A_PACK_CLS)
+        region_protect(r);
+      verify_bound(r, tp->plan.mode);
+    }
+  metrics.placement_verify_s = monotonic_seconds() - start;
+  metrics.placement_owned = 1;
+  return tp;
+}
+
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
  * including its reduction, wo_mm/w2_mm the leader's own share of the projection (batched: the whole GEMM, its reduction
  * apart in the `exchange` line), so the slowest member's lateness shows up as `straggler`. The exchange components are
@@ -1435,14 +1909,25 @@ float *tp_forward(Tp *tp, int token, int pos, int logits) {
   return logits ? tp->logits : NULL;
 }
 
+float *tp_all_logits(Tp *tp, int rows) {
+  if (rows > tp->batch_logits_rows) {
+    if (tp->plan.mode)
+      fail("all-position logits must be admitted with LLAMA_PREFILL_LOGITS=all");
+    memory_free(tp->batch_logits);
+    tp->batch_logits = memory_alloc((size_t)rows, checked_mul((size_t)tp->c.vocab_size, sizeof(float)), MEM_ACTIVATION);
+    tp->batch_logits_rows = rows;
+  }
+  return tp->batch_logits;
+}
+
 float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWanted want) {
   if (count < 1 || count > tp->rows || pos0 < 0 || pos0 > tp->c.seq_len - count)
     fail("two-socket batch out of range: count=%d (capacity %d) position=%d", count, tp->rows, pos0);
-  if (want == LOGITS_ALL && tp->pack == TP_PACK_BF16 && !tp->cls_ready)
-    pack_classifier(tp);
-  if (want == LOGITS_ALL && !tp->batch_logits)
-    tp->batch_logits = memory_alloc(checked_mul((size_t)tp->rows, (size_t)tp->c.vocab_size), sizeof(float),
-                                    MEM_ACTIVATION);
+  if (want == LOGITS_ALL) {
+    tp_all_logits(tp, tp->rows);
+    if (tp->pack == TP_PACK_BF16 && !tp->cls_ready)
+      pack_classifier(tp);
+  }
   tp->btokens = tokens;
   tp->bcount = count;
   tp->bpos0 = pos0;
@@ -1467,7 +1952,55 @@ float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWa
   return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? tp->batch_logits : tp->logits;
 }
 
+static void planned_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
+  const Config *p = &tp->c;
+  size_t all_layers = checked_mul(2 * (size_t)tp->sockets, (size_t)p->n_layers);
+  size_t bytes_per_position = checked_mul((size_t)tp->kv_dim_local, sizeof(float));
+  *out = (KvStats){.reserved_bytes = checked_mul(all_layers, tp->plan.kv_layer_bytes),
+                   .active_bytes = checked_mul(checked_mul(all_layers, bytes_per_position), (size_t)position),
+                   .active_prefix_only = 1,
+                   .node = tp->plan.kv_layers == 0             ? tp->plan.node[0][DDR]
+                           : tp->plan.kv_layers == p->n_layers ? tp->plan.node[0][HBM]
+                                                               : -1};
+  if (!verify || tp->plan.simulated)
+    return;
+  size_t spans = 1, row_bytes = bytes_per_position, page = region_alignment(-1, 0);
+  if (kernels_kv_layout_head()) {
+    spans = (size_t)(p->n_kv_heads / tp->sockets);
+    row_bytes = checked_mul((size_t)p->head_dim, sizeof(float));
+  }
+  size_t stride = checked_mul(row_bytes, (size_t)p->seq_len);
+  size_t used = checked_mul(row_bytes, (size_t)position), samples = region_verify_samples_default();
+  out->full = 1;
+  for (int s = 0; s < tp->sockets; s++)
+    for (int i = A_K_HBM; i <= A_V_DDR; i++) {
+      NumaRegion *r = &tp->arenas[s][i];
+      if (!r->data)
+        continue;
+      size_t layers = r->logical_bytes / tp->plan.kv_layer_bytes;
+      PageCheck check;
+      size_t pages, thp = 0;
+      if (region_verify_prefixes(r, checked_mul(layers, spans), stride, used, samples, &check, &pages))
+        fail("cannot verify active %s pages on socket %d node %d", region_role_name(r->role), s, r->node);
+      region_thp_bytes(r, &thp);
+      region_record_verification(r, &check, thp);
+      out->pages_queried += check.queried;
+      out->pages_wrong_node += check.wrong_node;
+      out->pages_missing += check.missing;
+      out->full &= check.full;
+      out->resident_bytes = checked_add(out->resident_bytes, checked_mul(pages, page));
+      if (check.wrong_node || check.missing || check.errors)
+        fail("active %s on socket %d node %d: %zu wrong-node, %zu missing, %zu page query errors",
+             region_role_name(r->role), s, r->node, check.wrong_node, check.missing, check.errors);
+    }
+  out->verified = 1;
+}
+
 void tp_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
+  if (tp->plan.mode) {
+    planned_kv_stats(tp, position, verify, out);
+    return;
+  }
   if (tp->sockets == 1) {
     size_t active = checked_mul(checked_mul(checked_mul(2, (size_t)tp->c.n_layers), (size_t)position),
                                 (size_t)tp->kv_dim_local * sizeof(float));
@@ -1529,7 +2062,7 @@ void tp_free(Tp *tp) {
   if (profile_enabled && tp->sockets == 2)
     log_profile(tp);
   exchange_destroy(tp->exchange);
-  if (tp->sockets == 1) {
+  if (tp->sockets == 1 && !tp->plan.mode) {
     runmem_free(&tp->mem, tp->s[0].work_data);
     runmem_free(&tp->mem, tp->s[0].key_cache);
     runmem_free(&tp->mem, tp->s[0].value_cache);
@@ -1540,6 +2073,9 @@ void tp_free(Tp *tp) {
   }
   for (int s = 0; s < SOCKETS; s++) {
     TpSocket *sk = &tp->s[s];
+    memory_free(sk->kv_layers);
+    for (int i = 0; i < A_COUNT; i++)
+      region_release(&tp->arenas[s][i]);
     memory_free(sk->debug);
     memory_free(sk->debug_hash);
     region_release(&sk->weights);
@@ -1558,7 +2094,9 @@ void tp_free(Tp *tp) {
   }
   region_release(&tp->global);
   shards_free(&tp->set);
-  memory_free(tp->logits);
-  memory_free(tp->batch_logits);
+  if (!tp->plan.mode) {
+    memory_free(tp->logits);
+    memory_free(tp->batch_logits);
+  }
   memory_free(tp);
 }

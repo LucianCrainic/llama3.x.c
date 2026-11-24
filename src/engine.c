@@ -25,7 +25,6 @@ typedef struct {
   TensorManifest manifest; // where each tensor lives in the file
   WeightStore store;       // one socket: where those bytes live now, the mapping or owned regions (A4)
   Tp *tp;                  // the shard engine: weights views, KV caches, activations and the forward pass
-  float *batch_logits;     // per-token prefill with all-position logits: M x vocab, allocated on first use
   int bf16;                // BF16 mode
   // Mapping ownership: one socket's weights borrow this region in file mode until engine_free().
   int fd;           // file descriptor for memory mapping
@@ -33,21 +32,23 @@ typedef struct {
   size_t file_size; // size of the checkpoint file in bytes
 } Transformer;
 
-static void read_checkpoint(const char *path, Transformer *t) {
+static void read_checkpoint(const char *path, Transformer *t, int planned) {
   int shared, gs;
   double start = monotonic_seconds();
-  checkpoint_map(path, engine_q8, &t->config, &shared, &gs, &t->fd, &t->data, &t->file_size, &t->manifest);
+  if (planned)
+    checkpoint_open(path, engine_q8, &t->config, &shared, &gs, &t->fd, &t->file_size, &t->manifest);
+  else
+    checkpoint_map(path, engine_q8, &t->config, &shared, &gs, &t->fd, &t->data, &t->file_size, &t->manifest);
   GS = engine_q8 ? gs : 0;
   metrics.checkpoint_s = monotonic_seconds() - start;
   /* Placement time is reported on its own, not as checkpoint_load. */
-  if (tp_sockets_requested() == 1) /* two sockets load their shards in tp_create, straight from the file */
+  if (!planned && tp_sockets_requested() == 1) /* two sockets load their shards in tp_create, straight from the file */
     weights_open(&t->store, t->fd, &t->data, t->file_size, &t->manifest);
   metrics.checkpoint_ready = 1;
 }
 
 static void free_transformer(Transformer *t) {
   tp_free(t->tp);
-  memory_free(t->batch_logits);
   weights_close(&t->store);
   manifest_free(&t->manifest);
   // close the memory mapping
@@ -68,17 +69,16 @@ static float *forward_batch(Model *model, const int *tokens, int count, int pos0
   if (model->prefill_gemm && (count > 1 || t->bf16))
     return tp_forward_batch(t->tp, tokens, count, pos0, want);
   size_t vocab = (size_t)t->config.vocab_size;
-  if (want == LOGITS_ALL && !t->batch_logits)
-    t->batch_logits = memory_alloc(checked_mul((size_t)model->max_batch, vocab), sizeof(float), MEM_ACTIVATION);
+  float *batch_logits = want == LOGITS_ALL ? tp_all_logits(t->tp, model->max_batch) : NULL;
   float *logits = NULL;
   for (int i = 0; i < count; i++) {
     /* The classifier runs only for the rows whose logits were asked for. */
     int wanted = want == LOGITS_ALL || (want == LOGITS_LAST && i == count - 1);
     logits = tp_forward(t->tp, tokens[i], pos0 + i, wanted);
     if (want == LOGITS_ALL)
-      memcpy(t->batch_logits + (size_t)i * vocab, logits, vocab * sizeof(float));
+      memcpy(batch_logits + (size_t)i * vocab, logits, vocab * sizeof(float));
   }
-  return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? t->batch_logits : logits;
+  return want == LOGITS_NONE ? NULL : want == LOGITS_ALL ? batch_logits : logits;
 }
 
 /* ---- load: the prefill policy of each format (D2 §7) ------------------------------------------------------------- */
@@ -129,16 +129,27 @@ static void configure_q8(Model *model) {
   }
 }
 
-/* CLI adapter: the executable picks the checkpoint format (engine_q8). */
-void engine_load(Model *model, const char *path) {
-  engine_load_context(model, path, 0);
-}
-void engine_load_context(Model *model, const char *path, int context) {
+static void load_context(Model *model, const char *path, int context, int plan_only) {
   Transformer *t = memory_alloc(1, sizeof(*t), MEM_METADATA);
   t->fd = -1;
+  t->data = MAP_FAILED;
   model->implementation = t;
+  const char *mode = placement_mode();
+  placement_record(mode);
+  const char *hybrid_knobs[] = {"LLAMA_HYBRID_WEIGHTS_HBM_LAYERS", "LLAMA_HYBRID_KV_HBM_LAYERS",
+                                "LLAMA_HYBRID_CLASSIFIER", "LLAMA_HYBRID_PACKED"};
+  if (strcmp(mode, "hybrid"))
+    for (size_t i = 0; i < sizeof(hybrid_knobs) / sizeof(*hybrid_knobs); i++) {
+      const char *value = getenv(hybrid_knobs[i]);
+      if (value && *value)
+        fail("%s requires LLAMA_PLACEMENT=hybrid", hybrid_knobs[i]);
+    }
+  int planned = placement_planned();
+  if (plan_only && !planned)
+    fail("--plan-only requires hbm-only, hybrid, or strict ddr placement");
   kernels_init();
-  kernels_backend_init();
+  if (!planned)
+    kernels_backend_init();
   if (engine_q8) {
     prefill_precision(1); /* LLAMA_PRECISION=bf16 is an error here */
     const char *activations = getenv("LLAMA_Q8_ACTIVATIONS");
@@ -148,7 +159,7 @@ void engine_load_context(Model *model, const char *path, int context) {
     if (!fp32_activations)
       kernels_attention_prefer_amx();
   }
-  read_checkpoint(path, t);
+  read_checkpoint(path, t, planned);
   model->config = t->config;
   model->file_bytes = t->file_size;
   model->mapped_bytes = t->data == MAP_FAILED ? 0 : t->file_size;
@@ -165,7 +176,11 @@ void engine_load_context(Model *model, const char *path, int context) {
   int amx_int8 = engine_q8 && model->prefill_gemm && model->prefill_kernel && !strcmp(model->prefill_kernel, "amx-int8");
   TpPack pack = t->bf16 ? TP_PACK_BF16 : amx_int8 ? TP_PACK_INT8 : TP_PACK_NONE;
   int rows = model->prefill_gemm ? model->max_batch : 1;
-  if (tp_sockets_requested() == 2) {
+  if (planned) {
+    t->tp = tp_create_planned(model, &t->manifest, t->fd, engine_q8, GS, fp32_activations, pack, plan_only);
+    close(t->fd);
+    t->fd = -1;
+  } else if (tp_sockets_requested() == 2) {
     /* D1: with the GEMM on, microbatches run through the batched two-socket forward, else per token. */
     t->tp = tp_create(&t->config, &t->manifest, t->fd, engine_q8, GS, fp32_activations, rows, pack);
     munmap(t->data, t->file_size); /* the shards were read with pread */
@@ -176,6 +191,15 @@ void engine_load_context(Model *model, const char *path, int context) {
   }
   metrics.runtime_s = monotonic_seconds() - start;
   metrics.runtime_ready = 1;
+}
+void engine_load(Model *model, const char *path) {
+  engine_load_context(model, path, 0);
+}
+void engine_load_context(Model *model, const char *path, int context) {
+  load_context(model, path, context, 0);
+}
+void engine_plan_context(Model *model, const char *path, int context) {
+  load_context(model, path, context, 1);
 }
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;

@@ -572,14 +572,18 @@ static size_t attention_amx_offset(size_t partial_floats) {
   return (checked_mul(partial_floats, sizeof(float)) + 63) / 64 * 64;
 }
 
-size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
-  int chunks = attention_max_chunks(n_kv_heads, seq_len, max_threads());
+size_t k_attention_bytes_rows_for(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows, int workers) {
+  int chunks = attention_max_chunks(n_kv_heads, seq_len, workers);
   size_t floats = checked_mul(attention_rows_capacity(n_heads, head_dim, chunks, rows),
                               attention_row_floats(n_heads, head_dim, chunks));
   if (rows > 1 && attention_amx_selected())
     return checked_add(attention_amx_offset(floats),
                        checked_mul(amx_attention_elems(n_kv_heads, head_dim, seq_len), sizeof(uint16_t)));
   return checked_mul(floats, sizeof(float));
+}
+
+size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows) {
+  return k_attention_bytes_rows_for(n_heads, n_kv_heads, head_dim, seq_len, rows, max_threads());
 }
 
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len) {

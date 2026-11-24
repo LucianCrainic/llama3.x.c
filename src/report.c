@@ -7,6 +7,7 @@
 #include "tp.h"
 #include "workers.h"
 #include <errno.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -120,6 +121,8 @@ static void kv_fields(FILE *f, const KvStats *k) {
     fprintf(f, "%d", k->node);
   else
     fputs("null", f);
+  if (k->active_prefix_only)
+    fputs(", \"residency_scope\": \"active_prefix\"", f);
   fprintf(f, ", \"verified\": %s, \"full\": %s, \"pages_queried\": %zu, \"pages_wrong_node\": %zu, "
              "\"pages_missing\": %zu",
           k->verified ? "true" : "false", k->full ? "true" : "false", k->pages_queried, k->pages_wrong_node,
@@ -245,6 +248,20 @@ static void write_v2_sections(FILE *f) {
   fputs(region_history_count() ? "\n  ]" : "]", f);
   fputs(",\n  \"kv\": ", f);
   kv_object(f);
+  fputs(",\n  \"placement_plan\": ", f);
+  tp_placement_report(f);
+  const char *names[] = {"prefill_start", "prefill_end", "decode_start", "decode_end"};
+  uint64_t markers[] = {metrics.prefill_start_ns, metrics.prefill_end_ns, metrics.decode_start_ns,
+                        metrics.decode_end_ns};
+  fputs(",\n  \"phase_epoch_ns\": {", f);
+  for (size_t i = 0; i < sizeof(markers) / sizeof(*markers); i++) {
+    fprintf(f, "%s\"%s\":", i ? "," : "", names[i]);
+    if (markers[i])
+      fprintf(f, "%" PRIu64, markers[i]);
+    else
+      fputs("null", f);
+  }
+  fputc('}', f);
   fprintf(f, ",\n  \"phase_seconds\": null,\n  \"prefill\": {\"microbatches\": %zu, \"tokens\": %zu, \"seconds\": %.9f, \"logits_rows\": %zu}",
           metrics.prefill_microbatches, metrics.processed_tokens, metrics.prefill_s, metrics.prefill_logits_rows);
 }

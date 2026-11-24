@@ -151,6 +151,7 @@ size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len)
 void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory);
 /* The same for batched prefill of up to `rows` rows per call: room for as many rows of split-K partials as the budget
  * (32 MiB) allows, never less than one row. Longer batches run in waves of that many rows. */
+size_t k_attention_bytes_rows_for(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows, int workers);
 size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows);
 void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
                            float *memory);
