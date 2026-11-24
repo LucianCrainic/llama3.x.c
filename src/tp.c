@@ -32,7 +32,7 @@ typedef struct {
                                     socket, or the one-socket loader's run memory and packed store) */
   size_t work_size, packed_size;
   void **packed_at;     /* [layer * 7 + PACK_ROLES index]: the packed copy in `packed`, or NULL */
-  float **pscales_at;   /* the same index: LLAMA_Q8_GEMM=pipelined, the transposed scales after the packed copy */
+  float **pscales_at;   /* the same index: the tiled Q8 kernel (LLAMA_Q8_GEMM=skewed|pipelined), the transposed scales after the packed copy */
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
   float *x, *xb, *hb, *q, *att, *rope; /* socket-local activations, in the work region */
@@ -54,7 +54,7 @@ struct Tp {
   Config c;
   int sockets; /* 1: the one-socket engine (tp_create_local); 2: tensor parallel over two sockets (tp_create) */
   int quantized, gs, check, fp32_activations;
-  int tiled; /* LLAMA_Q8_GEMM=pipelined on packed int8: activations quantized in tile order, scales transposed */
+  int tiled; /* LLAMA_Q8_GEMM=skewed|pipelined on packed int8: activations quantized in tile order, scales transposed */
   /* One socket: the run state and packed copies live where the one-socket loader places them (A4, A5, C5). */
   RunMemory mem;
   PackedStore local_packed, local_cls;
@@ -512,7 +512,7 @@ static void *packed_copy(const TpSocket *sk, int layer, int index) {
   return sk->packed_at ? sk->packed_at[(size_t)layer * 7 + (size_t)index] : NULL;
 }
 
-/* Its transposed scales (LLAMA_Q8_GEMM=pipelined), or NULL. */
+/* Its transposed scales (LLAMA_Q8_GEMM=skewed|pipelined), or NULL. */
 static const float *packed_scales(const TpSocket *sk, int layer, int index) {
   return sk->pscales_at ? sk->pscales_at[(size_t)layer * 7 + (size_t)index] : NULL;
 }
@@ -1059,7 +1059,7 @@ static size_t align_line(size_t n) {
   return (n + 63) / 64 * 64;
 }
 
-/* A packed copy: the VNNI tiles, and with LLAMA_Q8_GEMM=pipelined the transposed scales on the next cache line. */
+/* A packed copy: the VNNI tiles, and with the tiled Q8 kernel the transposed scales on the next cache line. */
 static size_t pack_bytes_of(const Tp *tp, const Shard *sh) {
   if (tp->pack == TP_PACK_BF16)
     return bf16_vnni_elements(sh->rows, sh->cols) * sizeof(uint16_t);

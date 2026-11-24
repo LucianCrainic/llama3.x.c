@@ -135,9 +135,10 @@ void k_gemm_q8(const int8_t *xq, const float *xs, int m, int k, int gs, const Ge
 /* The backend k_gemm_q8 would choose (for logging and reports). */
 Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
 
-/* The pipelined AMX-INT8 kernel (LLAMA_Q8_GEMM=pipelined): the same Q8_0 arithmetic as the AMX chunk kernel, bitwise,
- * on activations quantized straight into tile order and weight scales transposed at pack time, with the FP32 rescale of
- * one 16-row half-step overlapped with the tile instructions of the next.
+/* The tiled AMX-INT8 kernel (LLAMA_Q8_GEMM=skewed, the default, or pipelined): the same Q8_0 arithmetic as the AMX
+ * chunk kernel, bitwise, on activations quantized straight into tile order and weight scales transposed at pack time,
+ * with the FP32 rescale of one 16-row half-step overlapped with the tile instructions of the next; skewed also issues
+ * each half-step's tile store after the next half-step's tile products.
  * Tile order of A (k % 64 == 0): row r, bytes [64 t, 64 t + 64) live at
  *   ((r / 32 * 2 + r % 32 / 16) * (k / 64) + t) * 1024 + (r % 16) * 64,
  * so a 32-row block is 32 * k contiguous bytes and every 16 x 64 tile is one 1 KiB load. Rows are padded to whole
@@ -148,8 +149,8 @@ void gemm_q8_init_env(void); /* reads LLAMA_Q8_GEMM (kernels_init) */
  * kernels (default, where AVX-512 runs) or libm expf (bitwise the GEMV's silu_gate); read by kernels_init. */
 void gemm_swiglu_init_env(void);
 const char *k_gemm_swiglu_exp_name(void);
-const char *k_gemm_q8_mode_name(void); /* "chunk" or "pipelined" */
-int k_gemm_q8_tiled_active(void);      /* pipelined asked for and AMX active */
+const char *k_gemm_q8_mode_name(void); /* "skewed", "pipelined" or "chunk" */
+int k_gemm_q8_tiled_active(void);      /* skewed or pipelined asked for and AMX active */
 size_t s8_scales_t_bytes(int rows, int cols, int gs);
 void pack_s8_scales_t(float *st, const float *s, int rows, int groups, int first_tile, int last_tile);
 /* k_quantize_rows with the int8 values in tile order (scales as k_quantize_rows); q holds whole 32-row blocks. */

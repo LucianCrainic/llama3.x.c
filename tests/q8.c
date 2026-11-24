@@ -279,9 +279,9 @@ static void check_interleaved(const Case *c, const int8_t *xq, const float *xs, 
   free(want), free(got), free((void *)log.stored), free((void *)log.used);
 }
 
-/* LLAMA_Q8_GEMM=pipelined: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
- * transposed scales are the scales, and the pipelined kernel equals the AMX chunk kernel bit for bit, for every kind.
- */
+/* The tiled kernels: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
+ * transposed scales are the scales, and both tiled kernels (LLAMA_Q8_GEMM=skewed and =pipelined) equal the AMX chunk
+ * kernel bit for bit, for every kind. */
 static void check_tiled(const Case *c) {
   const int m = c->m, n = c->n, k = c->k, gs = c->gs, groups = k / gs, ldc = n + 3;
   const size_t rows = up((size_t)m, 32);
@@ -337,30 +337,36 @@ static void check_tiled(const Case *c) {
     base[i] = uniform() * 3;
   const GemmKind kinds[] = {GEMM_STORE, GEMM_ADD, GEMM_SWIGLU, GEMM_PARTIAL};
   gemm_amx_enable(1);
-  for (int t = 0; t < 4; t++) {
-    GemmQ8Segment seg = {.ldc = ldc,
-                         .w = {c->wq, c->ws},
-                         .w3 = {c->wq3, c->ws3},
-                         .pw = c->packed,
-                         .pw3 = c->packed3,
-                         .pws = st,
-                         .pws3 = st3,
-                         .n = n,
-                         .kind = kinds[t]};
-    memcpy(want, base, (size_t)m * ldc * 4);
-    memcpy(got, base, (size_t)m * ldc * 4);
-    seg.c = want;
-    k_gemm_q8_backend_test(Q8_GEMM_AMX, c->xq, c->xs, m, k, gs, &seg, 1);
-    seg.c = got;
-    k_gemm_q8_tiled(tq, ts, m, k, gs, &seg, 1);
-    checks++;
-    if (memcmp(want, got, (size_t)m * ldc * 4)) {
-      char detail[160];
-      snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: pipelined differs from the chunk kernel", m, n, k,
-               gs, kinds[t]);
-      bad("k_gemm_q8_tiled", detail);
+  static const char *const modes[] = {"skewed", "pipelined"};
+  for (int mode = 0; mode < 2; mode++)
+    for (int t = 0; t < 4; t++) {
+      setenv("LLAMA_Q8_GEMM", modes[mode], 1);
+      gemm_q8_init_env();
+      GemmQ8Segment seg = {.ldc = ldc,
+                           .w = {c->wq, c->ws},
+                           .w3 = {c->wq3, c->ws3},
+                           .pw = c->packed,
+                           .pw3 = c->packed3,
+                           .pws = st,
+                           .pws3 = st3,
+                           .n = n,
+                           .kind = kinds[t]};
+      memcpy(want, base, (size_t)m * ldc * 4);
+      memcpy(got, base, (size_t)m * ldc * 4);
+      seg.c = want;
+      k_gemm_q8_backend_test(Q8_GEMM_AMX, c->xq, c->xs, m, k, gs, &seg, 1);
+      seg.c = got;
+      k_gemm_q8_tiled(tq, ts, m, k, gs, &seg, 1);
+      checks++;
+      if (memcmp(want, got, (size_t)m * ldc * 4)) {
+        char detail[160];
+        snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: %s differs from the chunk kernel", m, n, k, gs,
+                 kinds[t], modes[mode]);
+        bad("k_gemm_q8_tiled", detail);
+      }
     }
-  }
+  unsetenv("LLAMA_Q8_GEMM");
+  gemm_q8_init_env();
   check_interleaved(c, tq, ts, st, 1);
   check_interleaved(c, c->xq, c->xs, NULL, 0);
   gemm_amx_enable(0);

@@ -439,6 +439,8 @@ void aligned_buffer_free(AlignedBuffer *buffer) {
 
 static _Thread_local float *q8_kb_buffer; /* the K-blocked driver's accumulators (q8_gemm_blocks_kblocked) */
 static _Thread_local size_t q8_kb_floats;
+/* LLAMA_Q8_GEMM: the tiled kernel (skewed, the default, or pipelined) or the chunk kernel. Set by gemm_q8_init_env. */
+static int q8_pipelined = 1, q8_skewed = 1;
 
 #if GEMM_AMX
 /* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
@@ -704,6 +706,61 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
     AMX_STORED(3, dots[1] + 16, 32 * sizeof(int32_t));
     q8_tiled_rescale(out, dots[0], xs, xs_ld, wst, 16, 1);
     q8_tiled_rescale(out + 16 * 32, dots[1], xs + 16 * xs_ld, xs_ld, wst, m - 16, 1);
+    return;
+  }
+  if (q8_skewed) {
+    /* LLAMA_Q8_GEMM=skewed: half-step h's tile products are issued first (C pair {0,1} or {2,3}, A tile 4 or 5 by
+     * parity), then half-step h-1's pair is stored and rescaled, so a tile store never waits on the products just
+     * issued before it (prototype amx_q8_proto2 variant 5: 135 -> 104 cycles per half-step on one core, L2-resident;
+     * job 5910129). Same products, same rescale order: bitwise the pipelined kernel. */
+    for (int h = g0 * halves; h <= count; h++) {
+      if (h < count) {
+        const int g = h / halves, rb = h % halves;
+        if (h & 1) {
+          AMX_ZERO(2);
+          if (wide)
+            AMX_ZERO(3);
+        } else {
+          AMX_ZERO(0);
+          if (wide)
+            AMX_ZERO(1);
+        }
+        for (int t = 0; t < steps; t++) {
+          const size_t ks = (size_t)g * (size_t)steps + (size_t)t;
+          if (rb == 0 || steps > 1) { /* gs = 64: the second half reuses the group's weight tiles */
+            AMX_LOADD(6, bp + ks * 1024, 64);
+            if (wide)
+              AMX_LOADD(7, bp + tile + ks * 1024, 64);
+          }
+          if (h & 1) {
+            AMX_LOADD(5, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_DPBSSD(2, 5, 6);
+            if (wide)
+              AMX_DPBSSD(3, 5, 7);
+          } else {
+            AMX_LOADD(4, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_DPBSSD(0, 4, 6);
+            if (wide)
+              AMX_DPBSSD(1, 4, 7);
+          }
+        }
+      }
+      if (h > g0 * halves) { /* half-step p = h - 1: store its C pair, then rescale it */
+        const int p = h - 1, g = p / halves, rb = p % halves, rows = m - rb * 16 < 16 ? m - rb * 16 : 16;
+        int32_t *d = dots[p & 1];
+        if (p & 1) {
+          AMX_STORED(2, d, 32 * sizeof(int32_t));
+          if (wide)
+            AMX_STORED(3, d + 16, 32 * sizeof(int32_t));
+        } else {
+          AMX_STORED(0, d, 32 * sizeof(int32_t));
+          if (wide)
+            AMX_STORED(1, d + 16, 32 * sizeof(int32_t));
+        }
+        q8_tiled_rescale(out + rb * 16 * 32, d, xs + (size_t)rb * 16 * xs_ld + (size_t)g, xs_ld, wst + (size_t)g * 32,
+                         rows, wide);
+      }
+    }
     return;
   }
   for (int h = g0 * halves; h <= count; h++) {
@@ -1450,22 +1507,28 @@ void k_gemm_q8_interleaved(const int8_t *xq, const float *xs, int m, int k, int 
   q8_gemm_run(k_gemm_q8_pick(gs, segment, 1), xq, xs, m, k, gs, segment, 1, tiled, hooks);
 }
 
-static int q8_pipelined = 1;
-
-/* LLAMA_Q8_GEMM=pipelined (the default: bitwise the chunk kernel's results, faster on one and two sockets; the decision
- * table is in docs/prefill-gap.md) or chunk, the previous kernel on row-major activations, kept as the way back. */
+/* LLAMA_Q8_GEMM=skewed (the default: the pipelined kernel with each half-step's tile store issued after the next
+ * half-step's tile products), pipelined (the store right after its own products) or chunk (the kernel on row-major
+ * activations). All three give bitwise the same results; pipelined and chunk are the ways back (decision tables in
+ * docs/prefill-gap.md and docs/gs64-gemm.md). */
 void gemm_q8_init_env(void) {
   const char *mode = getenv("LLAMA_Q8_GEMM");
   q8_pipelined = 1;
-  if (!mode || !*mode || !strcmp(mode, "pipelined"))
+  q8_skewed = 1;
+  if (!mode || !*mode || !strcmp(mode, "skewed"))
     return;
+  if (!strcmp(mode, "pipelined")) {
+    q8_skewed = 0;
+    return;
+  }
   if (strcmp(mode, "chunk"))
-    fail("LLAMA_Q8_GEMM must be pipelined or chunk");
+    fail("LLAMA_Q8_GEMM must be skewed, pipelined or chunk");
   q8_pipelined = 0;
+  q8_skewed = 0;
 }
 
 const char *k_gemm_q8_mode_name(void) {
-  return q8_pipelined ? "pipelined" : "chunk";
+  return !q8_pipelined ? "chunk" : q8_skewed ? "skewed" : "pipelined";
 }
 
 int k_gemm_q8_tiled_active(void) {
