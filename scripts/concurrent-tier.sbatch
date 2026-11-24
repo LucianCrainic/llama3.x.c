@@ -64,7 +64,7 @@ environment_extra() {
     printf 'numa_balancing=%s\n' "$(cat /proc/sys/kernel/numa_balancing 2> /dev/null || echo n/a)"
     printf 'hugepages_total=%s\n' "$(grep -E '^HugePages_Total' /proc/meminfo | tr -d ' ')"
     printf 'perf=%s\n' "$(perf --version 2> /dev/null || echo n/a)"
-    printf 'sudo_list: %s\n' "$(sudo -n -l 2>&1 | tr '\n' ' ' | cut -c1-600)"
+    printf 'sudo_list: %s\n' "$(sudo -n -l 2>&1 | tr '\n' ' ' | cut -c1-2000)"
     printf 'msr_device=%s rdmsr=%s wrmsr=%s\n' "$([[ -e /dev/cpu/0/msr ]] && echo present || echo absent)" \
       "$(command -v rdmsr || echo absent)" "$(command -v wrmsr || echo absent)"
     printf 'prefetch_msr_0x1a4: %s\n' "$(rdmsr -p 0 0x1a4 2>&1 | head -1 || true)"

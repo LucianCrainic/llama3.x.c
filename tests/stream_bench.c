@@ -852,6 +852,12 @@ static void fill2_fn(const void *p, int w, int workers) {
           sc[(size_t)r * (n / 32) + g] = 0.002f + 0.0001f * (float)((r + g) % 7);
       }
     }
+  /* The rest of the region (past the last whole layer) is touched too, so every page of it is populated and verified. */
+  size_t tail = (size_t)job->gemv_layers * layer_stride, words = (job->bytes - tail) / 8,
+         i0 = words * (size_t)w / (size_t)workers, i1 = words * (size_t)(w + 1) / (size_t)workers;
+  uint64_t *q = (uint64_t *)(job->base + tail);
+  for (size_t i = i0; i < i1; i++)
+    q[i] = mix64(i + 1) & 0x7f7f7f7f7f7f7f7fULL;
 }
 
 typedef struct {
@@ -1317,8 +1323,10 @@ static void verify_tier(Run *R, Sock *s, int tier, const char *stage, size_t sam
   int ok = s->R[tier].node >= 0 && region_verify(&s->R[tier], samples, &chk) == 0;
   if (R->real) {
     if (!ok || chk.on_node != chk.queried)
-      fail("socket %d %s placement verification failed (%s): %zu of %zu pages on node %d", s->socket,
-           tier ? "DDR" : "HBM", stage, chk.on_node, chk.queried, s->R[tier].node);
+      fail("socket %d %s placement verification failed (%s): %zu of %zu pages on node %d (%zu on another node, %zu "
+           "missing, %zu query errors)",
+           s->socket, tier ? "DDR" : "HBM", stage, chk.on_node, chk.queried, s->R[tier].node, chk.wrong_node,
+           chk.missing, chk.errors);
     region_thp_bytes(&s->R[tier], &thp);
     if (!R->page4k && thp < s->R[tier].data_bytes * 95 / 100)
       LOG(LOG_WARN, "socket %d %s: only %zu of %zu bytes are in transparent huge pages", s->socket,
