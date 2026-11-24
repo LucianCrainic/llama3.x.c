@@ -27,12 +27,12 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
-| P0 recon | in work | none | haiku x2 | | 0 |
+| P0 recon | inventory done; docs page in work | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
 | P1 concurrent bandwidth | in work | `perf/concurrent-tier-bandwidth` | sonnet | | |
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
-| Downloads / 70B gs64 conversion | waiting on P0 | | haiku | | |
+| Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest job in work (cpu partition) | | haiku | | |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
 | P5 gap loop | not started | | | | |
@@ -44,7 +44,22 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 24 Nov | Removed the three existing mentions of the earlier branch prefix from `docs/` (gs32-amx, C1 plan, C1 validation) on this branch | Owner rule §2: the name must not appear in `develop`. Commit history on `develop` has none (checked `git log` messages and authors) |
 | 24 Nov | P1 starts from the earlier concurrent-stream code (measured, older tree: job 5904726) rather than from scratch | It already pins two core groups to separate tiers with verified placement; E1-E6 extend it. Code is re-committed under the campaign's rules |
 | 24 Nov | P2b porting waits for the P2 merge, then one sonnet agent ports steps 1-6 in order on `feature/70b-comparison`; step 7 (70B Q8 re-run) after the gs64/gs32 70B files exist | Plan §P2b: port onto the planner; avoids porting onto a moving merge branch |
+| 24 Nov | No downloads: the 70B HF snapshot (community mirror, rev d50656ee, 30 shards hashed at download) and the gs64 (22 Nov) and gs32 (24 Nov) engine files already exist; only a sha256 manifest and provenance check are run | D1 asks for files, not for re-downloads |
+| 24 Nov | E3 uses `mbind` per chunk | Flat-node kernel is 5.14 (RHEL 9.4), no `weighted_interleave` sysfs |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
+
+## P0 findings (24 Nov)
+
+| Item | Finding |
+| --- | --- |
+| Internet | Compute nodes (cpu_dbg, hbm_dbg): none, no proxy. Login node reaches huggingface.co, github, pypi; HF LFS CDN name does not resolve. No transfer partition. No HF token on the cluster |
+| Kernel | 5.14.0-427 (RHEL 9.4) on hbm13-16: no `MPOL_WEIGHTED_INTERLEAVE` |
+| Memory mode | hbm15 (debug partition) shows 2 NUMA nodes only: Cache mode. hbm13/14 Flat per earlier jobs (confirmed again by P1/P2 job records) |
+| CPU | Max 9480, 56 cores/socket, 1 thread/core, AMX-INT8/BF16, VNNI, AVX512-FP16; THP `always` |
+| 70B files | HF snapshot 132 GB (community mirror rev d50656ee); engine v3 INT8 gs64 75.0 GB; engine v3 INT8 gs32 (from Q8_0 GGUF) 79.4 GB; FP32 v3 282 GB; Q8_0 and F32 GGUFs. All in scratch |
+| 8B files | v3 FP32, v3 gs64, v3 gs32, v4 per-channel, HF snapshot |
+| Storage | scratch is the large area; the store area reports ~45 GB free (unconfirmed), too small for the 70B engine files |
+| Earlier 70B result dirs | placement pilots (22 Nov), research runs (23 Nov), cross-engine runs (24 Nov), all in scratch/store |
 
 ## P2b inventory (verified 24 Nov)
 
