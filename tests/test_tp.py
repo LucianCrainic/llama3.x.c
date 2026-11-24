@@ -365,6 +365,24 @@ class TensorParallelTests(unittest.TestCase):
             self.assertEqual(data['runtime']['kernels_prefill'], 'amx-int8')
             self.assertEqual(sorted(r['socket'] for r in data['regions'] if r['role'] == 'packed'), list(range(sockets)))
 
+    def test_vnni_gemv_gs32_pairs(self):
+        """Group size 32 per-token decode on the AVX-512 kernels (the scalar model of the intrinsics, so the VNNI pair kernel
+        runs: one 64-byte load per two groups; every per-socket width of the wide fixture is a multiple of 64) agrees with
+        the per-token reference on one and two sockets up to W8A8 rounding flips. The kernel sums each row in 16 lanes, so
+        an activation within about 1e-5 of an int8 rounding tie can quantize one step apart. On two sockets that happens at
+        position 0 (layer 1's QKV input at x*127/amax = -7.499987: the first and only differing byte against the same kernel
+        summed in portable order), and through its K/V it moves every later position by up to 2e-2 (logits about 1.5).
+        Hence every row may be off, by at most 5e-2, and keeps its argmax within that. The exact check of the kernel is
+        test_q8 in tests/kernels.c; with the two scale halves swapped this test fails at 0.09, that one by whole units."""
+        self.need('probe-int8-avx512-emul')
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        reference = self.logits('int8', 'wide-gs32', None, 1, tokens=tokens)
+        for sockets in (1, 2):
+            with self.subTest(sockets=sockets):
+                vnni = self.logits('int8', 'wide-gs32', None, sockets, tokens=tokens, binary='probe-int8-avx512-emul',
+                                   LLAMA_KERNELS='avx512')
+                self.assert_agree_but_flips(reference, vnni, TP_WIDE_CONFIG[5], flips=len(tokens), flip_tol=5e-2)
+
     def test_interleaved_batch_reduction_is_bitwise_the_barrier_one(self):
         """LLAMA_TP_BATCH_REDUCE=interleaved (each stored block of the two-socket W8A8 Wo/W2 partials is added into the
         residual during the projection) and =wo (Wo only) give bitwise the logits of the barrier reduction,
