@@ -605,6 +605,7 @@ void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int
   work->kv_cache_bf16 = NULL; /* k_attention_set_kv_bf16 */
   work->kv_layer_elems = 0;
   work->kv_layers = work->kv_used = 0;
+  memset(work->kv_slot, 0, sizeof(work->kv_slot));
   work->kv_bf16 = bytes > checked_mul(work->capacity, sizeof(float))
                       ? (uint16_t *)((char *)work->partial + attention_amx_offset(work->capacity))
                       : NULL;
@@ -638,6 +639,20 @@ void k_attention_set_kv_bf16(AttentionWork *work, uint16_t *memory, int n_kv_hea
   work->kv_layer_elems = amx_attention_elems(n_kv_heads, head_dim, seq_len);
   work->kv_layers = layers;
   work->kv_used = 0;
+  memset(work->kv_slot, 0, sizeof(work->kv_slot));
+}
+
+void k_attention_set_kv_bf16_layers(AttentionWork *work, uint16_t *const *memory, const float *const *key_caches,
+                                    int n_kv_heads, int head_dim, int seq_len, int layers) {
+  if (layers < 1 || layers > (int)(sizeof(work->kv_slot) / sizeof(*work->kv_slot)))
+    fail("LLAMA_ATTN=amx: %d layers do not fit the persistent BF16 copy table", layers);
+  k_attention_set_kv_bf16(work, memory[0], n_kv_heads, head_dim, seq_len, layers);
+  for (int l = 0; l < layers; l++) {
+    work->kv_slot[l] = memory[l];
+    work->kv_key[l] = key_caches[l];
+    work->kv_valid[l] = 0;
+  }
+  work->kv_used = layers;
 }
 
 /* Positions from `position` on of the layer whose key cache is `key_cache` are being rewritten outside the AMX path
@@ -1549,7 +1564,7 @@ static void attention_batch_amx(float *out, const float *q, const float *key_cac
       work->kv_used++;
     }
     int valid = work->kv_valid[slot] < pos0 ? work->kv_valid[slot] : pos0;
-    kv = work->kv_cache_bf16 + (size_t)slot * work->kv_layer_elems;
+    kv = work->kv_slot[slot] ? work->kv_slot[slot] : work->kv_cache_bf16 + (size_t)slot * work->kv_layer_elems;
     pack_from = valid / AMX_ATTN_KB;
     work->kv_valid[slot] = pos0 + m;
   }

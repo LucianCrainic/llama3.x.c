@@ -85,6 +85,9 @@ typedef struct {
   int full;     /* that query fully covered its scope rather than sampling */
   int active_prefix_only; /* query and resident_bytes cover the active page union */
   size_t pages_queried, pages_wrong_node, pages_missing;
+  /* LLAMA_ATTN=amx: the persistent BF16 copy of K and V, planned and verified with the caches (0 when there is none).
+   * Its pages and wrong-node counts are part of the totals above; its bytes are reported apart. */
+  size_t bf16_reserved_bytes, bf16_active_bytes, bf16_resident_bytes;
 } KvStats;
 
 typedef struct {

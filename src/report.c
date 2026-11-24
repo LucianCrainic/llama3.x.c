@@ -127,6 +127,9 @@ static void kv_fields(FILE *f, const KvStats *k) {
              "\"pages_missing\": %zu",
           k->verified ? "true" : "false", k->full ? "true" : "false", k->pages_queried, k->pages_wrong_node,
           k->pages_missing);
+  if (k->bf16_reserved_bytes)
+    fprintf(f, ", \"bf16_copy\": {\"reserved_bytes\": %zu, \"active_bytes\": %zu, \"resident_bytes\": %zu}",
+            k->bf16_reserved_bytes, k->bf16_active_bytes, k->bf16_resident_bytes);
 }
 
 /* The final state, with the snapshot taken when the prompt had been processed nested as after_prompt. */

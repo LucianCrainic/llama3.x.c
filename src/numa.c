@@ -675,7 +675,7 @@ void region_record_verification(const NumaRegion *r, const PageCheck *check, siz
 
 const char *region_role_name(RegionRole role) {
   static const char *const names[] = {"weights", "packed",  "embedding", "kv.k",  "kv.v",
-                                      "work",    "scratch", "exchange",  "logits"};
+                                      "work",    "scratch", "exchange",  "logits", "kv.bf16"};
   return (unsigned)role < sizeof(names) / sizeof(*names) ? names[role] : "?";
 }
 

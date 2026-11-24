@@ -75,7 +75,8 @@ typedef enum {
   ROLE_WORK,
   ROLE_SCRATCH,
   ROLE_EXCHANGE,
-  ROLE_LOGITS
+  ROLE_LOGITS,
+  ROLE_KV_BF16 /* the persistent BF16 copy of K and V of LLAMA_ATTN=amx */
 } RegionRole;
 
 typedef struct {

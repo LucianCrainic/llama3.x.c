@@ -24,8 +24,12 @@ typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FOR
 /* The seven matrices of a layer that get a packed copy, in the order of TpSocket.packed_at. */
 static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W3};
 
+/* One layer's K and V caches, and with LLAMA_ATTN=amx under planned placement its persistent BF16 copy. Every access to
+ * the caches goes through kv_layer(): a plan can split the layers over two tiers, so a layer's offset in one region is
+ * not `layer * seq_len * kv_dim`. */
 typedef struct {
   float *k, *v;
+  uint16_t *bf16;
 } KvLayer;
 
 typedef struct {
@@ -42,7 +46,7 @@ typedef struct {
   uint16_t *cls_bf16;   /* the packed classifier range, once all-position logits were asked for (BF16 mode) */
   AlignedBuffer panel;  /* BF16 mode: the activations converted to BF16 */
   float *x, *xb, *hb, *q, *att, *rope; /* socket-local activations, in the work region */
-  float *key_cache, *value_cache; /* [layer][seq][kv_dim / 2]; LLAMA_KV_LAYOUT=head: [layer][kv head][seq][head_dim] */
+  /* kv_layers[l]: layer l's caches, [seq][kv_dim / 2]; LLAMA_KV_LAYOUT=head: [kv head][seq][head_dim] */
   float *kstage,
       *vstage; /* LLAMA_KV_LAYOUT=head: the K/V rows of the projections (rows x kv_dim / 2), stored per head */
   AttentionWork attention;
@@ -64,6 +68,8 @@ typedef enum {
   A_K_DDR,
   A_V_HBM,
   A_V_DDR,
+  A_KVB_HBM, /* the persistent BF16 K/V copy of LLAMA_ATTN=amx, tiered per layer like the caches */
+  A_KVB_DDR,
   A_WORK,
   A_EXCHANGE,
   A_EMBED,
@@ -85,7 +91,7 @@ typedef struct {
   int sockets, simulated, admitted, weights_layers, kv_layers, classifier, packed;
   int threads[SOCKETS], node[SOCKETS][TIERS];
   size_t budget[SOCKETS][TIERS], free_bytes[SOCKETS][TIERS], charge[SOCKETS][TIERS], job_cap;
-  size_t kv_layer_bytes, work_bytes[SOCKETS], panel_bytes;
+  size_t kv_layer_bytes, kv_bf16_layer_bytes, work_bytes[SOCKETS], panel_bytes;
   size_t logits_bytes;
   ArenaPlan arena[SOCKETS][A_COUNT];
 } PlacementPlan;
@@ -396,11 +402,8 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   return 1;
 }
 
-static KvLayer kv_layer(const TpSocket *sk, int layer, size_t floats_per_layer) {
-  if (sk->kv_layers)
-    return sk->kv_layers[layer];
-  size_t offset = (size_t)layer * floats_per_layer;
-  return (KvLayer){sk->key_cache + offset, sk->value_cache + offset};
+static KvLayer kv_layer(const TpSocket *sk, int layer) {
+  return sk->kv_layers[layer];
 }
 
 static void forward_fp32(Tp *tp, int s) {
@@ -412,7 +415,7 @@ static void forward_fp32(Tp *tp, int s) {
   SPROFILE(PHASE_ROPE_TABLE, k_rope_table(p, pos, sk->rope));
   for (int l = 0; l < p->n_layers; l++) {
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
-    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
+    KvLayer cache = kv_layer(sk, l);
     int head_layout = kernels_kv_layout_head();
     float *k = head_layout ? sk->kstage : cache.k + (size_t)pos * kvl,
           *v = head_layout ? sk->vstage : cache.v + (size_t)pos * kvl;
@@ -470,7 +473,7 @@ static void forward_q8(Tp *tp, int s) {
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_ATT, l, s), dim, p->norm_eps));
     K8Input in;
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
-    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
+    KvLayer cache = kv_layer(sk, l);
     int head_layout = kernels_kv_layout_head();
     float *k = head_layout ? sk->kstage : cache.k + (size_t)pos * kvl,
           *v = head_layout ? sk->vstage : cache.v + (size_t)pos * kvl;
@@ -820,7 +823,7 @@ static void forward_batch(Tp *tp, int s) {
   SPROFILE(PHASE_ROPE_TABLE, rope_tables(tp, sk));
   for (int l = 0; l < p->n_layers; l++) {
     norm_quantize_batch(tp, sk, s, norm_weight(tp, T_RMS_ATT, l, s));
-    KvLayer cache = kv_layer(sk, l, (size_t)p->seq_len * kvl);
+    KvLayer cache = kv_layer(sk, l);
     float *kc = cache.k, *vc = cache.v;
     int head_layout = kernels_kv_layout_head();
     float *kd = head_layout ? sk->kstage : kc + (size_t)pos0 * kvl,
@@ -984,35 +987,66 @@ static void setup_socket(Tp *tp, int s) {
   }
   float *attention_memory;
   CARVE(attention_memory, k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, tp->rows) / sizeof(float) + 1, float);
+  /* The persistent BF16 K/V copy (LLAMA_ATTN=amx): legacy placement carves it from the work region; a plan gives it
+   * arenas of its own, tiered per layer like the caches (KvLayer.bf16). */
   uint16_t *kv_bf16 = NULL;
   size_t kv_bf16_bytes = k_attention_kv_bf16_bytes(kl, p->head_dim, p->seq_len, p->n_layers);
-  if (kv_bf16_bytes)
+  if (kv_bf16_bytes && !tp->plan.mode)
     CARVE(kv_bf16, kv_bf16_bytes / sizeof(uint16_t), uint16_t);
 #undef CARVE
   if (used > sk->work_size)
     fail("socket %d work region holds %zu bytes, %zu needed", s, sk->work_size, used);
   k_attention_init_rows(&sk->attention, hl, kl, p->head_dim, p->seq_len, tp->rows, attention_memory);
-  if (S == 2 && !tp->plan.mode) {
-    sk->key_cache = sk->kv_k.data;
-    sk->value_cache = sk->kv_v.data;
+  /* The KV table: where each layer's caches are, whatever the placement. Legacy placement is one contiguous region per
+   * cache (the socket's own region, or the one-socket run memory); a plan built its table in tp_create_planned. */
+  size_t layer_floats = (size_t)p->seq_len * tp->kv_dim_local;
+  if (!tp->plan.mode) {
+    float *k = S == 2 ? sk->kv_k.data : runmem_cache(&tp->mem, 0), *v = S == 2 ? sk->kv_v.data : runmem_cache(&tp->mem, 1);
+    sk->kv_layers = memory_alloc((size_t)p->n_layers, sizeof(KvLayer), MEM_METADATA);
+    for (int l = 0; l < p->n_layers; l++)
+      sk->kv_layers[l] = (KvLayer){k + (size_t)l * layer_floats, v + (size_t)l * layer_floats, NULL};
   }
-  /* The socket's team writes its KV caches once now, so their pages exist (on the socket's node, created by its own
-   * threads) before the first prompt: otherwise each 4 KiB page is faulted in by the K/V store of the prefill, inside
-   * the time to first token. A fresh mapping is zero already; the values do not change. */
-  size_t kv_bytes = (size_t)p->n_layers * p->seq_len * tp->kv_dim_local * sizeof(float);
-  float *caches[2] = {sk->key_cache, sk->value_cache};
-  for (int i = 0; i < 2; i++) {
-    ZeroSpan span = {caches[i], kv_bytes};
+  if (kv_bf16)
+    k_attention_set_kv_bf16(&sk->attention, kv_bf16, kl, p->head_dim, p->seq_len, p->n_layers);
+  else if (kv_bf16_bytes && tp->plan.mode) {
+    if (!sk->kv_layers[0].bf16)
+      fail("socket %d: the placement plan holds no arena for the BF16 K/V copy that LLAMA_ATTN=amx needs", s);
+    uint16_t *memory[256];
+    const float *keys[256];
+    for (int l = 0; l < p->n_layers; l++) {
+      memory[l] = sk->kv_layers[l].bf16;
+      keys[l] = sk->kv_layers[l].k;
+    }
+    k_attention_set_kv_bf16_layers(&sk->attention, memory, keys, kl, p->head_dim, p->seq_len, p->n_layers);
+  }
+  /* The socket's team writes its KV caches (and the BF16 copy) once now, so their pages exist (on the socket's node,
+   * created by its own threads) before the first prompt: otherwise each 4 KiB page is faulted in by the K/V store of the
+   * prefill, inside the time to first token. A fresh mapping is zero already; the values do not change. A plan's tiers
+   * are separate arenas, each written whole. */
+  ZeroSpan spans[A_COUNT + 2];
+  int nspans = 0;
+  if (tp->plan.mode) {
+    for (int i = A_K_HBM; i <= A_KVB_DDR; i++)
+      if (tp->arenas[s][i].data)
+        spans[nspans++] = (ZeroSpan){tp->arenas[s][i].data, tp->arenas[s][i].logical_bytes};
+  } else {
+    size_t kv_bytes = (size_t)p->n_layers * layer_floats * sizeof(float);
+    spans[nspans++] = (ZeroSpan){sk->kv_layers[0].k, kv_bytes};
+    spans[nspans++] = (ZeroSpan){sk->kv_layers[0].v, kv_bytes};
+  }
+  for (int i = 0; i < nspans; i++) {
     if (sk->team)
-      team_run(sk->team, zero_span, &span);
+      team_run(sk->team, zero_span, &spans[i]);
     else
-      zero_span(&span, 0, 1);
+      zero_span(&spans[i], 0, 1);
   }
 }
 
 /* ---- region sizes -------------------------------------------------------------------------------------------- */
 
-static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs, int rows, int workers) {
+/* kv_bf16: count the persistent BF16 K/V copy of LLAMA_ATTN=amx in the work region (legacy placement carves it there);
+ * a plan gives it arenas of its own. */
+static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs, int rows, int workers, int kv_bf16) {
   int hl = p->n_heads / sockets, kl = p->n_kv_heads / sockets;
   size_t slice = (size_t)(p->dim > p->hidden_dim ? p->dim : p->hidden_dim) / sockets;
   size_t bytes = 64 * 16; /* alignment of each buffer */
@@ -1033,11 +1067,13 @@ static size_t work_bytes_for(const Config *p, int sockets, int quantized, int gs
   size_t att = workers ? k_attention_bytes_rows_for(hl, kl, p->head_dim, p->seq_len, rows, workers)
                        : k_attention_bytes_rows(hl, kl, p->head_dim, p->seq_len, rows);
   bytes = checked_add(bytes, checked_add(att, 64));
+  if (kv_bf16)
+    bytes = checked_add(bytes, checked_add(k_attention_kv_bf16_bytes(kl, p->head_dim, p->seq_len, p->n_layers), 64));
   return bytes;
 }
 
 size_t tp_work_bytes(const Config *p, int quantized, int gs, int rows) {
-  return work_bytes_for(p, SOCKETS, quantized, gs, rows, 0);
+  return work_bytes_for(p, SOCKETS, quantized, gs, rows, 0, 1);
 }
 
 size_t tp_exchange_bytes(const Config *p, int rows) {
@@ -1045,7 +1081,7 @@ size_t tp_exchange_bytes(const Config *p, int rows) {
 }
 
 static size_t work_bytes(const Tp *tp) {
-  return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, 0);
+  return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, 0, !tp->plan.mode);
 }
 
 static void socket_command(Tp *tp, int socket) {
@@ -1282,8 +1318,6 @@ Tp *tp_create_local(const Config *p, const TensorManifest *m, const WeightStore 
     runmem_seal(&tp->mem);
     sk->work_data = runmem_alloc(&tp->mem, sk->work_size, 1);
   }
-  sk->key_cache = runmem_cache(&tp->mem, 0);
-  sk->value_cache = runmem_cache(&tp->mem, 1);
   setup_socket(tp, 0);
   tp->logits = memory_alloc((size_t)p->vocab_size, sizeof(float), MEM_ACTIVATION);
   if (pack == TP_PACK_BF16)
@@ -1564,6 +1598,7 @@ static void placement_layout(Tp *tp) {
       arena_plan(plan, s, A_WEIGHTS_HBM + t, t, weight_bytes[s][t], ROLE_WEIGHTS, thp);
       arena_plan(plan, s, A_K_HBM + t, t, kv_bytes, ROLE_KV_K, thp);
       arena_plan(plan, s, A_V_HBM + t, t, kv_bytes, ROLE_KV_V, thp);
+      arena_plan(plan, s, A_KVB_HBM + t, t, checked_mul(plan->kv_bf16_layer_bytes, (size_t)layers), ROLE_KV_BF16, thp);
     }
     arena_plan(plan, s, A_WORK, hot, checked_add(align_line(plan->work_bytes[s]), plan->panel_bytes), ROLE_WORK, 0);
     arena_plan(plan, s, A_EXCHANGE, hot, plan->sockets == 2 ? tp_exchange_bytes(&tp->c, tp->rows) : 0, ROLE_EXCHANGE,
@@ -1628,9 +1663,14 @@ static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
       plan->free_bytes[s][t] = node_free_bytes(plan->node[s][t]);
     }
     plan->threads[s] = pool->threads[s];
-    plan->work_bytes[s] = work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, pool->threads[s]);
+    plan->work_bytes[s] = work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, pool->threads[s], 0);
   }
   plan->kv_layer_bytes = checked_mul((size_t)tp->c.seq_len, checked_mul((size_t)tp->kv_dim_local, sizeof(float)));
+  /* LLAMA_ATTN=amx: one BF16 copy of K and V per layer (0 when the attention kernel does not keep one), planned with the
+   * layer's caches: the layers that stay in HBM keep their copy there too. */
+  plan->kv_bf16_layer_bytes = k_attention_kv_bf16_bytes(tp->c.n_kv_heads / tp->sockets, tp->c.head_dim, tp->c.seq_len, 1);
+  if (plan->kv_bf16_layer_bytes && tp->c.n_layers > 256)
+    plan->kv_bf16_layer_bytes = 0; /* the copy table holds 256 layers; k_attention_kv_bf16_bytes agrees */
   if (tp->pack == TP_PACK_BF16) {
     int hidden = tp->c.hidden_dim / tp->sockets;
     plan->panel_bytes = k_gemm_bf16_panel_bytes(tp->rows, hidden > tp->c.dim ? hidden : tp->c.dim);
@@ -1691,9 +1731,11 @@ void tp_placement_report(FILE *f) {
   }
   fprintf(f,
           "{\"mode\":\"%s\",\"admitted\":%s,\"simulated\":%s,\"weights_hbm_layers\":%d,\"kv_hbm_layers\":%d,"
-          "\"classifier\":\"%s\",\"packed\":\"%s\",\"cgroup_limit_bytes\":%zu,\"nodes\":[",
+          "\"classifier\":\"%s\",\"packed\":\"%s\",\"kv_layer_bytes\":%zu,\"kv_bf16_layer_bytes\":%zu,"
+          "\"cgroup_limit_bytes\":%zu,\"nodes\":[",
           plan->mode, plan->admitted ? "true" : "false", plan->simulated ? "true" : "false", plan->weights_layers,
-          plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed), plan->job_cap);
+          plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed), plan->kv_layer_bytes,
+          plan->kv_bf16_layer_bytes, plan->job_cap);
   for (int s = 0; s < plan->sockets; s++)
     for (int t = 0; t < TIERS; t++)
       fprintf(f,
@@ -1773,8 +1815,10 @@ Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int q
     for (int l = 0; l < p->n_layers; l++) {
       int tier = l < cut ? HBM : DDR;
       size_t at = (size_t)(tier == HBM ? l : l - cut) * tp->plan.kv_layer_bytes;
-      sk->kv_layers[l] =
-          (KvLayer){(float *)((char *)a[A_K_HBM + tier].data + at), (float *)((char *)a[A_V_HBM + tier].data + at)};
+      size_t at16 = (size_t)(tier == HBM ? l : l - cut) * tp->plan.kv_bf16_layer_bytes;
+      sk->kv_layers[l] = (KvLayer){
+          (float *)((char *)a[A_K_HBM + tier].data + at), (float *)((char *)a[A_V_HBM + tier].data + at),
+          tp->plan.kv_bf16_layer_bytes ? (uint16_t *)((char *)a[A_KVB_HBM + tier].data + at16) : NULL};
     }
     for (int t = 0; t < TIERS; t++)
       weight_bases[s][t] = a[A_WEIGHTS_HBM + t].data;
@@ -1792,6 +1836,11 @@ Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int q
   shards_bind_placed(&tp->set, weight_bases, tp->arenas[0][A_EMBED].data);
   if (sockets == 2) {
     tp->exchange = exchange_create(tp->rows * p->dim, exchange_regions);
+    /* The interleaved reduction flags blocks of 32 rows x 16 or 32 channels in the per-element flag array. */
+    if (batch_reduce_mode() &&
+        (long long)((p->dim + 15) / 16) * ((tp->rows + 31) / 32) > exchange_block_capacity(tp->exchange))
+      fail("LLAMA_TP_BATCH_REDUCE=%s: %d x %d blocks exceed the exchange flags", tp_batch_reduce_name(),
+           (p->dim + 15) / 16, (tp->rows + 31) / 32);
     if (profile_enabled)
       exchange_set_timing(tp->exchange, 1);
     if (pthread_create(&tp->thread, NULL, coordinator_main, tp))
@@ -1834,8 +1883,8 @@ Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int q
         tp->s[s].load_scratch = NULL;
         continue;
       }
-      if (i >= A_K_HBM && i <= A_V_DDR)
-        continue; /* K/V pages are checked once the prefix has been written. */
+      if (i >= A_K_HBM && i <= A_KVB_DDR)
+        continue; /* K/V pages and their BF16 copy are checked once the prefix has been written. */
       if (i <= A_WEIGHTS_DDR || i == A_EMBED || i == A_PACK || i == A_PACK_CLS)
         region_protect(r);
       verify_bound(r, tp->plan.mode);
@@ -1956,7 +2005,18 @@ static void planned_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
   const Config *p = &tp->c;
   size_t all_layers = checked_mul(2 * (size_t)tp->sockets, (size_t)p->n_layers);
   size_t bytes_per_position = checked_mul((size_t)tp->kv_dim_local, sizeof(float));
+  size_t bf16_total = ((size_t)p->seq_len + 31) / 32, bf16_blocks = ((size_t)position + 31) / 32;
+  if (bf16_blocks > bf16_total)
+    bf16_blocks = bf16_total;
+  size_t bf16_head = checked_mul(bf16_total * 32, (size_t)p->head_dim); /* elements of one (K or V, head) segment */
+  size_t bf16_used = checked_mul(checked_mul(bf16_blocks * 32, (size_t)p->head_dim), sizeof(uint16_t));
+  size_t bf16_spans = checked_mul(2, (size_t)(p->n_kv_heads / tp->sockets)), bf16_stride = checked_mul(bf16_head, sizeof(uint16_t));
   *out = (KvStats){.reserved_bytes = checked_mul(all_layers, tp->plan.kv_layer_bytes),
+                   .bf16_reserved_bytes = checked_mul(checked_mul((size_t)tp->sockets, (size_t)p->n_layers), tp->plan.kv_bf16_layer_bytes),
+                   .bf16_active_bytes = tp->plan.kv_bf16_layer_bytes
+                                            ? checked_mul(checked_mul(checked_mul((size_t)tp->sockets, (size_t)p->n_layers), bf16_spans),
+                                                          bf16_used)
+                                            : 0,
                    .active_bytes = checked_mul(checked_mul(all_layers, bytes_per_position), (size_t)position),
                    .active_prefix_only = 1,
                    .node = tp->plan.kv_layers == 0             ? tp->plan.node[0][DDR]
@@ -1989,6 +2049,27 @@ static void planned_kv_stats(Tp *tp, int position, int verify, KvStats *out) {
       out->pages_missing += check.missing;
       out->full &= check.full;
       out->resident_bytes = checked_add(out->resident_bytes, checked_mul(pages, page));
+      if (check.wrong_node || check.missing || check.errors)
+        fail("active %s on socket %d node %d: %zu wrong-node, %zu missing, %zu page query errors",
+             region_role_name(r->role), s, r->node, check.wrong_node, check.missing, check.errors);
+    }
+  for (int s = 0; s < tp->sockets; s++)
+    for (int i = A_KVB_HBM; i <= A_KVB_DDR; i++) {
+      NumaRegion *r = &tp->arenas[s][i];
+      if (!r->data)
+        continue;
+      size_t layers = r->logical_bytes / tp->plan.kv_bf16_layer_bytes;
+      PageCheck check;
+      size_t pages, thp = 0;
+      if (region_verify_prefixes(r, checked_mul(layers, bf16_spans), bf16_stride, bf16_used, samples, &check, &pages))
+        fail("cannot verify active %s pages on socket %d node %d", region_role_name(r->role), s, r->node);
+      region_thp_bytes(r, &thp);
+      region_record_verification(r, &check, thp);
+      out->pages_queried += check.queried;
+      out->pages_wrong_node += check.wrong_node;
+      out->pages_missing += check.missing;
+      out->full &= check.full;
+      out->bf16_resident_bytes = checked_add(out->bf16_resident_bytes, checked_mul(pages, page));
       if (check.wrong_node || check.missing || check.errors)
         fail("active %s on socket %d node %d: %zu wrong-node, %zu missing, %zu page query errors",
              region_role_name(r->role), s, r->node, check.wrong_node, check.missing, check.errors);
@@ -2064,8 +2145,8 @@ void tp_free(Tp *tp) {
   exchange_destroy(tp->exchange);
   if (tp->sockets == 1 && !tp->plan.mode) {
     runmem_free(&tp->mem, tp->s[0].work_data);
-    runmem_free(&tp->mem, tp->s[0].key_cache);
-    runmem_free(&tp->mem, tp->s[0].value_cache);
+    runmem_free(&tp->mem, tp->s[0].kv_layers[0].k);
+    runmem_free(&tp->mem, tp->s[0].kv_layers[0].v);
     k_attention_free(&tp->s[0].attention);
     runmem_release(&tp->mem);
     packed_close(&tp->local_packed);
