@@ -13,12 +13,13 @@
 # analysis are tools/concurrent_tier.py.
 #
 # Required: ROOT (staged tree), OUT (new directory), PYTHON. Optional:
-#   STAGES   stages in order (default smoke): smoke base e1 e2 e3 e4 e5 e5hbm e6 lat rep rep-e5
+#   STAGES   stages in order (default smoke): smoke base e1 e2 e3 e4 e5 e5hbm e6 lat freq rep rep-e5
 #            smoke  one pass over a handful of configurations, one and two sockets, both page sizes (counter format, placement,
 #                   JSON); base  HBM-only and DDR-only sweeps (cores x streams x prefetch distance, hint, non-temporal), picks
 #                   BEST_*;  e1 split teams;  e2 shared cores;  e3 page-interleaved regions;  e4 both sockets at the best
 #                   E1/E2/E3 settings;  e5 the Q8 GEMV over the 70B shard;  e5hbm all-HBM GEMV with fewer workers;
-#                   e6 sensitivity at the best E1 point;  lat loaded latency;  rep, rep-e5 the replication points
+#                   e6 sensitivity at the best E1 point;  lat loaded latency;  freq core/uncore frequency (turbostat) under long windows;
+#                   rep, rep-e5 the replication points
 #   REPS     repetitions per point of the measured stages (default 7);  BASE_REPS for base (default 3)
 #   PAGES    "2m 4k" (default)
 #   BEST_ENV a BEST_* file of an earlier job (otherwise the base stage of this job writes OUT/best.env)
@@ -183,6 +184,21 @@ for stage in $STAGES; do
     e5hbm) rounds e5hbm "$REPS" 1 ;;
     e6) rounds e6 "$REPS" 1 ;;
     lat) rounds lat "$REPS" 1 ;;
+    freq)
+      # Core and uncore frequency (turbostat, the only privileged tool besides perf this account may run) under long HBM-only,
+      # split and DDR-only windows; every line carries the wall-clock time it was read, to be matched with real_begin/real_end.
+      best=()
+      [[ -z $BEST_ENV ]] || best=(--best-env "$BEST_ENV")
+      # shellcheck disable=SC2086
+      ct cfgs freq ${best[@]+"${best[@]}"} --results "$OUT" $PRIOR > "$OUT/cfg/freq.cfg"
+      if ! dry_run; then
+        (sudo -n /usr/bin/turbostat --quiet --interval 1 --num_iterations 90 --cpu 0,1,56,57 2>&1 |
+          while IFS= read -r line; do printf '%s %s\n' "$(date +%s.%N)" "$line"; done > "$OUT/raw/freq.turbostat.txt") &
+        ts_pid=$!
+      fi
+      run_proc "freq-2m-r1" 2m 1 "$OUT/cfg/freq.cfg"
+      dry_run || wait "$ts_pid" || true
+      ;;
     rep) rounds rep "$REPS" 1 ;;
     rep-e5) rounds rep-e5 "$REPS" 1 ;;
     *) die "unknown stage '$stage'" ;;
