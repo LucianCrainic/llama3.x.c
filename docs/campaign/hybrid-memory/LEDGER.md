@@ -28,7 +28,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | in work | `perf/concurrent-tier-bandwidth` | sonnet | | |
+| P1 concurrent bandwidth | in work: smoke done, job A running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A) | ~0.3 + A |
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
@@ -88,6 +88,16 @@ the mirror's file list and sizes match it.
 - The warm-up exchange-timing bug it fixes is live on `develop` (`src/app.c` warm_up only clears `profile_enabled`).
 - Docs cite research commit hashes that will not exist after the port: rewrite or label as pre-port.
 - C-engine 70B Q8 rows (TTFT 84 / 326 s, decode 4.5-5.3 tok/s) predate gs32 AMX/VNNI: stale.
+
+## P1 interim (smoke, 1 repetition, NOT results)
+
+- HBM-only 56 cores ~560-615 GB/s/socket (above the old 552); DDR-only ~253-260; split 48/8 539-582; 28/28 465-540;
+  shared 3:1 552-615; pages 4:1 604-615: no split clearly above HBM-only so far.
+- All-HBM Q8 GEMV gs64 ~406-457 GB/s: below the stream ceiling (core/power-bound?); r=0.25 similar.
+- CAS bytes / computed 0.993-1.02 over 70 windows; placement 100%.
+- Package ~350 W (TDP) in HBM and split windows, core clock 1.5-1.7 GHz vs 2.6 GHz DDR-only: power cap is the leading
+  hypothesis. Prefetcher and uncore-frequency controls are not available (sudo allows perf stat, ipmitool, turbostat).
+- Manager asked for RAPL (both sockets) and frequency per window, GEMV vs cores/frequency, best-HBM baseline with spread.
 
 ## Prior evidence (measured, older tree; not campaign numbers)
 
