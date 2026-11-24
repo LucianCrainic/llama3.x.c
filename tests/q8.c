@@ -4,7 +4,8 @@
  *                  scalar models of their instructions, so their exact loops are checked on any host.
  * Checks: the batched quantizer is bitwise the per-token one; the portable backend equals the per-row GEMV bitwise on
  * the scalar instruction set; every backend is within the Q8 budget (2e-5 sum|w x| + 1e-6) of a double reference built
- * from the dequantized operands; the AMX int32 group dots are exactly the scalar int32 dots; gs % 64 != 0 falls back.
+ * from the dequantized operands; the AMX int32 group dots are exactly the scalar int32 dots, for gs % 64 == 0 and for
+ * gs = 32 (half-shape tiles) with k % 64 == 0; other group sizes fall back.
  */
 #include "gemm.h"
 #include "kernels.h"
@@ -397,17 +398,17 @@ static void run_matrix(const char *label) {
             float *amx = check_backend(&c, Q8_GEMM_AMX, 0);
             amx_ran += amx != NULL;
             free(amx);
-            if (gs % 64 == 0) {
+            if (gs % 64 == 0 || (gs == 32 && k % 64 == 0)) {
               check_amx_dots(&c);
               check_tiled(&c);
             }
-            /* The pick: AMX when active and gs % 64 == 0, the fallback otherwise, the result within budget either way.
-             */
+            /* The pick: AMX when active and gs % 64 == 0 or gs = 32 (an odd number of gs = 32 groups then runs the
+             * portable GEMM), the fallback otherwise, the result within budget either way. */
             gemm_amx_enable(1);
             GemmQ8Segment probe = {.n = ns[j], .pw = c.packed, .kind = GEMM_STORE};
             Q8GemmBackend picked = k_gemm_q8_pick(gs, &probe, 1);
             checks++;
-            if ((gs % 64 == 0) != (picked == Q8_GEMM_AMX))
+            if ((gs % 64 == 0 || gs == 32) != (picked == Q8_GEMM_AMX))
               bad("k_gemm_q8_pick", "amx chosen for an unsupported group size or not chosen for a supported one");
             free(check_backend(&c, Q8_GEMM_PORTABLE, 1));
             gemm_amx_enable(0);
@@ -439,6 +440,11 @@ static void run_large(const char *label) {
                            {64, 4096, 2048, 64},
                            {64, 14336, 4096, 64},
                            {53, 1024, 2048, 64},
+                           /* gs = 32, the Q8_0 GGUF block (half-shape tiles): K-blocks of 64 groups, M and N edges */
+                           {64, 130, 2048, 32},
+                           {64, 33, 8192, 32},
+                           {37, 520, 1024, 32},
+                           {16, 48, 14336, 32},
                            /* per-channel INT8: one group over all of K (gs = K, wider than the quantizer's piece) */
                            {64, 130, 4096, 4096},
                            {40, 48, 14336, 14336},

@@ -62,7 +62,7 @@ set on 20 November 2026. Each rule applies only while its own knob is unset, and
 | Sockets | 2 when the discovered topology has two sockets with allowed CPUs, each with an HBM node in the job's allowed memory (Flat mode on a Xeon Max), and neither `LLAMA_TOPOLOGY` nor `LLAMA_PLACEMENT=file\|ddr` is set; else 1. A job bound to one socket (`numactl --cpunodebind`, a one-socket allocation) therefore keeps one |
 | Placement | `hbm` with two sockets on such a node (each socket's shards in its own HBM, verified), `file` otherwise |
 | Prefill batch | where the batched GEMM runs (AVX-512 or AMX, or `LLAMA_PREFILL_GEMM=on`): 128 rows for FP32 on one socket, 64 on two, 256 for W8A8 and AMX-BF16; 1 on the scalar kernels, with `LLAMA_PREFILL_GEMM=off`, and for W8A32 |
-| Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
+| Kernels | `auto`: AVX-512 where available, scalar otherwise. Batched prefill then takes AMX where it can run: AMX-INT8 for `runq` W8A8 (group size a multiple of 64, or 32 when dim and hidden_dim are multiples of 128), AMX-BF16 when `LLAMA_PRECISION=bf16` was asked for. An FP32 checkpoint without it never gets AMX or asks for the tile permission (BF16 stays a user decision) |
 
 To reproduce a run made before these defaults, set `LLAMA_SOCKETS=1 LLAMA_PREFILL_BATCH=1 LLAMA_KERNELS=avx512` (and
 `LLAMA_ATTN=split` for runs before E4, `LLAMA_KV_LAYOUT=rows` for runs before E5.4; the layout changes speed, never results). The campaign scripts at tag `campaigns-2026-11` did this job-wide; `scripts/cresco8.sbatch` runs at the defaults. Runs made
@@ -226,7 +226,7 @@ bandwidth-bound to compute-bound. The precision ladder (user decision: each rung
 | AVX-512 FP32 GEMM | `k_gemm_f32`: register-blocked microkernel, K blocks of 1024 | `LLAMA_PREFILL_BATCH>1` on AVX-512 (`LLAMA_PREFILL_GEMM=auto`) |
 | AMX-BF16 | `k_gemm_bf16`: activations converted to BF16 (round to nearest even) into an aligned panel; weights pre-packed in VNNI pairs; FP32 sums | `LLAMA_PRECISION=bf16 LLAMA_KERNELS=amx` (`run`) |
 | AVX-512 VNNI Q8 | `k_gemm_q8` tiled VNNI, per-group int32 dots scaled into FP32 | `runq`, W8A8, `gs % 64 == 0` |
-| AMX-INT8 | `k_gemm_q8` on weights packed in VNNI quads: exact int32 group dots on tiles, same Q8_0 semantics | `runq`, W8A8, `LLAMA_KERNELS=amx` |
+| AMX-INT8 | `k_gemm_q8` on weights packed in VNNI quads: exact int32 group dots on tiles, same Q8_0 semantics; at `gs = 32` (the Q8_0 GGUF block) half-shape tiles (K-steps of 32 bytes, [gs32-amx.md](gs32-amx.md)) | `runq`, W8A8, `LLAMA_KERNELS=amx`, `gs % 64 == 0` or `gs = 32` |
 
 AMX specifics (`gemm.c`): the tile-data permission is requested once with `arch_prctl(ARCH_REQ_XCOMP_PERM)` before any
 worker can execute a tile instruction; each thread configures its tiles (16 rows x 64 bytes) and releases them on exit.

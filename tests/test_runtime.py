@@ -583,12 +583,14 @@ class RuntimeTests(unittest.TestCase):
 
     def test_q8_batched_engine_and_amx_int8(self):
         wide = create(self.root/'q8-64', config=self.WIDE, gs=64)
-        narrow = create(self.root/'q8-32', config=self.WIDE, gs=32)
+        narrow = create(self.root/'q8-16', config=self.WIDE, gs=16)
+        half = create(self.root/'q8-32', config=self.WIDE, gs=32)
         for binary in ('test-q8-engine', 'test-q8-engine-emul'):
             with self.subTest(binary=binary):
                 if not (BUILD/binary).exists():
                     self.skipTest(f'{binary} was not built')
-                result = subprocess.run([str(BUILD/binary), str(wide/'int8.bin'), str(narrow/'int8.bin')],
+                result = subprocess.run([str(BUILD/binary), str(wide/'int8.bin'), str(narrow/'int8.bin'),
+                                         str(half/'int8.bin')],
                                         capture_output=True, text=True, timeout=300)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('q8 engine: ok', result.stdout)
