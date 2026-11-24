@@ -27,7 +27,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
-| P0 recon | inventory done; docs page in work | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
+| P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
 | P1 concurrent bandwidth | in work | `perf/concurrent-tier-bandwidth` | sonnet | | |
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
