@@ -446,8 +446,12 @@ static int q8_pipelined = 1, q8_skewed = 1;
 static int q8_kb_rows = 1;
 
 #if GEMM_AMX
-/* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
- * and a 16 x 16 FP32 or int32 C block. Tiles 0-3 hold C (m block x n block), 4-5 the A blocks, 6-7 the B blocks. */
+/* Tiles 0-3 hold C (m block x n block), 4-5 the A blocks, 6-7 the B blocks. In the standard shape (K-steps of 64 bytes)
+ * every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
+ * and a 16 x 16 FP32 or int32 C block. In the half shape (K-steps of 32 bytes: the Q8 kernels at gs = 32) the A tiles
+ * are 16 x 32 int8 and the B tiles 8 K-quads of 16 columns, so one tdpbssd is the exact dot of one group of 32. Both
+ * are views of the same memory layouts: a K = 32 A tile is a 64-byte tile row's first or second half (offset 0 or 32,
+ * stride 64), a K = 32 B tile the first or last 8 quad rows of a packed 1 KiB tile (offset 0 or 512). */
 typedef struct {
   uint8_t palette_id, start_row, reserved[14];
   uint16_t colsb[16];
@@ -456,12 +460,14 @@ typedef struct {
 _Static_assert(sizeof(TileConfig) == 64, "the tile configuration is 64 bytes");
 
 static _Thread_local int amx_thread_ready;
+static _Thread_local int amx_thread_k; /* the configured K-step in bytes: 64, 32 (half shape) or 0 (none) */
 static pthread_key_t amx_key;
 static pthread_once_t amx_key_once = PTHREAD_ONCE_INIT;
 
 AMX_TARGET static void amx_thread_exit(void *unused) {
   (void)unused;
   AMX_RELEASE();
+  amx_thread_k = 0;
   free(q8_kb_buffer);
   q8_kb_buffer = NULL;
   q8_kb_floats = 0;
@@ -471,20 +477,48 @@ static void amx_key_create(void) {
   pthread_key_create(&amx_key, amx_thread_exit);
 }
 
-/* Configures this thread's tiles at its first AMX job. A worker's tile state ends with the thread (the key's destructor
- * releases it explicitly); the coordinator thread calls gemm_amx_thread_release() when the engine is torn down. */
-AMX_TARGET static void amx_thread_configure(void) {
-  if (amx_thread_ready)
+/* Configures this thread's tiles in the shape of K-steps of kstep bytes (64, or 32 for the gs = 32 Q8 kernels), at its
+ * first AMX job and whenever a job needs the other shape (loading a configuration zeroes the tiles; every kernel zeroes
+ * its C tiles before use anyway). A worker's tile state ends with the thread (the key's destructor releases it
+ * explicitly); the coordinator thread calls gemm_amx_thread_release() when the engine is torn down. */
+AMX_TARGET static void amx_thread_configure_k(int kstep) {
+  if (amx_thread_k == kstep)
     return;
   TileConfig config __attribute__((aligned(64))) = {.palette_id = 1};
   for (int t = 0; t < 8; t++) {
     config.rows[t] = 16;
     config.colsb[t] = 64;
   }
+  if (kstep == 32) {
+    config.colsb[4] = config.colsb[5] = 32;
+    config.rows[6] = config.rows[7] = 8;
+  }
   AMX_LOADCFG(&config);
+  amx_thread_k = kstep;
+  if (amx_thread_ready)
+    return;
   amx_thread_ready = 1;
   pthread_once(&amx_key_once, amx_key_create);
   pthread_setspecific(amx_key, &amx_thread_ready);
+}
+
+AMX_TARGET static void amx_thread_configure(void) {
+  amx_thread_configure_k(64);
+}
+
+/* The Q8 kernels' K-step in bytes: whole 64-byte tile rows, or half of one at gs = 32. */
+static inline int q8_kstep(int gs) {
+  return gs % 64 ? 32 : 64;
+}
+
+/* Byte offsets of K-step j (of kstep bytes; half = kstep == 32) in a tile-ordered activation block's row of 1 KiB tiles
+ * and in a packed weight tile: tile j / 2 at its first or second half (A: 32 bytes into each 64-byte row; B: the last 8
+ * of its 16 quad rows) at half shape, tile j otherwise. */
+static inline size_t q8_a_step(size_t j, int half) {
+  return ((j >> half) << 10) + ((j & (size_t)half) << 5);
+}
+static inline size_t q8_b_step(size_t j, int half) {
+  return ((j >> half) << 10) + ((j & (size_t)half) << 9);
 }
 
 AMX_TARGET void gemm_amx_thread_release(void) {
@@ -492,6 +526,7 @@ AMX_TARGET void gemm_amx_thread_release(void) {
     return;
   AMX_RELEASE();
   amx_thread_ready = 0;
+  amx_thread_k = 0;
   pthread_setspecific(amx_key, NULL);
   free(q8_kb_buffer);
   q8_kb_buffer = NULL;
@@ -583,19 +618,22 @@ AMX_TARGET void amx_s8_tile_gemm(int32_t *c, size_t ldc, const int8_t *a, size_t
 }
 /* One chunk of the batched Q8_0 GEMM on AMX-INT8 (C6): out[m][n] = sum over groups g of
  * fma((float)dot_g[m][n] * xs[m][g], ws[n][g], previous), for m, n <= 32. dot_g is the exact int32 dot of one K group,
- * computed with signed x signed `tdpbssd` (gs / 64 tile steps accumulate into the same tiles before the rescale). The
+ * computed with signed x signed `tdpbssd` (gs / 64 tile steps accumulate into the same tiles before the rescale; at
+ * gs = 32 one half-shape step, amx_thread_configure_k). The
  * rescale operand order is that of the AVX-512 GEMV (`fmadd(mul(cvt(i32), xs), ws, acc)`); results are not bitwise
  * equal to it because the GEMV keeps 16 lane accumulators and reduces at the end. a   int8 activations, row stride lda
- * bytes, readable up to 32 rows (rows >= m are never used), k % gs == 0, gs % 64 == 0 xs  activation scales, row stride
+ * bytes, readable up to 32 rows (rows >= m are never used), k % gs == 0, gs % 64 == 0 or gs == 32 xs  activation
+ * scales, row stride
  * xs_ld floats bp  weights packed by pack_s8_vnni, the (at most two) 16-row tiles of this chunk ws  weight scales of
  * the chunk's rows, row stride ws_ld floats (the checkpoint's [row][group] layout) probe  when non-NULL, receives the
  * int32 dots, probe[(g * 32 + r) * 32 + c] (tests) */
 AMX_AVX_TARGET void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t lda, const float *xs, size_t xs_ld,
                                  const int8_t *bp, const float *ws, size_t ws_ld, int m, int n, int k, int gs,
                                  int32_t *probe) {
-  amx_thread_configure();
+  const int kstep = q8_kstep(gs);
+  amx_thread_configure_k(kstep);
   const size_t tile = (size_t)k * 16;
-  const int wide = n > 16, tall = m > 16, groups = k / gs, steps = gs / 64;
+  const int wide = n > 16, tall = m > 16, groups = k / gs, steps = gs / kstep, half = kstep == 32;
   _Alignas(64) int32_t dots[32 * 32];
   float scale[32];
   for (int r = 0; r < m; r++)
@@ -610,13 +648,13 @@ AMX_AVX_TARGET void amx_q8_chunk(float *out, size_t ldo, const int8_t *a, size_t
         AMX_ZERO(3);
     }
     for (int t = 0; t < steps; t++) {
-      const size_t k0 = (size_t)g * (size_t)gs + (size_t)t * 64;
+      const size_t j = (size_t)g * (size_t)steps + (size_t)t, k0 = j * (size_t)kstep;
       AMX_LOADD(4, a + k0, lda);
       if (tall)
         AMX_LOADD(5, a + 16 * lda + k0, lda);
-      AMX_LOADD(6, bp + (k0 / 64) * 1024, 64);
+      AMX_LOADD(6, bp + q8_b_step(j, half), 64);
       if (wide)
-        AMX_LOADD(7, bp + tile + (k0 / 64) * 1024, 64);
+        AMX_LOADD(7, bp + tile + q8_b_step(j, half), 64);
       AMX_DPBSSD(0, 4, 6);
       if (wide)
         AMX_DPBSSD(1, 4, 7);
@@ -682,9 +720,10 @@ AMX_AVX_TARGET static inline void q8_tiled_rescale(float *o, const int32_t *d, c
 AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, const float *xs, size_t xs_ld,
                                               const int8_t *bp, const float *wst, int m, int n, int k, int gs, int g0,
                                               int g1) {
-  amx_thread_configure();
+  const int kstep = q8_kstep(gs), half = kstep == 32;
+  amx_thread_configure_k(kstep);
   const size_t tile = (size_t)k * 16, ksteps = (size_t)k / 64;
-  const int wide = n > 16, halves = m > 16 ? 2 : 1, steps = gs / 64, groups = k / gs, count = g1 * halves;
+  const int wide = n > 16, halves = m > 16 ? 2 : 1, steps = gs / kstep, groups = k / gs, count = g1 * halves;
   _Alignas(64) int32_t dots[2][16 * 32];
   if (groups == 1 && halves == 2 && wide) {
     /* One group over all of k (per-channel INT8): the four C tiles accumulate the whole product, each A and B tile is
@@ -729,19 +768,19 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
             AMX_ZERO(1);
         }
         for (int t = 0; t < steps; t++) {
-          const size_t ks = (size_t)g * (size_t)steps + (size_t)t;
-          if (rb == 0 || steps > 1) { /* gs = 64: the second half reuses the group's weight tiles */
-            AMX_LOADD(6, bp + ks * 1024, 64);
+          const size_t j = (size_t)g * (size_t)steps + (size_t)t;
+          if (rb == 0 || steps > 1) { /* one step per group: the second half reuses the group's weight tiles */
+            AMX_LOADD(6, bp + q8_b_step(j, half), 64);
             if (wide)
-              AMX_LOADD(7, bp + tile + ks * 1024, 64);
+              AMX_LOADD(7, bp + tile + q8_b_step(j, half), 64);
           }
           if (h & 1) {
-            AMX_LOADD(5, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_LOADD(5, ap + (size_t)rb * ksteps * 1024 + q8_a_step(j, half), 64);
             AMX_DPBSSD(2, 5, 6);
             if (wide)
               AMX_DPBSSD(3, 5, 7);
           } else {
-            AMX_LOADD(4, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_LOADD(4, ap + (size_t)rb * ksteps * 1024 + q8_a_step(j, half), 64);
             AMX_DPBSSD(0, 4, 6);
             if (wide)
               AMX_DPBSSD(1, 4, 7);
@@ -780,13 +819,13 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
           AMX_ZERO(1);
       }
       for (int t = 0; t < steps; t++) {
-        const size_t ks = (size_t)g * (size_t)steps + (size_t)t;
-        if (rb == 0 || steps > 1) { /* gs = 64: the second half reuses the group's weight tiles */
-          AMX_LOADD(6, bp + ks * 1024, 64);
+        const size_t j = (size_t)g * (size_t)steps + (size_t)t;
+        if (rb == 0 || steps > 1) { /* one step per group: the second half reuses the group's weight tiles */
+          AMX_LOADD(6, bp + q8_b_step(j, half), 64);
           if (wide)
-            AMX_LOADD(7, bp + tile + ks * 1024, 64);
+            AMX_LOADD(7, bp + tile + q8_b_step(j, half), 64);
         }
-        AMX_LOADD(4, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+        AMX_LOADD(4, ap + (size_t)rb * ksteps * 1024 + q8_a_step(j, half), 64);
         if (h & 1) {
           AMX_DPBSSD(2, 4, 6);
           if (wide)
@@ -1106,8 +1145,8 @@ static void rmsnorm_quantize_tiled_chunks(const void *p, int segment, int first,
 }
 
 static QuantizeTiledJob quantize_tiled_job(int8_t *q, float *s, const float *x, size_t ldx, int n, int gs) {
-  if (gs <= 0 || gs % 64 || n % gs)
-    fail("tile-order quantization needs a group size that is a multiple of 64 dividing n");
+  if (gs <= 0 || (gs % 64 && gs != 32) || n % gs || n % 64)
+    fail("tile-order quantization needs a group size of 32 or a multiple of 64 dividing n, and n a multiple of 64");
   int span = gs > Q8_TILED_PIECE ? gs : Q8_TILED_PIECE / gs * gs;
   return (QuantizeTiledJob){
       .x = x, .q = q, .s = s, .ldx = ldx, .n = n, .gs = gs, .span = span, .pieces = (n + span - 1) / span};
@@ -1447,18 +1486,20 @@ static void q8_gemm_blocks(const void *p, int unused, int first, int last) {
     hooks->turn(hooks->ctx, first, next, last, 1);
 }
 
+/* AMX-INT8 takes group sizes that are multiples of 64 and 32 (half-shape tiles), on packed weights; the AVX-512 rung
+ * multiples of 64; anything else the portable GEMM. */
 Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count) {
-  if (gs % 64 == 0) {
+  if (gs % 64 == 0 || gs == 32) {
     int packed = GEMM_AMX && gemm_amx_active();
     for (int s = 0; s < count && packed; s++)
       packed = segments[s].pw && (segments[s].kind != GEMM_SWIGLU || segments[s].pw3);
     if (packed)
       return Q8_GEMM_AMX;
-#if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
-    if (kernels_avx512_active())
-      return Q8_GEMM_AVX512;
-#endif
   }
+#if GEMM_AVX512 && !defined(GEMM_EMULATE_AVX512)
+  if (gs % 64 == 0 && kernels_avx512_active())
+    return Q8_GEMM_AVX512;
+#endif
   return Q8_GEMM_PORTABLE;
 }
 
@@ -1473,6 +1514,11 @@ static void q8_gemm_run(Q8GemmBackend backend, const int8_t *xq, const float *xs
       fail("GEMM_SWIGLU needs a second weight matrix");
   if (m <= 0 || k <= 0)
     return;
+  if (backend == Q8_GEMM_AMX && k % 64) { /* gs = 32 with an odd number of groups: no whole packed tiles */
+    if (tiled)
+      fail("the pipelined Q8 GEMM needs K a multiple of 64, got %d", k);
+    backend = Q8_GEMM_PORTABLE;
+  }
   if (tiled) {
     if (backend != Q8_GEMM_AMX)
       fail("the pipelined Q8 GEMM needs AMX and packed weights");
@@ -1564,7 +1610,7 @@ int k_gemm_q8_backend_test(Q8GemmBackend backend, const int8_t *xq, const float 
                            const GemmQ8Segment *segments, int count) {
   if ((backend == Q8_GEMM_AMX && !GEMM_AMX) || (backend == Q8_GEMM_AVX512 && !GEMM_AVX512))
     return 0;
-  if (backend != Q8_GEMM_PORTABLE && gs % 64)
+  if ((backend == Q8_GEMM_AVX512 && gs % 64) || (backend == Q8_GEMM_AMX && gs % 64 && gs != 32))
     return 0;
   q8_gemm_run(backend, xq, xs, m, k, gs, segments, count, 0, NULL);
   return 1;

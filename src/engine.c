@@ -92,22 +92,24 @@ static void configure_fp32(Model *model, Transformer *t) {
 }
 
 /* Q8: W8A8 prefill takes 256 rows per pass, on AMX-INT8 where it can run (C6); W8A32 never batches, it stays on the
- * per-row kernel. The rungs below AMX: the VNNI Q8 GEMM, and the portable one when the group size is not a multiple of
- * 64. */
+ * per-row kernel. AMX-INT8 takes group sizes that are multiples of 64, and 32 (the Q8_0 GGUF block) when dim and
+ * hidden_dim are multiples of 128 (whole 64-byte k-steps on one or two sockets). The rungs below AMX: the VNNI Q8 GEMM
+ * (multiples of 64), and the portable one otherwise. */
 static void configure_q8(Model *model) {
   prefill_configure(model, fp32_activations ? 1 : 256);
   /* Per-channel INT8 (GS 0): each product's group is its per-socket input width, whole 64-byte k-steps when dim and
    * hidden_dim are multiples of 128 (one or two sockets). */
   const Config *c = &model->config;
   int gs64 = GS ? GS % 64 == 0 : c->dim % 128 == 0 && c->hidden_dim % 128 == 0;
-  if (!fp32_activations && model->prefill_gemm && gs64)
+  int amx_groups = gs64 || (GS == 32 && c->dim % 128 == 0 && c->hidden_dim % 128 == 0);
+  if (!fp32_activations && model->prefill_gemm && amx_groups)
     kernels_select_amx_auto();
   if (fp32_activations) {
     model->prefill_gemm = 0;
     if (kernels_amx_active())
       LOG(LOG_INFO, "W8A32 prefill uses avx512: the per-row kernel, never AMX-INT8");
   } else if (model->prefill_gemm) {
-    if (kernels_amx_active() && gs64) {
+    if (kernels_amx_active() && amx_groups) {
       model->prefill_kernel = "amx-int8";
       /* 1024 rows per pass on AMX-INT8 (prefill-gap fix 8: bitwise any M; the M sweep of job 5892402 put 1024 fastest
        * at 2048 and 8192 tokens, one and two sockets): each weight matrix streams from memory once per 1024 rows. */
@@ -121,8 +123,9 @@ static void configure_q8(Model *model) {
       if (kernels_avx512_active())
         LOG(LOG_INFO, "W8A8 batched prefill: group size %d is not a multiple of 64, using the portable Q8 GEMM", GS);
     }
-    if (kernels_amx_active() && !gs64)
-      LOG(LOG_INFO, "AMX-INT8 needs a group size that is a multiple of 64 (this checkpoint has %d): falling back", GS);
+    if (kernels_amx_active() && !amx_groups)
+      LOG(LOG_INFO, "AMX-INT8 needs a group size of 32 or a multiple of 64 (this checkpoint has %d, dim %d, hidden %d): "
+                    "falling back", GS, c->dim, c->hidden_dim);
   }
 }
 

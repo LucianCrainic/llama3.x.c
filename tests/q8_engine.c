@@ -1,10 +1,13 @@
 /* Batched Q8_0 prefill, end to end on the Q8 engine (C6). Linked with src/runq.c. argv[1] is a checkpoint whose group
- * size is a multiple of 64 (the AVX-512 / AMX-INT8 path), argv[2] one whose group size is not (the fallback).
+ * size is a multiple of 64 (the AVX-512 / AMX-INT8 path), argv[2] one whose group size AMX-INT8 cannot take (neither
+ * 32 nor a multiple of 64: the fallback), argv[3] one with group size 32 (AMX-INT8 with half-shape tiles).
  *  1. On the scalar instruction set the batched GEMM prefill equals the per-token forward bitwise, for any split.
  *  2. AMX-INT8 (the tile model in the emulated build, hardware where present) agrees with the portable batched forward
  *     within the Q8 budget; the difference is recorded.
  *  3. The per-token path (decode) is unchanged by selecting amx.
- *  4. W8A32 never uses the batched GEMM, with or without amx; a group size that is not a multiple of 64 falls back. */
+ *  4. W8A32 never uses the batched GEMM, with or without amx; a group size AMX-INT8 cannot take falls back; group size
+ *     32 runs AMX-INT8, independent of the split, and agrees with its portable batched forward up to activation
+ *     rounding flips (below). */
 #include "gemm.h"
 #include "kernels.h"
 #include "runtime.h"
@@ -76,8 +79,8 @@ static double max_diff(const Run *a, const Run *b, double *max_rel) {
 }
 
 int main(int argc, char **argv) {
-  assert(argc == 3);
-  const char *wide = argv[1], *narrow = argv[2];
+  assert(argc == 4);
+  const char *wide = argv[1], *narrow = argv[2], *half = argv[3];
   const size_t bytes = 0;
   (void)bytes;
   /* The budgets below are the GEMM's: keep the W8A8 defaults that change other rounding (AMX-BF16 attention, the
@@ -127,15 +130,45 @@ int main(int argc, char **argv) {
     check(!f32_amx.gemm, "W8A32 used the batched GEMM under amx");
     check(memcmp(f32_amx.logits, f32_base.logits, TOKENS * f32_amx.vocab * sizeof(float)) == 0,
           "W8A32 under amx differs from W8A32 without it");
-    /* 4b. gs % 64 != 0 */
+    /* 4b. a group size AMX-INT8 cannot take */
     Run narrow_amx = forward_all(narrow, "amx", "auto", "int8", 7, 0);
     Run narrow_scalar = forward_all(narrow, "scalar", "on", "int8", 7, 0);
-    check(!strcmp(narrow_amx.kernel, "portable-q8"), "gs=32 under amx did not fall back to the portable Q8 GEMM");
+    check(!strcmp(narrow_amx.kernel, "portable-q8"), "gs=16 under amx did not fall back to the portable Q8 GEMM");
     check(memcmp(narrow_amx.logits, narrow_scalar.logits, TOKENS * narrow_amx.vocab * sizeof(float)) == 0 ||
               !strcmp(base, "avx512"),
-          "gs=32 fallback differs from the scalar batched forward");
+          "gs=16 fallback differs from the scalar batched forward");
+    /* 4c. gs = 32: AMX-INT8 with half-shape tiles */
+    Run half_amx = forward_all(half, "amx", "auto", "int8", 7, 0);
+    Run half_portable = forward_all(half, "scalar", "on", "int8", TOKENS, 0);
+    check(!strcmp(half_amx.kernel, "amx-int8"), "amx did not select amx-int8 for gs = 32");
+    /* The AMX rescale (fma(dot * xs, ws, acc)) rounds differently from the portable one (acc += dot * ws * xs) by about
+     * 1e-7; an activation within that of an int8 rounding boundary then quantizes one step apart in the next layer and
+     * moves its position (and, through its K/V, later ones) by up to about 1e-2 on this fixture (positions 17-23; with
+     * the portable kernel switched to the AMX expression the two forwards are bitwise equal, docs/gs32-amx.md). So:
+     * every position keeps its argmax and no logit moves by more than 5e-2. */
+    double half_rel, half_abs = max_diff(&half_amx, &half_portable, &half_rel);
+    int beyond = 0, argmax_ok = 1;
+    for (int t = 0; t < TOKENS; t++) {
+      const float *a = half_amx.logits + (size_t)t * half_amx.vocab, *p = half_portable.logits + (size_t)t * half_amx.vocab;
+      size_t ia = 0, ip = 0;
+      double worst = 0;
+      for (size_t v = 0; v < half_amx.vocab; v++) {
+        ia = a[v] > a[ia] ? v : ia;
+        ip = p[v] > p[ip] ? v : ip;
+        worst = fmax(worst, fabs((double)a[v] - p[v]));
+      }
+      beyond += worst > 1e-4;
+      argmax_ok &= ia == ip;
+    }
+    printf("q8 engine: gs=32 amx-int8 vs portable batched Q8 forward: max_abs=%.3e max_rel=%.3e, %d of %d positions beyond "
+           "1e-4\n", half_abs, half_rel, beyond, TOKENS);
+    check(argmax_ok && half_abs <= 5e-2, "gs=32 AMX-INT8 forward disagrees with the portable one beyond rounding flips");
+    Run half_again = forward_all(half, "amx", "auto", "int8", TOKENS, 0);
+    double half_rel2, half_abs2 = max_diff(&half_amx, &half_again, &half_rel2);
+    check(half_abs2 == 0, "gs=32 AMX-INT8 results depend on the microbatch split");
     memory_free(amx.logits), memory_free(decode.logits), memory_free(decode_base.logits), memory_free(f32_amx.logits),
-        memory_free(f32_base.logits), memory_free(narrow_amx.logits), memory_free(narrow_scalar.logits);
+        memory_free(f32_base.logits), memory_free(narrow_amx.logits), memory_free(narrow_scalar.logits),
+        memory_free(half_amx.logits), memory_free(half_portable.logits), memory_free(half_again.logits);
   }
   memory_free(reference.logits), memory_free(portable.logits);
   for (int i = 0; i < MEM_COUNT; i++)

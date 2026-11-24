@@ -1184,8 +1184,10 @@ static Tp *tp_new(const Config *p, int sockets, int quantized, int gs, int fp32_
   tp->quantized = quantized;
   tp->fp32_activations = fp32_activations;
   tp->gs = quantized ? gs : 0;
-  /* Per-channel INT8 (gs 0) has one group per product: every per-socket input width must be whole k-steps. */
-  int steps = gs ? gs % 64 == 0 : (p->dim / sockets) % 64 == 0 && (p->hidden_dim / sockets) % 64 == 0;
+  /* Per-channel INT8 (gs 0) has one group per product, and gs = 32 half k-steps: every per-socket input width must be
+   * whole k-steps. */
+  int widths = (p->dim / sockets) % 64 == 0 && (p->hidden_dim / sockets) % 64 == 0;
+  int steps = gs ? gs % 64 == 0 || (gs == 32 && widths) : widths;
   tp->tiled = pack == TP_PACK_INT8 && steps && k_gemm_q8_tiled_active();
   return tp;
 }

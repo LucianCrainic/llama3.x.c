@@ -113,7 +113,8 @@ void pack_bf16_vnni_many(const PackBf16 *jobs, int count);
  * per token row and group by k_quantize, per group `(float)(int32 dot) * ws * xs` accumulated in FP32. Three backends
  * with that semantic: the portable one (the scalar GEMV's arithmetic, so on the scalar instruction set it equals the
  * per-row GEMV bitwise), a tiled AVX-512 VNNI kernel (the "avx512-q8" rung; agrees with the GEMV within the Q8 budget),
- * and AMX-INT8 on weights packed by pack_s8_vnni (exact int32 group dots; same budget). gs % 64 != 0 uses the portable
+ * and AMX-INT8 on weights packed by pack_s8_vnni (exact int32 group dots; same budget). AMX-INT8 takes gs % 64 == 0
+ * and gs = 32 (half-shape tiles, k % 64 == 0), the VNNI kernel gs % 64 == 0; other group sizes use the portable
  * backend. W8A32 is not routed through any of them. */
 typedef struct {
   float *c; /* m x n output, row-major, leading dimension ldc */

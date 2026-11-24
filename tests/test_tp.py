@@ -37,6 +37,7 @@ class TensorParallelTests(unittest.TestCase):
         }
         cls.fixtures['gs16'] = create(root/'gs16', config=TP_CONFIG, gs=16)
         cls.fixtures['wide'] = create(root/'wide', config=TP_WIDE_CONFIG, gs=64)
+        cls.fixtures['wide-gs32'] = create(root/'wide-gs32', config=TP_WIDE_CONFIG, gs=32)
         # per-channel INT8 (version 4): one scale per output channel, the same weights as `wide`
         cls.fixtures['wide-pc'] = upgrade_v3(create(root/'wide-pc', config=TP_WIDE_CONFIG, gs=0), config=TP_WIDE_CONFIG,
                                              gs=0, int8_version=4)
@@ -70,6 +71,24 @@ class TensorParallelTests(unittest.TestCase):
             top = max(r1)
             # argmax agreement, allowing a tie within the tolerance
             self.assertGreaterEqual(r2[r1.index(top)], max(r2) - (abs_tol + rel_tol * abs(top)))
+
+    def assert_agree_but_flips(self, one, two, vocab, flips=1, flip_tol=1e-2):
+        """assert_agree for W8A8 paths whose GEMM rescale rounds differently from the reference's: an activation that
+        lands on an int8 rounding boundary can quantize one step apart, which moves that position's logits by up to about
+        1e-3 and nothing else (the K/V it writes stay within the budget, so later positions agree). At most `flips` rows
+        may exceed the elementwise budget, by at most flip_tol; every row keeps its argmax within the row's tolerance."""
+        self.assertEqual(len(one), len(two))
+        off = 0
+        for row in range(len(one) // vocab):
+            r1, r2 = one[row*vocab:(row+1)*vocab], two[row*vocab:(row+1)*vocab]
+            worst = max(abs(a - b) - (ABS + REL * abs(a)) for a, b in zip(r1, r2))
+            tol = ABS + REL * abs(max(r1))
+            if worst > 0:
+                off += 1
+                self.assertLessEqual(worst, flip_tol, f'row {row}')
+                tol = flip_tol
+            self.assertGreaterEqual(r2[r1.index(max(r1))], max(r2) - tol, f'row {row}: argmax')
+        self.assertLessEqual(off, flips, f'{off} rows beyond the budget')
 
     def test_fp32_logits_agree_with_one_socket(self):
         for name, vocab in [('shared', TP_CONFIG[5]), ('unshared', TP_CONFIG[5]), ('odd', TP_ODD_CONFIG[5])]:
@@ -262,7 +281,8 @@ class TensorParallelTests(unittest.TestCase):
         self.assertEqual(data['runtime']['kernels_prefill'], 'amx-int8')
         self.assertEqual(sorted(r['socket'] for r in data['regions'] if r['role'] == 'packed'), [0, 1])
         self.assertGreater(data['memory_bytes']['packed_weights_peak'], 0)
-        # A group size below 64 cannot use the tile kernel: the VNNI or portable rung runs, with no packed copies.
+        # A group size other than 32 or a multiple of 64 cannot use the tile kernel: the VNNI or portable rung runs, with
+        # no packed copies.
         data = self.report('runq', 'int8.bin', binary='runq-amx-emul', full=True, LLAMA_KERNELS='amx',
                            LLAMA_PREFILL_BATCH='4')
         self.assertEqual(data['runtime']['kernels_prefill'], 'portable-q8')
@@ -318,6 +338,32 @@ class TensorParallelTests(unittest.TestCase):
                                 timeout=60, env=environment(1, LLAMA_Q8_KB_ORDER='bogus'))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('LLAMA_Q8_KB_ORDER must be rows or chunks', result.stderr)
+
+    def test_amx_int8_gs32_half_tiles(self):
+        """Group size 32 (the Q8_0 GGUF block) on AMX-INT8 with half-shape tiles: the tile kernel runs (packed copies on
+        both sockets), every tiled mode and K-block order gives bitwise the logits of the AMX chunk kernel, and the
+        result agrees with the per-token reference on one and two sockets, up to one position whose activation quantization
+        rounds one step apart (assert_agree_but_flips: position 10 of this prompt, on both kernels; eight other prompts
+        showed none)."""
+        self.need('probe-int8-amx-emul')
+        knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all', 'LLAMA_ATTN': 'tiled', 'LLAMA_SWIGLU_EXP': 'libm'}
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        reference = self.logits('int8', 'wide-gs32', None, 1, tokens=tokens)
+        for batch in (2, 5, 32):
+            for sockets in (1, 2):
+                with self.subTest(batch=batch, sockets=sockets):
+                    args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
+                    chunk = self.logits('int8', 'wide-gs32', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
+                    for mode, order in (('skewed', 'rows'), ('pipelined', 'rows'), ('skewed', 'chunks')):
+                        tiled = self.logits('int8', 'wide-gs32', 'batch', sockets, LLAMA_Q8_GEMM=mode,
+                                            LLAMA_Q8_KB_ORDER=order, **args)
+                        self.assertEqual(chunk.tobytes(), tiled.tobytes(), (mode, order))
+                    self.assert_agree_but_flips(reference, chunk, TP_WIDE_CONFIG[5])
+        for sockets in (1, 2):
+            data = self.report('runq', 'int8.bin', sockets=sockets, fixture='wide-gs32', binary='runq-amx-emul',
+                               full=True, LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4')
+            self.assertEqual(data['runtime']['kernels_prefill'], 'amx-int8')
+            self.assertEqual(sorted(r['socket'] for r in data['regions'] if r['role'] == 'packed'), list(range(sockets)))
 
     def test_interleaved_batch_reduction_is_bitwise_the_barrier_one(self):
         """LLAMA_TP_BATCH_REDUCE=interleaved (each stored block of the two-socket W8A8 Wo/W2 partials is added into the
