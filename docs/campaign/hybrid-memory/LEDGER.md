@@ -31,7 +31,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P1 concurrent bandwidth | in work | `perf/concurrent-tier-bandwidth` | sonnet | | |
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
-| P2b 70B port | inventory done, awaiting owner approval (Q1) | `feature/70b-comparison` | sonnet | | |
+| P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
 | Downloads / 70B gs64 conversion | waiting on P0 | | haiku | | |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
@@ -43,6 +43,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | --- | --- | --- |
 | 24 Nov | Removed the three existing mentions of the earlier branch prefix from `docs/` (gs32-amx, C1 plan, C1 validation) on this branch | Owner rule §2: the name must not appear in `develop`. Commit history on `develop` has none (checked `git log` messages and authors) |
 | 24 Nov | P1 starts from the earlier concurrent-stream code (measured, older tree: job 5904726) rather than from scratch | It already pins two core groups to separate tiers with verified placement; E1-E6 extend it. Code is re-committed under the campaign's rules |
+| 24 Nov | P2b porting waits for the P2 merge, then one sonnet agent ports steps 1-6 in order on `feature/70b-comparison`; step 7 (70B Q8 re-run) after the gs64/gs32 70B files exist | Plan §P2b: port onto the planner; avoids porting onto a moving merge branch |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
 
 ## P2b inventory (verified 24 Nov)
@@ -72,4 +73,4 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 
 | # | Question | State |
 | --- | --- | --- |
-| Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | sent 24 Nov, waiting |
+| Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
