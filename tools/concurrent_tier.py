@@ -154,7 +154,7 @@ def gen(stage, env, results=None):
                 add(fmt(name=f'e5-gs{gs}-r{r}-shared', kind='gemv', gs=gs, r=r, gshared=1))
     elif stage == 'e5hbm':
         for gs in (64, 32):
-            for act in (32, 40, 48, 52, 56):
+            for act in (14, 28, 32, 42, 48, 56):
                 add(fmt(name=f'e5hbm-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
     elif stage == 'e6':
         best = best_points(results or [], env)
@@ -198,6 +198,8 @@ def gen(stage, env, results=None):
         for gs in (64, 32):
             for r, cdw in ((0, 0), (0.1, 6), (0.2, 11), (0.3, 17), (1.0, 55)):
                 add(fmt(name=f'e5-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
+            for act in (28, 42):
+                add(fmt(name=f'e5hbm-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
     else:
         raise SystemExit(f'unknown stage {stage}')
     return out
