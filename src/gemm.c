@@ -439,6 +439,11 @@ void aligned_buffer_free(AlignedBuffer *buffer) {
 
 static _Thread_local float *q8_kb_buffer; /* the K-blocked driver's accumulators (q8_gemm_blocks_kblocked) */
 static _Thread_local size_t q8_kb_floats;
+/* LLAMA_Q8_GEMM: the tiled kernel (skewed, the default, or pipelined) or the chunk kernel. Set by gemm_q8_init_env. */
+static int q8_pipelined = 1, q8_skewed = 1;
+/* LLAMA_Q8_KB_ORDER: the order of a K-blocked piece's blocks within each K-block (q8_gemm_blocks_kblocked): rows (the
+ * default, row block outer) or chunks (channel chunk outer). Set by gemm_q8_init_env. */
+static int q8_kb_rows = 1;
 
 #if GEMM_AMX
 /* Every tile is 16 rows of 64 bytes: a 16 x 32 BF16 or 16 x 64 int8 A block, a K-pair or K-quad B block of 16 columns,
@@ -704,6 +709,61 @@ AMX_AVX_TARGET static void amx_q8_block_tiled(float *out, const int8_t *ap, cons
     AMX_STORED(3, dots[1] + 16, 32 * sizeof(int32_t));
     q8_tiled_rescale(out, dots[0], xs, xs_ld, wst, 16, 1);
     q8_tiled_rescale(out + 16 * 32, dots[1], xs + 16 * xs_ld, xs_ld, wst, m - 16, 1);
+    return;
+  }
+  if (q8_skewed) {
+    /* LLAMA_Q8_GEMM=skewed: half-step h's tile products are issued first (C pair {0,1} or {2,3}, A tile 4 or 5 by
+     * parity), then half-step h-1's pair is stored and rescaled, so a tile store never waits on the products just
+     * issued before it (prototype amx_q8_proto2 variant 5: 135 -> 104 cycles per half-step on one core, L2-resident;
+     * job 5910129). Same products, same rescale order: bitwise the pipelined kernel. */
+    for (int h = g0 * halves; h <= count; h++) {
+      if (h < count) {
+        const int g = h / halves, rb = h % halves;
+        if (h & 1) {
+          AMX_ZERO(2);
+          if (wide)
+            AMX_ZERO(3);
+        } else {
+          AMX_ZERO(0);
+          if (wide)
+            AMX_ZERO(1);
+        }
+        for (int t = 0; t < steps; t++) {
+          const size_t ks = (size_t)g * (size_t)steps + (size_t)t;
+          if (rb == 0 || steps > 1) { /* gs = 64: the second half reuses the group's weight tiles */
+            AMX_LOADD(6, bp + ks * 1024, 64);
+            if (wide)
+              AMX_LOADD(7, bp + tile + ks * 1024, 64);
+          }
+          if (h & 1) {
+            AMX_LOADD(5, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_DPBSSD(2, 5, 6);
+            if (wide)
+              AMX_DPBSSD(3, 5, 7);
+          } else {
+            AMX_LOADD(4, ap + ((size_t)rb * ksteps + ks) * 1024, 64);
+            AMX_DPBSSD(0, 4, 6);
+            if (wide)
+              AMX_DPBSSD(1, 4, 7);
+          }
+        }
+      }
+      if (h > g0 * halves) { /* half-step p = h - 1: store its C pair, then rescale it */
+        const int p = h - 1, g = p / halves, rb = p % halves, rows = m - rb * 16 < 16 ? m - rb * 16 : 16;
+        int32_t *d = dots[p & 1];
+        if (p & 1) {
+          AMX_STORED(2, d, 32 * sizeof(int32_t));
+          if (wide)
+            AMX_STORED(3, d + 16, 32 * sizeof(int32_t));
+        } else {
+          AMX_STORED(0, d, 32 * sizeof(int32_t));
+          if (wide)
+            AMX_STORED(1, d + 16, 32 * sizeof(int32_t));
+        }
+        q8_tiled_rescale(out + rb * 16 * 32, d, xs + (size_t)rb * 16 * xs_ld + (size_t)g, xs_ld, wst + (size_t)g * 32,
+                         rows, wide);
+      }
+    }
     return;
   }
   for (int h = g0 * halves; h <= count; h++) {
@@ -1295,10 +1355,13 @@ static void q8_gemm_block(const Q8GemmJob *job, const GemmQ8Segment *seg, int n0
 enum { Q8_KBLOCK = 2048, Q8_KB_PIECE = 64 };
 
 /* The tiled product in K-blocks: a worker takes up to Q8_KB_PIECE of its blocks at a time and, for each K-block of
- * job->kgroups groups, adds that K-block's sums to every block's FP32 accumulator before moving to the next, so the
- * activation panel slice of one K-block (m x K-block bytes) stays in L2 while all the piece's channel chunks pass over
- * it. Each output element still adds its groups in ascending order through the same fma, so the result is bitwise the
- * one-pass kernel's. */
+ * job->kgroups groups, adds that K-block's sums to every block's FP32 accumulator before moving to the next. Within a
+ * K-block the piece's blocks run row block outer (LLAMA_Q8_KB_ORDER=rows, the default): one row block's activation
+ * slice (Q8_MB x K-block bytes, 64 KiB) stays in L2 while the piece's channel chunks (their weight slices, 64 KiB each,
+ * stay in L2 across the row blocks) pass over it. In channel chunk order (=chunks, the way back) the whole activation
+ * slice of the K-block (m x K-block bytes, 2 MiB at m = 1024) passes between two uses of a row block's slice and comes
+ * from LLC every time. Each output element still adds its groups in ascending order through the same fma, so the result
+ * is bitwise the one-pass kernel's in both orders. */
 static void q8_gemm_blocks_kblocked(const Q8GemmJob *job, int first, int last) {
   const int mblocks = (job->m + Q8_MB - 1) / Q8_MB, per = Q8_MB * 32;
   const size_t need = (size_t)Q8_KB_PIECE * 2 * (size_t)per;
@@ -1314,14 +1377,22 @@ static void q8_gemm_blocks_kblocked(const Q8GemmJob *job, int first, int last) {
   for (int p0 = first; p0 < last; p0 += Q8_KB_PIECE) {
     const int p1 = last - p0 < Q8_KB_PIECE ? last : p0 + Q8_KB_PIECE;
     memset(q8_kb_buffer, 0, (size_t)(p1 - p0) * 2 * (size_t)per * sizeof(float));
+    /* The piece's blocks with their segments, in the order they run: row block outer (rows) or as listed (chunks). */
+    int order[Q8_KB_PIECE], segs[Q8_KB_PIECE], bases[Q8_KB_PIECE], count = 0;
+    for (int r = 0; r < (q8_kb_rows ? mblocks : 1); r++)
+      for (int t = p0, s = 0, base = 0; t < p1; t++) {
+        while (t >= base + job->blocks[s])
+          base += job->blocks[s++];
+        if (q8_kb_rows && (t - base) % mblocks != r)
+          continue;
+        order[count] = t, segs[count] = s, bases[count++] = base;
+      }
     for (int g0 = 0, g1, done = 0; !done; g0 = g1) {
       done = g0 >= job->groups;
       g1 = done || job->groups - g0 < job->kgroups ? job->groups : g0 + job->kgroups;
-      int s = 0, base = 0;
-      for (int t = p0; t < p1; t++) {
-        while (t >= base + job->blocks[s])
-          base += job->blocks[s++];
-        const GemmQ8Segment *seg = &job->segment[s];
+      for (int i = 0; i < count; i++) {
+        const int t = order[i], base = bases[i];
+        const GemmQ8Segment *seg = &job->segment[segs[i]];
         const int chunk = (t - base) / mblocks, n0 = chunk * 32, nc = seg->n - n0 < 32 ? seg->n - n0 : 32,
                   m0 = ((t - base) % mblocks) * Q8_MB, mb = job->m - m0 < Q8_MB ? job->m - m0 : Q8_MB;
         float *acc = q8_kb_buffer + (size_t)(t - p0) * 2 * (size_t)per, *gate = acc + per;
@@ -1450,22 +1521,38 @@ void k_gemm_q8_interleaved(const int8_t *xq, const float *xs, int m, int k, int 
   q8_gemm_run(k_gemm_q8_pick(gs, segment, 1), xq, xs, m, k, gs, segment, 1, tiled, hooks);
 }
 
-static int q8_pipelined = 1;
-
-/* LLAMA_Q8_GEMM=pipelined (the default: bitwise the chunk kernel's results, faster on one and two sockets; the decision
- * table is in docs/prefill-gap.md) or chunk, the previous kernel on row-major activations, kept as the way back. */
+/* LLAMA_Q8_GEMM=skewed (the default: the pipelined kernel with each half-step's tile store issued after the next
+ * half-step's tile products), pipelined (the store right after its own products) or chunk (the kernel on row-major
+ * activations). All three give bitwise the same results; pipelined and chunk are the ways back (decision tables in
+ * docs/prefill-gap.md and docs/gs64-gemm.md). */
 void gemm_q8_init_env(void) {
+  const char *order = getenv("LLAMA_Q8_KB_ORDER");
+  q8_kb_rows = 1;
+  if (order && *order && strcmp(order, "rows")) {
+    if (strcmp(order, "chunks"))
+      fail("LLAMA_Q8_KB_ORDER must be rows or chunks");
+    q8_kb_rows = 0;
+  }
   const char *mode = getenv("LLAMA_Q8_GEMM");
   q8_pipelined = 1;
-  if (!mode || !*mode || !strcmp(mode, "pipelined"))
+  q8_skewed = 1;
+  if (!mode || !*mode || !strcmp(mode, "skewed"))
     return;
+  if (!strcmp(mode, "pipelined")) {
+    q8_skewed = 0;
+    return;
+  }
   if (strcmp(mode, "chunk"))
-    fail("LLAMA_Q8_GEMM must be pipelined or chunk");
+    fail("LLAMA_Q8_GEMM must be skewed, pipelined or chunk");
   q8_pipelined = 0;
+  q8_skewed = 0;
 }
 
+const char *k_gemm_q8_kb_order_name(void) {
+  return q8_kb_rows ? "rows" : "chunks";
+}
 const char *k_gemm_q8_mode_name(void) {
-  return q8_pipelined ? "pipelined" : "chunk";
+  return !q8_pipelined ? "chunk" : q8_skewed ? "skewed" : "pipelined";
 }
 
 int k_gemm_q8_tiled_active(void) {

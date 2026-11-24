@@ -273,11 +273,13 @@ class TensorParallelTests(unittest.TestCase):
         self.assertIsNone(data['runtime']['kernels_prefill'])
         self.assertEqual([r for r in data['regions'] if r['role'] == 'packed'], [])
 
-    def test_amx_int8_pipelined_kernel_is_bitwise_the_chunk_kernel(self):
-        """LLAMA_Q8_GEMM=pipelined (the default: tile-order activations, transposed weight scales, overlapped rescale)
-        gives bitwise the logits of the chunk kernel (LLAMA_Q8_GEMM=chunk, the way back), on one and two sockets, all
-        positions, batches that end mid-block; it is reported in build.q8_gemm, packs the transposed scales, and refuses
-        other values."""
+    def test_amx_int8_tiled_kernels_are_bitwise_the_chunk_kernel(self):
+        """LLAMA_Q8_GEMM=skewed (the default: the pipelined kernel with each tile store issued after the next half-step's
+        tile products) and =pipelined (tile-order activations, transposed weight scales, overlapped rescale) give bitwise
+        the logits of the chunk kernel (LLAMA_Q8_GEMM=chunk, the way back), on one and two sockets, all positions,
+        batches that end mid-block, in both K-block orders (LLAMA_Q8_KB_ORDER=rows, the default, and =chunks); the mode
+        is reported in build.q8_gemm and the order in build.q8_kb_order, the tiled kernels pack the transposed scales,
+        and other values are refused."""
         self.need('probe-int8-amx-emul')
         knobs = {'LLAMA_KERNELS': 'amx', 'LLAMA_PREFILL_LOGITS': 'all'}
         for prompt in (5, 33):
@@ -287,34 +289,47 @@ class TensorParallelTests(unittest.TestCase):
                     with self.subTest(prompt=prompt, batch=batch, sockets=sockets):
                         args = dict(tokens=tokens, binary='probe-int8-amx-emul', LLAMA_PREFILL_BATCH=str(batch), **knobs)
                         chunk = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='chunk', **args)
-                        pipelined = self.probe('int8', 'wide', 'batch', sockets, **args)
+                        pipelined = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_GEMM='pipelined', **args)
+                        skewed = self.probe('int8', 'wide', 'batch', sockets, **args)
+                        chunks = self.probe('int8', 'wide', 'batch', sockets, LLAMA_Q8_KB_ORDER='chunks', **args)
                         self.assertEqual(len(chunk), prompt * TP_WIDE_CONFIG[5] * 4)
                         self.assertEqual(chunk, pipelined)
+                        self.assertEqual(chunk, skewed)
+                        self.assertEqual(chunk, chunks)
         for sockets in (1, 2):
             reports = {mode: self.report('runq', 'int8.bin', sockets=sockets, fixture='wide', binary='runq-amx-emul',
                                          full=True, LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='4', LLAMA_Q8_GEMM=mode)
-                       for mode in ('chunk', 'pipelined')}
-            self.assertEqual(reports['chunk']['build']['q8_gemm'], 'chunk')
-            self.assertEqual(reports['pipelined']['build']['q8_gemm'], 'pipelined')
-            self.assertGreater(reports['pipelined']['memory_bytes']['packed_weights_peak'],
-                               reports['chunk']['memory_bytes']['packed_weights_peak'])
+                       for mode in ('chunk', 'pipelined', 'skewed', '')}
+            for mode in ('chunk', 'pipelined', 'skewed'):
+                self.assertEqual(reports[mode]['build']['q8_gemm'], mode)
+            self.assertEqual(reports['']['build']['q8_gemm'], 'skewed')
+            self.assertEqual(reports['']['build']['q8_kb_order'], 'rows')
+            for mode in ('pipelined', 'skewed'):
+                self.assertGreater(reports[mode]['memory_bytes']['packed_weights_peak'],
+                                   reports['chunk']['memory_bytes']['packed_weights_peak'])
         directory = self.fixtures['wide']
         result = subprocess.run([str(BUILD/'runq-amx-emul'), str(directory/'int8.bin'), '-z',
                                  str(directory/'tokenizer.bin'), '-i', 'A', '-t', '0'], capture_output=True, text=True,
                                 timeout=60, env=environment(1, LLAMA_Q8_GEMM='bogus'))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('LLAMA_Q8_GEMM must be pipelined or chunk', result.stderr)
+        self.assertIn('LLAMA_Q8_GEMM must be skewed, pipelined or chunk', result.stderr)
+        result = subprocess.run([str(BUILD/'runq-amx-emul'), str(directory/'int8.bin'), '-z',
+                                 str(directory/'tokenizer.bin'), '-i', 'A', '-t', '0'], capture_output=True, text=True,
+                                timeout=60, env=environment(1, LLAMA_Q8_KB_ORDER='bogus'))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('LLAMA_Q8_KB_ORDER must be rows or chunks', result.stderr)
 
     def test_interleaved_batch_reduction_is_bitwise_the_barrier_one(self):
         """LLAMA_TP_BATCH_REDUCE=interleaved (each stored block of the two-socket W8A8 Wo/W2 partials is added into the
         residual during the projection) and =wo (Wo only) give bitwise the logits of the barrier reduction,
-        on the portable and the AMX kernels (pipelined and chunk), all positions, batches that end mid-block and thread
+        on the portable and the AMX kernels (skewed, pipelined and chunk), all positions, batches that end mid-block and thread
         counts that split the blocks unevenly; LLAMA_TP_CHECK holds; it is reported in build.tp_batch_reduce and refuses
         other values."""
         self.need('probe-int8-amx-emul')
         tokens = [65 + (i * 7) % 20 for i in range(33)]
         cases = [('shared', None, {'LLAMA_PREFILL_GEMM': 'on'}), ('odd', None, {'LLAMA_PREFILL_GEMM': 'on'}),
                  ('wide', 'probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx'}),
+                 ('wide', 'probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx', 'LLAMA_Q8_GEMM': 'pipelined'}),
                  ('wide', 'probe-int8-amx-emul', {'LLAMA_KERNELS': 'amx', 'LLAMA_Q8_GEMM': 'chunk'})]
         for fixture, binary, knobs in cases:
             for batch in (3, 32):
