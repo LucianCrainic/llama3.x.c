@@ -150,6 +150,7 @@ void gemm_q8_init_env(void); /* reads LLAMA_Q8_GEMM (kernels_init) */
 void gemm_swiglu_init_env(void);
 const char *k_gemm_swiglu_exp_name(void);
 const char *k_gemm_q8_mode_name(void); /* "skewed", "pipelined" or "chunk" */
+const char *k_gemm_q8_kb_order_name(void); /* LLAMA_Q8_KB_ORDER: "rows" or "chunks" */
 int k_gemm_q8_tiled_active(void);      /* skewed or pipelined asked for and AMX active */
 size_t s8_scales_t_bytes(int rows, int cols, int gs);
 void pack_s8_scales_t(float *st, const float *s, int rows, int groups, int first_tile, int last_tile);

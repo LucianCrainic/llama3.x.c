@@ -280,8 +280,8 @@ static void check_interleaved(const Case *c, const int8_t *xq, const float *xs, 
 }
 
 /* The tiled kernels: the tile-order quantizer writes the same int8 values and scales as k_quantize_rows, the
- * transposed scales are the scales, and both tiled kernels (LLAMA_Q8_GEMM=skewed and =pipelined) equal the AMX chunk
- * kernel bit for bit, for every kind. */
+ * transposed scales are the scales, and both tiled kernels (LLAMA_Q8_GEMM=skewed and =pipelined) in both K-block
+ * orders (LLAMA_Q8_KB_ORDER=rows and =chunks) equal the AMX chunk kernel bit for bit, for every kind. */
 static void check_tiled(const Case *c) {
   const int m = c->m, n = c->n, k = c->k, gs = c->gs, groups = k / gs, ldc = n + 3;
   const size_t rows = up((size_t)m, 32);
@@ -337,10 +337,11 @@ static void check_tiled(const Case *c) {
     base[i] = uniform() * 3;
   const GemmKind kinds[] = {GEMM_STORE, GEMM_ADD, GEMM_SWIGLU, GEMM_PARTIAL};
   gemm_amx_enable(1);
-  static const char *const modes[] = {"skewed", "pipelined"};
-  for (int mode = 0; mode < 2; mode++)
+  static const char *const modes[][2] = {{"skewed", "rows"}, {"pipelined", "rows"}, {"skewed", "chunks"}};
+  for (int mode = 0; mode < 3; mode++)
     for (int t = 0; t < 4; t++) {
-      setenv("LLAMA_Q8_GEMM", modes[mode], 1);
+      setenv("LLAMA_Q8_GEMM", modes[mode][0], 1);
+      setenv("LLAMA_Q8_KB_ORDER", modes[mode][1], 1);
       gemm_q8_init_env();
       GemmQ8Segment seg = {.ldc = ldc,
                            .w = {c->wq, c->ws},
@@ -360,12 +361,13 @@ static void check_tiled(const Case *c) {
       checks++;
       if (memcmp(want, got, (size_t)m * ldc * 4)) {
         char detail[160];
-        snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: %s differs from the chunk kernel", m, n, k, gs,
-                 kinds[t], modes[mode]);
+        snprintf(detail, sizeof(detail), "m=%d n=%d k=%d gs=%d kind=%d: %s/%s differs from the chunk kernel", m, n, k,
+                 gs, kinds[t], modes[mode][0], modes[mode][1]);
         bad("k_gemm_q8_tiled", detail);
       }
     }
   unsetenv("LLAMA_Q8_GEMM");
+  unsetenv("LLAMA_Q8_KB_ORDER");
   gemm_q8_init_env();
   check_interleaved(c, tq, ts, st, 1);
   check_interleaved(c, c->xq, c->xs, NULL, 0);
