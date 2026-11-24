@@ -32,7 +32,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
-| Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest job in work (cpu partition) | | haiku | | |
+| Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
 | P5 gap loop | not started | | | | |
@@ -45,6 +45,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 24 Nov | P1 starts from the earlier concurrent-stream code (measured, older tree: job 5904726) rather than from scratch | It already pins two core groups to separate tiers with verified placement; E1-E6 extend it. Code is re-committed under the campaign's rules |
 | 24 Nov | P2b porting waits for the P2 merge, then one sonnet agent ports steps 1-6 in order on `feature/70b-comparison`; step 7 (70B Q8 re-run) after the gs64/gs32 70B files exist | Plan §P2b: port onto the planner; avoids porting onto a moving merge branch |
 | 24 Nov | No downloads: the 70B HF snapshot (community mirror, rev d50656ee, 30 shards hashed at download) and the gs64 (22 Nov) and gs32 (24 Nov) engine files already exist; only a sha256 manifest and provenance check are run | D1 asks for files, not for re-downloads |
+| 24 Nov | Engine checkpoints stay in scratch; protection against a purge is the manifest plus the recipe (HF rev d50656ee, whose 30 shard hashes match the hub's; conversion jobs 5892714 gs64, 5910127/5910128/5910181 FP32/GGUF/gs32) | Store area quota is 100 GB hard with ~47 GB free; the two 70B Q8 files are 154 GB |
 | 24 Nov | E3 uses `mbind` per chunk | Flat-node kernel is 5.14 (RHEL 9.4), no `weighted_interleave` sysfs |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
 
@@ -60,6 +61,24 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 8B files | v3 FP32, v3 gs64, v3 gs32, v4 per-channel, HF snapshot |
 | Storage | scratch is the large area; the store area reports ~45 GB free (unconfirmed), too small for the 70B engine files |
 | Earlier 70B result dirs | placement pilots (22 Nov), research runs (23 Nov), cross-engine runs (24 Nov), all in scratch/store |
+
+## Manifest (D1)
+
+| File | Bytes | sha256 (first 16) | Source |
+| --- | ---: | --- | --- |
+| 70B int8-v3 gs64 | 74967187712 | 39016780130c2e4f | export job 5892714 from HF rev d50656ee; exporter commit not recorded |
+| 70B tokenizer-v2 | 1864864 | ae7eab7f00edbd82 | same |
+| 70B q8-gguf-v3 gs32 | 79376711936 | 7d59133b707e4209 | Q8_0 GGUF (job 5910128) repacked by job 5910181 |
+| 70B q8_0.gguf | 74975050112 | 18b23ebb06099766 | job 5910128 |
+| 70B fp32-v3 | 282214826240 | a4b504bc585e1af9 | job 5910127 |
+| 8B int8-v3 gs64 | 8532934912 | 8d23a3b55c2dc46b | phase-2 export (matches earlier record) |
+| 8B fp32-v3 | 32121045248 | 5ed04fb1046b7023 | same |
+| 8B int8-pc-v4 | 8037591296 | 64cd68ffa9bbbb4a | 21 Nov |
+| 8B tokenizer-v2 | 1864927 | 9b7aaa19a7abe3a5 | phase-2 export |
+| 8B q8-gguf gs32 | 9034809600 | 68a6ac940702f205 | gs32 work, 24 Nov |
+
+Full hashes are in the cluster manifest next to the models. The gated upstream repository hides its LFS hashes;
+the mirror's file list and sizes match it.
 
 ## P2b inventory (verified 24 Nov)
 
@@ -88,4 +107,5 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 
 | # | Question | State |
 | --- | --- | --- |
+| Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
