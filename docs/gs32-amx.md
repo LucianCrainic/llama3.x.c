@@ -111,7 +111,7 @@ trees. The ratio (2.7–4.7x) is indicative, not a paired measurement.
 1. ~~**Decode at gs32 stays portable.**~~ Done: the VNNI pair kernel, §6.
 2. **Hugging Face gate for the gs32 file** on both paths (batched and per token), as for every model file
    ([prefill-gap.md](prefill-gap.md)). The weights are llama.cpp's, so this measures the GGUF quantization, not the kernel.
-3. **The 70B comparison** repacks its Q8_0 GGUF to gs32 in the same way (branch `codex/70b-engine-comparison`). Its
+3. **The 70B comparison** repacks its Q8_0 GGUF to gs32 in the same way (the earlier 70B comparison work). Its
    prefill runs should be rerun on this tree.
 4. **Correction to [xengine-results.md](xengine-results.md) §5 and [plans/xengine-comparison.md](plans/xengine-comparison.md).**
    Both say llama3.x.c's 8B file uses 32-element groups. `int8-v3.bin` uses 64, so the "218 M group accumulations per

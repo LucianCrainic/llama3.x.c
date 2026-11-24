@@ -20,7 +20,7 @@ Implementation notes:
   `LLAMA_PREFILL_LOGITS` parsing and input validation. User documentation is
   [`docs/prefill.md`](../../prefill.md) and local evidence
   [`docs/prefill-c1-validation.md`](../../prefill-c1-validation.md) (developed on
-  `codex/prefill-c1-batch-api`, merged here).
+  the C1 batch-API branch, merged here).
 - Report schema v2: `prefill = {microbatches, tokens, seconds, logits_rows}` and
   `runtime.prefill_batch` / `runtime.prefill_logits` are now filled.
 - `tools/compare_engines.py` gained `--batch-a/--batch-b M` (runs the probe's `batch` mode with
