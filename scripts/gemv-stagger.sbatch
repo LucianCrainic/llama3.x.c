@@ -46,8 +46,9 @@ select_config() {
 cfg=()
 bind=()
 [[ -z ${CONFIG:-} || $STAGE == check ]] || select_config "$CONFIG"
-# Cells: page size and knob. THP=off is the engine default (4 KiB pages).
-cells=("thp=off stagger=0" "thp=off stagger=1" "thp=on stagger=0" "thp=on stagger=1")
+# Cells: page size and knob. LLAMA_THP=off is the engine default (the system's choice: 2 MiB pages on a node with THP
+# [always]); never forces 4 KiB pages.
+cells=("thp=off stagger=0" "thp=off stagger=1" "thp=never stagger=0" "thp=never stagger=1")
 
 if [[ ${DRY_RUN:-0} == 1 ]]; then
   echo "config=${CONFIG:-} stage=$STAGE repeats=$repeats context=$context warm=$warm generation=$generation"
@@ -106,7 +107,7 @@ probe_config() {
   # a fixed 97-token input (BOS and ids spread over the vocabulary); the probe prints every position's logits as raw float32
   tokens=(128000 $(seq 1009 1301 125000))
   local status=0
-  for cell in off0 off1 on0 on1; do
+  for cell in off0 off1 never0 never1; do
     thp=${cell%[01]}; stagger=${cell: -1}
     for who in base tree; do
       [[ $who == tree || -n ${BASE_ROOT:-} ]] || continue

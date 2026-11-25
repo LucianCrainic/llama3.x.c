@@ -147,6 +147,7 @@ void region_record_verification(const NumaRegion *r, const PageCheck *check, siz
 
 int region_round(size_t bytes, size_t align, size_t *rounded); /* -1 on zero or overflow */
 int region_thp_default(void);                                  /* LLAMA_THP=on */
+int region_thp_never(void);                                    /* LLAMA_THP=never: MADV_NOHUGEPAGE on bound regions */
 const char *region_role_name(RegionRole role);
 
 #endif

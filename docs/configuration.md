@@ -58,7 +58,7 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_PLACEMENT` | `file` (one socket), `hbm` (two sockets on an HBM node) | `file\|hbm\|ddr\|hbm-only\|hybrid`. See [planned placement](#planned-placement) for strict and mixed configurations. |
 | `LLAMA_PLACEMENT_STRICT` | `1` for explicit tier placement, else `0` | require page-placement verification. `hbm-only` and `hybrid` require strict placement. |
 | `LLAMA_HBM_BUDGET_GIB` | `56` | per-socket HBM budget checked before reserving |
-| `LLAMA_THP` | `off`, `on` | transparent huge pages for owned regions |
+| `LLAMA_THP` | `off`, `on`, `never` | transparent huge pages for owned regions: `on` asks for them (`MADV_HUGEPAGE`, regions aligned to 2 MiB); `off` (default) leaves the system's choice (a node with THP `[always]` backs the weights with 2 MiB pages anyway: `thp_bytes` in the report); `never` forces 4 KiB pages (`MADV_NOHUGEPAGE`; [gemv-stagger.md](gemv-stagger.md)) |
 | `LLAMA_VERIFY_SAMPLES` | `0` (every page) or N | pages sampled per region by the placement check |
 | `LLAMA_KV_VERIFY` | `1`, `0` | verify KV-cache page placement in the report |
 

@@ -152,7 +152,7 @@ static void kv_object(FILE *f) {
 
 /* Schema v2: runtime, topology, teams, regions and placeholders for producers that do not exist yet (null). */
 static void write_v2_sections(FILE *f) {
-  const char *thp = region_thp_default() ? "on" : "off";
+  const char *thp = region_thp_default() ? "on" : region_thp_never() ? "never" : "off";
   fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
   string(f, kernels_backend_name());
   fprintf(f, ",\n    \"sockets\": %d,\n    \"placement\": ", metrics.sockets ? metrics.sockets : 1);

@@ -6,7 +6,7 @@ import statistics
 import sys
 from pathlib import Path
 
-CELLS = ['thp=off-stagger=0', 'thp=off-stagger=1', 'thp=on-stagger=0', 'thp=on-stagger=1']
+CELLS = ['thp=off-stagger=0', 'thp=off-stagger=1', 'thp=never-stagger=0', 'thp=never-stagger=1']
 PHASES = ['qkv', 'wo', 'w1_w3_swiglu', 'w2', 'attention', 'classifier', 'other']
 
 
@@ -31,7 +31,7 @@ def main(directory):
         if rates[cell]:
             print(f'| {cell} | {span(rates[cell])} | {len(rates[cell])} |')
     print()
-    for page in ('off', 'on'):
+    for page in ('off', 'never'):
         off, on = rates[f'thp={page}-stagger=0'], rates[f'thp={page}-stagger=1']
         if off and on:
             delta = 100 * (statistics.median(on) / statistics.median(off) - 1)
