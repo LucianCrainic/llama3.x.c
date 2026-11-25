@@ -28,7 +28,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | A, B, C done; job D (fill check, E3/E4 random, shuffled E5) blocked on SSH | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B) | ~2.0 + B |
+| P1 concurrent bandwidth | A, B, C, D done; docs in writing; independent review + D re-derivation running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
 | G1 decision | open | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; final TSAN gate 5916531 result unknown (SSH drop) | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
@@ -101,6 +101,15 @@ the mirror's file list and sizes match it.
 - E5 all-HBM GEMV gs64: 317 (32 w), 398 (48), 418 (52), 401 (56) GB/s: below stream ceiling, 56 < 52 workers.
 - Counter/computed exceptions: 6 base windows up to 1.47, 7 DDR windows up to 1.07: must be explained in validation.
 - Loaded latency: DDR probe 132 -> 366 ns under 55 DDR streaming cores.
+
+## P1 job D (agent-reported, under verification)
+
+- E5 shuffled: best all-HBM GEMV 447.2 [440.6-451.7] (4K, 56 w, = 12.1 tok/s-equivalent 70B gs64); best row split
+  453.4 [442.5-459.8] (+1.4%, overlapping). 2M all-HBM 400.9 (56 w) / ~422 (52 w): page-size effect ~11%, not alignment.
+- E3 random: max 573.4 [567.0-577.4] at 8:1 (overlaps HBM-only). E4 node: HBM-only 1127.8, best mixed 1167.8
+  [1113.1-1180.2] (overlaps). UPI 1.5 GB/s in E4 interleave unexplained.
+- Zero data reads 6% faster than random (600.9 vs 565.8) at equal 351 W, core clock 1.75 vs 1.64 GHz.
+- Manager's provisional G1 reading: **No** (E5 +1.4% within noise, far below 10%; raw streams no gain). Final after review.
 
 ## P1 interim from job B (agent-reported, unverified)
 
