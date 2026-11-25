@@ -93,7 +93,7 @@ Compiled 24 November 2026 from `develop` at b9b9bbb, plus the earlier 70B compar
 | 1.53 | TTFT, 35-token prompt, HBM only (two repeats) | 0.83 s and 15.31 s | same; the source calls these pairs unstable and confounded | measured | 5892715 | same |
 | 1.54 | TTFT, 35-token prompt, hybrid (two repeats) | 13.28 s and 0.82 s | same | measured | 5892715 | same |
 | 1.55 | TTFT, 35-token prompt, DDR only (two repeats) | 9.86 s and 0.83 s | same | measured | 5892715 | same |
-| 1.56 | Replicate, decode HBM only | 10.90 tok/s [10.84-10.93] | 70B Q8_0 group 64, VNNI, research revision cc000dd, node hbm14, three repeats in rotated order | measured | 5904620 | earlier 70B comparison work (older tree), "Matched 70B replication" |
+| 1.56 | Replicate, decode HBM only | 10.90 tok/s [10.84-10.93] | 70B Q8_0 group 64, VNNI, pre-port revision (job 5904620), node hbm14, three repeats in rotated order | measured | 5904620 | earlier 70B comparison work (older tree), "Matched 70B replication" |
 | 1.57 | Replicate, TTFT HBM only | 0.816 s [0.812-0.837] | same | measured | 5904620 | same |
 | 1.58 | Replicate, decode hybrid 40/40 | 8.14 tok/s [8.09-8.14] | same | measured | 5904620 | same |
 | 1.59 | Replicate, TTFT hybrid | 0.828 s [0.819-0.842] | same | measured | 5904620 | same |
