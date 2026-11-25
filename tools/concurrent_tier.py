@@ -502,11 +502,19 @@ def aggregate(windows):
                     'gemv_pass_s', 'gemv_best_pass_s'):
             e[key] = node_value(g, key)
         e['probe_ns'] = med_min_max([w['probe_ns'] for w in s0 if w['probe_ns']])
-        # the other timer: all bytes issued (warm-up included) / wall time from the common start to the end of the window
+        # The other timer (same bytes and interval as the worker rate, only the clock differs): the bytes issued during the measured
+        # interval (warm-up excluded) over the wall time from the common start of that interval to the end of the window (the join of
+        # the team). Measured bytes = sum of the workers' counted bytes = rate x mean worker duration (a GEMV pass: bytes per pass x 16
+        # measured passes); the measured interval starts `warm` seconds (GEMV: two warm-up passes of the measured pass time) after the
+        # common start real_begin. Fixed-volume windows are not given.
         wb, wd = defaultdict(float), {}
         for w in g:
-            wb[(w['label'], w['window'])] += w['hbm_bytes'] + w['ddr_bytes']
-            wd[(w['label'], w['window'])] = w['real_end'] - w['real_begin']
+            if w['volume'] or not w['mean_worker_s']:
+                continue
+            gemv = w['kind'] == 3
+            k = (w['label'], w['window'])
+            wb[k] += w['combined_gbps'] * 1e9 * w['mean_worker_s'] * (16 if gemv else 1)
+            wd[k] = w['real_end'] - w['real_begin'] - (2 * w['mean_worker_s'] if gemv else w['warm'])
         e['wall_gbps'] = med_min_max([wb[k] / wd[k] / 1e9 for k in wb if wd[k] > 0])
         e['socket0_combined'] = med_min_max([w['combined_gbps'] for w in s0])
         # counters (per node: both sockets summed)
@@ -757,7 +765,7 @@ def tables(agg, windows, idle):
                          f'{(e["wall_gbps"]["median"] / ref_wall - 1) * 100:+.1f}%'))
         return rows
 
-    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps', 'p: above the best all-HBM by chance', 'wall-clock GB/s (bytes issued incl. warm-up / wall time)', 'vs best all-HBM, wall-clock']
+    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps', 'p: above the best all-HBM by chance', 'wall-clock GB/s (measured bytes / wall time from the common start of the measured interval to the end of the window)', 'vs best all-HBM, wall-clock']
     for prefixes, title in ((('e5-', 'e5hbm-'), 'E5 Q8 GEMV over the 70B per-socket shard, file order'),
                             (('e5c-',), 'E5 confirmation, every process in its own shuffled order'),
                             (('e5c2-',), 'E5 row split, DDR worker count +-2 around the best point, shuffled order')):
