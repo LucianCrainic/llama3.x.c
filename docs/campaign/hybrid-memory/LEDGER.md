@@ -30,7 +30,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
 | P1 concurrent bandwidth | A-G done (E 5924010, F 5924011 hbm13, G 5925935); docs being finalized | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
 | G1 decision | open | | manager | | |
-| P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; final job 5923182 running | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
+| P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; 5923182 on ce43988: make test rc 0, A/B equal (1S HBM decode 44.74 vs 44.77, 2S 89.55 vs 89.72; manager-verified); carry-over diff 719232e..ce43988 = tests + docs only. **Open: test-q8-emul TSAN never completed; 20 h cpu-partition rerun refused by the permission system, asked owner** | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
@@ -188,4 +188,5 @@ the mirror's file list and sizes match it.
 | # | Question | State |
 | --- | --- | --- |
 | Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
+| Q3 | Approve a ~20 h TSAN run of test-q8-emul (cresco8_cpu) to complete the P2 gate, or accept partial TSAN evidence? | asked 25 Nov |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
