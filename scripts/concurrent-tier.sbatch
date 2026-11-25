@@ -20,7 +20,8 @@
 #                   E1/E2/E3 settings;  e5 the Q8 GEMV over the 70B shard;  e5hbm all-HBM GEMV with fewer workers;
 #                   e6 sensitivity at the best E1 point;  lat loaded latency;  freq core/uncore frequency (turbostat) under long windows;
 #                   fillcmp reads over random and zero-filled regions, e5c shuffled E5 confirmation (both page sizes),
-#                   e5off GEMV alignment test;
+#                   e5off GEMV alignment test, e6b real-split sensitivity, hbmx HBM-only baseline extension, e5alias stripe-aliasing tests,
+#                   e5c2 row-split worker-count scan, repe3 repe4 repe5 the shuffled replication on the second node;
 #                   rep, rep-e5 the replication points
 #   REPS     repetitions per point of the measured stages (default 7);  BASE_REPS for base (default 3)
 #   PAGES    "2m 4k" (default)
@@ -199,6 +200,13 @@ for stage in $STAGES; do
     e5) rounds e5 "$REPS" 1 ;;
     e5c) rounds e5c "$REPS" 1 ;;
     e5off) rounds e5off "$REPS" 1 ;;
+    e6b) rounds e6b "$REPS" 1 ;;
+    hbmx) rounds hbmx "$REPS" 1 ;;
+    e5alias) rounds e5alias "$REPS" 1 ;;
+    e5c2) rounds e5c2 "$REPS" 1 ;;
+    repe3) rounds repe3 "$REPS" 1 --region-mib 1024 ;;
+    repe4) rounds repe4 "$REPS" 2 ;;
+    repe5) rounds repe5 "$REPS" 1 ;;
     fillcmp)
       # The same reads over pseudo-random and over zero-filled tier regions, alternating inside each repetition.
       for tag in random zero; do ct cfgs "fillcmp-$tag" ${BEST_ENV:+--best-env "$BEST_ENV"} > "$OUT/cfg/fillcmp-$tag.cfg"; done

@@ -407,7 +407,11 @@ typedef struct {
   int kind, ch, cd, a, b, unit, streams, hint, nt, pf, alt, probe, volume;
   int dstreams, dhint, dnt, dpf; /* the DDR group's own settings (-1 = those of the HBM group) */
   int gs, gshared, cdw, act, warm_passes, passes; /* act: active workers of a gemv window (0 = all) */
-  size_t off; /* gemv: every weight address is moved up by this many bytes (a multiple of 64): alignment test */
+  size_t off;  /* gemv: every weight address is moved up by this many bytes (a multiple of 64): alignment test */
+  size_t skew; /* gemv: worker i of a group reads its weights skew x i bytes higher (a multiple of 64): staggered partition */
+  int stripe;  /* split, all workers on HBM: worker w reads its own stripe of `stripe` MiB (w x stripe MiB from the region start) */
+  int lock;    /* stripe mode: > 0 = fixed number of 1 MiB blocks with a team barrier after each (lockstep), else timed */
+  size_t stag; /* stripe mode: worker w starts stag x w bytes into its stripe (a multiple of 64) */
   double r, warm, seconds;
 } Cfg;
 
@@ -443,7 +447,7 @@ typedef struct {
 
 typedef struct {
   int sockets, threads, real, page4k, verify_stride;
-  size_t inter_mib;
+  size_t inter_mib, region_bytes;
   int fill; /* content of the tier regions: 0 pseudo-random, 1 zeros, 2 ones (--fill) */
   const Topology *topology;
   Sock sock[2];
@@ -636,6 +640,37 @@ static void raw_worker(const void *p, int w, int workers) {
   RdFn rd = rd_h;
   size_t pf = pf_h;
   long sink = 0;
+  if (c->kind == CFG_SPLIT && c->stripe > 0) {
+    /* Stripe mode: worker w streams its own stripe [w x stripe, (w + 1) x stripe) of the HBM region, starting stag x w bytes in; with
+     * lock > 0 all workers read the same number of blocks and meet at a team barrier after each one. */
+    const size_t stripe = (size_t)c->stripe * MIB;
+    char *mine = s->base[0] + (size_t)w * stripe;
+    size_t off = ((size_t)w * c->stag) % stripe & ~(size_t)63;
+    wait_until(j->t_go);
+    if (c->lock > 0) {
+      const int warm_blocks = c->lock / 4;
+      for (int b = 0; b < warm_blocks + c->lock; b++) {
+        sink ^= rd_h(mine + off, blk, pf_h);
+        off = (off + MIB) % stripe;
+        team_barrier(s->team);
+        if (b == warm_blocks - 1)
+          r->t_begin = monotonic_seconds();
+      }
+      r->t_end = monotonic_seconds();
+      r->bytes_total[0] = (double)(warm_blocks + c->lock) * MIB;
+      r->bytes_meas[0] = (double)c->lock * MIB;
+    } else {
+      for (;;) {
+        sink ^= rd_h(mine + off, blk, pf_h);
+        off = (off + MIB) % stripe;
+        ACCOUNT(MIB, 0);
+        if (done)
+          break;
+      }
+    }
+    r->sink = sink;
+    return;
+  }
   if (c->kind == CFG_SPLIT || c->kind == CFG_INTER) {
     int gi = w, gn = nstream, tier = 0;
     char *base = c->kind == CFG_INTER ? s->xbase : NULL;
@@ -775,7 +810,7 @@ static void gemv_part(const Cfg *c, Sock *s, int m, int layer, int tier, int gi,
   int rows = tier ? rows_d : rows_h, first = tier ? rows_h : 0;
   if (rows <= 0 || gn <= 0)
     return;
-  size_t n = (size_t)shard[m].n, lay = (size_t)layer * layer_stride + c->off;
+  size_t n = (size_t)shard[m].n, lay = (size_t)layer * layer_stride + c->off + (size_t)gi * c->skew;
   K8Weight wt = {(const int8_t *)(s->base[tier] + lay + mat_q_off[m]) + (size_t)first * n,
                  (const float *)(s->base[tier] + lay + mat_s_off[m]) + (size_t)first * (n / (size_t)c->gs)};
   K8Input x = {s->xq, s->xs, NULL};
@@ -1255,6 +1290,14 @@ static int parse_cfg(const char *text, Cfg *c) {
       c->cdw = atoi(v);
     else if (!strcmp(k, "off"))
       c->off = (size_t)atoll(v);
+    else if (!strcmp(k, "skew"))
+      c->skew = (size_t)atoll(v);
+    else if (!strcmp(k, "stripe"))
+      c->stripe = atoi(v);
+    else if (!strcmp(k, "lock"))
+      c->lock = atoi(v);
+    else if (!strcmp(k, "stag"))
+      c->stag = (size_t)atoll(v);
     else if (!strcmp(k, "act"))
       c->act = atoi(v);
     else if (!strcmp(k, "gshared"))
@@ -1289,18 +1332,27 @@ static void check_cfg(const Run *R, const Cfg *c) {
   int stream = R->threads - (c->probe ? 1 : 0);
   if (c->kind == CFG_SPLIT && (c->ch < 0 || c->cd < 0 || c->ch + c->cd < 1 || c->ch + c->cd > stream))
     fail("config %s: ch + cd must be 1..%d", c->name, stream);
+  if (c->kind == CFG_SPLIT && c->stripe > 0 && (c->cd || c->ch != R->threads || c->probe || c->stag % 64 ||
+                                               (size_t)c->stripe * (size_t)R->threads * MIB + MIB > R->region_bytes))
+    fail("config %s: stripe mode needs ch = threads, cd = 0 and threads x stripe within the region", c->name);
   if (c->kind == CFG_GEMV &&
-      (c->cdw < 0 || c->cdw >= R->threads || (c->cdw == 0) != (c->r == 0 || c->gshared) || c->probe || c->off % 64 ||
+      (c->cdw < 0 || c->cdw >= R->threads || (c->cdw == 0) != (c->r == 0 || c->gshared) || c->probe || c->off % 64 || c->skew % 64 ||
                                  c->act > R->threads || (c->act && c->cdw >= c->act)))
     fail("config %s: cdw must be 0 exactly when r = 0 (or gshared)", c->name);
 }
 
-static pid_t perf_start(const char *cmd, const char *out) {
+static pid_t perf_start(const char *cmd, const char *out, int cpu) {
 #ifdef __linux__
   pid_t pid = fork();
   if (pid < 0)
     fail("fork failed: %s", strerror(errno));
   if (pid == 0) {
+    if (cpu >= 0) { /* perf and its workload inherit the pool leader's single CPU: move them off it */
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(cpu, &set);
+      sched_setaffinity(0, sizeof(set), &set);
+    }
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
   }
@@ -1319,6 +1371,7 @@ static pid_t perf_start(const char *cmd, const char *out) {
 #else
   (void)cmd;
   (void)out;
+  (void)cpu;
   return -1;
 #endif
 }
@@ -1426,6 +1479,7 @@ static int research_main(int argc, char **argv) {
   R->page4k = !strcmp(page, "4k");
   R->verify_stride = verify_stride;
   R->inter_mib = inter_mib;
+  R->region_bytes = region_mib * MIB;
   R->fill = fill;
   PoolConfig config = {.teams = sockets,
                        .threads = {threads, threads},
@@ -1484,7 +1538,9 @@ static int research_main(int argc, char **argv) {
   }
   pid_t perf = -1;
   if (perf_cmd)
-    perf = perf_start(perf_cmd, perf_out);
+    /* A CPU that is not the pool leader's: the last core of the idle socket in a one-socket run, else the last worker of socket 1. */
+    perf = perf_start(perf_cmd, perf_out,
+                      R->real ? topology->socket[1].cpus[sockets == 1 ? topology->socket[1].ncpus - 1 : threads - 1] : -1);
   (void)perf;
   sleep_s(0.8);
   printf("{\"event\": \"start\", \"experiment\": \"%s\", \"real_time\": %.6f, \"windows\": %d, \"reps\": %d, "
@@ -1494,6 +1550,20 @@ static int research_main(int argc, char **argv) {
          label, realtime_now(), ncfg * reps, reps, threads, sockets, page, region_mib, R->real, perf_cmd != NULL,
          need_gemv ? gemv_layers(&R->sock[0]) : 0, layer_stride);
   fflush(stdout);
+  /* Observed pinning: the CPU every worker's affinity mask was read back as, against the CPU assigned to it. */
+  for (int so = 0; so < sockets; so++) {
+    const TeamSummary *ts = pool_summary(so);
+    int equal = 0;
+    for (int i = 0; ts && i < ts->threads; i++)
+      equal += ts->assigned[i] == ts->observed[i];
+    printf("{\"event\": \"pinning\", \"socket\": %d, \"threads\": %d, \"pinned\": %d, \"verified\": %d, \"observed_equals_assigned\": %d, \"observed\": [",
+           so, ts ? ts->threads : 0, ts ? ts->pinned : 0, ts ? ts->verified : 0, equal);
+    for (int i = 0; ts && i < ts->threads; i++)
+      printf("%s%d", i ? "," : "", ts->observed[i]);
+    printf("]}\n");
+    if (R->real && (!ts || !ts->pinned || !ts->verified || equal != ts->threads))
+      fail("socket %d: workers are not pinned to their assigned CPUs (%d of %d verified)", so, equal, ts ? ts->threads : 0);
+  }
   /* The exact command line and the content/ordering options are part of the record. */
   printf("{\"event\": \"args\", \"fill\": \"%s\", \"shuffle\": %d, \"argv\": \"", fill == 0 ? "random" : fill == 1 ? "zero" : "ones",
          shuffle);

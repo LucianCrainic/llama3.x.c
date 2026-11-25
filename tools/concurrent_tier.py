@@ -208,6 +208,56 @@ def gen(stage, env, results=None):
         for gs in (64, 32):
             for off in (0, 64, 4096, 65536, 1048640):
                 add(fmt(name=f'e5off-gs{gs}-act56-off{off}', kind='gemv', gs=gs, r=0, cdw=0, act=56, off=off))
+    elif stage == 'e6b':  # sensitivity at real splits (cd = 4, 8, 16): DDR core placement, DDR group settings, HBM group prefetch
+        p, d = tier_params(env, 0)
+        for cd in (4, 8, 16):
+            base = dict(kind='split', ch=CORES - cd, cd=cd)
+            for alt in (0, 1):
+                add(fmt(name=f'e6b-cd{cd}-alt{alt}', **base, **p, **d, alt=alt))
+            for ds in (1, 2, 4):
+                add(fmt(name=f'e6b-cd{cd}-dS{ds}', **base, **p, dS=ds, dpf=d['dpf'], dhint=d['dhint'], dnt=d['dnt']))
+            for dpf in (0, 4096, 16384):
+                add(fmt(name=f'e6b-cd{cd}-dpf{dpf}', **base, **p, dS=d['dS'], dpf=dpf, dhint=d['dhint'], dnt=d['dnt']))
+            add(fmt(name=f'e6b-cd{cd}-dnt1', **base, **p, dS=d['dS'], dpf=d['dpf'], dhint=d['dhint'], dnt=1))
+            for pf in (4096, 65536):
+                add(fmt(name=f'e6b-cd{cd}-hpf{pf}', **base, S=p['S'], pf=pf, hint=p['hint'], nt=p['nt'], **d))
+    elif stage == 'hbmx':  # HBM-only baseline extension: longer prefetch, hint and non-temporal variants at one stream
+        for pf in (16384, 32768, 65536, 131072):
+            add(fmt(name=f'hbmx-S1-pf{pf}', kind='split', ch=CORES, cd=0, S=1, pf=pf, hint=0, nt=0))
+        add(fmt(name='hbmx-S1-pf16384-nt1', kind='split', ch=CORES, cd=0, S=1, pf=16384, hint=0, nt=1))
+        add(fmt(name='hbmx-S1-pf16384-hint1', kind='split', ch=CORES, cd=0, S=1, pf=16384, hint=1, nt=0))
+        add(fmt(name='hbmx-S1-pf16384-hint2', kind='split', ch=CORES, cd=0, S=1, pf=16384, hint=2, nt=0))
+    elif stage == 'e5alias':  # stripe-aliasing test of the all-HBM GEMV and of a raw read
+        for gs in (64, 32):
+            for act in (27, 28, 29, 53, 54, 55, 56):
+                add(fmt(name=f'e5alias-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
+            for skew in (4096, 65536):
+                add(fmt(name=f'e5alias-gs{gs}-act56-skew{skew}', kind='gemv', gs=gs, r=0, cdw=0, act=56, skew=skew))
+        for stag in (0, 4096, 1052672):  # worker w starts w x stag bytes into its 360 MiB stripe (stripes are multiples of 2 MiB)
+            add(fmt(name=f'e5alias-raw-lock-stag{stag}', kind='split', ch=CORES, cd=0, S=1, pf=16384, stripe=360, lock=2048, stag=stag))
+            add(fmt(name=f'e5alias-raw-timed-stag{stag}', kind='split', ch=CORES, cd=0, S=1, pf=16384, stripe=360, stag=stag))
+        add(fmt(name='e5alias-raw-sliced', kind='split', ch=CORES, cd=0, S=1, pf=16384))
+    elif stage == 'e5c2':  # E5 row split with the DDR worker count +-2 around the best point, r = 0.2 .. 0.3
+        for gs in (64, 32):
+            for act in (52, 56):
+                add(fmt(name=f'e5c2-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
+            for r, centre in ((0.2, 14), (0.25, 18), (0.3, 21)):
+                for cdw in (centre - 2, centre, centre + 2):
+                    add(fmt(name=f'e5c2-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
+    elif stage == 'repe3':  # shuffled replication on the second node
+        p = tier_params(env, 0)[0]
+        for a, b in ((1, 0), (4, 1), (8, 1)):
+            add(fmt(name=f'e3-{a}-{b}', kind='inter', a=a, b=b, **p))
+    elif stage == 'repe4':
+        p = tier_params(env, 0)[0]
+        add(split_cfg('e4-hbm56', CORES, 0, env))
+        add(fmt(name='e4-inter-8-1', kind='inter', a=8, b=1, **p))
+    elif stage == 'repe5':
+        for gs in (64, 32):
+            add(fmt(name=f'e5c-gs{gs}-act56', kind='gemv', gs=gs, r=0, cdw=0, act=56))
+            add(fmt(name=f'e5c-gs{gs}-act52', kind='gemv', gs=gs, r=0, cdw=0, act=52))
+            for r, cdw in ((0.1, 6), (0.2, 14), (0.25, 18)):
+                add(fmt(name=f'e5c-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
     elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, mixed and DDR-only load
         add(split_cfg('freq-hbm56', CORES, 0, env, warm=0.5, seconds=8))
         add(split_cfg('freq-split48-8', 48, 8, env, warm=0.5, seconds=8))
@@ -297,7 +347,9 @@ def burst_counters(burst, upi_flit_bytes):
         idt = sum(r['t1'] - r['t0'] for r in interior)
         res[s] = {
             'ddr_bytes': tot['ddr'] * DDR_CAS, 'hbm_bytes': tot['hbm'] * HBM_CAS,
-            'upi_rx_bytes': tot['upi_rx'] * upi_flit_bytes, 'upi_tx_bytes': tot['upi_tx'] * upi_flit_bytes,
+            # UPI over the interior intervals only: the edge intervals contain the allocation and release of the interleaved regions
+            'upi_rx_bytes': sum(r['s'][s]['upi_rx'] for r in interior) * upi_flit_bytes,
+            'upi_tx_bytes': sum(r['s'][s]['upi_tx'] for r in interior) * upi_flit_bytes, 'interior_s': idt,
             'pkg_j': tot['pkg_j'], 'ram_j': tot['ram_j'],
             # average core clock over the interior intervals of the burst (the first and last interval hold the idle edges where
             # the spinning workers run at another clock): unhalted cycles / reference cycles x 1.9 GHz TSC, all 56 cores of the socket
@@ -388,7 +440,29 @@ def med_min_max(xs_):
     xs_ = [x for x in xs_ if x is not None]
     if not xs_:
         return None
-    return {'median': statistics.median(xs_), 'min': min(xs_), 'max': max(xs_), 'n': len(xs_)}
+    return {'median': statistics.median(xs_), 'min': min(xs_), 'max': max(xs_), 'n': len(xs_), 'vals': list(xs_)}
+
+
+def perm_p(a, b):
+    """One-sided exact permutation p-value of median(a) - median(b) >= observed, over all splits of the pooled values."""
+    import itertools
+    pool = list(a) + list(b)
+    obs = statistics.median(a) - statistics.median(b)
+    n, hits, total = len(a), 0, 0
+    for idx in itertools.combinations(range(len(pool)), n):
+        s = set(idx)
+        x = [pool[i] for i in idx]
+        y = [pool[i] for i in range(len(pool)) if i not in s]
+        total += 1
+        hits += statistics.median(x) - statistics.median(y) >= obs - 1e-9
+    return hits / total
+
+
+def pcol(e, ref):
+    """p-value that e's combined rate exceeds ref's by chance (permutation test over the repetitions); '-' when e is not above ref."""
+    if not e or not ref or e['combined_gbps']['median'] <= ref['combined_gbps']['median']:
+        return '-'
+    return f'{perm_p(e["combined_gbps"]["vals"], ref["combined_gbps"]["vals"]):.3f}'
 
 
 def node_value(group, key):
@@ -425,17 +499,18 @@ def aggregate(windows):
                 for f in ('hbm_bytes', 'ddr_bytes', 'upi_rx_bytes', 'upi_tx_bytes', 'pkg_j', 'ram_j', 'pkg_w', 'ram_w'):
                     per[k][f] += c[f]
                 per[k]['burst_s'] = c['burst_s']
+                per[k]['interior_s'] = c['interior_s']
                 per[k]['exp_h'] += w['expected']['hbm_bytes']
                 per[k]['exp_d'] += w['expected']['ddr_bytes']
             e['counter_hbm_gbps'] = med_min_max([v['hbm_bytes'] / v['burst_s'] / 1e9 for v in per.values()])
             e['counter_ddr_gbps'] = med_min_max([v['ddr_bytes'] / v['burst_s'] / 1e9 for v in per.values()])
             e['ddr_share'] = med_min_max([v['ddr_bytes'] / (v['hbm_bytes'] + v['ddr_bytes']) for v in per.values()])
-            e['upi_gbps'] = med_min_max([(v['upi_rx_bytes'] + v['upi_tx_bytes']) / v['burst_s'] / 1e9 for v in per.values()])
+            e['upi_gbps'] = med_min_max([(v['upi_rx_bytes'] + v['upi_tx_bytes']) / v['interior_s'] / 1e9 for v in per.values() if v['interior_s']])
             e['pkg_w'] = med_min_max([v['pkg_w'] for v in per.values()])
             e['pkg_w0'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 0])
             e['pkg_w1'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 1])
             e['ram_w1'] = med_min_max([w['counters']['ram_w'] for w in cw if w['socket'] == 1])
-            e['upi_flits_s'] = med_min_max([(w['counters']['upi_rx_bytes'] + w['counters']['upi_tx_bytes']) / (64 / 9) / w['counters']['burst_s']
+            e['upi_flits_s'] = med_min_max([(w['counters']['upi_rx_bytes'] + w['counters']['upi_tx_bytes']) / (64 / 9) / w['counters']['interior_s']
                                             for w in cw if w['socket'] == 0])
             e['ram_w0'] = med_min_max([w['counters']['ram_w'] for w in cw if w['socket'] == 0])
             e['freq_ghz'] = med_min_max([w['counters']['freq_ghz'] for w in cw if w['socket'] == 0 and w['counters']['freq_ghz']])
@@ -473,7 +548,7 @@ def best_points(results_dirs, env):
         c = [e for e in agg.values() if e['name'].startswith(prefix) and pred(e)]
         return max(c, key=lambda e: e['combined_gbps']['median']) if c else None
 
-    e1 = top('e1-cd')
+    e1 = top('e1-cd', lambda e: e['cfg']['cd'] > 0)  # a real split: at least one DDR core
     if e1:
         best['e1_cd'] = e1['cfg']['cd']
     e2 = top('e2-', lambda e: e['cfg']['a'] and e['cfg']['b'])
@@ -538,7 +613,7 @@ def idle_power(results):
 def hbm_only_reference(agg, min_reps=7):
     # pseudo-random data only: zero-filled regions read faster under the power cap (see the data-content table)
     cands = [e for e in agg.values() if is_hbm_only(e) and e['sockets'] == 1 and e['reps'] >= min_reps and e['cfg']['kind'] != 3
-             and not e['name'].startswith(('fczero', 'zfill'))]
+             and not e['name'].startswith(('fczero', 'zfill', 'e1v'))]  # timed windows only; never the fixed-volume windows
     return max(cands, key=lambda e: e['combined_gbps']['median']) if cands else None
 
 
@@ -605,9 +680,9 @@ def tables(agg, windows, idle):
             v = agg.get((e['name'].replace('e1-', 'e1v-'), page, 1))
             body.append((ch, cd, h, d, c, n, mm(v['volume_gbps']) if v else '-', mm(v['common_hbm_gbps']) if v else '-',
                          mm(v['common_ddr_gbps']) if v else '-', mm(e.get('freq_ghz'), 2),
-                         f'{e["pkg_w0"]["median"]:.0f}' if e.get('pkg_w0') else '-'))
+                         f'{e["pkg_w0"]["median"]:.0f}' if e.get('pkg_w0') else '-', pcol(e, agg.get(('e1-cd0', page, 1)))))
         md.append(table(['HBM cores', 'DDR cores', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps', 'fixed-volume run: total volume / total time',
-                         'fixed-volume run: HBM GB/s over the common interval', 'DDR GB/s over the common interval', 'core GHz (counters)', 'package W per socket'], body))
+                         'fixed-volume run: HBM GB/s over the common interval', 'DDR GB/s over the common interval', 'core GHz (counters)', 'package W (socket 0)', 'p: above e1-cd0 by chance'], body))
         best = max(rows, key=lambda r: r[6]['combined_gbps']['median'])
         e = best[6]
         gain = e['combined_gbps']['median'] / ref['combined_gbps']['median'] - 1 if ref else float('nan')
@@ -618,19 +693,21 @@ def tables(agg, windows, idle):
                     key=lambda e: (e['cfg']['unit'], e['cfg']['b'] / (e['cfg']['a'] + e['cfg']['b'])))
         if es:
             md.append(f'## E2 shared cores, {page} pages (all 56 cores read both tiers; per-socket GB/s)\n')
-            md.append(table(['variant', 'HBM:DDR bytes', 'DDR share', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps'],
+            md.append(table(['variant', 'HBM:DDR bytes', 'DDR share', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps', 'p: above e1-cd0 by chance'],
                             [(('line interleave' if e['cfg']['unit'] == 1 else f'chunks of {e["cfg"]["unit"]} lines'),
                               f'{e["cfg"]["a"]}:{e["cfg"]["b"]}', f'{e["cfg"]["b"] / (e["cfg"]["a"] + e["cfg"]["b"]):.2f}',
-                              mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), e['reps']) for e in es]))
+                              mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), e['reps'], pcol(e, agg.get(('e1-cd0', page, 1)))) for e in es]))
             md.append('')
     for page in ('2m', '4k'):
         es = sorted((e for e in agg.values() if e['name'].startswith('e3-') and e['page'] == page and e['sockets'] == 1),
                     key=lambda e: e['cfg']['b'] / (e['cfg']['a'] + e['cfg']['b']))
         if es:
             md.append(f'## E3 page-interleaved region, {page} pages (per-socket GB/s; tier split from the counters)\n')
-            md.append(table(['HBM:DDR pages', 'page share on DDR', 'combined GB/s', 'DDR share of the counter bytes (HBM CAS x 32 B, DDR CAS x 64 B)', 'reps'],
+            md.append(table(['HBM:DDR pages', 'page share on DDR', 'combined GB/s', 'DDR share of the counter bytes (HBM CAS x 32 B, DDR CAS x 64 B)', 'reps',
+                             'p: above e1-cd0 by chance', 'p: above this region 1:0 by chance'],
                             [(f'{e["cfg"]["a"]}:{e["cfg"]["b"]}', f'{e["cfg"]["b"] / (e["cfg"]["a"] + e["cfg"]["b"]):.3f}', mm(e['combined_gbps']),
-                              mm(e.get('ddr_share'), 3), e['reps']) for e in es]))
+                              mm(e.get('ddr_share'), 3), e['reps'], pcol(e, agg.get(('e1-cd0', page, 1))),
+                              pcol(e, agg.get((f'e3-1-0', page, 1)))) for e in es]))
             md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith(('zfill-e3-', 'zfill-e4-'))), key=lambda e: (e['sockets'], e['page'], e['name']))
     if es:
@@ -641,12 +718,13 @@ def tables(agg, windows, idle):
     if es:
         md.append('## E4 both sockets at once (node totals, GB/s; UPI traffic from the counters)\n')
         md.append(table(['config', 'page', 'node combined GB/s', 'socket-0 GB/s', 'package W socket 0 / socket 1', 'UPI GB/s (rx+tx, 64/9 B per flit assumed)',
-                         'UPI Mflit/s (rx+tx, both directions of socket 0 and 1 summed)', 'reps'],
+                         'UPI Mflit/s (rx+tx, interior intervals)', 'reps', 'p: above e4-hbm56 by chance'],
                         [(e['name'], e['page'], mm(e['combined_gbps']), mm(e['socket0_combined']),
                           f'{e["pkg_w0"]["median"]:.0f} / {e["pkg_w1"]["median"]:.0f}' if e.get('pkg_w0') else '-', mm(e.get('upi_gbps'), 2),
-                          f'{e["upi_gbps"]["median"] * 1e9 * 9 / 64 / 1e6:.1f}' if e.get('upi_gbps') else '-', e['reps']) for e in es]))
+                          f'{e["upi_gbps"]["median"] * 1e9 * 9 / 64 / 1e6:.1f}' if e.get('upi_gbps') else '-', e['reps'],
+                          pcol(e, agg.get(('e4-hbm56', e['page'], 2)))) for e in es]))
         md.append('')
-    def gemv_rows(es, ref_gbps, gs):
+    def gemv_rows(es, ref_gbps, gs, href_e):
         rows = []
         for e in sorted(es, key=lambda e: (e['cfg']['r'], e['cfg']['gshared'], e['cfg']['act'], e['cfg']['cdw'])):
             tok = e['combined_gbps']['median'] * 1e9 / bytes_per_token(gs)
@@ -654,12 +732,13 @@ def tables(agg, windows, idle):
             act = e['cfg']['act'] or 56
             who = 'every worker' if e['cfg']['gshared'] else (f'{e["cfg"]["cdw"]} of {act}' if e['cfg']['r'] else f'none ({act} workers)')
             rows.append((e['page'], e['cfg']['r'], who, mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), f'{tok:.2f}',
-                         f'{gain * 100:+.1f}%', e['reps']))
+                         f'{gain * 100:+.1f}%', e['reps'], pcol(e, href_e)))
         return rows
 
-    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps']
+    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps', 'p: above the best all-HBM by chance']
     for prefixes, title in ((('e5-', 'e5hbm-'), 'E5 Q8 GEMV over the 70B per-socket shard, file order'),
-                            (('e5c-',), 'E5 confirmation, every process in its own shuffled order')):
+                            (('e5c-',), 'E5 confirmation, every process in its own shuffled order'),
+                            (('e5c2-',), 'E5 row split, DDR worker count +-2 around the best point, shuffled order')):
         for gs in (64, 32):
             es = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['sockets'] == 1 and e['name'].startswith(prefixes)
                   and not e['name'].startswith('e5off-')]
@@ -669,13 +748,23 @@ def tables(agg, windows, idle):
             href = max(hb, key=lambda e: e['combined_gbps']['median'])
             md.append(f'## {title}, gs{gs} (GB/s = bytes read per pass / pass time; tok/s-eq. = GB/s / {bytes_per_token(gs) / 1e9:.1f} GB per token)\n')
             md.append(f'Best all-HBM point: {mm(href["combined_gbps"])} GB/s ({href["name"]}, {href["page"]}, {href["cfg"]["act"] or 56} workers).\n')
-            md.append(table(hdr, gemv_rows(es, href['combined_gbps']['median'], gs)))
+            md.append(table(hdr, gemv_rows(es, href['combined_gbps']['median'], gs, href)))
             md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith('e5off-')), key=lambda e: (e['cfg']['gs'], e['page'], int(e['name'].rsplit('off', 1)[1])))
     if es:
         md.append('## GEMV alignment test: every weight address moved up by `off` bytes (all-HBM, 56 workers)\n')
         md.append(table(['gs', 'page', 'offset bytes', 'GB/s', 'reps'], [(e['cfg']['gs'], e['page'], e['name'].rsplit('off', 1)[1], mm(e['combined_gbps']), e['reps']) for e in es]))
         md.append('')
+    for prefix, title in (('hbmx-', 'HBM-only baseline extension (S = 1; shuffled order)'),
+                          ('e6b-', 'E6 at real splits cd = 4, 8, 16 (shuffled order)'),
+                          ('e5alias-', 'GEMV and raw-read stripe-aliasing tests (shuffled order)')):
+        es = sorted((e for e in agg.values() if e['name'].startswith(prefix) and e['sockets'] == 1), key=lambda e: (e['page'], e['name']))
+        if es:
+            md.append(f'## {title}\n')
+            md.append(table(['config', 'page', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps', 'p: above e1-cd0 by chance'],
+                            [(e['name'], e['page'], mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), e['reps'],
+                              pcol(e, agg.get(('e1-cd0', e['page'], 1))) if e['cfg']['kind'] == 0 else '-') for e in es]))
+            md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith('e6-')), key=lambda e: (e['page'], e['name']))
     if es:
         md.append('## E6 sensitivity (per-socket GB/s)\n')
@@ -770,9 +859,9 @@ def tables(agg, windows, idle):
             gbs = e['combined_gbps']['median']
             total = e['pkg_w0']['median'] + e['ram_w0']['median']
             rows.append((name, f'{gbs:.0f}', f'{e["pkg_w0"]["median"]:.0f}', f'{e["ram_w0"]["median"]:.0f}', f'{total / gbs:.3f}',
-                         f'{(total - ip[0] - ip[1]) / gbs:.3f}', mm(e.get('freq_ghz'), 2)))
+                         mm(e.get('freq_ghz'), 2)))
     if rows:
-        md.append(table(['config (2m)', 'GB/s', 'package W', 'DRAM W', 'J/GB (package + DRAM)', 'J/GB above the quiet baseline', 'core GHz'], rows))
+        md.append(table(['config (2m)', 'GB/s', 'package W', 'DRAM W', 'J/GB (package + DRAM of socket 0)', 'core GHz'], rows))
     return '\n'.join(md)
 
 
