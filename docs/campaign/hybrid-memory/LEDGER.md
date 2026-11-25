@@ -4,6 +4,8 @@ Standing instructions: [`docs/plans/hybrid-memory-manager-prompt.md`](../../plan
 (local, not committed). This file is the manager's memory across sessions. Started 24 November 2026 from `develop` at
 `b9b9bbb`.
 
+**Blocker 25 Nov ~01:30:** SSH master to the cluster dropped; owner must reopen it. Jobs keep running.
+
 **Resume:** read this file, `git fetch`, `git log develop`, `squeue -u $USER`, then continue from **Next action**.
 
 ## Next action
@@ -98,6 +100,15 @@ the mirror's file list and sizes match it.
 - E5 all-HBM GEMV gs64: 317 (32 w), 398 (48), 418 (52), 401 (56) GB/s: below stream ceiling, 56 < 52 workers.
 - Counter/computed exceptions: 6 base windows up to 1.47, 7 DDR windows up to 1.07: must be explained in validation.
 - Loaded latency: DDR probe 132 -> 366 ns under 55 DDR streaming cores.
+
+## P1 verification of A/C (independent haiku re-derivation, 25 Nov)
+
+- Confirmed exactly: E1 medians and ranges (all 12 splits, both pages), E5 HBM-only GEMV scan, 7 reps, placement 456/456
+  events 100%, run-level CAS bytes 0.999 HBM / 1.001 DDR, package power ~351 W in all configurations.
+- Corrections sent to P1: HBM-only core clock median 1.71 GHz (1.77 is the max); `common_s = 0` so E1 numbers are
+  whole-window values; per-window CAS ratios depend on perf alignment (extremes not reproduced); interleaving only across
+  page sizes; no E3 claim before job B.
+- Open: C-vs-A replication not re-derived (SSH master dropped).
 
 ## P1 smoke (1 repetition, superseded)
 
