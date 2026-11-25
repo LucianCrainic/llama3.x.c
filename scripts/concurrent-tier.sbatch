@@ -53,6 +53,7 @@ BEST_ENV=${BEST_ENV:-}
 STAGES=${STAGES//+/ }
 PAGES=${PAGES//+/ }
 PRIOR=${PRIOR//+/ }
+SUMMARY_ARGS=${SUMMARY_ARGS:-}
 SUMMARY_ARGS=${SUMMARY_ARGS//+/ }
 job_begin
 # Fixed explicit map: S0 = cores 0-55, DDR node 0, HBM node 2; S1 = cores 56-111, DDR node 1, HBM node 3.
