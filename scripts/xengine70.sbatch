@@ -16,6 +16,9 @@
 # LLAMA_* knob of the same name), and LEGACY=1 for the configuration of the earlier 70B comparison work (KERNELS=avx512
 # ATTN=tiled ATTN_DECODE=group KV_LAYOUT=head THP=off Q8_ACTIVATIONS=int8; any option set explicitly wins over it). The
 # Q8 rows of docs/xengine-70b.md were measured before the gs32 AMX and VNNI kernels existed; re-run the c-q8 modes to refresh.
+# C modes also take PLACEMENT (default ddr, or hbm-only for *-hbm) and HYBRID_WEIGHTS_HBM_LAYERS, HYBRID_KV_HBM_LAYERS,
+# HYBRID_PACKED (LLAMA_HYBRID_*). With the AMX packed copy, 70B hbm-only exceeds the HBM budget; the HBM rows of
+# docs/xengine-70b.md use PLACEMENT=hybrid HYBRID_WEIGHTS_HBM_LAYERS=80 HYBRID_KV_HBM_LAYERS=80 HYBRID_PACKED=ddr.
 set -euo pipefail
 root=$(realpath "$1")
 out=$2
@@ -132,6 +135,11 @@ PY
       [[ -z ${THP:-} ]] || export LLAMA_THP=$THP
       [[ -z ${Q8_ACTIVATIONS:-} ]] || export LLAMA_Q8_ACTIVATIONS=$Q8_ACTIVATIONS
       export LLAMA_SOCKETS=2 LLAMA_THREADS=55 LLAMA_PREFILL_BATCH="$batch"
+      unset LLAMA_HYBRID_WEIGHTS_HBM_LAYERS LLAMA_HYBRID_KV_HBM_LAYERS LLAMA_HYBRID_PACKED
+      [[ -z ${PLACEMENT:-} ]] || placement=$PLACEMENT
+      [[ -z ${HYBRID_WEIGHTS_HBM_LAYERS:-} ]] || export LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=$HYBRID_WEIGHTS_HBM_LAYERS
+      [[ -z ${HYBRID_KV_HBM_LAYERS:-} ]] || export LLAMA_HYBRID_KV_HBM_LAYERS=$HYBRID_KV_HBM_LAYERS
+      [[ -z ${HYBRID_PACKED:-} ]] || export LLAMA_HYBRID_PACKED=$HYBRID_PACKED
       export LLAMA_PLACEMENT="$placement" LLAMA_PLACEMENT_STRICT=1 LLAMA_VERIFY_SAMPLES=16384
       env | grep '^LLAMA_' | sort >> "$out/environment.txt"
       command=(taskset -c 0-54,56-110 "$build/xengine70-$precision" "$model" "${ids[@]}")
