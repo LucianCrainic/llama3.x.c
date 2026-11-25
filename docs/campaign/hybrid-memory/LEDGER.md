@@ -30,7 +30,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | in work: A (hbm14) and C (hbm13) done, B (E3/E4/E5 r-sweep) running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B) | ~2.0 + B |
+| P1 concurrent bandwidth | A, B, C done; job D (fill check, E3/E4 random, shuffled E5) blocked on SSH | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B) | ~2.0 + B |
 | G1 decision | open | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; final TSAN gate 5916531 result unknown (SSH drop) | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
@@ -102,6 +102,16 @@ the mirror's file list and sizes match it.
 - E5 all-HBM GEMV gs64: 317 (32 w), 398 (48), 418 (52), 401 (56) GB/s: below stream ceiling, 56 < 52 workers.
 - Counter/computed exceptions: 6 base windows up to 1.47, 7 DDR windows up to 1.07: must be explained in validation.
 - Loaded latency: DDR probe 132 -> 366 ns under 55 DDR streaming cores.
+
+## P1 interim from job B (agent-reported, unverified)
+
+- E5 gs64 2M: best all-HBM 418 (52 w), best split ~447 (r 0.25-0.3) = +6.8%; 4K: all-HBM 444 (56 w), split 455-456 = ~+1%.
+  Against the best all-HBM over both page sizes the gain is ~0-1%: G1 tends to No, pending shuffled confirmation (job D).
+- E3 all-HBM read 603 vs E1 569: E3 regions zero-filled vs random in E1; data-dependent power under the cap suspected.
+  Job D tests random vs zero (`fillcmp`) and reruns E3/E4 with random data.
+- **Side finding for P5:** all-HBM GEMV 4K pages 444 vs 2M 403 GB/s at 56 workers (+10%); engine weights use THP. Asked
+  for a shuffled 2M/4K GEMV pair in job D.
+- 96 outlier windows (NTA hint up to 1.47, small-DDR-volume points up to 1.09) now listed; run-level HBM 0.993-1.007.
 
 ## P2 notes for P4
 
