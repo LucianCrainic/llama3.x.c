@@ -80,16 +80,18 @@ cell_env() { # cell_env "thp=off stagger=1" -> LLAMA_THP=off LLAMA_GEMV_STAGGER=
 }
 
 build() { # build TREE DIR
-  make -C "$1" -j 56 CC=gcc BUILD_DIR="$2" all probe-int8 > "$2.build.log" 2>&1 || { tail -30 "$2.build.log"; exit 1; }
+  make -C "$1" -j 56 CC=gcc BUILD_DIR="$2" all "$2/probe-int8" > "$2.build.log" 2>&1 || { tail -30 "$2.build.log"; exit 1; }
 }
 
 stage_check() {
   mkdir "$OUT/bin"
   build_dir="$OUT/bin"
-  make -C "$ROOT" -j 56 CC=gcc BUILD_DIR="$build_dir" test > "$OUT/make-test.log" 2>&1 && gate=0 || gate=$?
+  # the gate as the campaign check stage runs it: engine knobs unset, one socket (CPUs and memory of node 0)
+  clean numactl --cpunodebind=0 --membind=0 make -C "$ROOT" -j 56 CC=gcc BUILD_DIR="$build_dir" test > "$OUT/make-test.log" 2>&1 &&
+    gate=0 || gate=$?
   printf 'make test rc=%s\n' "$gate" | tee "$OUT/make-test.rc"
   tail -5 "$OUT/make-test.log"
-  [[ -z ${BASE_ROOT:-} ]] || make -C "$BASE_ROOT" -j 56 CC=gcc BUILD_DIR="$OUT/bin-base" all probe-int8 > "$OUT/build-base.log" 2>&1
+  [[ -z ${BASE_ROOT:-} ]] || make -C "$BASE_ROOT" -j 56 CC=gcc BUILD_DIR="$OUT/bin-base" all "$OUT/bin-base/probe-int8" > "$OUT/build-base.log" 2>&1
   [[ -n ${CONFIG:-} ]] || return "$gate"
   status=0
   for name in $CONFIG; do
@@ -116,6 +118,7 @@ probe_config() {
   done
   sort -u "$OUT"/logits-"$CONFIG"-*.sha256 | wc -l > "$OUT/logits-distinct-$CONFIG.txt"
   [[ $(cat "$OUT/logits-distinct-$CONFIG.txt") == 1 ]] || status=1
+  ! grep -q '^e3b0c442' "$OUT"/logits-"$CONFIG"-*.sha256 || status=1 # the digest of no output: a probe failed
   printf 'distinct logit digests over %s files: %s\n' "$(ls "$OUT"/logits-"$CONFIG"-*.sha256 | wc -l)" \
     "$(cat "$OUT/logits-distinct-$CONFIG.txt")"
   return "$status"
