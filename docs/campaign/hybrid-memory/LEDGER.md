@@ -115,8 +115,11 @@ the mirror's file list and sizes match it.
 
 ## P2 notes for P4
 
-- 70B plan-only: `hbm-only` refused at ctx 8192 and 98304 (agent says over budget; arena to confirm, likely the AMX packed
-  copy). `hybrid` admits gs64 and gs32 at ctx 98304 with HBM 55/56 GiB, auto KV layers 37 (gs64) / 33 (gs32).
+- 70B `hbm-only` overflows because of the AMX packed copy (per socket at ctx 8192: weights 34.4 GiB + packed 33.9 + rest
+  5.0 = 73.2 GiB vs 56 GiB budget; without packed ~39.3). `hbm-only` rejects `LLAMA_HYBRID_PACKED`. **The 70B HBM
+  baseline (C1) is therefore `hybrid` with all weight and KV layers in HBM and packed=ddr**, labelled as such.
+- BF16 K/V copy is 15 GiB/socket at ctx 98304: it competes with KV for HBM under hybrid.
+- `hybrid` admits gs64 and gs32 at ctx 98304 with HBM 55/56 GiB, auto KV layers 37 (gs64) / 33 (gs32).
 - The 2S planned prefault writes the whole DDR-tier KV and BF16 arenas at setup (as legacy): setup cost at 70B.
 
 ## P1 verification of A/C (independent haiku re-derivation, 25 Nov)
