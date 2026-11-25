@@ -1132,13 +1132,12 @@ class TensorParallelTests(unittest.TestCase):
         self.assertEqual([a['bytes'] for a in exchange], [3 * 32 * TP_WIDE_CONFIG[0] * 4] * 2)
         source = (Path(__file__).resolve().parent.parent/'src/tp.c').read_text()
         guards = [line.strip() for line in source.splitlines() if 'tp->plan.mode' in line]
-        # setup_socket (legacy 2S work memset; BF16 copy carve; legacy KV table; planned BF16 slots; planned KV spans),
+        # setup_socket (legacy 2S work memset; BF16 copy carve; planned BF16 slots; planned KV spans),
         # work_bytes (the copy is counted in the work region only without a plan), CMD_SETUP (the plan's zeroing),
         # tp_create_planned (mode), its verification loop (twice), tp_all_logits (admission), tp_kv_stats, tp_free (x2).
         self.assertEqual(guards, [
             'if (S == 2 && !tp->plan.mode)',
             'if (kv_bf16_bytes && !tp->plan.mode)',
-            'if (!tp->plan.mode) {',
             'else if (kv_bf16_bytes && tp->plan.mode) {',
             'if (tp->plan.mode) {',
             'return work_bytes_for(&tp->c, tp->sockets, tp->quantized, tp->gs, tp->rows, 0, !tp->plan.mode);',

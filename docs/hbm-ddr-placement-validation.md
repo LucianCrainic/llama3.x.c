@@ -27,7 +27,7 @@ tests: a per-channel plan wrote through a NULL KV pointer or divided by zero, th
 | 3 | gs 32 and gs 64 packed layouts | none needed (shared `pack_bytes_of`); tested | `test_hybrid_packed_tier_with_every_group_size` (gs 64, gs 32, per-channel; `LLAMA_HYBRID_PACKED=hbm` and `ddr`: arena on the requested tier, equal size in both, logits bitwise the unplanned run) | yes (1S) |
 | 4 | fused RMSNorm + quantizer with `kv_layer()` | merge keeps both | `test_fused_norm_quantizer_runs_with_a_split_kv_region` (pipelined = chunk = unplanned, split KV, three file types, 1S and 2S; source asserts the two fused calls and the accessor) | yes |
 | 5 | raw `key_cache`/`value_cache` | table for every placement | `test_no_raw_kv_indexing_outside_the_kv_table` (section 3) | n/a |
-| 6 | interleaved reduction, exchange, prefault, `plan.mode` guards | planned prefault, exchange flag check | `test_planned_split_kv_prefault_and_exchange` (barrier = wo = interleaved bitwise under a split plan and against `hbm-only`; exchange arena size; the 14 guards enumerated) | yes (NULL prefault) |
+| 6 | interleaved reduction, exchange, prefault, `plan.mode` guards | planned prefault, exchange flag check | `test_planned_split_kv_prefault_and_exchange` (barrier = wo = interleaved bitwise under a split plan and against `hbm-only`; exchange arena size; the 13 guards enumerated) | yes (NULL prefault) |
 | 7 | `hbm-ddr.sbatch` forces `LLAMA_KERNELS=avx512`, M = 64 | options, `LEGACY=1` | `test_hbm_ddr_script_follows_engine_defaults` | n/a |
 
 Virtual topologies are `simulated`: their page queries are skipped, so the page-level checks of the BF16 copy are covered by
