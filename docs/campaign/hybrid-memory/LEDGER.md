@@ -113,6 +113,13 @@ the mirror's file list and sizes match it.
   placement 100%, THP shares, in-process shuffle. Not confirmed: core clock (cycles/56 gives 2.10 vs 2.17 GHz, not 1.64 vs
   1.75); 351 W is socket 0 only (socket 1 ~180 W); CAS closure fails for e3 HBM (0.72, interleave bytes booked as HBM),
   e4 DDR (1.21-1.24), fill DDR (1.18); fill mode of e3/e4/e5c not recorded; e5off 4K spread 2.2%. Sent to P1 to fix.
+- **Independent sonnet review (25 Nov):** numbers, placement, timing, cache, counters pass. Blocking: E6 was run at cd=0
+  (best_points bug), so tuning at a real split never happened. Must-fix: small same-sign excess in E2-E5 (+0.8-3%, E5 +0.8/
+  +1.4/+2.0% over three jobs, p 0.002-0.06) to be stated, not called noise; HBM-only grid stopped at pf 16K; reference
+  must be e1-cd0; E3/E4 single node; GEMV is weight-stream only (upper bound). 2M-vs-4K GEMV effect is real (all jobs) but
+  'not alignment' untested: likely lockstep stripe aliasing (w1/w3 rows per worker = exactly 2 MiB at 28/56 workers).
+- Decision: before G1, P1 runs job E (E6 at real splits, pf 32-128K, aliasing test, cdw +-2) on hbm14 and job F
+  (E3/E4/E5c replication) on hbm13, after fixing best_points, CPU-observed record, perf pinning. P1 cap +15 node-h.
 - Manager's provisional G1 reading: **No** (E5 +1.4% within noise, far below 10%; raw streams no gain). Final after review.
 
 ## P1 interim from job B (agent-reported, unverified)
