@@ -1,7 +1,10 @@
-"""Tests of the 70B HBM/DDR research tools: tools/hbm_ddr_results.py, tools/hbm_worker_samples.py and the event names of
-tools/xengine_summary.py. Synthetic fixtures only; no cluster, no engine, no numpy or matplotlib."""
+"""Tests of the 70B HBM/DDR research tools: tools/hbm_ddr_results.py, tools/hbm_worker_samples.py, the event names of
+tools/xengine_summary.py and the DRY_RUN output of scripts/hbm-ddr-research.sbatch. Synthetic fixtures only; no cluster, no
+engine, no numpy or matplotlib."""
 from pathlib import Path
+import os
 import py_compile
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +14,8 @@ sys.path.insert(0, str(ROOT/'tools'))
 import hbm_ddr_results as results  # noqa: E402
 import hbm_worker_samples as samples  # noqa: E402
 import xengine_summary as summ  # noqa: E402
+
+SCRIPT = ROOT/'scripts/hbm-ddr-research.sbatch'
 
 
 def logical_report(sockets=2, hbm_weight_layers=40, hbm_kv_layers=40, mode='hybrid', classifier='hbm'):
@@ -96,6 +101,42 @@ class ToolSyntaxTests(unittest.TestCase):
     def test_plot_tool_compiles(self):
         with tempfile.TemporaryDirectory() as temp:
             py_compile.compile(str(ROOT/'tools/plot_hbm_ddr.py'), cfile=str(Path(temp)/'plot.pyc'), doraise=True)
+
+
+class ResearchScriptTests(unittest.TestCase):
+    def dry_run(self, **extra):
+        with tempfile.TemporaryDirectory() as temp:
+            env = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_')}
+            env.update(ROOT=str(ROOT), OUT=str(Path(temp)/'out'), MODEL_DIR=temp, CAMPAIGN='baseline', COMMIT='test', DRY_RUN='1')
+            env.update(extra)
+            result = subprocess.run(['bash', str(SCRIPT)], capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split('=', 1) for line in result.stdout.splitlines() if line.startswith('LLAMA_'))
+
+    def test_engine_defaults_are_not_forced(self):
+        knobs = self.dry_run()
+        for name in ('KERNELS', 'PREFILL_BATCH', 'PREFILL_LOGITS', 'KV_LAYOUT', 'ATTN', 'ATTN_DECODE', 'THP', 'Q8_ACTIVATIONS',
+                     'TOPOLOGY'):
+            self.assertNotIn(f'LLAMA_{name}', knobs)
+        self.assertEqual((knobs['LLAMA_SOCKETS'], knobs['LLAMA_THREADS'], knobs['LLAMA_HBM_BUDGET_GIB']), ('2', '56', '56'))
+        self.assertEqual(knobs['LLAMA_PLACEMENT_STRICT'], '1')
+        self.assertNotIn('LLAMA_SYNTHETIC_KV', knobs)
+
+    def test_legacy_restores_the_earlier_configuration_and_options_win(self):
+        legacy = self.dry_run(LEGACY='1')
+        self.assertEqual([legacy[f'LLAMA_{k}'] for k in ('KERNELS', 'PREFILL_BATCH', 'PREFILL_LOGITS', 'KV_LAYOUT', 'ATTN',
+                                                         'ATTN_DECODE', 'THP', 'Q8_ACTIVATIONS')],
+                         ['avx512', '128', 'last', 'head', 'tiled', 'split', 'off', 'int8'])
+        mixed = self.dry_run(LEGACY='1', KERNELS='amx', PREFILL_BATCH='256', TOPOLOGY='virtual:2x4')
+        self.assertEqual((mixed['LLAMA_KERNELS'], mixed['LLAMA_PREFILL_BATCH'], mixed['LLAMA_TOPOLOGY']),
+                         ('amx', '256', 'virtual:2x4'))
+        self.assertEqual(mixed['LLAMA_ATTN'], 'tiled')
+
+    def test_missing_options_are_refused(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_') and k not in ('ROOT', 'OUT', 'MODEL_DIR', 'CAMPAIGN')}
+        result = subprocess.run(['bash', str(SCRIPT)], capture_output=True, text=True, env=env, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('ROOT', result.stderr)
 
 
 if __name__ == '__main__':
