@@ -641,7 +641,7 @@ def idle_power(results):
 def hbm_only_reference(agg, min_reps=7):
     # pseudo-random data only: zero-filled regions read faster under the power cap (see the data-content table)
     cands = [e for e in agg.values() if is_hbm_only(e) and e['sockets'] == 1 and e['reps'] >= min_reps and e['cfg']['kind'] != 3
-             and not e['name'].startswith(('fczero', 'zfill', 'e1v'))]  # timed windows only; never the fixed-volume windows
+             and not e['name'].startswith(('fczero', 'zfill', 'e1v')) and '-lock-' not in e['name']]  # timed windows only: never fixed-volume or barrier-lockstep windows
     return max(cands, key=lambda e: e['combined_gbps']['median']) if cands else None
 
 
@@ -681,6 +681,10 @@ def tables(agg, windows, idle):
     ref = hbm_only_reference(agg)
     md.append(f'## Best HBM-only reference (>= 7 repetitions)\n\n{mm(ref["combined_gbps"]) if ref else "-"} GB/s per socket: '
               f'{describe(ref) if ref else "none"} ({ref["name"] if ref else ""}).\n')
+    locks = [e for e in agg.values() if '-lock-' in e['name'] and e['sockets'] == 1 and e['reps'] >= 7]
+    if locks:
+        bl = max(locks, key=lambda e: e['combined_gbps']['median'])
+        md.append(f'Best barrier-lockstep HBM-only read (a different measurement: fixed 1 MiB blocks, a team barrier after each): {mm(bl["combined_gbps"])} GB/s ({bl["name"]}, {bl["page"]}).\n')
     base = [e for e in agg.values() if e['name'].startswith('base-') and e['sockets'] == 1]
     for tier, pred in (('HBM-only', is_hbm_only), ('DDR-only', is_ddr_only)):
         top = sorted((e for e in base if pred(e)), key=lambda e: -e['combined_gbps']['median'])[:12]
