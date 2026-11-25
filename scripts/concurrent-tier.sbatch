@@ -19,7 +19,8 @@
 #                   BEST_*;  e1 split teams;  e2 shared cores;  e3 page-interleaved regions;  e4 both sockets at the best
 #                   E1/E2/E3 settings;  e5 the Q8 GEMV over the 70B shard;  e5hbm all-HBM GEMV with fewer workers;
 #                   e6 sensitivity at the best E1 point;  lat loaded latency;  freq core/uncore frequency (turbostat) under long windows;
-#                   fillcmp reads over random and zero-filled regions, e5c shuffled E5 confirmation;
+#                   fillcmp reads over random and zero-filled regions, e5c shuffled E5 confirmation (both page sizes),
+#                   e5off GEMV alignment test;
 #                   rep, rep-e5 the replication points
 #   REPS     repetitions per point of the measured stages (default 7);  BASE_REPS for base (default 3)
 #   PAGES    "2m 4k" (default)
@@ -194,6 +195,7 @@ for stage in $STAGES; do
     e4) rounds e4 "$REPS" 2 ;;
     e5) rounds e5 "$REPS" 1 ;;
     e5c) rounds e5c "$REPS" 1 ;;
+    e5off) rounds e5off "$REPS" 1 ;;
     fillcmp)
       # The same reads over pseudo-random and over zero-filled tier regions, alternating inside each repetition.
       for tag in random zero; do ct cfgs "fillcmp-$tag" ${BEST_ENV:+--best-env "$BEST_ENV"} > "$OUT/cfg/fillcmp-$tag.cfg"; done

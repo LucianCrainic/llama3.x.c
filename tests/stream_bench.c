@@ -407,6 +407,7 @@ typedef struct {
   int kind, ch, cd, a, b, unit, streams, hint, nt, pf, alt, probe, volume;
   int dstreams, dhint, dnt, dpf; /* the DDR group's own settings (-1 = those of the HBM group) */
   int gs, gshared, cdw, act, warm_passes, passes; /* act: active workers of a gemv window (0 = all) */
+  size_t off; /* gemv: every weight address is moved up by this many bytes (a multiple of 64): alignment test */
   double r, warm, seconds;
 } Cfg;
 
@@ -774,7 +775,7 @@ static void gemv_part(const Cfg *c, Sock *s, int m, int layer, int tier, int gi,
   int rows = tier ? rows_d : rows_h, first = tier ? rows_h : 0;
   if (rows <= 0 || gn <= 0)
     return;
-  size_t n = (size_t)shard[m].n, lay = (size_t)layer * layer_stride;
+  size_t n = (size_t)shard[m].n, lay = (size_t)layer * layer_stride + c->off;
   K8Weight wt = {(const int8_t *)(s->base[tier] + lay + mat_q_off[m]) + (size_t)first * n,
                  (const float *)(s->base[tier] + lay + mat_s_off[m]) + (size_t)first * (n / (size_t)c->gs)};
   K8Input x = {s->xq, s->xs, NULL};
@@ -852,7 +853,7 @@ static void fill2_fn(const void *p, int w, int workers) {
         uint64_t h = mix64((uint64_t)(layer * 7 + m) << 32 | (uint64_t)r);
         for (int i = 0; i < n; i++) {
           h = h * 6364136223846793005ULL + 1442695040888963407ULL;
-          int v = (int)((h >> 33) % 255) - 127;
+          int v = job->fill == 1 ? 0 : (int)((h >> 33) % 255) - 127; /* int8 in [-127, 127]; --fill zero: all zero */
           q[(size_t)r * n + i] = (int8_t)v;
         }
         for (int g = 0; g < n / 32; g++)
@@ -1252,6 +1253,8 @@ static int parse_cfg(const char *text, Cfg *c) {
       c->r = atof(v);
     else if (!strcmp(k, "cdw"))
       c->cdw = atoi(v);
+    else if (!strcmp(k, "off"))
+      c->off = (size_t)atoll(v);
     else if (!strcmp(k, "act"))
       c->act = atoi(v);
     else if (!strcmp(k, "gshared"))
@@ -1287,7 +1290,7 @@ static void check_cfg(const Run *R, const Cfg *c) {
   if (c->kind == CFG_SPLIT && (c->ch < 0 || c->cd < 0 || c->ch + c->cd < 1 || c->ch + c->cd > stream))
     fail("config %s: ch + cd must be 1..%d", c->name, stream);
   if (c->kind == CFG_GEMV &&
-      (c->cdw < 0 || c->cdw >= R->threads || (c->cdw == 0) != (c->r == 0 || c->gshared) || c->probe ||
+      (c->cdw < 0 || c->cdw >= R->threads || (c->cdw == 0) != (c->r == 0 || c->gshared) || c->probe || c->off % 64 ||
                                  c->act > R->threads || (c->act && c->cdw >= c->act)))
     fail("config %s: cdw must be 0 exactly when r = 0 (or gshared)", c->name);
 }

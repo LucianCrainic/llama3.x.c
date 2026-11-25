@@ -195,12 +195,19 @@ def gen(stage, env, results=None):
         add(fmt(name=f'fc{tag}-shared-4-1', kind='shared', a=4, b=1, unit=128, **p))
         add(fmt(name=f'fc{tag}-inter-1-0', kind='inter', a=1, b=0, **p))
         add(fmt(name=f'fc{tag}-inter-4-1', kind='inter', a=4, b=1, **p))
-    elif stage == 'e5c':  # confirmation of the E5 points near the all-HBM level, run in a shuffled order
         for gs in (64, 32):
             for act in (52, 56):
+                add(fmt(name=f'fc{tag}-gemv{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
+    elif stage == 'e5c':  # confirmation of the E5 points near the all-HBM level, run in a shuffled order
+        for gs in (64, 32):
+            for act in (48, 52, 56):
                 add(fmt(name=f'e5c-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
             for r, cdw in ((0.05, 3), (0.1, 6), (0.2, 14), (0.25, 18), (0.3, 21), (0.35, 24), (0.4, 28)):
                 add(fmt(name=f'e5c-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
+    elif stage == 'e5off':  # alignment test of the all-HBM GEMV: every weight address moved up by `off` bytes
+        for gs in (64, 32):
+            for off in (0, 64, 4096, 65536, 1048640):
+                add(fmt(name=f'e5off-gs{gs}-act56-off{off}', kind='gemv', gs=gs, r=0, cdw=0, act=56, off=off))
     elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, split and DDR-only load
         best = best_points(results or [], env)
         cd = best['e1_cd']
