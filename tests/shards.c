@@ -262,7 +262,7 @@ static void run_split_case(int sockets, int threads, int gs, unsigned ppm, int c
       if (sh->socket != s || sh->kind == SHARD_GLOBAL)
         continue;
       int q8 = sh->src->dtype == DT_Q8, ddr = sh->ddr_rows, first = sh->rows - ddr;
-      size_t groups = (size_t)shard_groups(sh);
+      size_t groups = q8 ? (size_t)shard_groups(sh) : 0;
       want[sh->tier] = aligned64(want[sh->tier]) + (size_t)first * (size_t)sh->cols * (q8 ? 1 : 4);
       if (q8)
         want[sh->tier] = aligned64(want[sh->tier]) + (size_t)first * groups * 4;
