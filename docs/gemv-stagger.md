@@ -106,6 +106,39 @@ cross-socket reduction wait); the whole-token effect (+1.9%) is the evidence the
 (8B one socket, 70B) and is the same on 4 KiB pages (70B: 13.2 ms), so on 2 MiB pages attention was running in the shadow of the slower GEMV; this is an observation,
 not tested further. Per-token forward time: 8B one socket -4.6%, 70B -5.6%.
 
+## 4b. Replication on the second Flat node and on gs32 (measured)
+
+Job 5935737, the same script (`scripts/gemv-stagger.sbatch` STAGE=ab), the same engine code (tree 59f6bc6), the same five interleaved repetitions and the same four cells, on the
+second Flat node ("node B"; section 4 is node A, the first). THP is `[always]` on both. gs32 uses the checkpoints named in the validation record (8B: the Q8_0 GGUF repacked to v3;
+70B: the cross-engine `q8-gguf-v3.bin`). Decode tok/s, median [min-max] of 5; the delta is knob on against off.
+
+| config | page size | node A (first run, gs64) off to on, delta | node B gs64: knob off | knob on | delta | on faster in |
+|---|---|---|---|---|---|---|
+| 8B, 1 socket | 2 MiB | 42.21 to 44.31, +5.0% | 42.43 [42.13-42.64] | 44.27 [44.18-44.39] | **+4.3%** | 5 of 5 |
+| 8B, 1 socket | 4 KiB | 43.88 to 43.81, -0.2% | 44.08 [43.96-44.14] | 44.02 [43.82-44.09] | -0.1% | 1 of 5 |
+| 8B, 2 sockets | 2 MiB | 73.53 to 74.95, +1.9% | 74.44 [73.19-76.05] | 75.31 [60.35-76.68] | **+1.2%** | 4 of 5 |
+| 8B, 2 sockets | 4 KiB | 74.81 to 74.43, -0.5% | 75.55 [75.18-75.78] | 74.81 [73.99-75.01] | -1.0% | 0 of 5 |
+| 70B, 2 sockets, hybrid 80/80 | 2 MiB | 10.00 to 10.60, +6.0% | 10.03 [10.02-10.04] | 10.62 [10.59-10.63] | **+5.9%** | 5 of 5 |
+| 70B, 2 sockets, hybrid 80/80 | 4 KiB | 10.49 to 10.53, +0.4% | 10.52 [10.47-10.55] | 10.51 [10.43-10.54] | -0.0% | 2 of 5 |
+
+| config (node B, gs32) | page size | knob off | knob on | delta | on faster in |
+|---|---|---|---|---|---|
+| 8B, 1 socket | 2 MiB | 39.67 [39.61-39.83] | 41.73 [41.60-41.89] | **+5.2%** | 5 of 5 |
+| 8B, 1 socket | 4 KiB | 41.34 [41.12-41.56] | 41.29 [40.84-41.31] | -0.1% | 2 of 5 |
+| 8B, 2 sockets | 2 MiB | 69.67 [68.96-70.82] | 70.80 [70.29-72.13] | **+1.6%** | 4 of 5 |
+| 8B, 2 sockets | 4 KiB | 71.18 [70.89-71.35] | 71.09 [70.99-71.53] | -0.1% | 2 of 5 |
+| 70B, 2 sockets, hybrid 80/80 | 2 MiB | 8.95 [8.95-9.00] | 10.03 [9.99-10.04] | **+12.0%** | 5 of 5 |
+| 70B, 2 sockets, hybrid 80/80 | 4 KiB | 9.98 [9.97-10.01] | 9.97 [9.94-9.98] | -0.0% | 2 of 5 |
+
+* **The gs64 result replicates on node B** within about one percentage point (8B one socket +4.3% against +5.0%, 8B two sockets +1.2% against +1.9%, 70B +5.9% against +6.0%), and the
+  4 KiB cells again show no gain. The knob-off values on node B are within 0.5-0.8% of node A (8B one socket 42.43 against 42.21; 8B two sockets 74.44 against 73.53; 70B 10.03 against 10.00).
+* **gs32 shows the same pattern with a larger 70B gain.** The VNNI pair kernel (gs32 decode) is aliased the same way: 8B one socket +5.2%, 8B two sockets +1.6%, and 70B **+12.0%** (8.95 to 10.03 tok/s). With the knob
+  on, 2 MiB pages reach the 4 KiB figure (10.03 against 9.98 tok/s); the gs32 70B is the case that loses the most to the aliasing: W1/W3 53.3 ms to 43.5 ms and W2 26.4 ms to 22.2 ms per token (profile, one run each), against 42.0 to 40.3 and 25.9 to 20.7 at gs64.
+* **8B two sockets, gs64, knob on at 2 MiB has one slow repetition (60.35 tok/s, repetition 2; the others 75.06-76.68).** The median and the order statistics are unaffected (4 of 5 faster), but that single run is
+  20% below its neighbours; its token trace is identical to the rest and no cause was examined (the run-to-run bimodality of [bimodality.md](bimodality.md) is a candidate, not tested). On 4 KiB pages the gs64 8B two-socket knob is -1.0% (0 of 5), a
+  small loss that node A did not show (-0.5%, 2 of 5); it is within about one spread and is not a finding, but it is the only cell where the knob is slower in every repetition.
+* Token traces of all 144 runs (24 per cell, six cells) are identical between knob off and on (`tokens-identical.txt` in each cell). The logits-level bitwise check of section 5 of the validation record was not repeated on gs32 or node B; the traces are the check here.
+
 ## 5. Limits and uncertainties
 
 * The page-size attribution rests on `LLAMA_THP=never` giving 4 KiB pages (the report shows `thp_bytes` 0 for every weight region) and on the knob making no difference there.
@@ -127,8 +160,7 @@ Do not make it the default yet; propose it for the owner's decision.
 
 * The evidence for turning it on is strong where it applies: on the engine's default page size (2 MiB on a node with THP `[always]`) it gains +5.0% (8B one socket), +1.9%
   (8B two sockets) and +6.0% (70B two sockets), 5 of 5 repetitions each, bitwise identical output, and it does nothing on 4 KiB pages (so it cannot hurt there).
-* Against that: one machine type and one node (the second node was not used), the mechanism is inferred, decode-only (prefill GEMM unchanged), gs64 only (gs32 and
-  per-channel go through different kernels and were not measured), and the FP32 engine is untouched. A default change should follow the owner's review of this A/B and,
-  ideally, a repeat on the second Flat node and on gs32 (the VNNI pair kernel of the gs32 decode); the cost to revert is one knob.
+* Against that: one machine type (the second node, section 4b, agrees), the mechanism is inferred, decode-only (prefill GEMM unchanged), gs64 and gs32 only (per-channel goes through a different kernel and was not measured), and the FP32 engine is untouched. The repeat on the second Flat node and on gs32 asked for earlier is section 4b: it agrees on gs64 (+4.3%, +1.2%, +5.9%) and on gs32 (+5.2%, +1.6%, +12.0%), 5 of 5 or 4 of 5 repetitions on every 2 MiB cell and no gain on 4 KiB pages. What remains for the owner is the decision itself;
+  the one cell where the knob is slower in all five repetitions is the 8B two-socket gs64 4 KiB cell (-1.0%), which is not the engine default page size on these nodes. The cost to revert is one knob.
 * Alternative to the knob: `LLAMA_THP=never` recovers 4.0%, 1.7% and 4.9% by itself and is already one environment variable, but it gives up what 2 MiB pages bring to the
   rest of the engine (KV, attention, prefill GEMM: not measured here), and the stagger gives more at the same page size.

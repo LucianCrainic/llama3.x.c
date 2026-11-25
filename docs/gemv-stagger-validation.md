@@ -75,3 +75,36 @@ Repetition order 1 to 5; cells are `THP / knob` (THP `off` is the engine default
 
 Decode profile of the 4 KiB cells (ms per token): 8B one socket W1/W3 8.087 and 8.132, W2 3.967 and 3.983 (knob off and on); 8B two sockets W1/W3 4.082 and 4.097, W2
 2.441 and 2.356; 70B W1/W3 40.324 and 40.627, W2 21.134 and 20.842: knob and page size give the same phase times once the aliasing is gone.
+
+## 7. Replication on the second node, gs64 and gs32 (job 5935737)
+
+One job, `scripts/gemv-stagger.sbatch` STAGE=ab invoked six times in a row (one results directory per cell, one build of the tree per cell), exclusive on the second Flat node ("node B",
+the other node of the pair that jobs 5934862-65 did not use), from the staged copy of develop 59f6bc6 (engine code of 2c8bc12; `COMMIT` and the sha256 of every source file are in each
+directory), after the gate job of that tree. Elapsed 1:37:23, state COMPLETED, every cell rc 0. Settings as in section 2 (generation 256 tokens for 8B, 128 for 70B, 4096 warm context, five
+interleaved repetitions in rotated order, then one profiled run per cell); only the checkpoint and the node differ.
+
+| cell | checkpoint (group size) | token traces | repetitions on 2 MiB (off / on) |
+|---|---|---|---|
+| 8B 1S gs64 | the 8B `int8-v3.bin` (64) | 24, 0 differ | 42.64 42.43 42.45 42.30 42.13 / 44.27 44.22 44.39 44.18 44.32 |
+| 8B 2S gs64 | same | 24, 0 differ | 74.44 76.05 74.57 73.71 73.19 / 75.31 60.35 76.01 76.68 75.06 |
+| 70B 2S gs64 | the 70B `int8-v3.bin` (64), hybrid 80/80, packed copy in DDR | 24, 0 differ | 10.04 10.03 10.02 10.03 10.04 / 10.62 10.63 10.63 10.59 10.59 |
+| 8B 1S gs32 | the 8B Q8_0 GGUF repacked to v3 (32) | 24, 0 differ | 39.63 39.81 39.67 39.61 39.83 / 41.62 41.73 41.89 41.73 41.60 |
+| 8B 2S gs32 | same | 24, 0 differ | 69.67 69.97 70.82 68.96 69.06 / 70.46 70.80 70.29 70.86 72.13 |
+| 70B 2S gs32 | the 70B Q8_0 GGUF repacked to v3 (32), hybrid 80/80, packed copy in DDR | 24, 0 differ | 8.95 9.00 8.95 8.96 8.95 / 10.04 10.03 10.03 10.00 9.99 |
+
+Repetitions on 4 KiB pages (`LLAMA_THP=never`, off / on):
+
+| cell | off | on |
+|---|---|---|
+| 8B 1S gs64 | 44.14 44.08 43.96 44.05 44.09 | 43.82 44.03 43.96 44.02 44.09 |
+| 8B 2S gs64 | 75.55 75.63 75.45 75.78 75.18 | 73.99 74.82 74.81 75.01 74.08 |
+| 70B 2S gs64 | 10.50 10.47 10.54 10.55 10.52 | 10.51 10.54 10.52 10.51 10.43 |
+| 8B 1S gs32 | 41.34 41.15 41.56 41.12 41.40 | 41.22 41.31 40.84 41.29 41.29 |
+| 8B 2S gs32 | 71.18 71.25 70.89 71.08 71.35 | 71.09 71.06 71.53 70.99 71.46 |
+| 70B 2S gs32 | 10.01 9.99 9.97 9.98 9.98 | 9.94 9.97 9.96 9.98 9.98 |
+
+Medians, ranges and deltas in [gemv-stagger.md](gemv-stagger.md) section 4b are `tools/gemv_stagger_summary.py` over each cell's directory (the table of each run is its output; the deltas
+are median ratios). Decode profile of the 2 MiB cells (ms per token, one profiled run per cell, knob off / on): 8B 1S gs64 W1/W3 8.994 / 8.033, W2 4.301 / 3.917; 8B 1S gs32 W1/W3 9.782 / 8.946, W2 4.551 / 4.190;
+70B gs64 W1/W3 41.982 / 40.340, W2 25.911 / 20.698; 70B gs32 W1/W3 53.256 / 43.454, W2 26.444 / 22.196, forward 111.792 / 99.905. The 4 KiB profiles give the same phase times for knob off and on in every cell.
+
+What was not repeated: the `make test` gate and the logit digests of sections 3 and 4 (the engine code is the code of 2c8bc12, whose gate and logits passed in jobs 5934865 and, for 59f6bc6, the gate job that ran before this one), and no gs32 logit digest was taken (token traces only). The anomalous repetition (8B 2S gs64, knob on, 2 MiB, repetition 2: 60.35 tok/s) has an identical token trace and was not investigated.
