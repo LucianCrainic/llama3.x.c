@@ -1282,6 +1282,194 @@ class TensorParallelTests(unittest.TestCase):
             'if (!tp->plan.mode) {',
         ])
 
+    # ---- LLAMA_HYBRID_SPLIT=rows (docs/concurrent-tiers.md) ----------------------------------------------------------
+
+    ROLE_ORDER = ('wq', 'wk', 'wv', 'w1', 'w3', 'wo', 'w2')  # the order of a layer's shards in a socket's arenas
+
+    def split_shapes(self, sockets, gs):
+        """(rows, cols, groups) of the seven large shards of one socket of the wide fixture."""
+        dim, hidden, _, heads, kv_heads = TP_WIDE_CONFIG[:5]
+        kv = dim // heads * kv_heads // sockets
+        gs = gs or 0
+        shapes = {'wq': (dim // sockets, dim), 'wk': (kv, dim), 'wv': (kv, dim), 'w1': (hidden // sockets, dim),
+                  'w3': (hidden // sockets, dim), 'wo': (dim, dim // sockets), 'w2': (dim, hidden // sockets)}
+        return {name: (rows, cols, cols // gs if gs else 1) for name, (rows, cols) in shapes.items()}
+
+    @staticmethod
+    def ddr_rows(rows, ppm):
+        """shards_ddr_rows: the fraction of the rows rounded down to 32, at most 15/16 of the rows."""
+        n = rows * ppm // 1000000
+        n -= n % 32
+        most = rows * 15 // 16
+        return most - most % 32 if n > most else n
+
+    def expected_ddr_weights(self, sockets, gs, ppm):
+        """The DDR weights arena of one socket for a fraction: every split part's values and scales, 64-byte aligned in
+        shard order (recomputed here, independently of the planner)."""
+        shapes, cursor = self.split_shapes(sockets, gs), 0
+        for _ in range(TP_WIDE_CONFIG[2]):
+            for name in self.ROLE_ORDER:
+                rows, cols, groups = shapes[name]
+                ddr = self.ddr_rows(rows, ppm)
+                if ddr:
+                    cursor = (cursor + 63) // 64 * 64 + ddr * cols
+                    cursor = (cursor + 63) // 64 * 64 + ddr * groups * 4
+        return cursor
+
+    def test_row_split_decode_and_prefill_are_bitwise_the_unsplit_run(self):
+        """LLAMA_HYBRID_SPLIT=rows reads each output row exactly as before, from either arena: the logits of a batched
+        prefill (packed AMX tiles, their transposed scales, the barrier-form Wo/W2 reduction and the split GEMM calls) and
+        of greedy decode (the team GEMV with members assigned to the DDR rows) are bitwise those of hbm-only, for every
+        group size, per-channel files, one and two sockets, several fractions and DDR core counts."""
+        tokens = [65 + (i * 7) % 20 for i in range(33)]
+        for binary, kernels in (('probe-int8', 'scalar'), ('probe-int8-amx-emul', 'amx')):
+            self.need(binary)
+            for fixture in ('wide', 'wide-gs32', 'wide-pc'):
+                for sockets in (1, 2):
+                    common = dict(binary=binary, LLAMA_KERNELS=kernels, LLAMA_PREFILL_BATCH='8',
+                                  LLAMA_PREFILL_LOGITS='all', LLAMA_TOPOLOGY=f'virtual:{sockets}x3')
+                    reference = {mode: self.probe('int8', fixture, mode, sockets, tokens=tokens,
+                                                  LLAMA_PLACEMENT='hbm-only', **common)
+                                 for mode in ('batch', 'generate')}
+                    for fraction, cores in (('0.25', None), ('0.5', '1'), ('0.9', '2'), ('auto', '2')):
+                        knobs = dict(LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_SPLIT='rows',
+                                     LLAMA_HYBRID_DDR_FRACTION=fraction, **common)
+                        if cores:
+                            knobs['LLAMA_HYBRID_DDR_CORES'] = cores
+                        for mode in ('batch', 'generate'):
+                            with self.subTest(binary=binary, fixture=fixture, sockets=sockets, fraction=fraction,
+                                              cores=cores, mode=mode):
+                                self.assertEqual(reference[mode], self.probe('int8', fixture, mode, sockets,
+                                                                             tokens=tokens, **knobs))
+
+    def test_row_split_with_fp32_activations_and_the_stagger(self):
+        """W8A32 decode (the FP32-activation kernel) and the staggered GEMV are bitwise the unsplit run too."""
+        tokens = [65 + (i * 7) % 20 for i in range(9)]
+        for sockets in (1, 2):
+            for extra in (dict(LLAMA_Q8_ACTIVATIONS='fp32'), dict(LLAMA_GEMV_STAGGER='1')):
+                common = dict(LLAMA_KERNELS='scalar', LLAMA_TOPOLOGY=f'virtual:{sockets}x3', **extra)
+                with self.subTest(sockets=sockets, **extra):
+                    reference = self.probe('int8', 'wide', 'generate', sockets, tokens=tokens,
+                                           LLAMA_PLACEMENT='hbm-only', **common)
+                    self.assertEqual(reference, self.probe('int8', 'wide', 'generate', sockets, tokens=tokens,
+                                                           LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_SPLIT='rows',
+                                                           LLAMA_HYBRID_DDR_FRACTION='0.5', **common))
+
+    def test_row_split_plan_arithmetic(self):
+        """The planner's DDR weights arena is exactly the split rows' values and scales, the HBM weights arena shrinks by the
+        same rows, nothing else moves, `auto` takes the smallest fraction that fits the budget (and the measured balance of
+        docs/concurrent-tiers.md when everything fits), and the report names the split."""
+        self.need('runq-amx-emul')
+        args = dict(LLAMA_KERNELS='amx', LLAMA_PREFILL_BATCH='32')
+        for fixture, gs in (('wide', 64), ('wide-gs32', 32), ('wide-pc', 0)):
+            for sockets in (1, 2):
+                base = dict(args, LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='2', LLAMA_TOPOLOGY=f'virtual:{sockets}x3')
+                result, whole = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets, **base)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(whole['placement_plan']['split'], 'layers')
+                self.assertEqual(self.arenas(whole, 'weights')[0]['tier'], 'hbm')
+                hbm_whole = {a['socket']: a['bytes'] for a in self.arenas(whole, 'weights') if a['tier'] == 'hbm'}
+                charged = {(n['socket'], n['tier']): n['charged_bytes'] for n in whole['placement_plan']['nodes']}
+                for fraction in ('0.25', '0.5', '0.9'):
+                    ppm = round(float(fraction) * 1e6)
+                    with self.subTest(fixture=fixture, sockets=sockets, fraction=fraction):
+                        result, report = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets,
+                                                   LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_DDR_FRACTION=fraction,
+                                                   LLAMA_HYBRID_DDR_CORES='2', **base)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        plan = report['placement_plan']
+                        self.assertEqual((plan['split'], plan['ddr_cores'], plan['ddr_fraction_auto']), ('rows', 2, False))
+                        self.assertAlmostEqual(plan['ddr_fraction'], float(fraction))
+                        want = self.expected_ddr_weights(sockets, gs, ppm)
+                        ddr = [a for a in self.arenas(report, 'weights') if a['tier'] == 'ddr']
+                        self.assertEqual([a['bytes'] for a in ddr], [want] * sockets)
+                        hbm = {a['socket']: a['bytes'] for a in self.arenas(report, 'weights') if a['tier'] == 'hbm'}
+                        for s in range(sockets):
+                            self.assertLess(hbm[s], hbm_whole[s])
+                        # every other arena is the layer-split plan's, and the charges move with the weights only
+                        other = lambda r: sorted((a['socket'], a['tier'], a['role'], a['bytes'])
+                                                 for a in self.arenas(r) if a['role'] != 'weights')
+                        self.assertEqual(other(report), other(whole))
+                        nodes = {(n['socket'], n['tier']): n['charged_bytes'] for n in plan['nodes']}
+                        for s in range(sockets):
+                            self.assertLess(nodes[(s, 'hbm')], charged[(s, 'hbm')])
+                            self.assertGreater(nodes[(s, 'ddr')], charged[(s, 'ddr')])
+                # auto, everything fits: the balance of docs/concurrent-tiers.md
+                result, report = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets, LLAMA_HYBRID_SPLIT='rows', **base)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((report['placement_plan']['ddr_fraction'], report['placement_plan']['ddr_fraction_auto']),
+                                 (0.2, True))
+                # auto, a budget below what hbm-only needs: the smallest fraction (to 0.1%) that fits, and none smaller
+                gib = lambda n: str(n / (1 << 30))
+                for shave in (1, 20000):
+                    budget = max(charged[(s, 'hbm')] for s in range(sockets)) - shave
+                    result, report = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets, LLAMA_HYBRID_SPLIT='rows',
+                                               LLAMA_HBM_BUDGET_GIB=gib(budget), **base)
+                    with self.subTest(fixture=fixture, sockets=sockets, budget=budget):
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        plan = report['placement_plan']
+                        self.assertTrue(plan['ddr_fraction_auto'] and plan['admitted'])
+                        self.assertGreater(plan['ddr_fraction'], 0)
+                        self.assertTrue(all(n['charged_bytes'] <= n['budget_bytes'] for n in plan['nodes']))
+                        below = plan['ddr_fraction'] - 0.001
+                        if below > 0:
+                            result, _ = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets, LLAMA_HYBRID_SPLIT='rows',
+                                                  LLAMA_HYBRID_DDR_FRACTION=f'{below:.3f}', LLAMA_HBM_BUDGET_GIB=gib(budget),
+                                                  **base)
+                            if self.expected_ddr_weights(sockets, gs, round(below * 1e6)) != \
+                               self.expected_ddr_weights(sockets, gs, round(plan['ddr_fraction'] * 1e6)):
+                                self.assertNotEqual(result.returncode, 0)
+                                self.assertIn('over its', result.stderr)
+                # the DDR budget bounds the DDR share
+                result, _ = self.plan('runq-amx-emul', fixture, 'int8.bin', sockets, LLAMA_HYBRID_SPLIT='rows',
+                                      LLAMA_HYBRID_DDR_FRACTION='0.5', LLAMA_DDR_BUDGET_GIB='0.0001', **base)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('over its', result.stderr)
+
+    def test_row_split_knob_parsing_and_refusals(self):
+        self.need('runq-amx-emul')
+        base = dict(LLAMA_KERNELS='amx', LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='2')
+
+        def refused(text, binary='runq-amx-emul', fixture='wide', filename='int8.bin', **knobs):
+            result, _ = self.plan(binary, fixture, filename, **{**base, **knobs})
+            self.assertNotEqual(result.returncode, 0, knobs)
+            self.assertIn(text, result.stderr, knobs)
+
+        def accepted(**knobs):
+            result, report = self.plan('runq-amx-emul', 'wide', 'int8.bin', **{**base, **knobs})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return report['placement_plan']
+
+        refused('must be layers or rows', LLAMA_HYBRID_SPLIT='bogus')
+        refused('requires LLAMA_HYBRID_SPLIT=rows', LLAMA_HYBRID_DDR_FRACTION='0.2')
+        refused('requires LLAMA_HYBRID_SPLIT=rows', LLAMA_HYBRID_SPLIT='layers', LLAMA_HYBRID_DDR_CORES='2')
+        refused('requires LLAMA_PLACEMENT=hybrid', LLAMA_PLACEMENT='hbm-only', LLAMA_HYBRID_SPLIT='rows')
+        refused('requires LLAMA_PLACEMENT=hybrid', LLAMA_PLACEMENT='ddr', LLAMA_HYBRID_DDR_FRACTION='0.2')
+        refused('needs a Q8_0 checkpoint', binary='run', fixture='unshared', filename='fp32.bin', LLAMA_KERNELS='scalar',
+                LLAMA_HYBRID_SPLIT='rows')
+        refused('cannot be combined with LLAMA_HYBRID_SPLIT=rows', LLAMA_HYBRID_SPLIT='rows',
+                LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1')
+        for value in ('1.5', '-0.1', 'abc', '0.95', '0.2x', 'nan'):
+            refused('LLAMA_HYBRID_DDR_FRACTION must be auto or a fraction', LLAMA_HYBRID_SPLIT='rows',
+                    LLAMA_HYBRID_DDR_FRACTION=value)
+        for value in ('0', '-1', 'x', '3', '2.5'):  # three threads per socket: 1 or 2 members on the DDR rows
+            refused('LLAMA_HYBRID_DDR_CORES must be a whole number between 1 and 2', LLAMA_HYBRID_SPLIT='rows',
+                    LLAMA_HYBRID_DDR_CORES=value)
+        plan = accepted(LLAMA_HYBRID_SPLIT='layers')
+        self.assertEqual((plan['split'], plan['ddr_fraction'], plan['ddr_cores']), ('layers', 0.0, 0))
+        plan = accepted(LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_DDR_FRACTION='0')
+        self.assertEqual((plan['split'], plan['ddr_fraction'], plan['ddr_fraction_auto']), ('rows', 0.0, False))
+        plan = accepted(LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_DDR_FRACTION='0.9', LLAMA_HYBRID_DDR_CORES='1')
+        self.assertEqual((plan['ddr_fraction'], plan['ddr_cores']), (0.9, 1))
+        plan = accepted(LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_HYBRID_DDR_FRACTION='.3')
+        self.assertEqual(plan['kv_hbm_layers'], 1)
+        # a team of three serves the DDR rows with one member by default (14 of 56, scaled, at least one)
+        self.assertEqual(accepted(LLAMA_HYBRID_SPLIT='rows')['ddr_cores'], 1)
+        # auto KV with an auto fraction keeps every layer's caches in HBM; with an explicit fraction it is the usual prefix
+        self.assertEqual(accepted(LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_KV_HBM_LAYERS='auto')['kv_hbm_layers'], 2)
+        self.assertEqual(accepted(LLAMA_HYBRID_SPLIT='rows', LLAMA_HYBRID_DDR_FRACTION='0.2',
+                                  LLAMA_HYBRID_KV_HBM_LAYERS='auto')['kv_hbm_layers'], 2)
+
     def test_hbm_ddr_script_follows_engine_defaults(self):
         """Hazard 7: scripts/hbm-ddr.sbatch forces no kernel, batch, attention, layout or page knob unless asked; LEGACY=1
         and the named options bring the old values back."""

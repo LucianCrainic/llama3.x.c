@@ -203,5 +203,9 @@ void pack_s8_vnni_many(const PackS8 *jobs, int count);
  * like with one pack_*_many call, then use the result with GemmBf16Segment.w / GemmQ8Segment.pw. */
 PackBf16 pack_bf16_job_from_shard(uint16_t *dst, const Shard *shard);
 PackS8 pack_s8_job_from_shard(int8_t *dst, const Shard *shard);
+/* The same for a shard that may be row-split (Shard.ddr_rows, LLAMA_HYBRID_SPLIT=rows): one job, or two writing the
+ * packed copy of the whole shard (the second job's tiles start at the tile boundary of the split). Returns the count.
+ * The jobs carry no scales; the caller adds st/s/groups where it packs transposed scales. */
+int pack_s8_jobs_from_shard(int8_t *dst, const Shard *shard, PackS8 jobs[2]);
 
 #endif

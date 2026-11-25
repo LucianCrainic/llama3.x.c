@@ -1691,5 +1691,24 @@ PackBf16 pack_bf16_job_from_shard(uint16_t *dst, const Shard *shard) {
 
 PackS8 pack_s8_job_from_shard(int8_t *dst, const Shard *shard) {
   check_packable(shard, DT_Q8, "pack_s8_job_from_shard");
+  if (shard->ddr_rows)
+    fail("pack_s8_job_from_shard: the shard is row-split, use pack_s8_jobs_from_shard");
   return (PackS8){.dst = dst, .w = shard->q, .rows = shard->rows, .cols = shard->cols, .ld = shard->ld};
+}
+
+int pack_s8_jobs_from_shard(int8_t *dst, const Shard *shard, PackS8 jobs[2]) {
+  check_packable(shard, DT_Q8, "pack_s8_jobs_from_shard");
+  int first = shard->rows - shard->ddr_rows;
+  jobs[0] = (PackS8){.dst = dst, .w = shard->q, .rows = first, .cols = shard->cols, .ld = shard->ld};
+  if (!shard->ddr_rows)
+    return 1;
+  if (first % 16 || !shard->q2)
+    fail("pack_s8_jobs_from_shard: a row-split shard must split at a tile boundary and be bound");
+  /* the tiles of the last rows follow those of the first rows in the packed copy of the whole shard */
+  jobs[1] = (PackS8){.dst = dst + s8_vnni_bytes(first, shard->cols),
+                     .w = shard->q2,
+                     .rows = shard->ddr_rows,
+                     .cols = shard->cols,
+                     .ld = shard->ld};
+  return 2;
 }

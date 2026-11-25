@@ -98,6 +98,10 @@ typedef struct {
   size_t budget[SOCKETS][TIERS], free_bytes[SOCKETS][TIERS], charge[SOCKETS][TIERS], job_cap;
   size_t kv_layer_bytes, kv_bf16_layer_bytes, work_bytes[SOCKETS], panel_bytes;
   size_t logits_bytes;
+  /* LLAMA_HYBRID_SPLIT=rows: the DDR share (parts per million) of the output rows of each large matrix, whether it was
+   * chosen from the HBM budget or the balance (ddr_auto), and the team members that serve those rows (0 = default). */
+  int split_rows, ddr_auto, ddr_cores;
+  unsigned ddr_ppm;
   ArenaPlan arena[SOCKETS][A_COUNT];
 } PlacementPlan;
 
@@ -275,7 +279,7 @@ typedef struct {
   size_t ld;
   const float *x, *w;               /* FP32 */
   const K8Input *input;             /* Q8 */
-  const K8Weight *wq;               /* Q8; NULL for FP32 */
+  const K8Rows *wq;                 /* Q8; NULL for FP32 */
   double *leader_seconds;           /* LLAMA_PROFILE: the leader's own share of the projection */
   atomic_int claim;                 /* row counter shared by the members (zero before the team starts) */
 } ProjectJob;
@@ -293,8 +297,8 @@ static void project_reduce_fn(const void *p, int worker, int workers) {
   const ProjectJob *job = p;
   double start = worker == 0 && job->leader_seconds ? monotonic_seconds() : 0.0;
   if (job->wq)
-    k_matmul_q8_ld_worker(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
-                          workers, (atomic_int *)&job->claim, rows_done_fn, (void *)job);
+    k_matmul_q8_ld_worker_rows(job->partial, job->input, job->wq, job->ld, job->n, job->d, job->gs, K_PARTIAL, worker,
+                               workers, (atomic_int *)&job->claim, rows_done_fn, (void *)job);
   else
     k_matmul_ld_worker(job->partial, job->x, job->w, job->ld, job->n, job->d, K_PARTIAL, worker, workers,
                        (atomic_int *)&job->claim, rows_done_fn, (void *)job);
@@ -359,8 +363,25 @@ static int tp_group(const Tp *tp, int k) {
   return tp->gs ? tp->gs : k;
 }
 
+/* The weights of a shard that lives in one place; a row-split shard (LLAMA_HYBRID_SPLIT=rows) must go through q8_rows or
+ * the batched row-split helpers, never here. */
 static K8Weight q8_weight(const Shard *sh) {
+  if (sh->ddr_rows)
+    fail("internal error: a row-split %s shard reached a kernel that reads one place", manifest_role_name(sh->src->role));
   return (K8Weight){(const int8_t *)sh->q, sh->s};
+}
+
+/* The first rows of a shard, which are all of them unless it is row-split. */
+static K8Weight q8_weight_lo(const Shard *sh) {
+  return (K8Weight){(const int8_t *)sh->q, sh->s};
+}
+
+/* A shard for the decode kernels: its HBM rows and, when row-split, its DDR rows. */
+static K8Rows q8_rows(const Shard *sh) {
+  K8Rows rows = {.lo = q8_weight_lo(sh), .split = sh->rows - sh->ddr_rows};
+  if (sh->ddr_rows)
+    rows.hi = (K8Weight){(const int8_t *)sh->q2, sh->s2};
+  return rows;
 }
 
 /* The engine's profile counters are shared, so only socket 0 feeds them; every socket also keeps its own in tp->prof. */
@@ -385,7 +406,7 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   int dim = tp->c.dim;
   if (tp->sockets == 1) {
     if (tp->quantized)
-      SPROFILE(phase, k_matmul_q8_add(sk->x, in, q8_weight(w), n, dim, tp_group(tp, n)));
+      SPROFILE(phase, k_matmul_q8_add_rows(sk->x, in, q8_rows(w), n, dim, tp_group(tp, n)));
     else
       SPROFILE(phase, k_matmul_add(sk->x, x, w->q, n, dim));
     return 1;
@@ -393,7 +414,7 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
   float *partial = exchange_partial(tp->exchange, s);
   if (!partial)
     return 0;
-  K8Weight wq = tp->quantized ? q8_weight(w) : (K8Weight){0};
+  K8Rows wq = tp->quantized ? q8_rows(w) : (K8Rows){0};
   ProjectJob job = {.n = n,
                     .d = dim,
                     .gs = tp_group(tp, n),
@@ -528,9 +549,9 @@ static void forward_q8(Tp *tp, int s) {
     int head_layout = kernels_kv_layout_head();
     float *k = head_layout ? sk->kstage : cache.k + (size_t)pos * kvl,
           *v = head_layout ? sk->vstage : cache.v + (size_t)pos * kvl;
-    K8Weight wq = q8_weight(shards_find(&tp->set, T_WQ, l, s)), wk = q8_weight(shards_find(&tp->set, T_WK, l, s)),
-             wv = q8_weight(shards_find(&tp->set, T_WV, l, s));
-    SPROFILE(PHASE_QKV, k_matmul_q8_qkv(sk->q, k, v, &in, wq, wk, wv, dim, dim / S, kvl, gs));
+    K8Rows wq = q8_rows(shards_find(&tp->set, T_WQ, l, s)), wk = q8_rows(shards_find(&tp->set, T_WK, l, s)),
+           wv = q8_rows(shards_find(&tp->set, T_WV, l, s));
+    SPROFILE(PHASE_QKV, k_matmul_q8_qkv_rows(sk->q, k, v, &in, wq, wk, wv, dim, dim / S, kvl, gs));
     SPROFILE(PHASE_ROPE, k_rope_apply(sk->q, k, sk->rope, hl, kl, hd));
     if (head_layout)
       SPROFILE(PHASE_KV_STORE, k_kv_store(cache.k, k, (size_t)kvl, pos, 1, kl, hd, p->seq_len);
@@ -543,8 +564,8 @@ static void forward_q8(Tp *tp, int s) {
 
     SPROFILE(PHASE_RMSNORM, k_rmsnorm(sk->xb, sk->x, norm_weight(tp, T_RMS_FFN, l, s), dim, p->norm_eps));
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->xq, sk->xs, sk->xb, dim));
-    K8Weight w1 = q8_weight(shards_find(&tp->set, T_W1, l, s)), w3 = q8_weight(shards_find(&tp->set, T_W3, l, s));
-    SPROFILE(PHASE_W1_W3, k_matmul_q8_swiglu(sk->hb, &in, w1, w3, dim, hidden_l, gs));
+    K8Rows w1 = q8_rows(shards_find(&tp->set, T_W1, l, s)), w3 = q8_rows(shards_find(&tp->set, T_W3, l, s));
+    SPROFILE(PHASE_W1_W3, k_matmul_q8_swiglu_rows(sk->hb, &in, w1, w3, dim, hidden_l, gs));
     SPROFILE(PHASE_QUANTIZE, in = q8_input(tp, sk->aq, sk->as, sk->hb, hidden_l));
     if (!project_residual(tp, s, PHASE_W2, TP_W2_MM, shards_find(&tp->set, T_W2, l, s), sk->hb, &in, hidden_l))
       return;
@@ -630,6 +651,41 @@ static void gemm_q8(const Tp *tp, const int8_t *xq, const float *xs, int k, cons
     k_gemm_q8_tiled(xq, xs, tp->bcount, k, tp_group(tp, k), seg, count);
   else
     k_gemm_q8(xq, xs, tp->bcount, k, tp_group(tp, k), seg, count);
+}
+
+/* gemm_q8 for segments whose weights may be row-split (LLAMA_HYBRID_SPLIT=rows): `seg` describes each segment with the
+ * first rows of its shard (n = all rows); sh[i] (and sh3[i] for a SwiGLU pair) says whether the last ddr_rows rows live
+ * in the DDR arena. The product runs as one call on the first rows of every segment and a second one on the DDR rows
+ * of the split ones, each output column block written by exactly one of them with the same arithmetic, so the result is
+ * bitwise that of the unsplit weights. The split sits on a multiple of 32 rows, where packed tiles (16 rows) and
+ * transposed scale chunks (32 channels) start. */
+static void gemm_q8_rows(const Tp *tp, const int8_t *xq, const float *xs, int k, const GemmQ8Segment *seg,
+                         const Shard *const *sh, const Shard *const *sh3, int count) {
+  GemmQ8Segment lo[GEMM_MAX_SEGMENTS], hi[GEMM_MAX_SEGMENTS];
+  int nhi = 0, groups = k / tp_group(tp, k);
+  for (int i = 0; i < count; i++) {
+    lo[i] = seg[i];
+    if (!sh[i]->ddr_rows)
+      continue;
+    int first = sh[i]->rows - sh[i]->ddr_rows;
+    if (first % SHARD_SPLIT_ALIGN || (sh3 && sh3[i]->ddr_rows != sh[i]->ddr_rows))
+      fail("internal error: a row-split shard splits at row %d", first);
+    lo[i].n = first;
+    GemmQ8Segment b = seg[i];
+    b.c = seg[i].c + first;
+    b.n = sh[i]->ddr_rows;
+    b.w = (K8Weight){(const int8_t *)sh[i]->q2, sh[i]->s2};
+    if (sh3)
+      b.w3 = (K8Weight){(const int8_t *)sh3[i]->q2, sh3[i]->s2};
+    b.pw = seg[i].pw ? seg[i].pw + s8_vnni_bytes(first, k) : NULL;
+    b.pw3 = seg[i].pw3 ? seg[i].pw3 + s8_vnni_bytes(first, k) : NULL;
+    b.pws = seg[i].pws ? seg[i].pws + (size_t)(first / 32) * (size_t)groups * 32 : NULL;
+    b.pws3 = seg[i].pws3 ? seg[i].pws3 + (size_t)(first / 32) * (size_t)groups * 32 : NULL;
+    hi[nhi++] = b;
+  }
+  gemm_q8(tp, xq, xs, k, lo, count);
+  if (nhi)
+    gemm_q8(tp, xq, xs, k, hi, nhi);
 }
 
 /* One product on FP32 activations: the FP32 GEMM, or in BF16 mode the same segments on the packed copies (the
@@ -804,13 +860,19 @@ static int project_batch_reduce(Tp *tp, TpSocket *sk, const float *a, int lda, c
   GemmKind kind = one ? GEMM_ADD : GEMM_PARTIAL;
   double start = profile_enabled ? monotonic_seconds() : 0.0;
   if (tp->quantized) {
-    GemmQ8Segment seg = {
-        .c = partial, .ldc = tp->c.dim, .w = q8_weight(w), .pw = packed, .pws = pscales, .n = tp->c.dim, .kind = kind};
-    if (!one && batch_reduce_mode() > (slot == TP_W2_MM)) {
+    GemmQ8Segment seg = {.c = partial,
+                         .ldc = tp->c.dim,
+                         .w = q8_weight_lo(w),
+                         .pw = packed,
+                         .pws = pscales,
+                         .n = tp->c.dim,
+                         .kind = kind};
+    /* The interleaved reduction flags blocks of one GEMM; a row-split projection takes the barrier form (same result). */
+    if (!one && !w->ddr_rows && batch_reduce_mode() > (slot == TP_W2_MM)) {
       project_interleaved(tp, sk, aq, as, k, &seg, slot);
       return !workers_aborted();
     }
-    gemm_q8(tp, aq, as, k, &seg, 1);
+    gemm_q8_rows(tp, aq, as, k, &seg, &w, NULL, 1);
   } else {
     GemmSegment seg = {.c = partial, .ldc = tp->c.dim, .w = w->q, .ldw = w->ld, .n = tp->c.dim, .kind = kind};
     gemm_f32_or_bf16(tp, sk, a, lda, k, &seg, 1, &packed, NULL);
@@ -884,26 +946,27 @@ static void forward_batch(Tp *tp, int s) {
     if (q8) {
       GemmQ8Segment qkv[3] = {{.c = sk->q,
                                .ldc = ql,
-                               .w = q8_weight(wq),
+                               .w = q8_weight_lo(wq),
                                .pw = packed_copy(sk, l, 0),
                                .pws = packed_scales(sk, l, 0),
                                .n = ql,
                                .kind = GEMM_STORE},
                               {.c = kd,
                                .ldc = kvl,
-                               .w = q8_weight(wk),
+                               .w = q8_weight_lo(wk),
                                .pw = packed_copy(sk, l, 1),
                                .pws = packed_scales(sk, l, 1),
                                .n = kvl,
                                .kind = GEMM_STORE},
                               {.c = vd,
                                .ldc = kvl,
-                               .w = q8_weight(wv),
+                               .w = q8_weight_lo(wv),
                                .pw = packed_copy(sk, l, 2),
                                .pws = packed_scales(sk, l, 2),
                                .n = kvl,
                                .kind = GEMM_STORE}};
-      SPROFILE(PHASE_QKV, gemm_q8(tp, sk->xq, sk->xs, dim, qkv, 3));
+      const Shard *const split_qkv[3] = {wq, wk, wv};
+      SPROFILE(PHASE_QKV, gemm_q8_rows(tp, sk->xq, sk->xs, dim, qkv, split_qkv, NULL, 3));
     } else {
       GemmSegment qkv[3] = {{.c = sk->q, .ldc = ql, .w = wq->q, .ldw = wq->ld, .n = ql, .kind = GEMM_STORE},
                             {.c = kd, .ldc = kvl, .w = wk->q, .ldw = wk->ld, .n = kvl, .kind = GEMM_STORE},
@@ -932,15 +995,15 @@ static void forward_batch(Tp *tp, int s) {
     if (q8) {
       GemmQ8Segment up = {.c = sk->hb,
                           .ldc = hidden_l,
-                          .w = q8_weight(w1),
-                          .w3 = q8_weight(w3),
+                          .w = q8_weight_lo(w1),
+                          .w3 = q8_weight_lo(w3),
                           .pw = packed_copy(sk, l, 4),
                           .pw3 = packed_copy(sk, l, 6),
                           .pws = packed_scales(sk, l, 4),
                           .pws3 = packed_scales(sk, l, 6),
                           .n = hidden_l,
                           .kind = GEMM_SWIGLU};
-      SPROFILE(PHASE_W1_W3, gemm_q8(tp, sk->xq, sk->xs, dim, &up, 1));
+      SPROFILE(PHASE_W1_W3, gemm_q8_rows(tp, sk->xq, sk->xs, dim, &up, &w1, &w3, 1));
       SPROFILE(PHASE_QUANTIZE, quantize_batch(tp, sk->aq, sk->as, sk->hb, (size_t)hidden_l, hidden_l));
     } else {
       GemmSegment up = {.c = sk->hb, .ldc = hidden_l, .w = w1->q, .w3 = w3->q, .ldw = w1->ld, .n = hidden_l,
@@ -1272,8 +1335,9 @@ static void plan_packing(Tp *tp) {
     if (tp->pack == TP_PACK_BF16)
       tp->bjobs[s] = memory_alloc(count, sizeof(PackBf16), MEM_METADATA);
     else
-      tp->sjobs[s] = memory_alloc(count, sizeof(PackS8), MEM_METADATA);
+      tp->sjobs[s] = memory_alloc(count * 2, sizeof(PackS8), MEM_METADATA); /* a row-split shard packs in two pieces */
     tp->njobs[s] = (int)count;
+    int jobs = 0;
     size_t used = 0;
     for (int l = 0; l < tp->c.n_layers; l++)
       for (int i = 0; i < 7; i++) {
@@ -1286,15 +1350,26 @@ static void plan_packing(Tp *tp) {
         if (tp->pack == TP_PACK_BF16) {
           tp->bjobs[s][at] = pack_bf16_job_from_shard((uint16_t *)dst, sh);
         } else {
-          tp->sjobs[s][at] = pack_s8_job_from_shard((int8_t *)dst, sh);
-          if (tp->tiled) {
-            PackS8 *job = &tp->sjobs[s][at];
-            job->st = sk->pscales_at[at] = (float *)(dst + align_line(s8_vnni_bytes(sh->rows, sh->cols)));
-            job->s = sh->s;
-            job->groups = sh->cols / tp_group(tp, sh->cols);
+          PackS8 parts[2];
+          int n = pack_s8_jobs_from_shard((int8_t *)dst, sh, parts);
+          float *scales_t = (float *)(dst + align_line(s8_vnni_bytes(sh->rows, sh->cols)));
+          int groups = sh->cols / tp_group(tp, sh->cols);
+          if (tp->tiled)
+            sk->pscales_at[at] = scales_t;
+          for (int part = 0; part < n; part++) {
+            PackS8 *job = &tp->sjobs[s][jobs++];
+            *job = parts[part];
+            if (tp->tiled) {
+              size_t first = (size_t)(sh->rows - sh->ddr_rows);
+              job->st = part ? scales_t + first / 32 * (size_t)groups * 32 : scales_t;
+              job->s = part ? sh->s2 : sh->s;
+              job->groups = groups;
+            }
           }
         }
       }
+    if (tp->pack != TP_PACK_BF16)
+      tp->njobs[s] = jobs;
     if (used > sk->packed_size)
       fail("socket %d packed region holds %zu bytes, %zu needed", s, sk->packed_size, used);
   }
@@ -1660,7 +1735,7 @@ static void placement_layout(Tp *tp) {
   int hot = ddr_only ? DDR : HBM, cold = hbm_only ? HBM : DDR;
   int thp = region_thp_default();
   size_t weight_bytes[SOCKETS][TIERS];
-  shards_place(&tp->set, plan->weights_layers, plan->classifier, hot, weight_bytes);
+  shards_place(&tp->set, plan->weights_layers, plan->classifier, hot, plan->ddr_ppm, weight_bytes);
   memset(plan->charge, 0, sizeof(plan->charge));
   for (int s = 0; s < plan->sockets; s++) {
     for (int t = 0; t < TIERS; t++) {
@@ -1704,6 +1779,45 @@ static void largest_prefix(Tp *tp, int *prefix) {
       hi = *prefix - 1;
   }
   *prefix = lo;
+}
+
+/* LLAMA_HYBRID_DDR_FRACTION: a number of at most MAX_DDR_PPM parts per million (0.9), or auto. */
+enum { MAX_DDR_PPM = 900000, AUTO_BALANCE_PPM = 200000 };
+
+static unsigned ddr_fraction_setting(const char *value) {
+  char *end;
+  double x = strtod(value, &end);
+  if (end == value || *end || !(x >= 0.0) || x > MAX_DDR_PPM / 1e6)
+    fail("LLAMA_HYBRID_DDR_FRACTION must be auto or a fraction between 0 and %.1f, got \"%s\"", MAX_DDR_PPM / 1e6, value);
+  return (unsigned)(x * 1e6 + 0.5);
+}
+
+/* The DDR fraction `auto` picks: the smallest one (to 0.1%) at which every socket's HBM charge fits its budget, found by
+ * bisection (the charge falls monotonically as the fraction grows, including rounded arenas); when everything fits in
+ * HBM already, AUTO_BALANCE_PPM, the share at which the engine's Q8 GEMV over the 70B shard measured fastest with 14 of 56
+ * members on the DDR rows (docs/concurrent-tier-bandwidth.md E5, r = 0.2). If even MAX_DDR_PPM does not fit, that value
+ * is returned and the admission check reports the overflow. */
+static unsigned auto_ddr_ppm(Tp *tp) {
+  PlacementPlan *plan = &tp->plan;
+  plan->ddr_ppm = 0;
+  placement_layout(tp);
+  if (tier_fits(plan, HBM))
+    return AUTO_BALANCE_PPM;
+  unsigned lo = 0, hi = MAX_DDR_PPM / 1000; /* in units of 0.1%: lo does not fit */
+  plan->ddr_ppm = hi * 1000;
+  placement_layout(tp);
+  if (!tier_fits(plan, HBM))
+    return hi * 1000;
+  while (hi - lo > 1) {
+    unsigned mid = lo + (hi - lo) / 2;
+    plan->ddr_ppm = mid * 1000;
+    placement_layout(tp);
+    if (tier_fits(plan, HBM))
+      hi = mid;
+    else
+      lo = mid;
+  }
+  return hi * 1000;
 }
 
 static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
@@ -1754,6 +1868,41 @@ static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
   int weights = hybrid ? layer_setting("LLAMA_HYBRID_WEIGHTS_HBM_LAYERS", layers) : ddr ? 0 : layers;
   int kv = hybrid ? layer_setting("LLAMA_HYBRID_KV_HBM_LAYERS", layers) : ddr ? 0 : layers;
   int classifier = hybrid ? tier_setting("LLAMA_HYBRID_CLASSIFIER", -1, 1) : ddr ? DDR : HBM;
+  /* LLAMA_HYBRID_SPLIT=rows: every large matrix's output rows are split over both tiers instead of whole layers. */
+  const char *split = setting("LLAMA_HYBRID_SPLIT"), *fraction = setting("LLAMA_HYBRID_DDR_FRACTION"),
+             *cores = setting("LLAMA_HYBRID_DDR_CORES");
+  if (split && strcmp(split, "layers") && strcmp(split, "rows"))
+    fail("LLAMA_HYBRID_SPLIT must be layers or rows");
+  int rows = split && !strcmp(split, "rows");
+  if (!rows && (fraction || cores))
+    fail("%s requires LLAMA_HYBRID_SPLIT=rows", fraction ? "LLAMA_HYBRID_DDR_FRACTION" : "LLAMA_HYBRID_DDR_CORES");
+  if (rows) {
+    if (!hybrid)
+      fail("LLAMA_HYBRID_SPLIT=rows requires LLAMA_PLACEMENT=hybrid");
+    if (!tp->quantized)
+      fail("LLAMA_HYBRID_SPLIT=rows needs a Q8_0 checkpoint: it splits the rows of the int8 decode GEMV");
+    if (setting("LLAMA_HYBRID_WEIGHTS_HBM_LAYERS"))
+      fail("LLAMA_HYBRID_WEIGHTS_HBM_LAYERS cannot be combined with LLAMA_HYBRID_SPLIT=rows: the fraction decides how "
+           "much of every layer's weights is in DDR");
+    plan->split_rows = 1;
+    plan->ddr_auto = !fraction || !strcmp(fraction, "auto");
+    if (!plan->ddr_auto)
+      plan->ddr_ppm = ddr_fraction_setting(fraction);
+    if (cores) {
+      char *end;
+      long n = strtol(cores, &end, 10);
+      int fewest = pool->threads[0] < pool->threads[plan->sockets - 1] ? pool->threads[0] : pool->threads[plan->sockets - 1];
+      if (strspn(cores, "0123456789") != strlen(cores) || *end || n < 1 || (fewest > 1 && n >= fewest))
+        fail("LLAMA_HYBRID_DDR_CORES must be a whole number between 1 and %d (one fewer than the threads of a socket), "
+             "got \"%s\"", fewest > 1 ? fewest - 1 : 1, cores);
+      plan->ddr_cores = (int)n;
+    }
+    if (plan->ddr_auto && kv < 0)
+      kv = layers; /* an auto fraction is sized to the KV caches the budget must also hold: all layers' caches in HBM */
+    weights = layers; /* every layer's first rows are in HBM */
+    if (classifier < 0)
+      classifier = HBM; /* the DDR fraction absorbs the pressure; the classifier is read every token */
+  }
   plan->packed = hybrid ? tier_setting("LLAMA_HYBRID_PACKED", DDR, 0) : ddr ? DDR : HBM;
   if (hybrid && tp->pack == TP_PACK_NONE && setting("LLAMA_HYBRID_PACKED"))
     fail("LLAMA_HYBRID_PACKED requires a packed prefill kernel");
@@ -1765,6 +1914,8 @@ static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
     if (!tier_fits(plan, HBM))
       plan->classifier = DDR;
   }
+  if (rows && plan->ddr_auto)
+    plan->ddr_ppm = auto_ddr_ppm(tp);
   if (weights < 0)
     largest_prefix(tp, &plan->weights_layers);
   if (kv < 0)
@@ -1789,6 +1940,9 @@ static void placement_plan(Tp *tp, const Model *model, const PoolConfig *pool) {
   placement_summary = *plan;
   LOG(LOG_INFO, "%s plan: %d of %d weight layers and %d KV layers in HBM, classifier=%s, packed=%s", plan->mode,
       plan->weights_layers, layers, plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed));
+  if (plan->split_rows)
+    LOG(LOG_INFO, "row split: %.1f%% of every large matrix's rows in DDR (%s), %s DDR cores per team", plan->ddr_ppm / 1e4,
+        plan->ddr_auto ? "auto" : "explicit", plan->ddr_cores ? "explicit" : "default");
   for (int s = 0; s < plan->sockets; s++)
     LOG(LOG_INFO, "socket %d: HBM %zu of %zu bytes, DDR %zu of %zu bytes", s, plan->charge[s][HBM],
         plan->budget[s][HBM], plan->charge[s][DDR], plan->budget[s][DDR]);
@@ -1803,10 +1957,12 @@ void tp_placement_report(FILE *f) {
   fprintf(f,
           "{\"mode\":\"%s\",\"admitted\":%s,\"simulated\":%s,\"weights_hbm_layers\":%d,\"kv_hbm_layers\":%d,"
           "\"classifier\":\"%s\",\"packed\":\"%s\",\"kv_layer_bytes\":%zu,\"kv_bf16_layer_bytes\":%zu,"
-          "\"cgroup_limit_bytes\":%zu,\"nodes\":[",
+          "\"cgroup_limit_bytes\":%zu,\"split\":\"%s\",\"ddr_fraction\":%.6f,\"ddr_fraction_auto\":%s,"
+          "\"ddr_cores\":%d,\"nodes\":[",
           plan->mode, plan->admitted ? "true" : "false", plan->simulated ? "true" : "false", plan->weights_layers,
           plan->kv_layers, tier_name(plan->classifier), tier_name(plan->packed), plan->kv_layer_bytes,
-          plan->kv_bf16_layer_bytes, plan->job_cap);
+          plan->kv_bf16_layer_bytes, plan->job_cap, plan->split_rows ? "rows" : "layers", plan->ddr_ppm / 1e6,
+          plan->ddr_auto ? "true" : "false", plan->split_rows ? k_gemv_ddr_workers(plan->threads[0]) : 0);
   for (int s = 0; s < plan->sockets; s++)
     for (int t = 0; t < TIERS; t++)
       fprintf(f,
@@ -1861,6 +2017,7 @@ Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int q
   tp->check = sockets == 2 && check && !strcmp(check, "1");
   shards_plan(&tp->set, m, p, sockets, gs);
   placement_plan(tp, model, &pool);
+  k_gemv_ddr_cores(tp->plan.ddr_cores);
   if (plan_only)
     return tp;
 

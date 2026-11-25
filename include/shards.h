@@ -77,6 +77,13 @@ typedef struct {
   void *q;                    /* values: F32 or int8, rows x cols, stride ld */
   float *s;                   /* Q8 group scales, rows x (cols / gs); NULL for F32 */
   size_t ld;                  /* destination row stride in elements (= cols) */
+  /* LLAMA_HYBRID_SPLIT=rows (shards_place with a DDR fraction): the last ddr_rows rows of the shard live in the socket's
+   * DDR weights arena, at q2 (values, stride ld) and s2 (scales), and q / s hold only the first rows - ddr_rows rows.
+   * ddr_rows == 0: the whole shard is at q / s. Only Q8 shards of the seven large matrices are ever split. */
+  int ddr_rows;
+  size_t q2_offset, s2_offset;
+  void *q2;
+  float *s2;
 } Shard;
 
 typedef struct {
@@ -104,7 +111,13 @@ const Shard *shards_find(const ShardSet *set, TensorRole role, int layer, int so
 void shards_bind(ShardSet *set, void *const socket_base[2], void *global_base);
 /* Reads the shards of `socket` from the checkpoint into their bound places. `team` (the socket's team) splits the
  * reads and the column packing among its workers; NULL runs on the calling thread. GLOBAL shards load with socket 0. */
-void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, size_t bytes[2][2]);
+void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, unsigned ddr_ppm,
+                  size_t bytes[2][2]);
+/* The rows of a shard that a DDR fraction of ddr_ppm parts per million puts in DDR: 0 for anything but a Q8 shard of
+ * the matrices Wq, Wk, Wv, Wo, W1, W2, W3, else the fraction of its rows rounded down to a multiple of
+ * SHARD_SPLIT_ALIGN (one AMX tile pair, so a packed copy splits at a tile boundary), never more than 15/16 of them. */
+enum { SHARD_SPLIT_ALIGN = 32 };
+int shards_ddr_rows(const Shard *sh, unsigned ddr_ppm);
 void shards_bind_placed(ShardSet *set, void *base[2][2], void *global_base);
 size_t shards_scratch_bytes(const ShardSet *set, int socket);
 struct Team;

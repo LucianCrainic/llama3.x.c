@@ -110,6 +110,27 @@ typedef struct {
   const float *s;
   const float *f;
 } K8Input;
+/* A Q8_0 weight whose output rows live in two places (LLAMA_HYBRID_SPLIT=rows: rows [split, d) in a DDR arena): rows
+ * [0, split) are read through `lo`, rows [split, d) through `hi`, whose row 0 is row `split` of the matrix, both with the
+ * same row stride. split == d (hi unused) is the ordinary weight. Every row's dot product is unchanged, so results are
+ * bitwise those of the same weight in one place. The team GEMV serves the two places with different members (see
+ * k_gemv_ddr_workers) inside one team job. */
+typedef struct {
+  K8Weight lo, hi;
+  int split;
+} K8Rows;
+void k_matmul_q8_rows(float *out, const K8Input *x, K8Rows w, int n, int d, int gs);
+void k_matmul_q8_add_rows(float *out, const K8Input *x, K8Rows w, int n, int d, int gs);
+void k_matmul_q8_qkv_rows(float *q, float *k, float *v, const K8Input *x, K8Rows wq, K8Rows wk, K8Rows wv, int n,
+                          int dq, int dkv, int gs);
+void k_matmul_q8_swiglu_rows(float *out, const K8Input *x, K8Rows w1, K8Rows w3, int n, int d, int gs);
+void k_matmul_q8_ld_worker_rows(float *out, const K8Input *x, const K8Rows *w, size_t ld, int n, int d, int gs, int kind,
+                                int worker, int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx);
+/* LLAMA_HYBRID_DDR_CORES: the members of a team that serve the DDR rows of a split weight (0 = the default, 14 of 56 scaled to
+ * the team); k_gemv_ddr_workers(workers) is the count a team of that size uses (0 for a team of one, which serves both
+ * places itself, else 1 to workers - 1). */
+void k_gemv_ddr_cores(int n);
+int k_gemv_ddr_workers(int workers);
 void k_quantize(int8_t *q, float *s, const float *x, int n, int gs);
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs);
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs);
