@@ -47,8 +47,8 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P2b 70B port | **merged** ee24659 (local): steps 1-6 + fidelity note 301df53; codex greps empty; 5929376 (hbm14): default-path tokens bitwise equal to develop (1S/2S, warm 0/512, profile on); profile fix not visible on 8B (develop exchange not inflated; classifier phase 0.46 vs 0.04 ms/token, cause unconfirmed); 5929377: synthetic decode 50.44/50.49 vs real 52.01 tok/s (-3.0/-2.9%), amx -0.8%, CAS within 1.2%, placement + KV accounting identical (manager-read raw JSON). Gate 5929402 on ee24659 **passed** (make test rc 0, 0 FAIL/ERROR, 7 suites OK). Step 7 done: 70B C Q8 re-run merged dbd8e14 (jobs 5929406/5929407 DDR, 5935580 HBM = hybrid 80/80 packed=ddr; manager re-derived medians from runs.jsonl): DDR gs32 TTFT 2.69/10.22 s, decode 5.93/5.76; HBM 2.60/9.92 s, 10.97/10.12 tok/s; gs64 HBM 11.58/10.71; ids equal to 5910211. Script PLACEMENT/HYBRID_* options 119d912 | `feature/70b-comparison` | sonnet | 5929376, 5929377 | 0.35 |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | bounded prototype started 25 Nov on hbm13 (rows split, opt-in, ≤12 node-h; fits + spill cases) | `feature/concurrent-tiers` | | | |
-| P4 limits + baseline | limits doc started 25 Nov (docs/hybrid-limits, analysis only); campaign C0-C8 after | | | | |
-| P5 gap loop | not started | | | | |
+| P4 limits + baseline | limits doc merged (develop, after 59f6bc6; tests + --check-doc rc 0, TTFT ceiling re-derived by manager: 285 TOP, 0.63 s at 2048). Key: 70B TTFT 12-16x AMX peak; concurrent beats serial only in spill (1S: +15-32% modelled). Campaign C0-C8 after TTFT diagnosis | | | | |
+| P5 gap loop | TTFT diagnosis (70B 2S P=2113/547, batch 256/1024, packed hbm/ddr, profile + CAS) + stagger replication hbm14/gs32 queued on hbm14 after 5935721 | | | | |
 
 ## Decisions
 
