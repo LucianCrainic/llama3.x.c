@@ -125,6 +125,10 @@ the mirror's file list and sizes match it.
   r=0.2 / 14 DDR workers 469.8 (+2.3%, p=0.006); 12 or 16 DDR workers lose. Engine-shaped gain now +0.8 to +2.3% in four
   runs: small, reproducible, needs an exact worker split. **Aliasing confirmed:** 2M all-HBM GEMV 411 at 56 workers,
   437-447 at 53-55, 447.5 with a 4 KiB x worker stagger; raw lockstep 2M-aligned stripes 403 vs 554-577 staggered.
+- **Job E re-derived (25 Nov): all medians/ranges confirmed**, pinning 3136/3136, random fill, placement. New: raw
+  56-stream HBM read with stripes staggered 1 MiB+4 KiB = 576.7 [541.8-586.6] > e1-cd0 569.1 (the E1 reference is partly
+  aliased). Reported vs bytes/wall GB/s differ (0.976-1.066); E5 best split +2.3% reported, +3.1% recomputed; best-of-11
+  Bonferroni p ~0.013. Decision: job G (staggered HBM-only reference vs staggered splits) before G1.
 - Manager's provisional G1 reading: **No** (E5 +1.4% within noise, far below 10%; raw streams no gain). Final after review.
 
 ## P1 interim from job B (agent-reported, unverified)
