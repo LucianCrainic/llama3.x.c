@@ -640,12 +640,14 @@ static void raw_worker(const void *p, int w, int workers) {
   RdFn rd = rd_h;
   size_t pf = pf_h;
   long sink = 0;
-  if (c->kind == CFG_SPLIT && c->stripe > 0) {
-    /* Stripe mode: worker w streams its own stripe [w x stripe, (w + 1) x stripe) of the HBM region, starting stag x w bytes in; with
-     * lock > 0 all workers read the same number of blocks and meet at a team barrier after each one. */
+  int sgi = w, sgn = nstream, stier = c->kind == CFG_SPLIT ? split_role(c, w, nstream, &sgi, &sgn) : -1;
+  if (c->kind == CFG_SPLIT && c->stripe > 0 && stier == 0) {
+    /* Stripe mode: HBM worker i streams its own stripe [i x stripe, (i + 1) x stripe) of the HBM region, starting stag x i bytes in; with
+     * lock > 0 all workers (cd = 0) read the same number of blocks and meet at a team barrier after each one. The DDR group of a split
+     * reads its slices as usual. */
     const size_t stripe = (size_t)c->stripe * MIB;
-    char *mine = s->base[0] + (size_t)w * stripe;
-    size_t off = ((size_t)w * c->stag) % stripe & ~(size_t)63;
+    char *mine = s->base[0] + (size_t)sgi * stripe;
+    size_t off = ((size_t)sgi * c->stag) % stripe & ~(size_t)63;
     wait_until(j->t_go);
     if (c->lock > 0) {
       const int warm_blocks = c->lock / 4;
@@ -687,13 +689,15 @@ static void raw_worker(const void *p, int w, int workers) {
     size_t len;
     slice_of(base, bytes, gi, gn, &mine, &len);
     size_t blocks = len / MIB, bi = 0;
+    /* kind=inter with stag: worker i starts stag x i bytes into its slice (reads wrap inside the slice's 1 MiB grid, so the stagger persists). */
+    const size_t shift = c->kind == CFG_INTER && c->stag ? ((size_t)gi * c->stag) % len & ~(size_t)63 : 0;
     wait_until(j->t_go);
     if (c->kind == CFG_SPLIT && c->volume) {
       /* Fixed volume per worker; progress is logged every LOG_BYTES so a common interval can be cut out afterwards. */
       double need = (double)c->volume * MIB, total = 0, next_log = LOG_BYTES;
       r->t_begin = monotonic_seconds();
       while (total < need) {
-        sink ^= rd(mine + bi * MIB, blk, pf);
+        sink ^= rd(mine + (bi * MIB + shift) % len, blk, pf);
         bi = bi + 1 == blocks ? 0 : bi + 1;
         total += MIB;
         if (total >= next_log && r->nlog < LOG_MAX) {
@@ -705,7 +709,7 @@ static void raw_worker(const void *p, int w, int workers) {
       r->bytes_total[tier] = r->bytes_meas[tier] = total;
     } else {
       for (;;) {
-        sink ^= rd(mine + bi * MIB, blk, pf);
+        sink ^= rd(mine + (bi * MIB + shift) % len, blk, pf);
         bi = bi + 1 == blocks ? 0 : bi + 1;
         ACCOUNT(c->kind == CFG_INTER ? MIB : (tier == 0 ? MIB : 0), c->kind == CFG_INTER ? 0 : (tier == 1 ? MIB : 0));
         if (done)
@@ -1022,7 +1026,7 @@ static void inter_prepare(Run *R, const Cfg *c) {
     Sock *s = &R->sock[so];
     size_t page = R->page4k ? 4096 : (size_t)2 * MIB, bytes = R->inter_mib * MIB;
     s->xbytes = bytes;
-    s->xmap_bytes = bytes + 2 * MIB;
+    s->xmap_bytes = bytes + 4 * MIB;
 #ifdef __linux__
     void *m = mmap(NULL, s->xmap_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED)
@@ -1332,9 +1336,12 @@ static void check_cfg(const Run *R, const Cfg *c) {
   int stream = R->threads - (c->probe ? 1 : 0);
   if (c->kind == CFG_SPLIT && (c->ch < 0 || c->cd < 0 || c->ch + c->cd < 1 || c->ch + c->cd > stream))
     fail("config %s: ch + cd must be 1..%d", c->name, stream);
-  if (c->kind == CFG_SPLIT && c->stripe > 0 && (c->cd || c->ch != R->threads || c->probe || c->stag % 64 ||
-                                               (size_t)c->stripe * (size_t)R->threads * MIB + MIB > R->region_bytes))
-    fail("config %s: stripe mode needs ch = threads, cd = 0 and threads x stripe within the region", c->name);
+  if (c->kind == CFG_SPLIT && c->stripe > 0 &&
+      (c->ch < 1 || (c->lock && (c->cd || c->ch != R->threads)) || c->probe || c->stag % 64 ||
+       (size_t)c->stripe * (size_t)c->ch * MIB + MIB > R->region_bytes))
+    fail("config %s: stripe mode needs ch >= 1 stripes inside the region (lock: cd = 0 and ch = threads)", c->name);
+  if (c->kind == CFG_INTER && c->stag % 64)
+    fail("config %s: stag must be a multiple of 64", c->name);
   if (c->kind == CFG_GEMV &&
       (c->cdw < 0 || c->cdw >= R->threads || (c->cdw == 0) != (c->r == 0 || c->gshared) || c->probe || c->off % 64 || c->skew % 64 ||
                                  c->act > R->threads || (c->act && c->cdw >= c->act)))

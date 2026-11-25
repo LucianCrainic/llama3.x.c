@@ -258,6 +258,20 @@ def gen(stage, env, results=None):
             add(fmt(name=f'e5c-gs{gs}-act52', kind='gemv', gs=gs, r=0, cdw=0, act=52))
             for r, cdw in ((0.1, 6), (0.2, 14), (0.25, 18)):
                 add(fmt(name=f'e5c-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
+    elif stage == 'e1g':  # HBM-only and splits with the HBM workers on stripes of 360 MiB started stag x i bytes apart
+        for stag in (0, 4096, 1052672):
+            add(fmt(name=f'e1g-hbm-timed-stag{stag}', kind='split', ch=CORES, cd=0, S=1, pf=16384, stripe=360, stag=stag))
+            add(fmt(name=f'e1g-hbm-lock-stag{stag}', kind='split', ch=CORES, cd=0, S=1, pf=16384, stripe=360, lock=2048, stag=stag))
+        add(fmt(name='e1g-hbm-sliced', kind='split', ch=CORES, cd=0, S=1, pf=16384))
+        for cd in (4, 8, 16):
+            add(split_cfg(f'e1g-cd{cd}-alt1-sliced', CORES - cd, cd, env, alt=1))
+            for stag in (0, 4096, 1052672):
+                add(split_cfg(f'e1g-cd{cd}-alt1-stag{stag}', CORES - cd, cd, env, alt=1, stripe=360, stag=stag))
+    elif stage == 'e3g':  # interleaved region, every worker's start shifted stag x i bytes into its slice
+        p = tier_params(env, 0)[0]
+        for a, b in ((1, 0), (4, 1), (8, 1)):
+            for stag in (0, 4096, 1052672):
+                add(fmt(name=f'e3g-{a}-{b}-stag{stag}', kind='inter', a=a, b=b, stag=stag, **p))
     elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, mixed and DDR-only load
         add(split_cfg('freq-hbm56', CORES, 0, env, warm=0.5, seconds=8))
         add(split_cfg('freq-split48-8', 48, 8, env, warm=0.5, seconds=8))
@@ -488,6 +502,12 @@ def aggregate(windows):
                     'gemv_pass_s', 'gemv_best_pass_s'):
             e[key] = node_value(g, key)
         e['probe_ns'] = med_min_max([w['probe_ns'] for w in s0 if w['probe_ns']])
+        # the other timer: all bytes issued (warm-up included) / wall time from the common start to the end of the window
+        wb, wd = defaultdict(float), {}
+        for w in g:
+            wb[(w['label'], w['window'])] += w['hbm_bytes'] + w['ddr_bytes']
+            wd[(w['label'], w['window'])] = w['real_end'] - w['real_begin']
+        e['wall_gbps'] = med_min_max([wb[k] / wd[k] / 1e9 for k in wb if wd[k] > 0])
         e['socket0_combined'] = med_min_max([w['combined_gbps'] for w in s0])
         # counters (per node: both sockets summed)
         cw = [w for w in g if 'counters' in w]
@@ -726,16 +746,18 @@ def tables(agg, windows, idle):
         md.append('')
     def gemv_rows(es, ref_gbps, gs, href_e):
         rows = []
+        ref_wall = href_e['wall_gbps']['median']
         for e in sorted(es, key=lambda e: (e['cfg']['r'], e['cfg']['gshared'], e['cfg']['act'], e['cfg']['cdw'])):
             tok = e['combined_gbps']['median'] * 1e9 / bytes_per_token(gs)
             gain = e['combined_gbps']['median'] / ref_gbps - 1
             act = e['cfg']['act'] or 56
             who = 'every worker' if e['cfg']['gshared'] else (f'{e["cfg"]["cdw"]} of {act}' if e['cfg']['r'] else f'none ({act} workers)')
             rows.append((e['page'], e['cfg']['r'], who, mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), f'{tok:.2f}',
-                         f'{gain * 100:+.1f}%', e['reps'], pcol(e, href_e)))
+                         f'{gain * 100:+.1f}%', e['reps'], pcol(e, href_e), mm(e['wall_gbps']),
+                         f'{(e["wall_gbps"]["median"] / ref_wall - 1) * 100:+.1f}%'))
         return rows
 
-    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps', 'p: above the best all-HBM by chance']
+    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps', 'p: above the best all-HBM by chance', 'wall-clock GB/s (bytes issued incl. warm-up / wall time)', 'vs best all-HBM, wall-clock']
     for prefixes, title in ((('e5-', 'e5hbm-'), 'E5 Q8 GEMV over the 70B per-socket shard, file order'),
                             (('e5c-',), 'E5 confirmation, every process in its own shuffled order'),
                             (('e5c2-',), 'E5 row split, DDR worker count +-2 around the best point, shuffled order')):
@@ -757,13 +779,15 @@ def tables(agg, windows, idle):
         md.append('')
     for prefix, title in (('hbmx-', 'HBM-only baseline extension (S = 1; shuffled order)'),
                           ('e6b-', 'E6 at real splits cd = 4, 8, 16 (shuffled order)'),
-                          ('e5alias-', 'GEMV and raw-read stripe-aliasing tests (shuffled order)')):
+                          ('e5alias-', 'GEMV and raw-read stripe-aliasing tests (shuffled order)'),
+                          ('e1g-', 'HBM-only and splits with the HBM workers on staggered stripes (shuffled order)'),
+                          ('e3g-', 'Interleaved region with every worker started stag x i bytes into its slice (shuffled order)')):
         es = sorted((e for e in agg.values() if e['name'].startswith(prefix) and e['sockets'] == 1), key=lambda e: (e['page'], e['name']))
         if es:
             md.append(f'## {title}\n')
             md.append(table(['config', 'page', 'HBM GB/s', 'DDR GB/s', 'combined GB/s', 'reps', 'p: above e1-cd0 by chance'],
                             [(e['name'], e['page'], mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), e['reps'],
-                              pcol(e, agg.get(('e1-cd0', e['page'], 1))) if e['cfg']['kind'] == 0 else '-') for e in es]))
+                              pcol(e, agg.get(('e1-cd0', e['page'], 1))) if e['cfg']['kind'] in (0, 2) else '-') for e in es]))
             md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith('e6-')), key=lambda e: (e['page'], e['name']))
     if es:

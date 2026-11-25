@@ -10,26 +10,25 @@ number is labelled **measured**, **derived** (arithmetic on measured numbers), *
 
 ## 1. Answer
 
-1. **No.** With a socket's 56 cores reading HBM and DDR at the same time, the combined read bandwidth never exceeded the best
-   HBM-only bandwidth in any of the four ways of mixing the tiers (split teams, shared cores, interleaved pages, both sockets at
-   once). The best HBM-only figure is **569.1 [554.2-571.2] GB/s per socket** (measured, 2 MiB pages, 56 cores, one stream per
-   core, 16 KiB software prefetch; the largest single median, 570.6, comes from a fixed-volume window of the same configuration).
-   The best mixed point is **562.4 [553.9-568.0]** (54 HBM + 2 DDR cores), about 1% below it; the E2 and E3 maxima (561 and 573.4
-   [567.0-577.4]) lie inside the HBM-only run-to-run range. Adding DDR cores beyond that point lowers the combined rate
-   monotonically, to 501 at 28+28 and 262 for DDR only. Run-to-run spread of the HBM-only reference is about 3% (554-571), so a gain of
-   less than about 3% could not be seen even if it existed.
-2. **The engine's own decode GEMV does not gain either.** Over the 70B per-socket shard (gs64), the best all-HBM configuration
-   (4 KiB pages, 56 workers) reads **447.2 [440.6-451.7] GB/s** (12.12 decode tok/s-equivalent). The best split of every matrix's rows
-   between an HBM and a DDR copy reads 453.4 [442.5-459.8] GB/s (12.29 tok/s-equivalent): +1.4%, ranges overlapping, in a run in
-   which every process used its own shuffled configuration order. gs32 gives the same picture (445.6 against 449.0, +0.7%).
-3. **Why** (section 6): the socket that runs the workers sits at its power limit in every run (348-355 W, measured, including DDR-only; the idle other socket draws 160-200 W), and
+Scope: core-issued loads (ordinary and prefetched AVX-512 loads) on this node, whose sockets run at a package power limit of about 350 W; nothing here says what a DMA engine or a node with a higher power limit would do.
+
+1. **Reading both tiers at once did not raise the combined bandwidth above HBM-only by more than about 1-3%, and not robustly.** The best HBM-only figure is **569.1 [554.2-571.2] GB/s per socket** (measured, 2 MiB pages, 56 cores, one stream per core, 16 KiB software prefetch; 7 repetitions;
+   no variant of prefetch distance, hint or non-temporal loads beat it in the extended sweep, section 3). Mixed configurations (per socket, 2 MiB pages unless stated; p = one-sided exact permutation p-value that the median is above e1-cd0 by chance, shown only when the median is higher):
+   * E1 split teams: best 562.4 [553.9-568.0] (54 HBM + 2 DDR cores) = 1.2% below; no split is above it; combined falls to 501 at 28+28.
+   * E2 shared cores: best 561.2 [555.0-568.5] (line interleave 4:1) = 1.4% below.
+   * E3 interleaved pages: 8:1 573.4 [567.0-577.4] (+0.8%, p = 0.029), 4 KiB 4:1 570.1 [565.9-581.2] (+2.1% over the 4 KiB HBM-only 558.5, p = 0.006); its own all-HBM region reads 562.1.
+   * E4 both sockets: node 1167.8 [1113.1-1180.2] for interleaved 8:1 against 1127.8 [1102.1-1148.8] HBM-only (+3.5%, p = 0.029); at 4 KiB 1130.4 against 1120.3 (p = 0.244).
+   These are small, same-sign excesses in the interleaved-page configurations (E3, E4) that do not appear in the split-team or shared-core configurations, whose ranges overlap the HBM-only range; with the run-to-run spread of the reference at about 3% and several dozen comparisons they are **not robust**.
+   The shuffled replication on a second node is in section 8.
+2. **The engine's own decode GEMV (an upper bound for the weight-stream part of decode, section 5) gains 1.4-2.4%.** Over the 70B per-socket shard (gs64), the best all-HBM point (4 KiB pages, 56 workers) reads 447.2 [440.6-451.7] and, in a second independent run, 459.0 [449.7-463.3] GB/s; the best row split (r = 0.2, 14 DDR workers, 4 KiB pages) reads
+   453.4 [442.5-459.8] (+1.4%, p = 0.017) and 469.8 [460.4-471.8] (+2.3%, p = 0.006) GB/s: 12.44 to 12.73 decode tok/s-equivalent (gs32: +2.1 to +2.4%). It is a small gain that needs the right worker split and is a fraction of a tok/s.
+3. **Why** (section 6): the socket that runs the workers sits at its power limit in every run (348-355 W, measured, including DDR-only; the idle other socket draws 160-200 W; both sockets draw 352-355 W in E4), and
    the average core clock falls from 2.28 GHz (DDR only) to 1.4-1.7 GHz as soon as cores read HBM while the uncore clock rises with the DDR
    share (1.7 to 2.1 GHz). DDR itself saturates at 28 cores (266 GB/s) and adds latency (up to 366 ns under load). The data are consistent with a
    power-limited rather than a controller-limited socket; they do not prove it, because no frequency or power knob could be set, and the clock difference between
    data contents is not resolved (section 6).
-4. **Two side findings that matter for any bandwidth benchmark:** (a) all-zero memory reads 6% faster than pseudo-random data
-   under the same power cap (565.8 against 600.9 GB/s HBM-only); (b) the engine's Q8 GEMV reads 11% more slowly from 2 MiB pages
-   than from 4 KiB pages (401 against 447 GB/s at 56 workers), unrelated to address alignment.
+4. **Side findings that matter for bandwidth work:** (a) all-zero memory reads 6% faster than pseudo-random data under the same power cap (565.8 against 600.9 GB/s HBM-only);
+   (b) the engine's Q8 GEMV on 2 MiB pages loses 8-10% at 56 and 28 workers to a stripe-aliasing effect that a 4 KiB stagger of the workers' addresses removes (411 to 447.5 GB/s, and a raw 56-stream lockstep read 403 against 554-577 GB/s): a hypothesis the tests support (section 5.1); (c) the NTA prefetch hint halves HBM bandwidth.
 
 ![combined, HBM and DDR bandwidth against DDR share, and the E5 GEMV](figures/concurrent-tier-bandwidth.png)
 
@@ -91,6 +90,12 @@ E6 sensitivity of the HBM-only rate (2 MiB pages, 7 reps; measured): one stream 
 twice). Spreading the DDR cores across the team (`alt`) instead of a block makes no difference. Hardware prefetchers and the uncore
 frequency cannot be changed with this account (sudo is limited to `perf stat`, `turbostat` and `ipmitool sensor`; no MSR tools;
 uncore limits not writable): not tested.
+
+**Extended HBM-only sweep and E6 at real splits** (shuffled order inside each process, 7 reps, per socket). Software prefetch distance 32, 64 and 128 KiB with one stream: 526.7 [519.0-564.6], 532.4 [528.9-545.9], 529.5 [526.3-554.2]
+(2 MiB), worse than 16 KiB (561.7 [528.6-567.1] in that run); the T1 hint 533.3, the NTA hint 238.2 (the counters read 1.45 times the requested bytes in every one of these windows, in both page sizes and every repetition: the hardware fetches each line twice; it is not an attribution artefact);
+non-temporal loads 567.3 [562.0-582.6] (4 KiB 560.1). No variant exceeds the e1-cd0 median of 569.1, so it remains the reference. At real splits (cd = 4, 8, 16; 2 MiB pages) spreading the DDR cores over the team instead of giving them a contiguous block gains 1-2%
+(cd 4: 566.2 [550.9-576.1] against 556.0 [550.7-558.6]; cd 8: 563.5 [558.6-569.5] against 558.0 [554.7-563.7]; cd 16: 544.2 against 542.2) and stays at or below the HBM-only reference; the DDR group's streams (1, 2, 4), prefetch distance (0, 4 KiB, 16 KiB) and non-temporal loads change nothing (all within 1%);
+a 64 KiB prefetch on the HBM group costs 5% (cd 8: 531.0 against 558.0); 4 KiB pages behave the same.
 
 ## 4. Results of the mixing experiments (per socket, measured)
 
@@ -168,47 +173,60 @@ flit size is recalled from Intel's tools, not verified on this part) for HBM-onl
 
 ## 5. E5: the engine's Q8 decode GEMV over the 70B per-socket shard
 
-Shard (per socket, 2-socket tensor parallel): Wq 4096x8192, Wk and Wv 512x8192, Wo 8192x4096 (column shard), W1 and W3 14336x8192,
-W2 8192x14336, 40 layers per tier copy (18.2 GB gs64, 19.3 GB gs32). Rows of every matrix are split between an HBM copy and a DDR copy
-in the ratio r (DDR fraction). tok/s-equivalent (derived) = GB/s / 36.9 GB (gs64) or / 39.1 GB (gs32) per socket per token; it ignores
-attention, the classifier and communication.
+**Scope.** This is the weight-stream part of a decode step only: the engine's `k_matmul_q8_ld_worker` on the seven matrices of a layer (W1 and W3 as two separate GEMVs, not the fused
+SwiGLU pair), with a team barrier after each phase, over 40 layers per tier copy. There is no attention, KV cache, classifier, norm or cross-socket reduction. Every tok/s-equivalent below is therefore an **upper bound**
+on what a decode token can gain, not a decode speed.
 
-All-HBM GEMV against the number of workers (measured, 7 reps, file order, GB/s): 14 workers 157, 28 272, 32 317, 40 363, 42 367, 48 398,
-52 418, 56 403 (2 MiB pages, gs64); 4 KiB pages 325.9 (32), 373.1 (40), 405.4 (48), 432.5 (52), 443.6 (56). The kernel reaches 11.2 GB/s per worker at 14
-workers and 7.2 at 56 with 2 MiB pages (8.0 with 4 KiB; derived), i.e. 71% (2 MiB) to 80% (4 KiB) of the stream rate at 56 cores. The package power is 350-353 W at every worker count (counters), and the core clock falls from 2.27 GHz at 14 workers to
-1.86-1.99 GHz at 52-56 (measured; the stream at 52-56 cores runs at 1.6-1.7 GHz), so the GEMV is not
-bound by the core clock in the way the stream is, and it does not saturate HBM (447 against 569 GB/s). Because the kernel uses less
-HBM bandwidth than a stream does, moving rows to DDR could in principle relieve a per-core limit; the measurement shows it does not.
+Shard (per socket, 2-socket tensor parallel): Wq 4096x8192, Wk and Wv 512x8192, Wo 8192x4096 (column shard), W1 and W3 14336x8192, W2 8192x14336, 40 layers per tier copy (18.2 GB gs64,
+19.3 GB gs32). Rows of every matrix are split between an HBM copy and a DDR copy in the ratio r (DDR fraction); a group of workers streams each part. tok/s-equivalent (derived) = GB/s / 36.9 GB (gs64) or / 39.1 GB (gs32) per socket per token.
 
-Shuffled confirmation (every process runs its configurations in its own random order; 2 MiB and 4 KiB alternate; 7 reps; gs64, tok/s-eq.
-in brackets; the best all-HBM point over both page sizes and all worker counts is 447.2 [440.6-451.7] GB/s, 4 KiB, 56 workers):
+### 5.1 All-HBM GEMV and the 2 MiB page effect
 
-| config | 2 MiB GB/s | 4 KiB GB/s | 4 KiB vs best all-HBM |
-|---|---|---|---|
-| all-HBM, 48 workers | 402.9 [398.1-404.9] | 403.3 [395.5-410.9] | -9.8% |
-| all-HBM, 52 workers | 422.2 [408.5-426.8] | 427.0 [420.7-434.5] | -4.5% |
-| all-HBM, 56 workers | 400.9 [398.1-406.0] | **447.2 [440.6-451.7]** (12.12) | 0 |
-| r = 0.05, 3 DDR workers | 437.0 [432.7-441.3] | 446.5 [441.6-454.3] | -0.2% |
-| r = 0.10, 6 DDR workers | 444.6 [438.7-446.9] | 449.5 [439.4-454.8] | +0.5% |
-| r = 0.20, 14 DDR workers | 439.5 [430.6-444.2] | **453.4 [442.5-459.8]** (12.29) | +1.4% |
-| r = 0.25, 18 DDR workers | 444.5 [435.1-453.6] | 453.4 [442.7-456.5] | +1.4% |
-| r = 0.30, 21 DDR workers | 440.7 [433.5-449.3] | 446.7 [443.0-458.1] | -0.1% |
-| r = 0.35, 24 DDR workers | 432.3 [429.1-442.1] | 434.4 [428.0-438.5] | -2.9% |
-| r = 0.40, 28 DDR workers | 431.3 [430.3-435.9] | 433.8 [432.8-439.9] | -3.0% |
+All-HBM against workers (measured, 7 reps, gs64, GB/s): 14 workers 157, 28 272-277, 32 317, 40 363, 42 367, 48 398-403, 52 418-428, 56 401-411 with 2 MiB pages; with 4 KiB pages 326, 373, 405, 433, 444-459. With 4 KiB pages the rate rises
+to 56 workers; with 2 MiB pages it **drops** at 56 workers (and at 28) by 8-10% (411 against 444-447 at 52-55 workers). The kernel reaches 11.2 GB/s per worker at 14 workers and 7.3-8.2 at 56 (derived), i.e. 72-80% of the stream rate, at 350-353 W
+and 1.86-1.99 GHz (counters), while the stream at 52-56 cores runs at 1.4-1.7 GHz.
 
-gs32 (best all-HBM 445.6 [442.3-446.7] GB/s, 11.41 tok/s-eq.): best split r = 0.10-0.25 about 447-449 GB/s (+0.3 to +0.7%); 2 MiB all-HBM 405.4. Earlier runs in file order gave 2 MiB splits
-of up to 447 GB/s against a 2 MiB all-HBM 56-worker point of 401-405 (+10%), but that is a comparison against a poor baseline: with 4 KiB
-pages the all-HBM kernel alone reaches 447. Against the best all-HBM point the split is within +-1.5%, with overlapping ranges: **no demonstrated gain**.
-Rows split in the E2 style (every worker reads both tiers) is 2-7% worse than the best worker split (415.9-438.4 GB/s in the file-order run, against 446.8).
-Split with too few DDR workers is much worse (r = 0.25 with 10 DDR workers: 330 GB/s) because the DDR group finishes last.
+**Stripe aliasing (a hypothesis that the data support).** With 56 (or 28) workers, W1 and W3 give every worker exactly 256 (or 512) rows of 8192 bytes = 2 MiB (4 MiB), so all workers read at addresses that differ by multiples of 2 MiB at the same time, and with
+2 MiB pages the physical addresses are as contiguous as the virtual ones. Tests (2 MiB pages, all-HBM, shuffled order, 7 reps, GB/s):
 
-Beyond r = 0.3 the total falls: all-DDR reads 250-253 GB/s (6.8 tok/s-eq.).
+| test | gs64 | gs32 |
+|---|---|---|
+| 53 / 54 / 55 workers | 436.7 / 443.9 / 446.4 | 438.2 / 442.5 / 447.4 |
+| 56 workers | **411.1 [410.2-415.0]** | **414.3 [413.1-416.9]** |
+| 56 workers, worker i reads 4 KiB x i higher | **447.5 [443.1-452.3]** | **443.1 [439.8-450.5]** |
+| 56 workers, 64 KiB x i higher | 441.8 [441.2-447.9] | 437.4 [432.1-440.9] |
+| 27 / 28 / 29 workers | 292.9 / **277.3** / 309.6 | 278.4 / **272.4** / 295.5 |
+| 56 workers, 4 KiB pages (no skew) | 456.7 [451.7-462.6] | 454.3 [452.4-462.1] |
 
-**Page-size finding.** Reading the shard from 2 MiB pages is 11% slower than from 4 KiB pages at 56 workers (400.9 against 447.2 GB/s gs64; 405.4 against 445.6 gs32)
-and equal at 48 workers (402.9 against 403.3). Adding a constant byte offset of 64 B, 4 KiB, 64 KiB or 1 MiB + 64 B to every weight address changes the 2 MiB rate by at most 0.4% (gs64 medians 400.9-402.5, gs32
-404.7-406.3 GB/s); at 4 KiB the medians span 2.2% (gs64 438.3-448.0, gs32 438.9-447.0), with the 4 KiB offset lowest in both, and the ranges overlap (for example 418.7-443.8 against 442.8-450.5), so there is no
-systematic alignment effect and a small, within-noise one cannot be excluded. In particular the 2 MiB rate does not recover with any offset, so the 11% gap is not an alignment effect of the row blocks within 2 MiB pages. The cause was not found. Because the
-engine also runs weights on THP, this matters beyond this study (estimate: up to about 10% of decode bandwidth at 56 workers).
+The dip at 56 and 28 workers disappears when the workers' addresses are staggered by 4 KiB, and does not occur with 4 KiB pages. A raw read confirms it with no arithmetic: 56 workers each stream their own 360 MiB stripe (a multiple of 2 MiB) in barrier lockstep, one 1 MiB block per barrier:
+stripes aligned (all start at the stripe base) **403.4 [397.4-411.1] GB/s**, started 4 KiB x i in **553.6 [518.2-562.2]**, started (1 MiB + 4 KiB) x i in **576.7 [541.8-586.6]**; without barriers (time-based) the aligned case reads 559.2 [546.3-567.9]; sliced evenly like E1 554.8. With 4 KiB pages the aligned lockstep case is 543.6 [537.4-575.6].
+So 2 MiB-aligned simultaneous streams lose 27-30% in the raw read and 8-9% in the GEMV, and only when the workers advance in lockstep on 2 MiB pages. The mechanism (the address interleave across HBM channels and banks) was not examined; this is an inference from where the loss appears and disappears.
+The earlier test that shifted all workers by the same offset did not change this (it shifted every address equally, which keeps the 2 MiB relations between workers). **This is a finding beyond this study: an engine that keeps its weights on 2 MiB pages and runs 56 (or 28) workers over such shapes loses about 8-10% of the weight-stream bandwidth, and a per-worker stagger of 4 KiB recovers it** (estimate: not tried in the engine).
+
+### 5.2 Row split against the best all-HBM point
+
+The reference is the best all-HBM point over both page sizes and all worker counts in the same shuffled run (4 KiB pages, 56 workers). Two independent shuffled runs on node A (the first scanned r and the DDR worker count; the second repeated the neighbourhood of the best point, DDR worker count +-2):
+
+| gs64, 4 KiB pages | run 1 GB/s | vs all-HBM (p) | run 2 GB/s | vs all-HBM (p) |
+|---|---|---|---|---|
+| all-HBM, 56 workers | 447.2 [440.6-451.7] | 0 | 459.0 [449.7-463.3] | 0 |
+| r = 0.20, 12 DDR workers | - | - | 436.6 [434.8-440.3] | -4.9% |
+| r = 0.20, 14 DDR workers | 453.4 [442.5-459.8] | +1.4% (0.017) | **469.8 [460.4-471.8]** (12.73 tok/s-eq.) | **+2.3% (0.006)** |
+| r = 0.20, 16 DDR workers | - | - | 446.1 [438.7-449.1] | -2.8% |
+| r = 0.25, 16 DDR workers | - | - | 464.0 [456.0-476.6] | +1.1% (0.047) |
+| r = 0.25, 18 DDR workers | 453.4 [442.7-456.5] | +1.4% (0.017) | 460.8 [458.5-472.1] | +0.4% (0.238) |
+| r = 0.30, 21 DDR workers | 446.7 [443.0-458.1] | -0.1% | 455.3 [447.7-464.6] | -0.8% |
+
+gs32: all-HBM 4 KiB 445.6 [442.3-446.7] (run 1) and 455.3 [452.7-459.0] (run 2); best split run 1 449.0 (+0.7%); run 2 r = 0.20 with 14 DDR workers 465.0 [459.4-468.5] (+2.1%, p = 0.006) and r = 0.25 with 16 DDR workers 466.1 [462.0-469.7] (+2.4%, p = 0.006). With 2 MiB pages the best split (456.8-461.2) is within +-1.3% of the best all-HBM point, but 11% above the 2 MiB all-HBM point at 56 workers
+(410.2), which the aliasing explains. p is the one-sided exact permutation p-value of the difference of the medians over the 7 + 7 repetitions; the smallest value this test can give is 0.0058. Fewer than 14 or more than 16-18 DDR workers loses (r = 0.2 with 12 workers -4.9%, 16 workers -2.8%): the gain exists only when the DDR group's finishing time matches the HBM group's.
+
+[[F5]]
+
+**Reading.** A row split at r = 0.2 - 0.25 with 14-18 DDR workers gains **+1.4% to +2.4%** of weight-stream bandwidth at 4 KiB pages in two independent runs (p = 0.017 and 0.006 for the pre-chosen point), as an upper bound on the gain for a decode token (12.44 to 12.73 tok/s-equivalent in run 2; 0.29 tok/s). It is small, depends on the worker split
+(a window of 2-4 workers), is smaller or absent for other points of the scan (many same-sign points have p between 0.006 and 0.4; with about 40 comparisons per table, the smallest uncorrected p of 0.006 would be about 0.2 after a Bonferroni correction, so only the replication of the pre-chosen point carries evidence), and sits on a baseline that
+the 2 MiB aliasing lowers by 8-10% on the page size the engine actually uses. Not robust enough to call a result of this study beyond "no gain larger than about 2-3%".
+
+All-DDR reads 250-253 GB/s (6.8 tok/s-eq.). Rows split in the E2 style (every worker reads both parts) is 2-7% worse than the best worker split.
 
 ## 6. Why the curve has this shape
 
@@ -238,8 +256,8 @@ Everything below is supported by counters measured in the same windows.
 5. **Mixed configurations lose on both sides.** At 48 + 8, the 8 DDR cores read 75.5 GB/s (9.4 GB/s per core) and the 48 HBM cores 479.3 GB/s (10.0 per core), against 12.7 GB/s per core for
    DDR at 16 cores alone and 10.2 per core for 56 HBM cores; the combined rate is the sum of two reduced streams. Fixed-volume runs show the second effect: the group with fewer cores
    per byte finishes last, so total volume / total time falls up to 16% below the fixed-time rate (44+12: 453 against 537 GB/s; 28+28: 455 against 501).
-6. **The GEMV does not escape.** It uses 71-80% of the stream rate with 56 workers at lower power-limited clocks (1.9-2.0 GHz) and rises almost linearly with
-   workers to 52; DDR workers added to the HBM workers draw their share of the same package budget, and every split stays within 1.5% of the all-HBM level.
+6. **The GEMV is limited by something else as well, and gains little.** It uses 72-80% of the stream rate with 56 workers at 1.9-2.0 GHz, and with 2 MiB pages it loses another 8-10% to the stripe aliasing of section 5.1. DDR workers added to the HBM workers
+   draw their share of the same package budget; the best row split is 1.4-2.4% above the best all-HBM point (4 KiB pages).
 
 Whether the limit is power or bandwidth: the constant package power, the lower clocks under HBM traffic, the rising uncore clock with the DDR share and the data-content effect are all
 consistent with a package power budget being the binding quantity; the DDR ceiling (262-266 GB/s at 28 cores) bounds the DDR side only. This is an interpretation: no
@@ -271,15 +289,16 @@ for gs64 and bytes per token 36.9 GB; the engine's real kernel reaches about 79%
 
 * Replication on a second Flat node (node B, 7 reps): E1 cd 0, 4, 8, 16, 28, 56 and the fixed-volume point at both page sizes differ from node A by -1.6% to +0.9%
   (for example 56+0: 566.5 against 569.1; 28+28: 493.2 against 501.1; DDR only 262.4 against 262.5). E5 on node B (file order, 7 reps, gs64): all-HBM with 56 workers is again 405.7 [402.7-408.8] GB/s at 2 MiB and 444.1 [437.0-453.1] at 4 KiB; the best split is r = 0.1 with 6 DDR workers, 445.5 [437.5-448.3] (2 MiB) and 453.1 [451.9-457.8] (4 KiB, +2.0%); gs32 gives 455.1 [449.8-456.4] against 444.9 [442.5-452.9] (+2.3%). On this node the split is therefore 2% ahead of the best all-HBM point with ranges that touch; on node A (shuffled run) it is +0.5% (r = 0.1) to +1.4% (r = 0.2). The gain is below the 3% run-to-run spread and is not demonstrated.
-* Energy per byte (socket 0, measured RAPL package + DRAM over the interior intervals of the window; socket 0 sits at 348 W package, 22 W DRAM with the worker teams spinning and no traffic):
-  HBM-only 569 GB/s at 354 + 22 W = 0.66 J/GB; DDR-only 263 GB/s at 352 + 74 W = 1.62 J/GB; 48+8 0.71 J/GB; 28+28 0.84 J/GB (derived, J per GB of reads). Above the spinning-idle baseline, HBM-only costs
-  0.010 J/GB and DDR-only 0.212 J/GB (derived): the incremental energy of a DDR byte is about 20 times that of an HBM byte, but the package budget is the binding quantity.
+* Energy per byte (socket 0, measured RAPL package + DRAM over the interior intervals of the window): HBM-only 569 GB/s at 354 + 22 W = 0.66 J/GB; DDR-only 263 GB/s at 352 + 74 W = 1.62 J/GB; 48+8 0.71 J/GB; 28+28 0.84 J/GB (derived; J per GB read, package + DRAM of one socket, not
+  corrected for the 348 W and 22 W that socket draws with the worker teams spinning and no traffic, so the figures are dominated by the pinned package power and say little about the cost of a byte of either tier).
 
 ## 9. Limits and uncertainties
 
-* The conclusions are about read streams and the engine's decode GEMV; writes, attention and KV traffic were not mixed in.
-* Run-to-run spread of the HBM-only reference is 3% (7 reps, interleaved); a mixed configuration within about 3% of it cannot be called a loss or a gain. No configuration exceeded it by more than its own spread.
+* Scope: core-issued loads on this node's ~350 W-per-socket power limit, reads only (writes, attention and KV traffic were not mixed in). The GEMV is the weight stream of decode only (separate W1 and W3, no attention, KV cache or classifier): an upper bound.
+* Run-to-run spread of the HBM-only reference is 3% (7 reps); same-sign excesses of 0.7-3.5% (E3, E4, E5) have nominal one-sided permutation p-values of 0.006-0.05, but they come from many comparisons, depend on the worker split, and were replicated only partly; they are reported as "no gain beyond about 2-3%, not robust".
 * Core clock is an average of 56 cores of the socket including spinning idle workers; turbostat uncore values are one-second samples of package 0.
-* The power-cap explanation is consistent with every counter but unproven (no frequency or power control).
-* The 2 MiB GEMV slowness is unexplained.
-* UPI bytes use an assumed 64/9 bytes per data flit.
+* The power-cap explanation is consistent with every counter but unproven (no frequency or power control), and the clock difference between zero and random data is not resolved.
+* The stripe-aliasing mechanism is inferred from where the loss appears and disappears; the address-interleave mechanism was not examined, and the stagger fix was not tried inside the engine.
+* Open: (a) the UPI traffic of the E4 interleaved 2 MiB runs (median 0.75 GB/s, range 0.14-1.0, against 0.15 elsewhere): the spike sits in the intervals adjacent to the window (allocation and release of the 32 GiB regions), but inside interior intervals some repetitions still show it; (b) 11 of 14 E4 4 KiB interleaved
+  windows have no counters (the window's burst merged with the allocation burst); (c) the delivered bandwidth of the NTA hint.
+* UPI bytes use an assumed 64/9 bytes per data flit (flits per second are given).
