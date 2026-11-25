@@ -4,8 +4,6 @@ Standing instructions: [`docs/plans/hybrid-memory-manager-prompt.md`](../../plan
 (local, not committed). This file is the manager's memory across sessions. Started 24 November 2026 from `develop` at
 `b9b9bbb`.
 
-**Blocker 25 Nov ~01:30:** SSH master to the cluster dropped; owner must reopen it. Jobs keep running.
-
 **Resume:** read this file, `git fetch`, `git log develop`, `squeue -u $USER`, then continue from **Next action**.
 
 ## Next action
@@ -49,6 +47,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 24 Nov | No downloads: the 70B HF snapshot (community mirror, rev d50656ee, 30 shards hashed at download) and the gs64 (22 Nov) and gs32 (24 Nov) engine files already exist; only a sha256 manifest and provenance check are run | D1 asks for files, not for re-downloads |
 | 24 Nov | Engine checkpoints stay in scratch; protection against a purge is the manifest plus the recipe (HF rev d50656ee, whose 30 shard hashes match the hub's; conversion jobs 5892714 gs64, 5910127/5910128/5910181 FP32/GGUF/gs32) | Store area quota is 100 GB hard with ~47 GB free; the two 70B Q8 files are 154 GB |
 | 24 Nov | E3 uses `mbind` per chunk | Flat-node kernel is 5.14 (RHEL 9.4), no `weighted_interleave` sysfs |
+| 25 Nov | Gate 5916531 (tree 719232e) HW make test rc=2, only the stale guard-list test fixed in ce43988; HW make test reruns on ce43988, TSAN carries over if src unchanged | §8: gates on the final tree |
 | 25 Nov | P2 lands by `merge --no-ff merge/hbm-ddr-placement` into develop with the gate id in that message; no history rewrite of the branch | §10: no rewrites |
 | 25 Nov | P2 needs an extra A/B on the HBM path (1S HBM, ~51 tok/s) | Its 1S A/B used the default file/DDR placement (~14 tok/s) |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
@@ -129,7 +128,7 @@ the mirror's file list and sizes match it.
 - Corrections sent to P1: HBM-only core clock median 1.71 GHz (1.77 is the max); `common_s = 0` so E1 numbers are
   whole-window values; per-window CAS ratios depend on perf alignment (extremes not reproduced); interleaving only across
   page sizes; no E3 claim before job B.
-- Open: C-vs-A replication not re-derived (SSH master dropped).
+- Replication hbm13 (C) vs hbm14 (A) re-derived: combined E1 points within -1.56..+0.39% (2M and 4K). Confirmed.
 
 ## P1 smoke (1 repetition, superseded)
 
