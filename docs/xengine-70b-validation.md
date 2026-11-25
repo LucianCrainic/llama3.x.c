@@ -1,6 +1,6 @@
 # 70B cross-engine comparison: validation record
 
-**Status: carried over, not re-run.** Provenance of [xengine-70b.md](xengine-70b.md) and of the harness ported with it (`tools/xengine70/`, `scripts/xengine70.sbatch`, the `xengine70-fp32` and `xengine70-q8` targets of the Makefile). The measurements were made on an older tree; the port ran no cluster job (0 node-hours).
+**Status: carried over; the llama3.x.c Q8 DDR rows were re-run on `ee24659` (jobs 5929406, 5929407; see "Re-run on the current tree"), everything else is not re-run.** Provenance of [xengine-70b.md](xengine-70b.md) and of the harness ported with it (`tools/xengine70/`, `scripts/xengine70.sbatch`, the `xengine70-fp32` and `xengine70-q8` targets of the Makefile). The measurements were made on an older tree; the port ran no cluster job (0 node-hours).
 
 ## Provenance
 
@@ -24,9 +24,23 @@
 | 5910211 | Q8_0 DDR cells for both engines and the C HBM cell; reached its time limit in the llama.cpp HBM cell | Q8_0 table |
 | 5913407 | llama.cpp Q8_0 HBM cell, repeated on the same node | Q8_0 table |
 
+## Re-run on the current tree
+
+| Item | Value |
+| --- | --- |
+| Tree | `ee24659` (develop), `scripts/xengine70.sbatch` modes `c-q8` and `c-q8-hbm`, engine defaults, no `LEGACY` (`LLAMA_KERNELS=auto`, AMX prefill) |
+| Node | `cresco8-hbm14`, exclusive, after the gate job 5929402 |
+| Jobs | 5929406 (gs32 checkpoint, the file of the old rows): DDR cell completed, HBM cell failed at startup; 5929407 (native gs64 checkpoint): same. 6 min 1 s and 4 min 48 s, about 0.18 node-hours |
+| Workloads | the 547- and 2,113-token prompts of the earlier jobs (same SHA-256), 128 greedy tokens, context 8,192, batch 256, one warm-up and three measured requests, two sockets of 55 threads |
+| DDR gs32 | TTFT 2.689 s and 10.222 s, decode 5.928 and 5.755 tok/s (old 84.236 s, 326.208 s, 5.068, 4.489) |
+| DDR gs64 | TTFT 2.154 s and 8.065 s, decode 6.216 and 6.011 tok/s (no earlier value) |
+| Token check | gs32: all 8 requests (both workloads, warm-up included) equal the 128 IDs of job 5910211 and each other, a bitwise match across the kernel change; gs64: long equal to it, short diverges at position 3 (zero-based) from the gs32 trace (different checkpoint) |
+| HBM cell | not measured: with strict `hbm-only` placement the engine needs 83.0 GB (gs32) or 78.6 GB (gs64) per socket and stops at startup, 22.9 GB and 18.5 GB over its 56 GiB per-socket HBM budget; the old tree needed 43 GB per socket. The HBM rows stay STALE. Cause of the larger footprint not investigated |
+| Raw results | cluster result directory `xengine70-20261125-cq8` (cells `gs32-c-q8`, `gs32-c-q8-hbm`, `gs64-c-q8`, `gs64-c-q8-hbm`, each with `runs.jsonl`, `engine.log`, `environment.txt`, `command.sh`); not in the repository |
+
 ## Staleness
 
-The llama3.x.c Q8_0 rows (TTFT 84 s and 326 s, decode 4.5-5.3 tok/s) are STALE: they ran the portable group-32 kernels, before the gs32 AMX-INT8 prefill and VNNI decode work ([gs32-amx.md](gs32-amx.md): 8B decode 24.6 to 48.0 tok/s on one socket, prefill many times faster). The FP32 rows used the then-current kernels and are also older than the prefill and Wo/W2 work. The llama.cpp and vLLM rows do not depend on this tree.
+The llama3.x.c Q8_0 DDR rows were replaced by the re-run above. The llama3.x.c Q8_0 HBM rows (TTFT 84 s and 327 s, decode 5.3 tok/s) remain STALE: they ran the portable group-32 kernels, before the gs32 AMX-INT8 prefill and VNNI decode work ([gs32-amx.md](gs32-amx.md): 8B decode 24.6 to 48.0 tok/s on one socket, prefill many times faster). The FP32 rows used the then-current kernels and are also older than the prefill and Wo/W2 work. The llama.cpp and vLLM rows do not depend on this tree.
 
 ## Checks made for the port (this tree, no cluster)
 
@@ -40,5 +54,5 @@ The llama3.x.c Q8_0 rows (TTFT 84 s and 326 s, decode 4.5-5.3 tok/s) are STALE: 
 
 ## Not validated
 
-- The harness has not been run on this tree. Run `c-q8` on the same node first; compare the output IDs with the 128-token traces of the earlier jobs.
-- A re-run on this tree will use the current defaults (AMX prefill, VNNI decode, fused reductions); it will not reproduce the stale rows, and that is the point.
+- The C engine Q8 HBM cell on the current tree (see the re-run table): it does not fit the per-socket HBM budget. It would need a placement that splits the weights between HBM and DDR, which is a different configuration from the earlier HBM cell.
+- llama.cpp and vLLM were not re-run.

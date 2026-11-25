@@ -2,7 +2,7 @@
 
 > **Measured on an older tree (the earlier 70B comparison work, before the prefill, Wo/W2 and gs32/gs64 kernel work); numbers are not comparable with current-tree measurements.**
 
-Numbers are measured. [The validation record](xengine-70b-validation.md) lists the jobs. Only the llama3.x.c Q8 rows are marked STALE; nothing here was re-run on the current tree.
+Numbers are measured. [The validation record](xengine-70b-validation.md) lists the jobs. The llama3.x.c Q8 DDR rows were re-measured on the current tree (`ee24659`, jobs 5929406 and 5929407); the llama3.x.c Q8 HBM rows could not be re-run there and stay STALE. Everything else was not re-run on the current tree.
 
 This comparison pins the same source snapshot, input token IDs, output length and CPU resources. All three engines run FP32 on DDR. llama3.x.c and llama.cpp also run identical numeric Q8_0 weights.
 
@@ -14,7 +14,7 @@ This comparison pins the same source snapshot, input token IDs, output length an
 - **Requests.** The 547-ID input is the concatenated 512-position warm-up and 35-token prompt from the hybrid pilot. The 2,113-ID input is the AMX campaign prompt. Every engine receives each array as one request, generates 128 greedy tokens, ignores EOS, caps the context at 8,192 and uses a prefill batch limit of 256. One warm-up request per shape precedes three measurements. Prefix caching is disabled for vLLM and each native request starts with an empty logical cache.
 - **Timing.** TTFT starts at request submission with token IDs and stops at the first greedy token. Decode is 127 divided by the time from first to last generated token. The native drivers use the same in-process timer. vLLM uses local streaming HTTP, so its client timings include local server and transport overhead. Startup and checkpoint conversion are outside these measurements.
 
-The native INT8 comparison uses a single Q8_0 GGUF. [The repacker](../tools/xengine70/repack_q8.py) copies the 32-value blocks exactly, widens their FP16 scales to FP32 and preserves the RoPE ordering used by both engines. The physical scale storage and kernel implementations differ. Both set the KV cache to FP32. On the pre-port tree the accelerated W8A8 matmul kernels required groups divisible by 64, so this exact 32-value checkpoint ran on the portable matmuls (the C-engine Q8 rows below are therefore STALE). The current tree has the gs32 AMX-INT8 prefill and VNNI decode kernels ([gs32-amx.md](gs32-amx.md)), which a re-run on it would use; the hybrid study used the native group-64 checkpoint, which selected the VNNI decode and AMX prefill kernels even then. Stock vLLM CPU supports compressed-tensors for W8A8, and its GGUF implementation is GPU-targeted. [vLLM CPU quantization support](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/index.html) · [vLLM quantization matrix](https://docs.vllm.ai/en/latest/features/quantization/)
+The native INT8 comparison uses a single Q8_0 GGUF. [The repacker](../tools/xengine70/repack_q8.py) copies the 32-value blocks exactly, widens their FP16 scales to FP32 and preserves the RoPE ordering used by both engines. The physical scale storage and kernel implementations differ. Both set the KV cache to FP32. On the pre-port tree the accelerated W8A8 matmul kernels required groups divisible by 64, so this exact 32-value checkpoint ran on the portable matmuls (the old C-engine Q8 rows are therefore STALE). The current tree has the gs32 AMX-INT8 prefill and VNNI decode kernels ([gs32-amx.md](gs32-amx.md)), which the re-run of the DDR rows below used; the hybrid study used the native group-64 checkpoint, which selected the VNNI decode and AMX prefill kernels even then. Stock vLLM CPU supports compressed-tensors for W8A8, and its GGUF implementation is GPU-targeted. [vLLM CPU quantization support](https://docs.vllm.ai/en/stable/getting_started/installation/cpu/index.html) · [vLLM quantization matrix](https://docs.vllm.ai/en/latest/features/quantization/)
 
 ## Results
 
@@ -37,24 +37,28 @@ Jobs **5910133** (llama3.x.c), **5910177** (vLLM) and **5912354** (llama.cpp) ra
 
 ### Q8_0 with identical quantized weights
 
-**STALE: the llama3.x.c rows below (TTFT 84 s and 326 s, decode 4.5-5.3 tok/s) were measured on the portable group-32 kernels, before the gs32 AMX prefill and VNNI decode work. They do not describe the current engine and must not be compared with its measurements; the llama.cpp rows are unaffected.**
+**Re-measured on the current tree (`ee24659`, engine defaults, no `LEGACY`; jobs 5929406 gs32 and 5929407 gs64, node `cresco8-hbm14`) for the llama3.x.c DDR rows. The llama3.x.c HBM rows are still STALE (pre gs32 AMX/VNNI, measured on the portable group-32 kernels) because that cell does not run on the current tree, see below. The llama.cpp rows are unaffected.**
 
 | Memory | Engine | Prompt tokens | TTFT (s) | Decode (tok/s) |
 | --- | --- | ---: | ---: | ---: |
-| DDR | llama3.x.c (STALE) | 547 | 84.236 [84.222–84.753] | 5.068 [5.064–5.069] |
+| DDR | llama3.x.c (current tree, gs32) | 547 | 2.689 [2.686–2.693] | 5.928 [5.928–5.931] |
 | DDR | llama.cpp | 547 | 5.928 [5.820–6.069] | 3.100 [3.066–3.131] |
-| DDR | llama3.x.c (STALE) | 2,113 | 326.208 [326.052–327.975] | 4.489 [4.471–4.494] |
+| DDR | llama3.x.c (current tree, gs32) | 2,113 | 10.222 [10.200–10.236] | 5.755 [5.749–5.760] |
 | DDR | llama.cpp | 2,113 | 23.716 [23.319–23.793] | 3.037 [3.033–3.068] |
 | HBM | llama3.x.c (STALE) | 547 | 84.484 [84.484–84.499] | 5.343 [5.341–5.346] |
 | HBM | llama.cpp | 547 | 17.068 [16.129–17.354] | 2.704 [2.683–2.733] |
 | HBM | llama3.x.c (STALE) | 2,113 | 326.997 [326.994–327.051] | 5.290 [5.289–5.291] |
 | HBM | llama.cpp | 2,113 | 67.208 [65.885–68.249] | 2.639 [2.626–2.672] |
 
-Stale (pre gs32 AMX/VNNI): the C engine decoded 1.48–1.64× as fast as llama.cpp on DDR and 1.98–2.00× as fast on HBM. Its time to first token was 13.75–14.21× as long on DDR and 4.87–4.95× as long on HBM. The C startup log of those jobs confirms the portable group-32 prefill kernel. llama.cpp logged Q8_0 weights repacked into an AMX buffer and FP32 K and V.
+Re-run (DDR, same 547- and 2,113-token prompts, 128 greedy tokens, one warm-up and three measured requests, two sockets of 55 threads, prefill batch 256, the same group-32 checkpoint as before): the C engine's TTFT fell from 84.236 s to 2.689 s (547 tokens, 31.3× shorter) and from 326.208 s to 10.222 s (2,113 tokens, 31.9× shorter). Decode rose from 5.068 to 5.928 tok/s (+17.0%) and from 4.489 to 5.755 tok/s (+28.2%). Against llama.cpp on DDR the C engine's TTFT is now 0.45× and 0.43× of llama.cpp's (was 14.2× and 13.8× as long), and it decodes 1.91× and 1.89× as fast (was 1.64× and 1.48×). The startup log confirms `LLAMA_KERNELS=auto` with AMX for the batched prefill. The old values in this paragraph came from the pre-port tree (job 5910211) and are kept for reference only.
 
-HBM raised the C engine's decode rate by 5.4% at 547 tokens and 17.8% at 2,113 tokens. Median TTFT moved by under 1 s for each prompt. In the tested llama.cpp interleaved configuration, HBM reduced decode throughput by 12.8–13.1% and increased TTFT by 2.83–2.88×. These are results for the 110-worker pool with interleaving over both memory nodes of the selected tier.
+The same two workloads on the native group-64 checkpoint (a different file with different quantization, so not the identical-weights comparison) gave TTFT 2.154 s [2.150–2.163] and 8.065 s [8.063–8.072], decode 6.216 tok/s [6.210–6.228] and 6.011 tok/s [6.007–6.030] (job 5929407).
 
-Both engines matched their own output IDs across repeats and memory tiers. Across engines the output IDs match for all 128 long-prompt tokens. The short continuations share the first three IDs. The workloads use identical prompt IDs, 128 greedy output steps and the same attention depth at every step.
+The HBM cell does not run: the current engine places 83.0 GB (gs32; 78.6 GB for gs64) per socket, against the 56 GiB (60.13 GB) per-socket HBM budget, and with strict placement it stops at startup ("needs ... bytes of hbm (22,870,310,912 over its 60,129,542,144-byte budget)", 18,493,263,872 over for gs64). The old tree held 43 GB per socket on the same file, so the current per-socket footprint is about 1.9× the old one (the cause of the larger footprint was not investigated here); the 64 GiB of physical HBM per socket would not hold it either. The HBM rows therefore keep the old values.
+
+With the old (STALE) C-engine kernels, HBM raised the C engine's decode rate by 5.4% at 547 tokens and 17.8% at 2,113 tokens. Median TTFT moved by under 1 s for each prompt. In the tested llama.cpp interleaved configuration, HBM reduced decode throughput by 12.8–13.1% and increased TTFT by 2.83–2.88×. These are results for the 110-worker pool with interleaving over both memory nodes of the selected tier.
+
+The current-tree C engine's 128 output IDs equal the pre-port ones on all four requests of both workloads for the gs32 checkpoint (job 5929406 against job 5910211), so the numerics did not change for this file; the gs64 checkpoint gives the same long continuation but diverges from the gs32 one at the fourth ID of the short prompt (a different checkpoint, not a kernel change). Both engines matched their own output IDs across repeats and memory tiers. Across engines the output IDs match for all 128 long-prompt tokens. The short continuations share the first three IDs. The workloads use identical prompt IDs, 128 greedy output steps and the same attention depth at every step.
 
 Job **5910211** completed both DDR cells and the C HBM cell on `cresco8-hbm14`. It reached its time limit during the llama.cpp HBM cell. Job **5913407** repeated that cell on the same node with all eight requests. The DDR resident samples were 78,475 MiB for the C process and 85,109 MiB for llama.cpp, all on DDR. HBM resident samples were 78,462 MiB and 85,106 MiB, respectively, with under 13 MiB of DDR residency in either process. The C engine's final active KV page checks passed in both placements.
 
