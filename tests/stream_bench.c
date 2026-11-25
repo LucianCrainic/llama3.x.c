@@ -443,6 +443,7 @@ typedef struct {
 typedef struct {
   int sockets, threads, real, page4k, verify_stride;
   size_t inter_mib;
+  int fill; /* content of the tier regions: 0 pseudo-random, 1 zeros, 2 ones (--fill) */
   const Topology *topology;
   Sock sock[2];
   atomic_uint go_gen, done_gen;
@@ -815,6 +816,7 @@ typedef struct {
   char *base;
   size_t bytes;
   int gemv_layers; /* 0 = raw pattern, else the shard layout over this many layers */
+  int fill;
 } FillJob2;
 
 static uint64_t mix64(uint64_t x) {
@@ -825,14 +827,19 @@ static uint64_t mix64(uint64_t x) {
   return x ^ (x >> 33);
 }
 
+/* Words of the raw fill: pseudo-random (the default), zeros or ones. The content matters: the package is power-capped and
+ * the memory interfaces' power depends on the data, so zero pages read faster than random ones (see the documentation). */
+static void fill_words(uint64_t *q, size_t n, size_t seed, int fill) {
+  for (size_t i = 0; i < n; i++)
+    q[i] = fill == 1 ? 0 : fill == 2 ? ~0ULL : (mix64(seed + i + 1) & 0x7f7f7f7f7f7f7f7fULL);
+}
+
 static void fill2_fn(const void *p, int w, int workers) {
   const FillJob2 *job = p;
   if (!job->gemv_layers) {
     size_t words = job->bytes / 8, i0 = words * (size_t)w / (size_t)workers,
            i1 = words * (size_t)(w + 1) / (size_t)workers;
-    uint64_t *q = (uint64_t *)job->base;
-    for (size_t i = i0; i < i1; i++)
-      q[i] = mix64(i + 1) & 0x7f7f7f7f7f7f7f7fULL;
+    fill_words((uint64_t *)job->base + i0, i1 - i0, i0, job->fill);
     return;
   }
   for (int layer = 0; layer < job->gemv_layers; layer++)
@@ -855,15 +862,13 @@ static void fill2_fn(const void *p, int w, int workers) {
   /* The rest of the region (past the last whole layer) is touched too, so every page of it is populated and verified. */
   size_t tail = (size_t)job->gemv_layers * layer_stride, words = (job->bytes - tail) / 8,
          i0 = words * (size_t)w / (size_t)workers, i1 = words * (size_t)(w + 1) / (size_t)workers;
-  uint64_t *q = (uint64_t *)(job->base + tail);
-  for (size_t i = i0; i < i1; i++)
-    q[i] = mix64(i + 1) & 0x7f7f7f7f7f7f7f7fULL;
+  fill_words((uint64_t *)(job->base + tail) + i0, i1 - i0, i0, job->fill);
 }
 
 typedef struct {
   char *base;
   size_t pages, page;
-  int a, b, hbm_node, ddr_node, real;
+  int a, b, hbm_node, ddr_node, real, fill;
 } InterJob;
 
 #ifdef __linux__
@@ -894,7 +899,9 @@ static void inter_fn(const void *p, int w, int workers) {
       }
     }
 #endif
-    *(volatile char *)(j->base + pg * j->page) = 1;
+    *(volatile char *)(j->base + pg * j->page) = 1; /* first touch, under the page's policy */
+    if (j->fill != 1)
+      fill_words((uint64_t *)(j->base + pg * j->page), j->page / 8, pg * (j->page / 8), j->fill);
   }
 #ifdef __linux__
   if (j->real)
@@ -997,7 +1004,8 @@ static void inter_prepare(Run *R, const Cfg *c) {
                     .b = c->b,
                     .hbm_node = s->hbm_node,
                     .ddr_node = s->ddr_node,
-                    .real = R->real};
+                    .real = R->real,
+                    .fill = R->fill};
     team_run(s->team, inter_fn, &job);
   }
   for (int so = 0; so < R->sockets; so++)
@@ -1342,7 +1350,7 @@ static int research_main(int argc, char **argv) {
   double gap = 0.6;
   const char *label = "run", *page = "2m", *perf_cmd = NULL, *perf_out = NULL, *perf_stop = NULL;
   static Cfg cfgs[MAX_CFGS];
-  int ncfg = 0, verify_stride = 1;
+  int ncfg = 0, verify_stride = 1, fill = 0, shuffle = 0;
   for (int i = 1; i + 1 < argc; i += 2) {
     const char *k = argv[i], *v = argv[i + 1];
     if (!strcmp(k, "--exp"))
@@ -1359,6 +1367,10 @@ static int research_main(int argc, char **argv) {
       region_mib = (size_t)atoll(v);
     else if (!strcmp(k, "--gap"))
       gap = atof(v);
+    else if (!strcmp(k, "--shuffle"))
+      shuffle = atoi(v);
+    else if (!strcmp(k, "--fill"))
+      fill = !strcmp(v, "random") ? 0 : !strcmp(v, "zero") ? 1 : !strcmp(v, "ones") ? 2 : -1;
     else if (!strcmp(k, "--inter-mib"))
       inter_mib = (size_t)atoll(v);
     else if (!strcmp(k, "--verify-stride"))
@@ -1395,7 +1407,7 @@ static int research_main(int argc, char **argv) {
       fail("unknown option %s", k);
   }
   if (!(argc % 2) || (sockets != 1 && sockets != 2) || threads < 2 || threads > 120 || reps < 1 || !ncfg ||
-      (strcmp(page, "2m") && strcmp(page, "4k")) || verify_stride < 1 || region_mib < 64 ||
+      (strcmp(page, "2m") && strcmp(page, "4k")) || verify_stride < 1 || fill < 0 || region_mib < 64 ||
       (perf_cmd && (!perf_out || !perf_stop)))
     fail("invalid research options");
   kernels_init();
@@ -1411,6 +1423,7 @@ static int research_main(int argc, char **argv) {
   R->page4k = !strcmp(page, "4k");
   R->verify_stride = verify_stride;
   R->inter_mib = inter_mib;
+  R->fill = fill;
   PoolConfig config = {.teams = sockets,
                        .threads = {threads, threads},
                        .cpus = {R->real ? topology->socket[0].cpus : NULL, R->real ? topology->socket[1].cpus : NULL}};
@@ -1438,7 +1451,7 @@ static int research_main(int argc, char **argv) {
         madvise(s->R[t].data, s->R[t].data_bytes, MADV_NOHUGEPAGE);
 #endif
       s->base[t] = s->R[t].data;
-      FillJob2 fill = {s->base[t], bytes, need_gemv ? gemv_layers(s) : 0};
+      FillJob2 fill = {s->base[t], bytes, need_gemv ? gemv_layers(s) : 0, R->fill};
       if (need_gemv && fill.gemv_layers == 0)
         fail("region of %zu MiB holds no layer of the shard (%zu bytes per layer)", region_mib, layer_stride);
       team_run(s->team, fill2_fn, &fill);
@@ -1479,11 +1492,23 @@ static int research_main(int argc, char **argv) {
          need_gemv ? gemv_layers(&R->sock[0]) : 0, layer_stride);
   fflush(stdout);
   int index = 0;
-  for (int rep = 0; rep < reps; rep++)
+  /* --shuffle N (N > 0): every repetition runs the configurations in its own pseudo-random order (seeded by N and the
+   * repetition), otherwise they run in file order. */
+  int order[MAX_CFGS];
+  for (int rep = 0; rep < reps; rep++) {
+    for (int i = 0; i < ncfg; i++)
+      order[i] = i;
+    for (int i = ncfg - 1; shuffle > 0 && i > 0; i--) {
+      int k = (int)(mix64((uint64_t)shuffle * 1000003ULL + (uint64_t)rep * 7919ULL + (uint64_t)i) % (uint64_t)(i + 1));
+      int tmp = order[i];
+      order[i] = order[k];
+      order[k] = tmp;
+    }
     for (int i = 0; i < ncfg; i++) {
-      run_window(R, &cfgs[i], rep, index++);
+      run_window(R, &cfgs[order[i]], rep, index++);
       sleep_s(gap);
     }
+  }
   if (perf_cmd) {
     sleep_s(0.5);
     int fd = open(perf_stop, O_CREAT | O_WRONLY, 0644);

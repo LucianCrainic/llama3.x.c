@@ -19,11 +19,14 @@
 #                   BEST_*;  e1 split teams;  e2 shared cores;  e3 page-interleaved regions;  e4 both sockets at the best
 #                   E1/E2/E3 settings;  e5 the Q8 GEMV over the 70B shard;  e5hbm all-HBM GEMV with fewer workers;
 #                   e6 sensitivity at the best E1 point;  lat loaded latency;  freq core/uncore frequency (turbostat) under long windows;
+#                   fillcmp reads over random and zero-filled regions, e5c shuffled E5 confirmation;
 #                   rep, rep-e5 the replication points
 #   REPS     repetitions per point of the measured stages (default 7);  BASE_REPS for base (default 3)
 #   PAGES    "2m 4k" (default)
 #   BEST_ENV a BEST_* file of an earlier job (otherwise the base stage of this job writes OUT/best.env)
 #   PRIOR    results directories of earlier jobs, read by e4 and e6 to find the best E1/E2/E3 points
+#   FILL     random (default), zero or ones: the content of the tier regions (stream-bench --fill); SHUFFLE=1 shuffles the order of
+#            the configurations inside every process
 #   REGION_MIB  tier region per socket (default 20480 = 20 GiB, above the 16 GiB floor); INTER_MIB (32768)
 #   DRY_RUN=1   print the commands of the processes, run nothing
 # Each process runs every configuration of a stage once; the repetitions loop outside it with the page sizes alternating, so
@@ -41,6 +44,8 @@ PAGES=${PAGES:-"2m 4k"}
 REGION_MIB=${REGION_MIB:-20480}
 INTER_MIB=${INTER_MIB:-32768}
 PRIOR=${PRIOR:-}
+FILL=${FILL:-random}
+SHUFFLE=${SHUFFLE:-0}
 BEST_ENV=${BEST_ENV:-}
 # sbatch --export cannot carry spaces: lists may be given with '+' instead.
 STAGES=${STAGES//+/ }
@@ -102,7 +107,9 @@ run_proc() {
   shift 4
   local base="$OUT/raw/$label" stop="$OUT/raw/$label.stop"
   local args=(--exp "$label" --sockets "$sockets" --threads 56 --page "$page" --reps 1 --cfgs "$cfg" --region-mib "$REGION_MIB"
-    --inter-mib "$INTER_MIB" "$@")
+    --inter-mib "$INTER_MIB" --fill "$FILL" "$@")
+  # SHUFFLE=1: the configurations of every process run in their own pseudo-random order (seeded by the repetition number).
+  [[ $SHUFFLE == 0 ]] || args+=(--shuffle "${label##*-r}")
   if [[ $PERF == 1 ]]; then
     args+=(--perf-cmd "sudo -n /usr/bin/perf stat -a --per-socket -I 100 -x, -e '$MEM_EVENTS' -- sh -c 'until [ -e $stop ]; do sleep 0.05; done' 2> '$base.perf.csv'"
       --perf-out "$base.perf.csv" --perf-stop "$stop")
@@ -186,6 +193,16 @@ for stage in $STAGES; do
     e3) rounds e3 "$REPS" 1 --region-mib 1024 ;;
     e4) rounds e4 "$REPS" 2 ;;
     e5) rounds e5 "$REPS" 1 ;;
+    e5c) rounds e5c "$REPS" 1 ;;
+    fillcmp)
+      # The same reads over pseudo-random and over zero-filled tier regions, alternating inside each repetition.
+      for tag in random zero; do ct cfgs "fillcmp-$tag" ${BEST_ENV:+--best-env "$BEST_ENV"} > "$OUT/cfg/fillcmp-$tag.cfg"; done
+      for rep in $(seq 1 "$REPS"); do
+        for tag in random zero; do
+          run_proc "fc$tag-2m-r$rep" 2m 1 "$OUT/cfg/fillcmp-$tag.cfg" --fill "$tag"
+        done
+      done
+      ;;
     e5hbm) rounds e5hbm "$REPS" 1 ;;
     e6) rounds e6 "$REPS" 1 ;;
     lat) rounds lat "$REPS" 1 ;;

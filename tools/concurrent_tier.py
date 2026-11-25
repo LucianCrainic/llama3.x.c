@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xengine_summary as xs  # noqa: E402  (the perf csv parser and the byte factors shared with the cross-engine campaign)
 
 DDR_CAS, HBM_CAS = 64, 32
+PERF_ORIGIN_S = 0.87  # perf's time origin precedes the 'start' event by this much (calibrated on 4590 windows)
 CORES = 56
 TSC_GHZ = 1.9  # reference-cycle rate of the Xeon Max 9480 (turbostat TSC_MHz 1900)
 BYTES_TOKEN_GS64 = 36.9e9  # per socket per decoded token, 70B Q8 gs64, 2-socket tensor parallel (task statement)
@@ -184,6 +185,22 @@ def gen(stage, env, results=None):
         for probe in (1, 2):
             for ch, cd in ((1, 0), (55, 0), (47, 8), (39, 16), (27, 28), (15, 40), (0, 55)):
                 add(split_cfg(f'lat-p{probe}-h{ch}-d{cd}', ch, cd, env, probe=probe))
+    elif stage in ('fillcmp-random', 'fillcmp-zero'):  # the same reads over pseudo-random and over all-zero tier regions
+        tag = stage.split('-')[1]
+        p = tier_params(env, 0)[0]
+        add(split_cfg(f'fc{tag}-hbm56', CORES, 0, env))
+        add(split_cfg(f'fc{tag}-split48-8', 48, 8, env))
+        add(split_cfg(f'fc{tag}-split28-28', 28, 28, env))
+        add(split_cfg(f'fc{tag}-ddr56', 0, CORES, env))
+        add(fmt(name=f'fc{tag}-shared-4-1', kind='shared', a=4, b=1, unit=128, **p))
+        add(fmt(name=f'fc{tag}-inter-1-0', kind='inter', a=1, b=0, **p))
+        add(fmt(name=f'fc{tag}-inter-4-1', kind='inter', a=4, b=1, **p))
+    elif stage == 'e5c':  # confirmation of the E5 points near the all-HBM level, run in a shuffled order
+        for gs in (64, 32):
+            for act in (52, 56):
+                add(fmt(name=f'e5c-gs{gs}-act{act}', kind='gemv', gs=gs, r=0, cdw=0, act=act))
+            for r, cdw in ((0.05, 3), (0.1, 6), (0.2, 14), (0.25, 18), (0.3, 21), (0.35, 24), (0.4, 28)):
+                add(fmt(name=f'e5c-gs{gs}-r{r}-cdw{cdw}', kind='gemv', gs=gs, r=r, cdw=cdw))
     elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, split and DDR-only load
         best = best_points(results or [], env)
         cd = best['e1_cd']
@@ -276,7 +293,10 @@ def burst_counters(burst, upi_flit_bytes):
             'ddr_bytes': tot['ddr'] * DDR_CAS, 'hbm_bytes': tot['hbm'] * HBM_CAS,
             'upi_rx_bytes': tot['upi_rx'] * upi_flit_bytes, 'upi_tx_bytes': tot['upi_tx'] * upi_flit_bytes,
             'pkg_j': tot['pkg_j'], 'ram_j': tot['ram_j'],
-            'freq_ghz': tot['cycles'] / tot['ref_cycles'] * TSC_GHZ if tot['ref_cycles'] else None,
+            # average core clock over the interior intervals of the burst (the first and last interval hold the idle edges where
+            # the spinning workers run at another clock): unhalted cycles / reference cycles x 1.9 GHz TSC, all 56 cores of the socket
+            'freq_ghz': (sum(r['s'][s]['cycles'] for r in interior) / sum(r['s'][s]['ref_cycles'] for r in interior) * TSC_GHZ
+                         if sum(r['s'][s]['ref_cycles'] for r in interior) else None),
             'pkg_w': sum(r['s'][s]['pkg_j'] for r in interior) / idt if idt else 0.0,
             'ram_w': sum(r['s'][s]['ram_j'] for r in interior) / idt if idt else 0.0,
             'burst_s': dur, 'intervals': len(burst),
@@ -304,20 +324,47 @@ def attach(results, upi_flit_bytes=xs.UPI_DATA_FLIT_BYTES):
             by_index[w['window']].append(w)
         counters = None
         note = ''
+        align = ''
         if perf.exists() and perf.stat().st_size:
             rows = interval_table(xs.parse_perf(perf))
             bs = bursts(rows)
-            if len(bs) == len(by_index):
-                counters = [burst_counters(b, upi_flit_bytes) for b in bs]
+            order = sorted(by_index)
+            if len(bs) == len(order):
+                counters = [burst_counters(b, upi_flit_bytes) for b in bs]  # k-th burst = k-th window
+                align = 'order'
             else:
-                note = f'{len(bs)} bursts for {len(by_index)} windows'
+                # Extra bursts (the kernel zeroing and touching the 32 GiB region built before an E3/E4 window): pair every
+                # window with the burst whose start is nearest to where the window must start on the perf clock, perf's origin
+                # being PERF_ORIGIN_S before the 'start' event. Each burst serves one window; no burst within 0.6 s = no counters.
+                counters, used = [], set()
+                for idx in order:
+                    w0 = by_index[idx][0]
+                    t_exp = w0['real_begin'] - start['real_time'] + PERF_ORIGIN_S if start else None
+                    best = None
+                    for j, b in enumerate(bs):
+                        if j in used or t_exp is None:
+                            continue
+                        d = abs(b[0]['t0'] - t_exp)
+                        if d < 0.6 and (best is None or d < best[0]):
+                            best = (d, j)
+                    if best:
+                        used.add(best[1])
+                        counters.append(burst_counters(bs[best[1]], upi_flit_bytes))
+                    else:
+                        counters.append(None)
+                align = f'time ({len(bs)} bursts, {len(order)} windows)'
+                if all(c is None for c in counters):
+                    counters, note = None, f'{len(bs)} bursts for {len(order)} windows, none within 0.6 s'
         else:
             note = 'no perf data'
         for k, idx in enumerate(sorted(by_index)):
             for w in by_index[idx]:
                 w = dict(w, label=label, stage=stage, page_size=page, rep_index=rep, placement=placement)
-                if counters:
+                if counters and counters[k] is None:
+                    w['counter_note'] = 'no burst near the window'
+                elif counters:
                     c = counters[k][w['socket']]
+                    w['align'] = align
                     exp_h, exp_d = expected_bytes(w)
                     w['counters'] = c
                     w['expected'] = {'hbm_bytes': exp_h, 'ddr_bytes': exp_d}
@@ -620,16 +667,43 @@ def tables(agg, windows, idle):
             if r[tier] is not None:
                 ratios[(stage_of(w['name']), tier)].append(r[tier])
                 if abs(r[tier] - 1) > 0.05:
-                    bad.append((w['label'], w['name'], w['socket'], tier, r[tier]))
+                    exp = w['expected']['hbm_bytes' if tier == 'hbm' else 'ddr_bytes']
+                    bad.append((w['label'], w['name'], w['socket'], tier, r[tier], exp / 1e9, w.get('align', '')))
     md.append(table(['stage', 'tier', 'windows', 'min', 'median', 'max', 'outside +-5%'],
                     [(k[0], k[1], len(v), f'{min(v):.3f}', f'{statistics.median(v):.3f}', f'{max(v):.3f}', sum(abs(x - 1) > 0.05 for x in v))
                      for k, v in sorted(ratios.items())]))
     md.append('')
     unattributed = sorted({(w['label'], w.get('counter_note')) for w in windows if 'counters' not in w})
     md.append(f'Runs without counters: {len(unattributed)} {unattributed[:6]}\n')
+    # aggregate check per run: all counter bytes of every attributed window of the process against all computed bytes
+    runs = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0])
+    for w in windows:
+        if 'counters' in w:
+            r = runs[w['label']]
+            r[0] += w['counters']['hbm_bytes']
+            r[1] += w['expected']['hbm_bytes']
+            r[2] += w['counters']['ddr_bytes']
+            r[3] += w['expected']['ddr_bytes']
+            r[4] += 1
+    per_run = [(k, v[4], v[0] / v[1] if v[1] > 5e8 else None, v[2] / v[3] if v[3] > 5e8 else None) for k, v in sorted(runs.items())]
+    hb = [x[2] for x in per_run if x[2]]
+    db = [x[3] for x in per_run if x[3]]
+    if hb and db:
+        md.append(f'Aggregate per run ({len(per_run)} processes): HBM counter/computed bytes min {min(hb):.4f} median {statistics.median(hb):.4f} '
+                  f'max {max(hb):.4f}; DDR min {min(db):.4f} median {statistics.median(db):.4f} max {max(db):.4f}.\n')
+        worst = [x for x in per_run if (x[2] and abs(x[2] - 1) > 0.02) or (x[3] and abs(x[3] - 1) > 0.02)]
+        md.append(f'Processes with an aggregate ratio outside +-2%: {worst if worst else "none"}.\n')
     if bad:
-        md.append('Windows outside +-5% (run, config, socket, tier, counter/computed):\n')
-        md.append(table(['run', 'config', 'socket', 'tier', 'ratio'], [(a, b, c, d, f'{e:.3f}') for a, b, c, d, e in bad[:60]]))
+        md.append(f'All {len(bad)} windows outside +-5% (run, config, socket, tier, counter/computed, computed GB of that tier in the window, attribution):\n')
+        md.append(table(['run', 'config', 'socket', 'tier', 'ratio', 'computed GB', 'attribution'], [(a, b, c, d, f'{e:.3f}', f'{g:.1f}', h) for a, b, c, d, e, g, h in bad]))
+        md.append('')
+    fz = [e for e in agg.values() if e['name'].startswith(('fcrandom-', 'fczero-')) and e['sockets'] == 1]
+    if fz:
+        md.append('## Content of the regions: pseudo-random against all-zero data (same reads, 2m pages, per-socket GB/s)\n')
+        rows = []
+        for e in sorted(fz, key=lambda e: (e['name'].split('-', 1)[1], e['name'])):
+            rows.append((e['name'], mm(e['combined_gbps']), mm(e.get('freq_ghz'), 2), f'{e["pkg_w0"]["median"]:.0f}' if e.get('pkg_w0') else '-', e['reps']))
+        md.append(table(['config', 'combined GB/s', 'core GHz', 'package W', 'reps'], rows))
         md.append('')
     md.append('## Power and energy of socket 0 (RAPL package and DRAM energy over the interior intervals of each one-socket window)\n')
     ip = idle.get(0)
@@ -663,7 +737,7 @@ def model_table(agg):
     for page in ('2m', '4k'):
         for ch, cd, h, d, c, n, e in e1_rows(agg, 'e1-cd', page):
             bh, bd = e['hbm_gbps']['median'], e['ddr_gbps']['median']
-            if cd == 0 or bd <= 0 or bw_d is None:
+            if cd == 0 or bd <= 0 or bh <= 0 or bw_d is None:
                 continue
             f = bd / (bh + bd)  # the byte fraction at which both groups finish together
             t_conc = max((1 - f) * B / (bh * 1e9), f * B / (bd * 1e9))
