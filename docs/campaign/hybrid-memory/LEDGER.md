@@ -4,11 +4,23 @@ Standing instructions: [`docs/plans/hybrid-memory-manager-prompt.md`](../../plan
 (local, not committed). This file is the manager's memory across sessions. Started 24 November 2026 from `develop` at
 `b9b9bbb`.
 
+## G1 decision (25 Nov)
+
+**Marginal.** Verified: raw split/shared reads never beat HBM-only (569.1; 578.3 lockstep-staggered); interleaved pages
++1-3% (two nodes, not robust); engine Q8 GEMV row split (r=0.2, 14 DDR workers, 4 KiB) +1.4% and +2.3% on node A, +3.9% on
+node B (wall-clock +1.0/+3.0/+3.3%), p 0.006 per test, 0.066 best-of-11. Socket at ~350 W in every run. Actions: (1)
+P3 as a bounded prototype (decode GEMV row split, opt-in) measured end to end on 70B against HBM-only, serial hybrid and
+DDR, with the spill case (70B 1S, long-context 2S) as the main motivation: modelled concurrent vs serial +3 to +33%;
+(2) first the 2 MiB GEMV stagger fix (perf/gemv-stagger, opt-in), which is the HBM-only baseline P3 must beat.
+
 **Resume:** read this file, `git fetch`, `git log develop`, `squeue -u $USER`, then continue from **Next action**.
 
 ## Next action
 
-P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
+25 Nov: G1 reported (marginal). Running: gate on develop tip (hbm14), perf/gemv-stagger (hbm13), P2b port (local),
+TSAN q8-emul 5929318 (cpu). Push develop after gate + TSAN are clean. Then P3 prototype and P4 limits doc.
+
+Older: P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
 verify P1 (§8) and run the independent review before G1; start downloads and the 70B gs64 conversion once P0 reports
 internet access and existing checkpoints; send the P2b table to the owner for approval.
 
@@ -28,12 +40,12 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | A-G done (E 5924010, F 5924011 hbm13, G 5925935); docs being finalized | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
-| G1 decision | open | | manager | | |
+| P1 concurrent bandwidth | **done**, merged 8fec0c8 (local); gate on develop tip running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
+| G1 decision | **MARGINAL** (25 Nov, verified): engine GEMV row split +1.4/+2.3% (node A), +3.9% (node B); raw reads no gain beyond 1-3% | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; 5923182 on ce43988: make test rc 0, A/B equal (1S HBM decode 44.74 vs 44.77, 2S 89.55 vs 89.72; manager-verified); carry-over diff 719232e..ce43988 = tests + docs only. **Open: test-q8-emul TSAN never completed; 20 h cpu-partition rerun refused by the permission system, asked owner** | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
 | P2b 70B port | porting in work (steps 1-6, local gates; cluster checks later) | `feature/70b-comparison` | sonnet | | |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
-| P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
+| P3 concurrent placement | bounded prototype (G1 marginal); starts after the GEMV stagger lands (baseline) | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
 | P5 gap loop | not started | | | | |
 
