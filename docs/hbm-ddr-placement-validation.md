@@ -1,22 +1,39 @@
 # Validation of the planned-placement merge (24 November 2026)
 
-Companion of `docs/hbm-ddr-placement.md`. Tree under test: the sources of `33a7fa4` (merge `feature/hbm-ddr-placement`
-1bc9189 into `develop` b9b9bbb, plus the fix, test and script commits; later commits only add this document and the
-reworded merge message, so `git diff 33a7fa4 HEAD -- src include tests tools scripts` is empty). Numbers are measured
-unless labelled. Hardware: CRESCO8 Flat node (dual Xeon Max 9480, gcc 11.4, `-O3`), 8B checkpoints (int8 gs 64 `int8-v3`,
+Companion of `docs/hbm-ddr-placement.md`. Merge of `feature/hbm-ddr-placement` 1bc9189 into `develop` b9b9bbb on
+`merge/hbm-ddr-placement`; final tree ce43988 (section 1 lists the three trees tested and why the ThreadSanitizer results of
+the middle one carry over). Numbers are measured unless labelled. Hardware: CRESCO8 Flat node (dual Xeon Max 9480, gcc 11.4, `-O3`), 8B checkpoints (int8 gs 64 `int8-v3`,
 FP32 `fp32-v3`, gs 32 `q8-gguf-8b-v3`, per-channel `int8-pc-v4`).
 
 ## 1. Jobs
 
+Trees: A = sources of 33a7fa4; B = 719232e (A plus 32d93c2, the main-thread KV table); C = ce43988 (B plus a test and a
+document change only):
+
+```
+$ git diff --stat 719232e ce43988
+ docs/hbm-ddr-placement-validation.md | 2 +-
+ tests/test_tp.py                     | 3 +--
+```
+
+No `src/`, `include/` or `Makefile` change, so the ThreadSanitizer results of tree B carry over to C.
+
 | job | node | what | tree | outcome |
 |---|---|---|---|---|
-| 5916198 | hbm13 | `p2-merge-ab`: bitwise logits and token traces develop against merged, interleaved 5-repeat benchmark, planned modes with `check_placement.py --planned`, gs 32 and per-channel files, 70B plan-only | b9b9bbb, 33a7fa4 | 122 PASS, 2 FAIL (both a defect of the job script: `plan-only` of `hbm-only` and `ddr` was given `LLAMA_HYBRID_KV_HBM_LAYERS`, which the engine refuses outside `hybrid`; rerun in the gate job); results `p2-20261124-merge-ab` |
-| 5916200 | hbm13 | `p2-merge-gate`: `make test` on socket 0, ThreadSanitizer (gcc-toolset-14) of `test_tp.py`, `test-q8`, `test-q8-emul`, `test-q8-engine-emul`; plan-only of the three placements | 33a7fa4 | GATE_PENDING |
+| 5916198 | hbm13 | `p2-merge-ab`: bitwise logits and token traces develop against merged, 5-repeat benchmark, planned modes with `check_placement.py --planned`, gs 32 and per-channel files, 70B plan-only | b9b9bbb, A | 122 PASS, 2 FAIL, both a defect of the job script (plan-only of `hbm-only` and `ddr` was given `LLAMA_HYBRID_KV_HBM_LAYERS`, refused outside `hybrid`) |
+| 5916200 | hbm13 | `p2-merge-gate`: `make test`, ThreadSanitizer (gcc-toolset-14) | A | `make test` rc 0 (3339 s). **ThreadSanitizer found a data race**: 100 reports, all `memory_alloc` called from `setup_socket` by both socket coordinators (the legacy KV table), racing on the allocation counters. Job cancelled; fixed in 32d93c2 (the table is built on the main thread) |
+| 5916430 | hbm13 | `p2-merge-ab` again | b9b9bbb, B | 122 PASS, 0 FAIL (plan-only included) |
+| 5916531 | hbm13 | `p2-merge-gate`: `make test` on socket 0, ThreadSanitizer of `test_tp.py`, `test-q8`, `test-q8-emul`, plan-only of the three placements | B | `make test` rc 2: the one failure is `test_planned_split_kv_prefault_and_exchange`, whose guard list was stale after 32d93c2 (fixed in ce43988; every other suite OK). TSAN: `test_tp.py` 47 tests, 1 failure (the same stale list), 0 ThreadSanitizer warnings; `test-q8` rc 0 (14678 s); `test-q8-emul` rc 124, **timed out at the 16200 s cap, not a pass**; files with race reports: 0; plan-only hbm-only, ddr, hybrid rc 0 |
+| 5923182 | hbm13 | `p2-merge-final`: `make test` on socket 0, then the interleaved 5-repeat A/B with 1S on HBM and 2S at the defaults | b9b9bbb, C | `make test` rc 0 (3344 s); A/B 0 fails (section 4b) |
+| q8-emul TSAN, alone | - | `test-q8-emul` under ThreadSanitizer with a 20 h limit on `cresco8_cpu` | C | **not run**: the submission was refused by the permission system (it exceeds the 6 h and hbm13 limits of the task) and needs the owner's decision |
 
-Local (macOS arm64, software AVX-512 and AMX models, virtual topologies): `make test` rc 0 on 33a7fa4: kernels, GEMM, AMX,
-BF16, Q8 C tests 0 failures; `test_runtime` 40 OK; `test_numa` 28 OK (4 skipped); `test_tp` 47 OK; `test_tools` 49 OK
-(1 skipped); `test_xengine` 28 OK. The state of the merge commit alone (0fb89ab, textual resolution only) fails the new
-tests: a per-channel plan wrote through a NULL KV pointer or divided by zero, the work region was 31 KB short of the BF16 copy.
+Local (macOS arm64, software AVX-512 and AMX models, virtual topologies): `make test` rc 0 on ce43988
+(`test_runtime` 40 OK, `test_numa` 28 OK (4 skipped), `test_tp` 47 OK, `test_tools` 49 OK (1 skipped), `test_xengine` 28 OK; C tests 0
+failures). The merge commit alone (0fb89ab, textual resolution only) fails the new tests: a per-channel plan wrote through a NULL KV
+pointer, the work region was 31 KB short of the BF16 copy.
+
+Open: `test-q8-emul` under ThreadSanitizer has not completed on any tree (timeout at 16200 s in 5916531). Zero races on `test_tp.py` and
+`test-q8`, and none reported by the partial `test-q8-emul` run, is not the same as a finished run.
 
 ## 2. Hazards and the tests that cover them
 
@@ -70,6 +87,19 @@ The TTFT spreads are the known bimodality of the prefill (`docs/bimodality.md`: 
 trees); the merged tree falls in both modes. Decode differs by less than the spread. No default changed.
 Raw: `bench/p2048-int8-s{1,2}-{dev,new}-{1..5}.json`, `bench/summary.txt`.
 
+### 4b. A/B with one socket on HBM (job 5923182, tree C against b9b9bbb)
+
+1S: `LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_TOPOLOGY=explicit:0/2/0,1/3/1 LLAMA_PLACEMENT=hbm LLAMA_SOCKETS=1` under
+`numactl --cpunodebind=0` (the prefill-gap settings); 2S at the defaults; P2048 + 128 generated, int8, 5 interleaved repeats:
+
+| | TTFT develop | TTFT merged | decode develop | decode merged |
+|---|---|---|---|---|
+| 1S HBM | 1.246 s [1.242, 1.334] | 1.243 s [1.232, 1.366] | 44.74 tok/s [44.53, 45.32] | 44.77 tok/s [44.63, 44.84] |
+| 2S | 0.795 s [0.743, 0.799] | 0.780 s [0.747, 0.812] | 89.55 tok/s [89.18, 89.84] | 89.72 tok/s [89.10, 89.88] |
+
+Equal within the spread. The 1S decode is lower than the 51 tok/s of the D workload because this run decodes after a
+2048-token prompt (context 2176 to 2304), against the short prompt of D. Raw: `p2-20261125-merge-final/ab/bench/`.
+
 ## 5. Planned modes on 8B (job 5916198)
 
 `run` of `runq` int8, 64 greedy tokens, 1S and 2S, reference: the merged tree at default placement. Every row below has an
@@ -90,8 +120,13 @@ the BF16 copy).
 ## 6. Deviations and what is not verified
 
 1. The two plan-only failures of job 5916198 are in the job script (see section 1), not in the engine.
-2. The merge message is reworded after the gate with its job id; hashes after it differ from the tested ones, the sources do not.
+2. History is not rewritten; the gate job id belongs in the message of the merge into develop.
 3. Not tested on hardware: the 70B run (plan-only only, by instruction), `LLAMA_THP=on` with the BF16 copy, 256 or more layers.
 4. The BF16 copy is zeroed whole at setup (also under a plan), so every page of every arena exists before the first prompt:
    a 70B hybrid plan therefore faults the DDR tier's full copy; this matches the legacy two-socket prefault and is not a
    change of the default path.
+5. `LLAMA_PLACEMENT=hbm-only` does not accept `LLAMA_HYBRID_PACKED` (`engine.c`: "requires LLAMA_PLACEMENT=hybrid"); the AMX packed copy
+   in DDR with everything else in HBM is `hybrid` with all weight and KV layers in HBM. 70B `hbm-only` at ctx 8192, per socket
+   (derived from a plan-only run on a metadata-only 70B gs64 file, AMX tile model, 200 GiB budget): weights 34.4 GiB, packed
+   copy 33.9, embedding 1.0, K, V and BF16 K/V copy 1.25 each, work 0.09: 73.2 GiB against the 56 GiB budget. The packed copy is
+   the arena that overflows (without it, about 39 GiB, derived).
