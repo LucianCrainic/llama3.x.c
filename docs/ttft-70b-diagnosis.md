@@ -117,7 +117,7 @@ Measured with the uncore CAS counters (DDR 64 B per CAS, HBM 32 B), plain driver
 | attention share | **in, small** | 6.1% at 2113 tokens (0.49 s at 12 TOP/s), 2.7% at 547; the same at both batch sizes |
 | non-AMX phases | **in, small** | small phases 4.4%; classifier 0.1% |
 | AMX not engaged for part of the work | **out** | `EXE.AMX_BUSY` agrees with the profile GEMM share; AVX-512 reference at 1.8% of the AMX peak and 0% AMX busy |
-| why W1/W3 and why 2.4 passes | **open** | candidates, untested: the W1 and W3 shards of one socket (117 MB each at gs64) exceed the L3 of 112 MB, so successive row blocks re-stream them from DDR; a 70B-only effect (the 8B shards are 29 MB). `gemm_bench` at the 70B shard shapes (N = 14336 or 28672, K = 8192, M = 256 and 1024) with the weights in DDR and in HBM would separate the kernel from the memory path |
+| why W1/W3 and why 2.4 passes | **open** | candidates, untested: the W1 and W3 shards of one socket (about 125 MB each at gs64) exceed the L3 of 112 MB, so successive row blocks re-stream them from DDR; a 70B-only effect (the 8B shards are about 31 MB). `gemm_bench` at the 70B shard shapes (N = 14336 or 28672, K = 8192, M = 256 and 1024) with the weights in DDR and in HBM would separate the kernel from the memory path |
 
 ## 7. Uncertainties
 
