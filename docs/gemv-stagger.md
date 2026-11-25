@@ -12,7 +12,7 @@ modelled. Decode speeds are the report's `throughput_tokens_per_second.decode` (
   (`LLAMA_THP=never`, added here) 8B gs64 decode on one socket is 4.0% faster than the default (43.88 against 42.21 tok/s), and the W1/W3 phase is 10% shorter.
 * **`LLAMA_GEMV_STAGGER=1` recovers it without changing a bit of the output** (measured, bitwise on 8B one and two sockets, 70B token traces). On 2 MiB pages: 8B one socket
   +5.0%, 8B two sockets +1.9%, 70B two sockets +6.0%. On 4 KiB pages it does nothing (-0.2%, -0.5%), as the aliasing explanation predicts.
-* The knob is opt-in (default `0`). The recommendation is in section 7.
+* The knob is on by default since 25 November 2026 (owner decision after the replication in section 4b: two Flat nodes, gs64 and gs32); `LLAMA_GEMV_STAGGER=0` restores the unstaggered order. The recommendation is in section 7.
 
 ## 2. Mechanism and what was tested
 

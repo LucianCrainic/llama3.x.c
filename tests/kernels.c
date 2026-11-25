@@ -586,7 +586,7 @@ static void count_rows(void *ctx, int r0, int r1) {
  * one, for every epilogue, fused form and activation form, whatever the number of rows, and each worker reports its whole
  * share to the rows-done callback exactly once. */
 static void test_gemv_stagger(void) {
-  const int n = 256, rows[] = {1, 3, 4, 5, 13, 100, 257};
+  const int n = 256, rows[] = {1, 3, 4, 5, 13, 100, 257}, previous = k_gemv_stagger_active();
   for (int gs = 32; gs <= 64; gs *= 2)
     for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++)
       for (int mode = 0; mode < 2; mode++) {
@@ -617,7 +617,7 @@ static void test_gemv_stagger(void) {
           k_matmul_q8_swiglu(out[on][3], &in, w[0], w[1], n, d, gs);
           k_matmul_q8_ld(out[on][4], &in, &w[2], (size_t)n, n, d, gs, K_PARTIAL);
         }
-        k_gemv_stagger(0);
+        k_gemv_stagger(previous);
         for (int k = 0; k < 5; k++) {
           checks++;
           if (memcmp(out[0][k], out[1][k], 3 * (size_t)d * sizeof(float)) && failures++ < 20)
@@ -631,7 +631,7 @@ static void test_gemv_stagger(void) {
           for (int worker = 0; worker < workers; worker++)
             k_matmul_q8_ld_worker(serial, &in, &w[2], (size_t)n, n, d, gs, K_PARTIAL, worker, workers, NULL, count_rows,
                                   seen);
-          k_gemv_stagger(0);
+          k_gemv_stagger(previous);
           checks++;
           if (memcmp(serial, out[0][4], d * sizeof(float)) && failures++ < 20)
             fprintf(stderr, "gemv stagger [%s]: worker entry d=%d workers=%d differs\n", current, d, workers);

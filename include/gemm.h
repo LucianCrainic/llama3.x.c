@@ -146,7 +146,7 @@ Q8GemmBackend k_gemm_q8_pick(int gs, const GemmQ8Segment *segments, int count);
  * 32-row blocks. Scales stay dense [row][k / gs]. Transposed weight scales: st[(c / 32 * groups + g) * 32 + c % 32] for
  * channel c and group g, channels padded to 32 with zeros (s8_scales_t_bytes). */
 void gemm_q8_init_env(void); /* reads LLAMA_Q8_GEMM (kernels_init) */
-void gemv_init_env(void);    /* reads LLAMA_GEMV_STAGGER=0|1 (kernels_init) */
+void gemv_init_env(void);    /* reads LLAMA_GEMV_STAGGER=0|1, default 1 (kernels_init) */
 int k_gemv_stagger_active(void);
 /* LLAMA_SWIGLU_EXP=vector|libm: the batched Q8 GEMM's SwiGLU epilogue with the AVX-512 exponential of the attention
  * kernels (default, where AVX-512 runs) or libm expf (bitwise the GEMV's silu_gate); read by kernels_init. */

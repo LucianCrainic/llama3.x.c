@@ -534,19 +534,20 @@ static void q8_rows(const void *p, int r0, int r1) {
   }
 }
 
-/* LLAMA_GEMV_STAGGER=1: member w of a team starts its share at block w (of BLOCK rows) and wraps, so simultaneous
- * members read addresses that differ by w blocks (32 KiB at the 8192-byte rows of the 70B shard) instead of by multiples of
- * their share. On 2 MiB pages shares of exactly 2 MiB put every member on the same stripe of the HBM address
- * interleave in barrier lockstep (docs/concurrent-tier-bandwidth.md 5.1, docs/gemv-stagger.md). Bitwise unchanged. */
-static int gemv_stagger;
+/* LLAMA_GEMV_STAGGER (default 1, 0 turns it off): member w of a team starts its share at block w (of BLOCK rows) and
+ * wraps, so simultaneous members read addresses that differ by w blocks (32 KiB at the 8192-byte rows of the 70B shard)
+ * instead of by multiples of their share. On 2 MiB pages shares of exactly 2 MiB put every member on the same stripe of
+ * the HBM address interleave in barrier lockstep (docs/concurrent-tier-bandwidth.md 5.1, docs/gemv-stagger.md). Bitwise
+ * unchanged. */
+static int gemv_stagger = 1;
 
 void gemv_init_env(void) {
   const char *value = getenv("LLAMA_GEMV_STAGGER");
-  gemv_stagger = 0;
-  if (value && *value && strcmp(value, "0")) {
-    if (strcmp(value, "1"))
+  gemv_stagger = 1;
+  if (value && *value) {
+    if (strcmp(value, "0") && strcmp(value, "1"))
       fail("LLAMA_GEMV_STAGGER must be 0 or 1");
-    gemv_stagger = 1;
+    gemv_stagger = !strcmp(value, "1");
   }
 }
 void k_gemv_stagger(int on) {
