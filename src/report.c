@@ -412,6 +412,11 @@ void write_report(void) {
   fputs(",\n    \"prefill_logits\": ", f);
   string(f, metrics.runtime_ready ? (model.prefill_logits == LOGITS_ALL ? "all" : "last") : NULL);
   fprintf(f, ",\n    \"warm_context\": %d", options.warm_context);
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  fprintf(f, ",\n    \"synthetic_kv\": %s", options.synthetic_kv ? "true" : "false");
+  if (options.synthetic_kv)
+    fprintf(f, ",\n    \"synthetic_kv_prime\": %d", options.synthetic_kv_prime);
+#endif
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "
           "\"generated_output\": %zu,\n    \"forward_passes\": %zu,\n    \"decode_steps\": %zu,\n    \"sampled\": "

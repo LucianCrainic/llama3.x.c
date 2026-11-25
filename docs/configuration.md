@@ -68,6 +68,7 @@ the machine (sockets, placement, prefill batch, AMX) are resolved as in its §2.
 | `LLAMA_PROFILE=1` | per-phase times (and per socket, with the exchange split) at log level `info` and in the report |
 | `LLAMA_TP_CHECK=1` | compare both sockets' residual copies after every layer (bitwise) |
 | `LLAMA_TOKENS_OUT=FILE` | write prompt and generated token ids as JSON (generate mode) |
+| `LLAMA_SYNTHETIC_KV=1`, `LLAMA_SYNTHETIC_KV_PRIME=N` | only in a `make SYNTHETIC_KV=1` build (the default build ignores them): fill the `--warm-context` prefix of every K/V cache with a fixed pattern instead of forwarding tokens, after N real primer positions (0 through the warm context). Needs `--benchmark`, a positive generation length and `LLAMA_KV_LAYOUT=head`; works with every placement and keeps the BF16 K/V copy of `LLAMA_ATTN=amx` consistent (repacked by the next batch). The report has `parameters.synthetic_kv`, the token trace `synthetic_kv`; `tools/compare_generation.py` refuses such traces. For decode measurements at depths a real warm-up cannot reach in a job |
 | `LLAMA_LOADER_CHUNK`, `LLAMA_LOADER_MAX_READ` | test-only: `pread` sizes of the owned loader, so the tests reach the multi-chunk and short-read paths on small fixtures |
 | `LLAMA_TOPOLOGY_ALLOW_FAR_HBM=1` | accept an explicit map that points a socket at the other socket's HBM (A6 remote control only) |
 | `LLAMA_SYSFS_ROOT`, `LLAMA_NUMA_FAULT` | test-only: fake sysfs tree, injected syscall errors |

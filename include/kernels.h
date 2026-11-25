@@ -151,6 +151,9 @@ void k_attention_set_kv_bf16(AttentionWork *work, uint16_t *memory, int n_kv_hea
  * so a layer's slot never depends on the order the layers first run in. */
 void k_attention_set_kv_bf16_layers(AttentionWork *work, uint16_t *const *memory, const float *const *key_caches,
                                     int n_kv_heads, int head_dim, int seq_len, int layers);
+/* The persistent BF16 copy of the layer whose key cache is `key_cache` is current only below `position` from now on (no
+ * effect without a copy). For writers of the FP32 cache that bypass the attention entry points. */
+void k_attention_kv_invalidate(AttentionWork *work, const float *key_cache, int position);
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);

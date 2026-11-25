@@ -3,6 +3,7 @@ backend, on fixtures that can be split (two KV heads)."""
 import array
 import json
 import os
+import re
 import struct
 from pathlib import Path
 import subprocess
@@ -132,6 +133,136 @@ class TensorParallelTests(unittest.TestCase):
         self.assertLess(phase['decode_start'], phase['decode_end'])
         self.assertEqual(data['kv']['residency_scope'], 'active_prefix')
         self.assertTrue(data['placement_plan']['simulated'])
+
+    def test_warm_up_stays_out_of_exchange_timing(self):
+        """--warm-context runs untimed: with LLAMA_PROFILE=1 the exchange clock must not run through it. When only the
+        phase profile was switched off, the first timed batch absorbed the whole warm-up (about 10x the cold value here)."""
+        fixture = self.fixtures['wide']
+
+        def exchange_ms_per_token(warm):
+            command = [str(BUILD/'runq'), str(fixture/'int8.bin'), '-z', str(fixture/'tokenizer.bin'), '--benchmark',
+                       '--no-text', '-t', '0', '-n', '0', '-i', 'A', '--warm-context', str(warm),
+                       '--context-length', '64', '--generation-length', '2']
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    env=environment(2, LLAMA_KERNELS='scalar', LLAMA_PROFILE='1',
+                                                    LLAMA_PREFILL_BATCH='4'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = [line for line in result.stderr.splitlines() if line.startswith('[INFO] tp prefill socket 0 (')]
+            self.assertEqual(len(lines), 1, result.stderr)
+            return sum(float(v) for v in re.findall(r' x_\w+=([0-9.]+)', lines[0]))
+
+        cold = sorted(exchange_ms_per_token(0) for _ in range(3))[1]
+        warm = sorted(exchange_ms_per_token(60) for _ in range(3))[1]
+        # Each value is the median of three runs and printed to 1 us; measured here: cold <= 0.001, warm 0.000-0.001 with
+        # the fix and 0.007-0.012 without it.
+        self.assertLess(warm, cold + 0.004)
+
+    def test_synthetic_kv_tracks_active_prefix_across_tiers(self):
+        fixture = self.fixtures['unshared']
+        report_path = Path(self.temp.name)/'synthetic-kv.json'
+        trace_path = Path(self.temp.name)/'synthetic-kv-tokens.json'
+
+        def run(mode, capacity, synthetic, layout='head', generation=4, fixture=fixture, sockets=2, prime=None):
+            cmd = [str(BUILD/'runq'), str(fixture/'int8.bin'), '-z', str(fixture/'tokenizer.bin'),
+                   '--benchmark', '--no-text', '-t', '0', '-n', '0', '-i', 'ABCDE', '--warm-context', '13',
+                   '--context-length', str(capacity), '--generation-length', str(generation), '--json', str(report_path)]
+            tier = {'LLAMA_HYBRID_KV_HBM_LAYERS': '1'} if mode == 'hybrid' else {}
+            if prime is not None:
+                tier['LLAMA_SYNTHETIC_KV_PRIME'] = prime
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                  env=environment(sockets, LLAMA_KERNELS='scalar', LLAMA_PLACEMENT=mode,
+                                                  LLAMA_TOPOLOGY=f'virtual:{sockets}x3', LLAMA_KV_LAYOUT=layout,
+                                                  LLAMA_SYNTHETIC_KV=str(int(synthetic)),
+                                                  LLAMA_TOKENS_OUT=str(trace_path), **tier))
+
+        result = run('hybrid', 32, False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        real = json.loads(report_path.read_text())
+        real_trace = json.loads(trace_path.read_text())
+        if 'synthetic_kv' not in real['parameters']:
+            self.skipTest('build with SYNTHETIC_KV=1')
+        self.assertFalse(real['parameters']['synthetic_kv'])
+        self.assertNotIn('synthetic_kv_prime', real['parameters'])
+        self.assertNotIn('synthetic_kv', real_trace)
+        self.assertEqual(len(real_trace['prompt']), 13 + real['tokens']['processed_prompt'])
+        expected_trace = None
+        for mode, capacity in (('hybrid', 32), ('ddr', 64), ('hbm-only', 64)):
+            with self.subTest(mode=mode, capacity=capacity):
+                result = run(mode, capacity, True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(report_path.read_text())
+                trace = json.loads(trace_path.read_text())
+                self.assertTrue(data['parameters']['synthetic_kv'])
+                self.assertEqual(data['parameters']['synthetic_kv_prime'], 0)
+                self.assertIsNotNone(data['timing_seconds']['warm_context'])
+                self.assertEqual(data['stop_reason'], 'generation_limit')
+                self.assertEqual(data['tokens']['decode_steps'], 3)
+                self.assertEqual(data['kv']['residency_scope'], 'active_prefix')
+                dim, _, layers, heads, kv_heads, *_ = TP_CONFIG
+                bytes_per_position = 2 * layers * kv_heads * (dim // heads) * 4  # both K and V, FP32
+                after_prompt = 13 + data['tokens']['processed_prompt']
+                self.assertEqual(data['kv']['reserved_bytes'], capacity * bytes_per_position)
+                self.assertEqual(data['kv']['after_prompt']['active_bytes'], after_prompt * bytes_per_position)
+                self.assertEqual(data['kv']['active_bytes'], (after_prompt + 3) * bytes_per_position)
+                self.assertTrue(trace['synthetic_kv'])
+                self.assertEqual(trace['synthetic_prefix_positions'], 13)
+                self.assertEqual(trace['prompt'], real_trace['prompt'][13:])
+                self.assertEqual(len(trace['generated']), 4)
+                if expected_trace is None:
+                    expected_trace = trace
+                self.assertEqual(trace, expected_trace)
+
+        for prime in ('0', '3', '13'):
+            with self.subTest(prime=prime):
+                result = run('hybrid', 32, True, prime=prime)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(report_path.read_text())
+                self.assertEqual(data['parameters']['synthetic_kv_prime'], int(prime))
+                self.assertEqual(data['tokens']['decode_steps'], 3)
+                self.assertEqual(json.loads(trace_path.read_text()), expected_trace)
+        for synthetic, prime in ((False, '0'), (True, ''), (True, '-1'), (True, '14'), (True, ' 1')):
+            with self.subTest(synthetic=synthetic, invalid_prime=prime):
+                result = run('hybrid', 32, synthetic, prime=prime)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('LLAMA_SYNTHETIC_KV_PRIME', result.stderr)
+
+        result = run('hybrid', 32, True, layout='rows')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requires LLAMA_KV_LAYOUT=head', result.stderr)
+        result = run('hybrid', 32, True, generation=32)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('complete generation', result.stderr)
+
+        stop_fixture = create(Path(self.temp.name)/'synthetic-stop', shared=False, stop='first')
+        result = run('hybrid', 32, True, fixture=stop_fixture, sockets=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(report_path.read_text())
+        self.assertEqual(data['tokens']['sampled_stop'], 4)
+        self.assertEqual(data['tokens']['decode_steps'], 3)
+        self.assertEqual(data['stop_reason'], 'generation_limit')
+
+    def test_synthetic_kv_keeps_the_bf16_kv_copy_consistent(self):
+        """LLAMA_ATTN=amx keeps a persistent BF16 copy of every layer's K/V, packed lazily from the FP32 caches. A real
+        prime before the synthetic fill leaves that copy valid for the primed positions; the fill must drop that validity,
+        or the batch after the fill reads BF16 values of the primed tokens where the FP32 caches hold the pattern. The
+        logits of the prefill that follows the fill are therefore bitwise independent of the prime, on one and two sockets,
+        with legacy and with split-tier planned KV."""
+        self.need('probe-int8-amx-emul')
+        if not (BUILD/'probe-int8-amx-emul').exists() or b'synthetic' not in (BUILD/'probe-int8-amx-emul').read_bytes():
+            self.skipTest('build with SYNTHETIC_KV=1')
+        suffix = [65 + (i * 7) % 20 for i in range(12)]
+        positions = 44  # the BF16 copy packs blocks of 32 positions: a prime of 33 or more leaves block 0 valid
+        planned = dict(LLAMA_PLACEMENT='hybrid', LLAMA_HYBRID_KV_HBM_LAYERS='1', LLAMA_HYBRID_WEIGHTS_HBM_LAYERS='1')
+        for sockets in (1, 2):
+            for name, tier in (('legacy', {}), ('split-tier', planned)):
+                args = dict(binary='probe-int8-amx-emul', LLAMA_KERNELS='amx', LLAMA_ATTN='amx', LLAMA_KV_LAYOUT='head',
+                            LLAMA_PREFILL_BATCH='8', LLAMA_PREFILL_LOGITS='all', LLAMA_TOPOLOGY=f'virtual:{sockets}x3', **tier)
+                with self.subTest(sockets=sockets, placement=name):
+                    outputs = [self.probe('int8', 'wide', 'synthetic', sockets, tokens=[prime, positions, *suffix], **args)
+                               for prime in (0, 8, 33, positions)]
+                    self.assertEqual(len(outputs[0]), len(suffix) * TP_WIDE_CONFIG[5] * 4)
+                    for prime, output in zip((8, 33, positions), outputs[1:]):
+                        self.assertEqual(output, outputs[0], f'prime {prime}')
 
     def test_plan_only_checks_rounded_budget_and_spills(self):
         report = Path(self.temp.name)/'tier-plan.json'

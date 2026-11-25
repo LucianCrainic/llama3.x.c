@@ -51,8 +51,10 @@ NOMINAL_GHZ = 1.9  # Xeon Max 9480 base frequency = TSC = ref-cycles rate
 NOMINAL_GB_PER_TOKEN = 7.97  # INT8 weights of the 8B model read once per decoded token (7974764544 B per socket set)
 
 EVENT_NAMES = {
-    'ddr_cas_rd': 'ddr', 'hbm_cas_rd': 'hbm', 'unc_upi_rxl_flits.all_data': 'upi_rx', 'unc_upi_txl_flits.all_data': 'upi_tx',
+    'ddr_cas_rd': 'ddr', 'hbm_cas_rd': 'hbm', 'ddr_cas_wr': 'ddr_wr', 'hbm_cas_wr': 'hbm_wr',
+    'unc_upi_rxl_flits.all_data': 'upi_rx', 'unc_upi_txl_flits.all_data': 'upi_tx',
     'power/energy-pkg/': 'pkg_j', 'power/energy-ram/': 'ram_j', 'cycles': 'cycles', 'ref-cycles': 'ref_cycles',
+    'context-switches': 'context_switches', 'cpu-migrations': 'cpu_migrations',
     'instructions': 'instructions', 'exe.amx_busy': 'amx_busy', 'amx_ops_retired.int8': 'amx_ops',
 }
 SOCKETS = (0, 1)

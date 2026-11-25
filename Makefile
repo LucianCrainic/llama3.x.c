@@ -2,6 +2,7 @@ CC ?= cc
 MODE ?= release
 NATIVE ?= 0
 PCRE2 ?= 1
+SYNTHETIC_KV ?= 0
 BUILD_DIR ?= build/$(MODE)
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -pthread
@@ -27,6 +28,11 @@ $(error OPENMP is no longer supported: the OpenMP backend was removed (docs/audi
 endif
 ifeq ($(NATIVE),1)
 CFLAGS += -march=native
+endif
+ifeq ($(SYNTHETIC_KV),1)
+CPPFLAGS += -DLLAMA_ENABLE_SYNTHETIC_KV
+else ifneq ($(SYNTHETIC_KV),0)
+$(error SYNTHETIC_KV must be 0 or 1)
 endif
 ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
@@ -119,7 +125,7 @@ $(BUILD_DIR)/test-prefill-fp32: tests/prefill.c src/run.c src/engine.c $(COMMON)
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/run.c src/engine.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD_DIR)/test-prefill-int8: tests/prefill.c src/runq.c src/engine.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
 	$(CC) $(CPPFLAGS) $(CFLAGS) tests/prefill.c src/runq.c src/engine.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
-TEST_BINS := $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-kernels-emul $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/amx-bench $(BUILD_DIR)/test-q8 $(BUILD_DIR)/test-q8-emul $(BUILD_DIR)/test-q8-engine $(BUILD_DIR)/test-q8-engine-emul $(BUILD_DIR)/runq-amx-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/gemm-bench-emul $(BUILD_DIR)/amx-bench-emul $(BUILD_DIR)/attention-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/test-shards $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-sizing $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8 $(BUILD_DIR)/probe-fp32-amx-emul $(BUILD_DIR)/probe-int8-amx-emul $(BUILD_DIR)/probe-fp32-avx512-emul $(BUILD_DIR)/probe-int8-avx512-emul
+TEST_BINS := $(BUILD_DIR)/test-fp32 $(BUILD_DIR)/test-int8 $(BUILD_DIR)/test-kernels $(BUILD_DIR)/test-kernels-emul $(BUILD_DIR)/test-gemm $(BUILD_DIR)/test-gemm-emul $(BUILD_DIR)/test-amx $(BUILD_DIR)/test-amx-emul $(BUILD_DIR)/test-bf16 $(BUILD_DIR)/test-bf16-emul $(BUILD_DIR)/amx-bench $(BUILD_DIR)/test-q8 $(BUILD_DIR)/test-q8-emul $(BUILD_DIR)/test-q8-engine $(BUILD_DIR)/test-q8-engine-emul $(BUILD_DIR)/runq-amx-emul $(BUILD_DIR)/test-bf16-engine $(BUILD_DIR)/test-bf16-engine-emul $(BUILD_DIR)/run-amx-emul $(BUILD_DIR)/gemm-bench $(BUILD_DIR)/gemm-bench-emul $(BUILD_DIR)/amx-bench-emul $(BUILD_DIR)/attention-bench $(BUILD_DIR)/test-manifest $(BUILD_DIR)/test-shards $(BUILD_DIR)/numa_probe $(BUILD_DIR)/test-regions $(BUILD_DIR)/test-workers $(BUILD_DIR)/test-sizing $(BUILD_DIR)/test-prefill-fp32 $(BUILD_DIR)/test-prefill-int8 $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8 $(BUILD_DIR)/probe-fp32-amx-emul $(BUILD_DIR)/probe-int8-amx-emul $(BUILD_DIR)/probe-fp32-avx512-emul $(BUILD_DIR)/probe-int8-avx512-emul $(BUILD_DIR)/xengine70-fp32 $(BUILD_DIR)/xengine70-q8
 test-bins: all $(TEST_BINS)
 test: test-bins
 	$(BUILD_DIR)/test-kernels
@@ -145,6 +151,8 @@ test: test-bins
 	python3 tests/test_tp.py $(BUILD_DIR)
 	BUILD_DIR=$(BUILD_DIR) python3 tests/test_tools.py
 	python3 tests/test_xengine.py
+	python3 tests/test_hbm_ddr.py
+	python3 tests/test_xengine70.py $(BUILD_DIR)
 clean:
 	rm -rf build
 
@@ -167,3 +175,10 @@ $(BUILD_DIR)/probe-int8-avx512-emul: tests/probe.c src/runq.c src/engine.c tests
 
 test-reference: all $(BUILD_DIR)/probe-fp32 $(BUILD_DIR)/probe-int8
 	$(if $(PYTHON),$(PYTHON),python3) tests/test_reference.py $(BUILD_DIR)
+
+# The native 70B drivers of the cross-engine comparison (tools/xengine70, scripts/xengine70.sbatch): one request per workload through the
+# public engine API, FP32 and Q8.
+$(BUILD_DIR)/xengine70-fp32: tools/xengine70/native_c.c tools/xengine70/bench.h src/run.c src/engine.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tools/xengine70/native_c.c src/run.c src/engine.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@
+$(BUILD_DIR)/xengine70-q8: tools/xengine70/native_c.c tools/xengine70/bench.h src/runq.c src/engine.c $(COMMON) $(HEADERS) $(BUILD_DIR)/config
+	$(CC) $(CPPFLAGS) $(CFLAGS) tools/xengine70/native_c.c src/runq.c src/engine.c $(COMMON) $(LDFLAGS) $(LDLIBS) -o $@

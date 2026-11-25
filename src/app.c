@@ -163,6 +163,24 @@ static void parse(int argc, char **argv) {
     if (options.generation_length < 0 && !steps_set)
       options.generation_length = 128;
   }
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  const char *synthetic_kv = getenv("LLAMA_SYNTHETIC_KV");
+  if (synthetic_kv && strcmp(synthetic_kv, "0")) {
+    if (strcmp(synthetic_kv, "1"))
+      fail("LLAMA_SYNTHETIC_KV must be 0 or 1");
+    if (!options.benchmark || options.plan_only || options.warm_context <= 0 || options.generation_length <= 0)
+      fail("LLAMA_SYNTHETIC_KV requires --benchmark, a positive --warm-context and generation length");
+    options.synthetic_kv = 1;
+  }
+  const char *prime = getenv("LLAMA_SYNTHETIC_KV_PRIME");
+  if (prime) {
+    if (!options.synthetic_kv)
+      fail("LLAMA_SYNTHETIC_KV_PRIME requires LLAMA_SYNTHETIC_KV=1");
+    if (prime[strspn(prime, "0123456789")])
+      fail("LLAMA_SYNTHETIC_KV_PRIME requires an integer from 0 through --warm-context");
+    options.synthetic_kv_prime = (int)integer(prime, "LLAMA_SYNTHETIC_KV_PRIME", options.warm_context);
+  }
+#endif
   if (!seed_set)
     options.seed = options.benchmark ? 1 : (unsigned long long)time(NULL);
   if (!options.seed)
@@ -209,7 +227,7 @@ static int *tokenize(Tokenizer *t, const char *text, int bos, int *n) {
 
 /* LLAMA_TOKENS_OUT=FILE (generate mode only): prompt collects every id forwarded before the first sampled token (the
  * --warm-context ids first, then the prompt), generated every sampled id, the final stop token included. The JSON is
- * written once, after generation. Unset, none of this runs. */
+ * written once, after generation. Synthetic KV adds prefix provenance but has no warm-up token IDs. Unset, none of this runs. */
 typedef struct {
   int *ids;
   int count, capacity;
@@ -242,7 +260,12 @@ static void tokens_write(void) {
   FILE *file = fopen(tokens_out, "wb");
   if (!file)
     fail("cannot open LLAMA_TOKENS_OUT '%s': %s", tokens_out, strerror(errno));
-  fputs("{\"prompt\": [", file);
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  if (options.synthetic_kv)
+    fprintf(file, "{\"synthetic_kv\": true, \"synthetic_prefix_positions\": %d, \"prompt\": [", options.warm_context);
+  else
+#endif
+    fputs("{\"prompt\": [", file);
   token_list_write(file, &token_prompt);
   fputs("], \"generated\": [", file);
   token_list_write(file, &token_generated);
@@ -340,8 +363,14 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       token_list_add(&token_generated, &next, 1);
     if (tokenizer_stop(t, next)) {
       metrics.stop_tokens++;
-      metrics.stop_reason = "stop_token";
-      return next;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+      /* Synthetic measurements forward sampled stop IDs as ordinary inputs to keep the window fixed. */
+      if (!options.synthetic_kv)
+#endif
+      {
+        metrics.stop_reason = "stop_token";
+        return next;
+      }
     }
     metrics.output_tokens++;
     output_count++;
@@ -373,9 +402,41 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
   return -1;
 }
 
-/* --warm-context: fill positions [0, warm) with the prompt tokens repeated (BOS only at position 0), in microbatches,
- * without logits. The time is kept apart in metrics.warm_s, and the profile and per-microbatch counters do not see it, so
- * that the timed prefill and decode start from a context of that length (B7 §4.1). */
+/* Fills positions [0, positions) with the prompt tokens repeated (BOS only at position 0), in microbatches, without
+ * logits, and returns the seconds it took. The profile (and the tensor-parallel exchange clock with it) and the
+ * per-microbatch counters do not see it. */
+static double forward_warm_prefix(const int *tokens, int n, int positions, int trace) {
+  int max = engine_max_batch(&model);
+  int *chunk = memory_alloc((size_t)max, sizeof(int), MEM_PROMPT);
+  /* engine_set_profiling also stops the tensor-parallel exchange clock: it keeps running when only profile_enabled
+   * is cleared, and the first timed batch would then absorb the whole warm-up into its exchange components. */
+  int saved_profile = profile_enabled;
+  if (saved_profile)
+    engine_set_profiling(&model, 0);
+  double start = monotonic_seconds();
+  for (int pos = 0; pos < positions;) {
+    int count = positions - pos < max ? positions - pos : max;
+    for (int j = 0; j < count; j++) {
+      int at = pos + j;
+      /* tokens[0] is BOS: later passes over the prompt skip it when the prompt has other tokens. */
+      chunk[j] = at < n ? tokens[at] : (n > 1 ? tokens[1 + (at - n) % (n - 1)] : tokens[0]);
+    }
+    if (trace)
+      token_list_add(&token_prompt, chunk, count);
+    engine_forward_batch(&model, chunk, count, pos, LOGITS_NONE);
+    pos += count;
+  }
+  double elapsed = monotonic_seconds() - start;
+  if (saved_profile)
+    engine_set_profiling(&model, saved_profile);
+  memory_free(chunk);
+  return elapsed;
+}
+
+/* --warm-context: fill positions [0, warm) with forward_warm_prefix. The time is kept apart in metrics.warm_s, so that the
+ * timed prefill and decode start from a context of that length (B7 §4.1). A SYNTHETIC_KV=1 build with LLAMA_SYNTHETIC_KV=1
+ * writes a fixed pattern into the caches instead (engine_synthetic_kv), after LLAMA_SYNTHETIC_KV_PRIME real positions
+ * that touch the same kernels, pages and workers first; the pattern then replaces them. */
 static int warm_up(const int *tokens, int n) {
   int warm = options.warm_context;
   if (warm <= 0)
@@ -385,26 +446,17 @@ static int warm_up(const int *tokens, int n) {
   if (warm >= options.steps)
     fail("--warm-context %d leaves no room: the context holds %d positions (-n / --context-length)", warm,
          options.steps);
-  int max = engine_max_batch(&model);
-  int *chunk = memory_alloc((size_t)max, sizeof(int), MEM_PROMPT);
-  int saved_profile = profile_enabled;
-  profile_enabled = 0;
-  double start = monotonic_seconds();
-  for (int pos = 0; pos < warm;) {
-    int count = warm - pos < max ? warm - pos : max;
-    for (int j = 0; j < count; j++) {
-      int at = pos + j;
-      /* tokens[0] is BOS: later passes over the prompt skip it when the prompt has other tokens. */
-      chunk[j] = at < n ? tokens[at] : (n > 1 ? tokens[1 + (at - n) % (n - 1)] : tokens[0]);
-    }
-    if (tokens_out)
-      token_list_add(&token_prompt, chunk, count);
-    engine_forward_batch(&model, chunk, count, pos, LOGITS_NONE);
-    pos += count;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  if (options.synthetic_kv) {
+    double start = monotonic_seconds();
+    if (options.synthetic_kv_prime)
+      forward_warm_prefix(tokens, n, options.synthetic_kv_prime, 0);
+    engine_synthetic_kv(&model, warm);
+    metrics.warm_s = monotonic_seconds() - start;
+    return warm;
   }
-  metrics.warm_s = monotonic_seconds() - start;
-  profile_enabled = saved_profile;
-  memory_free(chunk);
+#endif
+  metrics.warm_s = forward_warm_prefix(tokens, n, warm, tokens_out != NULL);
   return warm;
 }
 
@@ -416,6 +468,10 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
                     ? chat_prompt(t, options.system_prompt ? options.system_prompt : "", prompt ? prompt : "", 1, &n)
                     : tokenize(t, prompt ? prompt : "", 1, &n);
   metrics.tokenization_s += monotonic_seconds() - start;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  if (options.synthetic_kv && (int64_t)options.warm_context + n + options.generation_length - 1 > options.steps)
+    fail("LLAMA_SYNTHETIC_KV requires space for the warm context, prompt and complete generation");
+#endif
   int pos = warm_up(tokens, n);
   start += metrics.warm_s; /* the warm-up is neither prefill nor time to first token */
   double excluded = metrics.verify_excluded_s;
