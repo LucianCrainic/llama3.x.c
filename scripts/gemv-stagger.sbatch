@@ -14,7 +14,8 @@
 #                 tree with the knob on, byte for byte, on 4 KiB and on 2 MiB pages.
 #   STAGE=ab      decode benchmark cells (page size x knob), interleaved over REPEATS repetitions, then one profiled run of
 #                 each cell; token traces of every run are compared.
-# Required for the stages that load a model: CONFIG (8b-1s, 8b-2s, 70b-2s), CHECKPOINT, TOKENIZER.
+# Required for the stages that load a model: CONFIG (8b-1s, 8b-2s, 70b-2s; STAGE=check takes a list, CONFIG="8b-1s 8b-2s"),
+# CHECKPOINT, TOKENIZER.
 # Optional: REPEATS=5, WARM=4096, GENERATION=128, EXTRA=0 (context length = WARM + 256 + EXTRA), BASE_ROOT, DRY_RUN=1.
 # Nothing here names a host, a path or a credential: locations arrive through the environment.
 set -euo pipefail
@@ -30,16 +31,21 @@ prompt="Print a long numbered list of prime numbers. Keep listing primes for at 
 
 base=(LLAMA_BACKEND=teams LLAMA_THREADS=56 LLAMA_PLACEMENT_STRICT=1 LLAMA_VERIFY_SAMPLES=0 LLAMA_KV_VERIFY=1)
 topology=explicit:0/2/0,1/3/1
+select_config() {
+  bind=()
+  case $1 in
+    8b-1s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hbm LLAMA_SOCKETS=1); bind=(numactl --cpunodebind=0) ;;
+    8b-2s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hbm LLAMA_SOCKETS=2) ;;
+    # 70B does not fit HBM with the AMX packed copy: every weight and KV layer in HBM, the packed copy in DDR
+    # (docs/campaign/hybrid-memory/LEDGER.md, P2 notes for P4)
+    70b-2s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hybrid LLAMA_SOCKETS=2
+      LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80 LLAMA_HYBRID_KV_HBM_LAYERS=80 LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_PACKED=ddr) ;;
+    *) echo "CONFIG must be 8b-1s, 8b-2s or 70b-2s" >&2; exit 2 ;;
+  esac
+}
+cfg=()
 bind=()
-case ${CONFIG:-} in
-  8b-1s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hbm LLAMA_SOCKETS=1); bind=(numactl --cpunodebind=0) ;;
-  8b-2s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hbm LLAMA_SOCKETS=2) ;;
-  # 70B does not fit HBM with the AMX packed copy: every weight and KV layer in HBM, the packed copy in DDR
-  # (docs/campaign/hybrid-memory/LEDGER.md, P2 notes for P4)
-  70b-2s) cfg=("${base[@]}" "LLAMA_TOPOLOGY=$topology" LLAMA_PLACEMENT=hybrid LLAMA_SOCKETS=2 LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80
-    LLAMA_HYBRID_KV_HBM_LAYERS=80 LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_PACKED=ddr) ;;
-  *) [[ $STAGE == check && -z ${CONFIG:-} ]] || { echo "CONFIG must be 8b-1s, 8b-2s or 70b-2s" >&2; exit 2; } ;;
-esac
+[[ -z ${CONFIG:-} || $STAGE == check ]] || select_config "$CONFIG"
 # Cells: page size and knob. THP=off is the engine default (4 KiB pages).
 cells=("thp=off stagger=0" "thp=off stagger=1" "thp=on stagger=0" "thp=on stagger=1")
 
@@ -85,9 +91,19 @@ stage_check() {
   tail -5 "$OUT/make-test.log"
   [[ -z ${BASE_ROOT:-} ]] || make -C "$BASE_ROOT" -j 56 CC=gcc BUILD_DIR="$OUT/bin-base" all probe-int8 > "$OUT/build-base.log" 2>&1
   [[ -n ${CONFIG:-} ]] || return "$gate"
+  status=0
+  for name in $CONFIG; do
+    select_config "$name"
+    probe_config "$name" || status=1
+  done
+  return $((gate || status))
+}
+
+probe_config() {
+  local CONFIG=$1
   # a fixed 97-token input (BOS and ids spread over the vocabulary); the probe prints every position's logits as raw float32
   tokens=(128000 $(seq 1009 1301 125000))
-  status=0
+  local status=0
   for cell in off0 off1 on0 on1; do
     thp=${cell%[01]}; stagger=${cell: -1}
     for who in base tree; do
@@ -102,7 +118,7 @@ stage_check() {
   [[ $(cat "$OUT/logits-distinct-$CONFIG.txt") == 1 ]] || status=1
   printf 'distinct logit digests over %s files: %s\n' "$(ls "$OUT"/logits-"$CONFIG"-*.sha256 | wc -l)" \
     "$(cat "$OUT/logits-distinct-$CONFIG.txt")"
-  return $((gate || status))
+  return "$status"
 }
 
 run_cell() { # run_cell LABEL CELL [EXTRA_ENV...]
