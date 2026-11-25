@@ -208,11 +208,10 @@ def gen(stage, env, results=None):
         for gs in (64, 32):
             for off in (0, 64, 4096, 65536, 1048640):
                 add(fmt(name=f'e5off-gs{gs}-act56-off{off}', kind='gemv', gs=gs, r=0, cdw=0, act=56, off=off))
-    elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, split and DDR-only load
-        best = best_points(results or [], env)
-        cd = best['e1_cd']
+    elif stage == 'freq':  # long windows, to read the core and uncore frequencies (turbostat) under HBM-only, mixed and DDR-only load
         add(split_cfg('freq-hbm56', CORES, 0, env, warm=0.5, seconds=8))
-        add(split_cfg(f'freq-split-cd{cd}', CORES - cd, cd, env, warm=0.5, seconds=8))
+        add(split_cfg('freq-split48-8', 48, 8, env, warm=0.5, seconds=8))
+        add(split_cfg('freq-split28-28', 28, 28, env, warm=0.5, seconds=8))
         add(split_cfg('freq-ddr56', 0, CORES, env, warm=0.5, seconds=8))
     elif stage == 'rep':  # the key E1 points, for the replication job on the other node
         for cd in (0, 4, 8, 16, 28, 56):
