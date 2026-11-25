@@ -25,7 +25,7 @@ Setup of every cell: two sockets of 55 threads, `LLAMA_PLACEMENT=hybrid` with we
 
 ## 2. What was run
 
-Job 5935864 (hbm14, `scripts/ttft-diagnosis.sbatch`), one process per row, `LLAMA_*` of the caller cleared, `LLAMA_PREFILL_BATCH` equal to the driver's batch argument:
+Job 5935864 (`scripts/ttft-diagnosis.sbatch`), one process per row, `LLAMA_*` of the caller cleared, `LLAMA_PREFILL_BATCH` equal to the driver's batch argument:
 
 * **Plain driver** (`tools/xengine70`, `xengine70-q8`): the two prompt fixtures of [xengine-70b.md](xengine-70b.md) as exact id arrays (547 and 2113 tokens, each the whole prompt including the chat header), 1 warm-up + 3 measured requests each, 128 greedy tokens after the first; TTFT is the driver's own `ttft_s`. `perf stat -a --per-socket -I 50` counted the uncore events (DDR and HBM CAS reads and
   writes, UPI data flits) over the whole process; each request's prefill window is `[start_epoch_ns, start_epoch_ns + ttft_s]`, with the perf clock fixed by the epoch of the first interval line minus its time stamp (accuracy about 10 ms of 50 ms intervals; edge intervals are prorated).
