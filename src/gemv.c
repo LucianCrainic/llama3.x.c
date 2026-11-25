@@ -492,10 +492,15 @@ typedef struct {
   void *done_ctx;
 } Q8Job;
 
-static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
+/* The row loop of one range, from block `rot` (counted from r0) round to block rot - 1. Every block is the same BLOCK
+ * rows at the same offset from r0 as in the unrotated loop and writes its own outputs, so the results are bitwise those of
+ * rot = 0; only the order in which the blocks are read changes. */
+static void q8_blocks(const Q8Job *job, const Q8Segment *seg, int r0, int r1, int rot) {
   float dots[BLOCK], gates[BLOCK];
   size_t ld = job->ld ? job->ld : (size_t)job->n;
-  for (int i = r0; i < r1; i += BLOCK) {
+  int blocks = (r1 - r0 + BLOCK - 1) / BLOCK;
+  for (int k = 0; k < blocks; k++) {
+    int i = r0 + (k + rot < blocks ? k + rot : k + rot - blocks) * BLOCK;
     int rows = r1 - i < BLOCK ? r1 - i : BLOCK;
     q8_dots(seg->w, ld, i, rows, job->x, job->n, job->gs, dots);
     if (job->kind == SWIGLU)
@@ -513,6 +518,10 @@ static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
     job->done(job->done_ctx, r0, r1);
 }
 
+static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
+  q8_blocks(job, seg, r0, r1, 0);
+}
+
 static void q8_rows(const void *p, int r0, int r1) {
   const Q8Job *job = p;
   int base = 0;
@@ -525,12 +534,36 @@ static void q8_rows(const void *p, int r0, int r1) {
   }
 }
 
+/* LLAMA_GEMV_STAGGER=1: member w of a team starts its share at block w (of BLOCK rows) and wraps, so simultaneous
+ * members read addresses that differ by w blocks (32 KiB at the 8192-byte rows of the 70B shard) instead of by multiples of
+ * their share. On 2 MiB pages shares of exactly 2 MiB put every member on the same stripe of the HBM address
+ * interleave in barrier lockstep (docs/concurrent-tier-bandwidth.md 5.1, docs/gemv-stagger.md). Bitwise unchanged. */
+static int gemv_stagger;
+
+void gemv_init_env(void) {
+  const char *value = getenv("LLAMA_GEMV_STAGGER");
+  gemv_stagger = 0;
+  if (value && *value && strcmp(value, "0")) {
+    if (strcmp(value, "1"))
+      fail("LLAMA_GEMV_STAGGER must be 0 or 1");
+    gemv_stagger = 1;
+  }
+}
+void k_gemv_stagger(int on) {
+  gemv_stagger = on != 0;
+}
+int k_gemv_stagger_active(void) {
+  return gemv_stagger;
+}
+
 static void q8_team_static(const Q8Job *job, int worker, int workers) {
   for (int s = 0; s < job->count; s++) {
     const Q8Segment *seg = &job->segment[s];
     int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
-    if (r1 > r0)
-      q8_range(job, seg, r0, r1);
+    if (r1 > r0) {
+      int blocks = (r1 - r0 + BLOCK - 1) / BLOCK;
+      q8_blocks(job, seg, r0, r1, gemv_stagger ? worker % blocks : 0);
+    }
   }
 }
 

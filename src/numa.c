@@ -711,6 +711,11 @@ int region_thp_default(void) {
   return thp && !strcmp(thp, "on");
 }
 
+int region_thp_never(void) {
+  const char *thp = getenv("LLAMA_THP");
+  return thp && !strcmp(thp, "never");
+}
+
 int region_live_count(void) {
   return live_count;
 }
@@ -857,6 +862,11 @@ int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, Region
       r->thp_requested = 1;
     else if (thp)
       LOG(LOG_WARN, "madvise(MADV_HUGEPAGE) failed for a region on node %d: %s", node, strerror(errno));
+#endif
+#ifdef MADV_NOHUGEPAGE
+    /* LLAMA_THP=never: 4 KiB pages even where the system backs every region with huge pages ([always]). */
+    if (!thp && region_thp_never() && madvise(data, rounded, MADV_NOHUGEPAGE))
+      LOG(LOG_WARN, "madvise(MADV_NOHUGEPAGE) failed for a region on node %d: %s", node, strerror(errno));
 #endif
   }
 #endif

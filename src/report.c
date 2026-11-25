@@ -152,7 +152,7 @@ static void kv_object(FILE *f) {
 
 /* Schema v2: runtime, topology, teams, regions and placeholders for producers that do not exist yet (null). */
 static void write_v2_sections(FILE *f) {
-  const char *thp = region_thp_default() ? "on" : "off";
+  const char *thp = region_thp_default() ? "on" : region_thp_never() ? "never" : "off";
   fputs(",\n  \"runtime\": {\n    \"backend\": ", f);
   string(f, kernels_backend_name());
   fprintf(f, ",\n    \"sockets\": %d,\n    \"placement\": ", metrics.sockets ? metrics.sockets : 1);
@@ -379,6 +379,8 @@ void write_report(void) {
   string(f, kernels_name() ? k_gemm_q8_mode_name() : NULL);
   fputs(",\n    \"q8_kb_order\": ", f);
   string(f, kernels_name() ? k_gemm_q8_kb_order_name() : NULL);
+  fputs(",\n    \"gemv_stagger\": ", f);
+  fputs(kernels_name() && k_gemv_stagger_active() ? "true" : "false", f);
   fputs(",\n    \"swiglu_exp\": ", f);
   string(f, kernels_name() ? k_gemm_swiglu_exp_name() : NULL);
   fputs(",\n    \"tp_batch_reduce\": ", f);
