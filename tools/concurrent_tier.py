@@ -429,6 +429,7 @@ def aggregate(windows):
                 per[k]['exp_d'] += w['expected']['ddr_bytes']
             e['counter_hbm_gbps'] = med_min_max([v['hbm_bytes'] / v['burst_s'] / 1e9 for v in per.values()])
             e['counter_ddr_gbps'] = med_min_max([v['ddr_bytes'] / v['burst_s'] / 1e9 for v in per.values()])
+            e['ddr_share'] = med_min_max([v['ddr_bytes'] / (v['hbm_bytes'] + v['ddr_bytes']) for v in per.values()])
             e['upi_gbps'] = med_min_max([(v['upi_rx_bytes'] + v['upi_tx_bytes']) / v['burst_s'] / 1e9 for v in per.values()])
             e['pkg_w'] = med_min_max([v['pkg_w'] for v in per.values()])
             e['pkg_w0'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 0])
@@ -623,9 +624,9 @@ def tables(agg, windows, idle):
                     key=lambda e: e['cfg']['b'] / (e['cfg']['a'] + e['cfg']['b']))
         if es:
             md.append(f'## E3 page-interleaved region, {page} pages (per-socket GB/s; tier split from the counters)\n')
-            md.append(table(['HBM:DDR pages', 'DDR share', 'combined GB/s', 'HBM counter GB/s', 'DDR counter GB/s', 'reps'],
-                            [(f'{e["cfg"]["a"]}:{e["cfg"]["b"]}', f'{e["cfg"]["b"] / (e["cfg"]["a"] + e["cfg"]["b"]):.2f}', mm(e['combined_gbps']),
-                              mm(e.get('counter_hbm_gbps')), mm(e.get('counter_ddr_gbps')), e['reps']) for e in es]))
+            md.append(table(['HBM:DDR pages', 'page share on DDR', 'combined GB/s', 'DDR share of the counter bytes (HBM CAS x 32 B, DDR CAS x 64 B)', 'reps'],
+                            [(f'{e["cfg"]["a"]}:{e["cfg"]["b"]}', f'{e["cfg"]["b"] / (e["cfg"]["a"] + e["cfg"]["b"]):.3f}', mm(e['combined_gbps']),
+                              mm(e.get('ddr_share'), 3), e['reps']) for e in es]))
             md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith(('zfill-e3-', 'zfill-e4-'))), key=lambda e: (e['sockets'], e['page'], e['name']))
     if es:
@@ -831,9 +832,9 @@ def make_figure(agg, path):
             x = [e['cfg']['b'] / (e['cfg']['a'] + e['cfg']['b']) for e in es]
             a.plot(x, [e['combined_gbps']['median'] for e in es], '-o', color=colors[page], label=f'combined, {page}')
             a.fill_between(x, [e['combined_gbps']['min'] for e in es], [e['combined_gbps']['max'] for e in es], color=colors[page], alpha=0.2)
-            if all(e.get('counter_hbm_gbps') for e in es):
-                a.plot(x, [e['counter_hbm_gbps']['median'] for e in es], '--', color=colors[page], alpha=0.6, label=f'HBM (counters), {page}')
-                a.plot(x, [e['counter_ddr_gbps']['median'] for e in es], ':', color=colors[page], alpha=0.6, label=f'DDR (counters), {page}')
+            if all(e.get('ddr_share') for e in es):  # combined rate split by the share of the bytes the counters saw on each tier
+                a.plot(x, [e['combined_gbps']['median'] * (1 - e['ddr_share']['median']) for e in es], '--', color=colors[page], alpha=0.6, label=f'HBM part (counter share), {page}')
+                a.plot(x, [e['combined_gbps']['median'] * e['ddr_share']['median'] for e in es], ':', color=colors[page], alpha=0.6, label=f'DDR part (counter share), {page}')
     hline(a)
     a.set_xlabel('DDR share of the pages')
     a.set_ylabel('GB/s per socket')
