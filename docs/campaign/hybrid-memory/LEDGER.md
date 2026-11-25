@@ -28,7 +28,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | in work: smoke done, job A running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A) | ~0.3 + A |
+| P1 concurrent bandwidth | in work: A (hbm14) and C (hbm13) done, B (E3/E4/E5 r-sweep) running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B) | ~2.0 + B |
 | G1 decision | open | | manager | | |
 | P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
@@ -89,7 +89,17 @@ the mirror's file list and sizes match it.
 - Docs cite research commit hashes that will not exist after the port: rewrite or label as pre-port.
 - C-engine 70B Q8 rows (TTFT 84 / 326 s, decode 4.5-5.3 tok/s) predate gs32 AMX/VNNI: stale.
 
-## P1 interim (smoke, 1 repetition, NOT results)
+## P1 interim from job A/C (agent-reported, 7 reps, NOT yet verified by manager)
+
+- Best HBM-only 569.1 [554.2-571.2] GB/s/socket (2M), still rising at 56 cores; DDR saturates 265.8 at 28 cores.
+- E1: no split above HBM-only (54+2 562.4, 48+8 554.8, 28+28 501.1). E2 best ~561 (8:1..3:1), overlapping HBM-only.
+  Replication on hbm13 within 0-1.6%.
+- Package 351-354 W in every E1 window incl. DDR-only; core clock 1.77 GHz HBM-only, 1.44-1.57 mixed, 2.30 DDR-only.
+- E5 all-HBM GEMV gs64: 317 (32 w), 398 (48), 418 (52), 401 (56) GB/s: below stream ceiling, 56 < 52 workers.
+- Counter/computed exceptions: 6 base windows up to 1.47, 7 DDR windows up to 1.07: must be explained in validation.
+- Loaded latency: DDR probe 132 -> 366 ns under 55 DDR streaming cores.
+
+## P1 smoke (1 repetition, superseded)
 
 - HBM-only 56 cores ~560-615 GB/s/socket (above the old 552); DDR-only ~253-260; split 48/8 539-582; 28/28 465-540;
   shared 3:1 552-615; pages 4:1 604-615: no split clearly above HBM-only so far.
