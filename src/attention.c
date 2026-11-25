@@ -668,6 +668,10 @@ static void amx_kv_invalidate(AttentionWork *work, const float *key_cache, int p
     }
 }
 
+void k_attention_kv_invalidate(AttentionWork *work, const float *key_cache, int position) {
+  amx_kv_invalidate(work, key_cache, position);
+}
+
 void k_attention_free(AttentionWork *work) {
   if (!work->external)
     memory_free(work->partial);

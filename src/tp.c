@@ -19,7 +19,12 @@ enum { SOCKETS = 2, SPIN_LIMIT = 2048 };
 /* Per-socket profile slots: the engine's phases, then the projections that end in a reduction, timed on their own. */
 enum { TP_WO_MM = PHASE_COUNT, TP_W2_MM, TP_SLOTS };
 
-typedef enum { CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP } Command;
+typedef enum {
+  CMD_SETUP, CMD_LOAD, CMD_PACK, CMD_PACK_CLS, CMD_FORWARD, CMD_FORWARD_BATCH, CMD_STOP,
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  CMD_SYNTHETIC_KV, /* opt-in build (SYNTHETIC_KV=1): fill the first `pos` positions of every K/V cache with a fixed pattern */
+#endif
+} Command;
 
 /* The seven matrices of a layer that get a packed copy, in the order of TpSocket.packed_at. */
 static const TensorRole PACK_ROLES[7] = {T_WQ, T_WK, T_WV, T_WO, T_W1, T_W2, T_W3};
@@ -405,6 +410,52 @@ static int project_residual(Tp *tp, int s, Phase phase, int slot, const Shard *w
 static KvLayer kv_layer(const TpSocket *sk, int layer) {
   return sk->kv_layers[layer];
 }
+
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+typedef struct {
+  const Tp *tp;
+  int socket;
+} SyntheticKvJob;
+
+/* Each row owns the complete prefix of one (layer, KV head). The caches are reached through kv_layer(), so a plan's tiers
+ * and the layers' arena offsets need no special case here. The fixed pattern depends on the layer and the global head
+ * only: a value does not depend on the placement, the reservation or the tier. */
+static void fill_synthetic_kv(const void *arg, int first, int end) {
+  const SyntheticKvJob *job = arg;
+  const Tp *tp = job->tp;
+  const Config *p = &tp->c;
+  int heads = p->n_kv_heads / tp->sockets;
+  size_t head_stride = (size_t)p->seq_len * p->head_dim;
+  size_t active = (size_t)tp->pos * p->head_dim;
+  for (int row = first; row < end; row++) {
+    int layer = row / heads, head = row % heads;
+    KvLayer cache = kv_layer(&tp->s[job->socket], layer);
+    float *k = cache.k + (size_t)head * head_stride, *v = cache.v + (size_t)head * head_stride;
+    uint32_t seed = (uint32_t)layer * 0x9e3779b9u + (uint32_t)(job->socket * heads + head) * 0x85ebca6bu;
+    for (size_t i = 0; i < active; i++) {
+      uint32_t x = seed + (uint32_t)i * 0x7feb352du;
+      x ^= x >> 16;
+      /* Odd numerators give finite nonzero values in (-0.25, 0.25). */
+      k[i] = (2 * (int)(x & 255u) - 255) * (1.0f / 1024.0f);
+      v[i] = (2 * (int)((x >> 8) & 255u) - 255) * (1.0f / 1024.0f);
+    }
+  }
+}
+
+/* Fills the FP32 caches of the first `positions` positions on both sockets, then drops the persistent BF16 copy of
+ * LLAMA_ATTN=amx for them: the copy is derived from the FP32 caches, packed lazily from its first stale block, so the next
+ * batch repacks the prefix from the values written here. (A real prime before the fill leaves a copy valid for the primed
+ * positions; the fill replaced what it was packed from.) */
+void tp_synthetic_kv(Tp *tp, int positions) {
+  int heads = tp->c.n_kv_heads / tp->sockets;
+  if (!kernels_kv_layout_head())
+    fail("LLAMA_SYNTHETIC_KV requires LLAMA_KV_LAYOUT=head");
+  if (positions <= 0 || positions >= tp->c.seq_len || tp->c.n_layers > INT_MAX / heads)
+    fail("LLAMA_SYNTHETIC_KV prefix or layer/head count out of range");
+  tp->pos = positions;
+  run_both(tp, CMD_SYNTHETIC_KV);
+}
+#endif
 
 static void forward_fp32(Tp *tp, int s) {
   TpSocket *sk = &tp->s[s];
@@ -1123,6 +1174,20 @@ static void socket_command(Tp *tp, int socket) {
   case CMD_FORWARD_BATCH:
     forward_batch(tp, socket);
     break;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  case CMD_SYNTHETIC_KV: {
+    TpSocket *sk = &tp->s[socket];
+    SyntheticKvJob job = {.tp = tp, .socket = socket};
+    int rows = tp->c.n_layers * (tp->c.n_kv_heads / tp->sockets);
+    if (sk->team)
+      team_parallel_rows(sk->team, rows, fill_synthetic_kv, &job);
+    else
+      fill_synthetic_kv(&job, 0, rows);
+    for (int layer = 0; layer < tp->c.n_layers; layer++)
+      k_attention_kv_invalidate(&sk->attention, kv_layer(sk, layer).k, 0);
+    break;
+  }
+#endif
   case CMD_STOP:
     break;
   }

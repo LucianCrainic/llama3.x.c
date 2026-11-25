@@ -207,6 +207,12 @@ void engine_set_profiling(Model *model, int enabled) {
   profile_enabled = enabled;
   tp_set_exchange_timing(t->tp, enabled);
 }
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+void engine_synthetic_kv(Model *model, int positions) {
+  Transformer *t = model->implementation;
+  tp_synthetic_kv(t->tp, positions);
+}
+#endif
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;
   tp_kv_stats(t->tp, position, verify, out);

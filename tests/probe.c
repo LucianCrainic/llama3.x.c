@@ -75,6 +75,44 @@ int main(int argc, char **argv) {
     }
     memory_free(tokens);
     engine_free(&model);
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  } else if (!strcmp(argv[1], "synthetic")) {
+    /* synthetic MODEL PRIME POSITIONS tokens...: PRIME real positions (the tokens, repeated) through the batched
+     * prefill, then the synthetic fill of POSITIONS positions (SYNTHETIC_KV=1 builds), then the tokens as one batched
+     * prefill from position POSITIONS. Writes that last prefill's logits. The result must not depend on PRIME. */
+    if (argc < 6)
+      return 2;
+    int prime = atoi(argv[3]), positions = atoi(argv[4]), n = argc - 5;
+    if (prime < 0 || prime > positions)
+      return 2;
+    Model model = {0};
+    load(&model, argv[2], (long)positions + n);
+    int *tokens = memory_alloc(n, sizeof(int), MEM_PROMPT);
+    for (int i = 0; i < n; i++)
+      tokens[i] = atoi(argv[i + 5]);
+    int max = engine_max_batch(&model);
+    int *chunk = memory_alloc(max, sizeof(int), MEM_PROMPT);
+    for (int done = 0; done < prime;) {
+      int count = prime - done < max ? prime - done : max;
+      for (int j = 0; j < count; j++)
+        chunk[j] = tokens[(done + j) % n];
+      engine_forward_batch(&model, chunk, count, done, LOGITS_NONE);
+      done += count;
+    }
+    engine_synthetic_kv(&model, positions);
+    for (int i = 0; i < n;) {
+      int count = n - i < max ? n - i : max;
+      LogitsWanted want = model.prefill_logits == LOGITS_ALL ? LOGITS_ALL : (i + count == n ? LOGITS_LAST : LOGITS_NONE);
+      float *logits = engine_forward_batch(&model, tokens + i, count, positions + i, want);
+      size_t values = (want == LOGITS_ALL ? (size_t)count : want == LOGITS_LAST ? 1u : 0u) * model.config.vocab_size;
+      if (values && fwrite(logits, sizeof(float), values, stdout) != values)
+        return 1;
+      i += count;
+    }
+    memory_free(chunk);
+    memory_free(tokens);
+    engine_free(&model);
+#endif
   } else if (!strcmp(argv[1], "tail")) {
     /* tail MODEL K tokens...: the prompt except its last K tokens goes through the batched prefill when
      * LLAMA_PREFILL_BATCH allows it (no logits), then each of the last K tokens is a per-token forward whose logits are

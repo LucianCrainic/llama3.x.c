@@ -58,6 +58,10 @@ float *tp_forward(Tp *tp, int token, int pos, int logits);
  * so its capacity is 1).
  * Same return contract as engine_forward_batch: LAST one row, ALL count rows, NONE NULL; the storage belongs to tp. */
 float *tp_forward_batch(Tp *tp, const int *tokens, int count, int pos0, LogitsWanted want);
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+/* SYNTHETIC_KV=1 builds only (see engine_synthetic_kv). */
+void tp_synthetic_kv(Tp *tp, int positions);
+#endif
 /* Switches the exchange's own clock (a no-op on one socket); LLAMA_PROFILE alone only decides it at creation. */
 void tp_set_exchange_timing(Tp *tp, int enabled);
 

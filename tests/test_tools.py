@@ -558,6 +558,22 @@ class GenerationMathTests(unittest.TestCase):
         import compare_generation as cg
         cls.cg = cg
 
+    def test_synthetic_kv_token_traces_are_refused(self):
+        """A trace written by a SYNTHETIC_KV=1 run has no warm-up token ids: it cannot stand for a real generation."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            engine = Path(temp)/'engine.sh'
+            trace = Path(temp)/'trace.json'
+            engine.write_text('#!/bin/sh\nprintf \'%s\' "$FAKE_TRACE" > "$LLAMA_TOKENS_OUT"\n')
+            engine.chmod(0o755)
+
+            def call(text):
+                return self.cg.run_engine(engine, 'model', 'tokenizer', 'prompt', 4, 0, '', {'FAKE_TRACE': text}, trace)
+            self.assertEqual(call('{"prompt": [1, 2], "generated": [3]}'), ([1, 2], [3]))
+            with self.assertRaises(SystemExit) as error:
+                call('{"synthetic_kv": true, "synthetic_prefix_positions": 8, "prompt": [1, 2], "generated": [3]}')
+            self.assertIn('synthetic KV', str(error.exception))
+
     def test_first_divergence(self):
         self.assertIsNone(self.cg.first_divergence([1, 2, 3], [1, 2, 3]))
         self.assertIsNone(self.cg.first_divergence([], []))

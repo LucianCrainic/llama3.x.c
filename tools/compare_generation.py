@@ -46,6 +46,8 @@ def run_engine(engine, checkpoint, tokenizer, prompt_file, steps, warm_context, 
         prompt, generated = data['prompt'], data['generated']
     except (OSError, ValueError, KeyError) as error:
         raise SystemExit(f'engine did not write {tokens_path} under {env}: {error}')
+    if data.get('synthetic_kv'):
+        raise SystemExit('synthetic KV token traces cannot be used for generation equivalence')
     if not all(isinstance(t, int) for t in prompt + generated):
         raise SystemExit(f'LLAMA_TOKENS_OUT holds non-integer ids under {env}')
     return prompt, generated

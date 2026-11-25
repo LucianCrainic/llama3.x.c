@@ -2,6 +2,7 @@ CC ?= cc
 MODE ?= release
 NATIVE ?= 0
 PCRE2 ?= 1
+SYNTHETIC_KV ?= 0
 BUILD_DIR ?= build/$(MODE)
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -D_DARWIN_C_SOURCE -D_FILE_OFFSET_BITS=64 -Iinclude
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -pthread
@@ -27,6 +28,11 @@ $(error OPENMP is no longer supported: the OpenMP backend was removed (docs/audi
 endif
 ifeq ($(NATIVE),1)
 CFLAGS += -march=native
+endif
+ifeq ($(SYNTHETIC_KV),1)
+CPPFLAGS += -DLLAMA_ENABLE_SYNTHETIC_KV
+else ifneq ($(SYNTHETIC_KV),0)
+$(error SYNTHETIC_KV must be 0 or 1)
 endif
 ifeq ($(PCRE2),1)
 CPPFLAGS += -DLLAMA_PCRE2 $(shell pkg-config --cflags libpcre2-8)
