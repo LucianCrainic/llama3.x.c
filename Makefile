@@ -152,6 +152,7 @@ test: test-bins
 	BUILD_DIR=$(BUILD_DIR) python3 tests/test_tools.py
 	python3 tests/test_xengine.py
 	python3 tests/test_hbm_ddr.py
+	python3 tests/test_hybrid_limits.py
 	python3 tests/test_xengine70.py $(BUILD_DIR)
 clean:
 	rm -rf build
