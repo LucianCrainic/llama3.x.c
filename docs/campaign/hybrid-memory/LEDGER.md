@@ -31,7 +31,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P1 concurrent bandwidth | A-G done (E 5924010, F 5924011 hbm13, G 5925935); docs being finalized | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
 | G1 decision | open | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; 5923182 on ce43988: make test rc 0, A/B equal (1S HBM decode 44.74 vs 44.77, 2S 89.55 vs 89.72; manager-verified); carry-over diff 719232e..ce43988 = tests + docs only. **Open: test-q8-emul TSAN never completed; 20 h cpu-partition rerun refused by the permission system, asked owner** | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
-| P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
+| P2b 70B port | porting in work (steps 1-6, local gates; cluster checks later) | `feature/70b-comparison` | sonnet | | |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
@@ -50,6 +50,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 25 Nov | Gate 5916531 (tree 719232e) HW make test rc=2, only the stale guard-list test fixed in ce43988; HW make test reruns on ce43988, TSAN carries over if src unchanged | §8: gates on the final tree |
 | 25 Nov | P2 lands by `merge --no-ff merge/hbm-ddr-placement` into develop with the gate id in that message; no history rewrite of the branch | §10: no rewrites |
 | 25 Nov | P2 needs an extra A/B on the HBM path (1S HBM, ~51 tok/s) | Its 1S A/B used the default file/DDR placement (~14 tok/s) |
+| 25 Nov | P2 merged into develop (117cd0d) on owner's word with test-q8-emul TSAN incomplete; ledger branch merged (066a00d); both codex greps empty; push held until TSAN 5929318 is clean | D5: push only what passed every gate |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
 
 ## P0 findings (24 Nov)
@@ -188,5 +189,5 @@ the mirror's file list and sizes match it.
 | # | Question | State |
 | --- | --- | --- |
 | Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
-| Q3 | Approve a ~20 h TSAN run of test-q8-emul (cresco8_cpu) to complete the P2 gate, or accept partial TSAN evidence? | asked 25 Nov |
+| Q3 | test-q8-emul TSAN: owner said merge now; run afterwards | answered 25 Nov: merged 117cd0d; TSAN job 5929318 (cresco8_cpu, 12 h) submitted; push of develop held until it reports 0 races |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
