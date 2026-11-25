@@ -24,7 +24,7 @@
 # LLAMA_SYNTHETIC_KV=1 (primed by LLAMA_SYNTHETIC_KV_PRIME real positions). The packs, edge-* and stress cells that the study
 # ran with AMX-INT8 prefill check the report: they fail unless the engine selected the AMX kernels (set KERNELS=amx to force).
 # diagnostics: the serial/concurrent local-pair control of job 5904726 needed a stream-bench option that this tree does not
-# have (see docs/hbm-ddr-research.md); only the attention-bench half is run.
+# have (docs/concurrent-tier-bandwidth.md supersedes it); only the attention-bench half is run.
 set -euo pipefail
 
 : "${ROOT:?}" "${OUT:?}" "${MODEL_DIR:?}" "${CAMPAIGN:?}"

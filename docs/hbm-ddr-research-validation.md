@@ -48,6 +48,6 @@ The figures [decode](figures/hbm-ddr-decode.svg), [windows](figures/hbm-ddr-wind
 ## Not validated
 
 - No number in the document was re-measured or recounted from raw data; they are the earlier work's figures.
-- `stream-bench --local-pair` (job 5904726) was not ported: `perf/concurrent-tier-bandwidth` has a superseding research mode. That control cannot be reproduced with this script.
+- `stream-bench --local-pair` (job 5904726) was not ported: the merged [concurrent-tier bandwidth study](concurrent-tier-bandwidth.md) has a superseding research mode in `tests/stream_bench.c`. That control cannot be reproduced with this script.
 - The synthetic KV fill was reimplemented for the planned placements of this tree. On hardware it is not yet compared against a real warm-up: run a primed synthetic against a real fill on the 8B model first (decode rate within 3%, controller read volume within 5%, identical token traces and placement), as the document's proxy rule requires.
 - On the current tree the default kernels differ from those of every job above (AMX gs64 prefill, fused Wo/W2 reduction). Use `LEGACY=1` of the script to approximate the old configuration; it does not recreate the old kernels.
