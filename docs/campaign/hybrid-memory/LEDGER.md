@@ -4,11 +4,24 @@ Standing instructions: [`docs/plans/hybrid-memory-manager-prompt.md`](../../plan
 (local, not committed). This file is the manager's memory across sessions. Started 24 November 2026 from `develop` at
 `b9b9bbb`.
 
+## G1 decision (25 Nov)
+
+**Marginal.** Verified: raw split/shared reads never beat HBM-only (569.1; 578.3 lockstep-staggered); interleaved pages
++1-3% (two nodes, not robust); engine Q8 GEMV row split (r=0.2, 14 DDR workers, 4 KiB) +1.4% and +2.3% on node A, +3.9% on
+node B (wall-clock +1.0/+3.0/+3.3%), p 0.006 per test, 0.066 best-of-11. Socket at ~350 W in every run. Actions: (1)
+P3 as a bounded prototype (decode GEMV row split, opt-in) measured end to end on 70B against HBM-only, serial hybrid and
+DDR, with the spill case (70B 1S, long-context 2S) as the main motivation: modelled concurrent vs serial +3 to +33%;
+(2) first the 2 MiB GEMV stagger fix (perf/gemv-stagger, opt-in), which is the HBM-only baseline P3 must beat.
+
 **Resume:** read this file, `git fetch`, `git log develop`, `squeue -u $USER`, then continue from **Next action**.
 
 ## Next action
 
-P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
+25 Nov: G1 reported (marginal). Gate on develop 8fec0c8 **passed** (5929332, hbm14: make test rc 0, 3342 s, 0 FAIL/ERROR; manager-read). Running: perf/gemv-stagger 5929336 (hbm13),
+TSAN q8-emul 5929318 (cpu), P2b cluster checks (hbm14, queued after 5929332). Push develop once TSAN 5929318 is clean (codex greps first).
+P2b merged ee24659 + step 7 docs dbd8e14 + script fix 119d912 (local; docs/script-only after gate 5929402). perf/gemv-stagger merged 59f6bc6 (opt-in; manager re-derived medians from raw JSON: 2 MiB pages 8B 1S 42.21->44.31, 2S 73.53->74.95, 70B 10.00->10.60 tok/s; 4 KiB no effect; logits sha256 equal across 16 variants). Gate 5935721 on 59f6bc6 (hbm14). TSAN 5929318 **clean** (test-q8 rc 0 13268 s, test-q8-emul rc 0 16287 s, 0 race reports; manager-read). Push once gate 5935721 passes. Default flip of LLAMA_GEMV_STAGGER needs owner OK (D4) after replication on hbm14 + gs32. Then 70B C Q8 re-run (step 7), P3, P4.
+
+Older: P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
 verify P1 (§8) and run the independent review before G1; start downloads and the 70B gs64 conversion once P0 reports
 internet access and existing checkpoints; send the P2b table to the owner for approval.
 
@@ -28,14 +41,14 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | Phase | Status | Branch | Agent | Jobs | Node-h |
 | --- | --- | --- | --- | --- | --- |
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
-| P1 concurrent bandwidth | A-G done (E 5924010, F 5924011 hbm13, G 5925935); docs being finalized | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
-| G1 decision | open | | manager | | |
+| P1 concurrent bandwidth | **done**, merged 8fec0c8 (local); gate on develop tip running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
+| G1 decision | **MARGINAL** (25 Nov, verified): engine GEMV row split +1.4/+2.3% (node A), +3.9% (node B); raw reads no gain beyond 1-3% | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; 5923182 on ce43988: make test rc 0, A/B equal (1S HBM decode 44.74 vs 44.77, 2S 89.55 vs 89.72; manager-verified); carry-over diff 719232e..ce43988 = tests + docs only. **Open: test-q8-emul TSAN never completed; 20 h cpu-partition rerun refused by the permission system, asked owner** | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
-| P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
+| P2b 70B port | **merged** ee24659 (local): steps 1-6 + fidelity note 301df53; codex greps empty; 5929376 (hbm14): default-path tokens bitwise equal to develop (1S/2S, warm 0/512, profile on); profile fix not visible on 8B (develop exchange not inflated; classifier phase 0.46 vs 0.04 ms/token, cause unconfirmed); 5929377: synthetic decode 50.44/50.49 vs real 52.01 tok/s (-3.0/-2.9%), amx -0.8%, CAS within 1.2%, placement + KV accounting identical (manager-read raw JSON). Gate 5929402 on ee24659 **passed** (make test rc 0, 0 FAIL/ERROR, 7 suites OK). Step 7 done: 70B C Q8 re-run merged dbd8e14 (jobs 5929406/5929407 DDR, 5935580 HBM = hybrid 80/80 packed=ddr; manager re-derived medians from runs.jsonl): DDR gs32 TTFT 2.69/10.22 s, decode 5.93/5.76; HBM 2.60/9.92 s, 10.97/10.12 tok/s; gs64 HBM 11.58/10.71; ids equal to 5910211. Script PLACEMENT/HYBRID_* options 119d912 | `feature/70b-comparison` | sonnet | 5929376, 5929377 | 0.35 |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
-| P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
-| P4 limits + baseline | not started | | | | |
-| P5 gap loop | not started | | | | |
+| P3 concurrent placement | bounded prototype started 25 Nov on hbm13 (rows split, opt-in, ≤12 node-h; fits + spill cases) | `feature/concurrent-tiers` | | | |
+| P4 limits + baseline | limits doc merged (develop, after 59f6bc6; tests + --check-doc rc 0, TTFT ceiling re-derived by manager: 285 TOP, 0.63 s at 2048). Key: 70B TTFT 12-16x AMX peak; concurrent beats serial only in spill (1S: +15-32% modelled). Campaign C0-C8 after TTFT diagnosis | | | | |
+| P5 gap loop | TTFT diagnosis (70B 2S P=2113/547, batch 256/1024, packed hbm/ddr, profile + CAS) + stagger replication hbm14/gs32 queued on hbm14 after 5935721 | | | | |
 
 ## Decisions
 
@@ -50,6 +63,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 25 Nov | Gate 5916531 (tree 719232e) HW make test rc=2, only the stale guard-list test fixed in ce43988; HW make test reruns on ce43988, TSAN carries over if src unchanged | §8: gates on the final tree |
 | 25 Nov | P2 lands by `merge --no-ff merge/hbm-ddr-placement` into develop with the gate id in that message; no history rewrite of the branch | §10: no rewrites |
 | 25 Nov | P2 needs an extra A/B on the HBM path (1S HBM, ~51 tok/s) | Its 1S A/B used the default file/DDR placement (~14 tok/s) |
+| 25 Nov | P2 merged into develop (117cd0d) on owner's word with test-q8-emul TSAN incomplete; ledger branch merged (066a00d); both codex greps empty; push held until TSAN 5929318 is clean | D5: push only what passed every gate |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
 
 ## P0 findings (24 Nov)
@@ -188,5 +202,5 @@ the mirror's file list and sizes match it.
 | # | Question | State |
 | --- | --- | --- |
 | Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
-| Q3 | Approve a ~20 h TSAN run of test-q8-emul (cresco8_cpu) to complete the P2 gate, or accept partial TSAN evidence? | asked 25 Nov |
+| Q3 | test-q8-emul TSAN: owner said merge now; run afterwards | answered 25 Nov: merged 117cd0d; TSAN job 5929318 (cresco8_cpu, 12 h) submitted; push of develop held until it reports 0 races |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
