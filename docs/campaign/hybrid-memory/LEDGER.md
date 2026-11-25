@@ -17,8 +17,8 @@ DDR, with the spill case (70B 1S, long-context 2S) as the main motivation: model
 
 ## Next action
 
-25 Nov: G1 reported (marginal). Running: gate on develop tip 5929332 (hbm14), perf/gemv-stagger 5929336 (hbm13),
-TSAN q8-emul 5929318 (cpu), P2b cluster checks (hbm14, queued after 5929332). Push develop after gate + TSAN are clean.
+25 Nov: G1 reported (marginal). Gate on develop 8fec0c8 **passed** (5929332, hbm14: make test rc 0, 3342 s, 0 FAIL/ERROR; manager-read). Running: perf/gemv-stagger 5929336 (hbm13),
+TSAN q8-emul 5929318 (cpu), P2b cluster checks (hbm14, queued after 5929332). Push develop once TSAN 5929318 is clean (codex greps first).
 P2b port done locally (8 commits, 04b148f): merge after its cluster checks pass. Then 70B C Q8 re-run (step 7), P3, P4.
 
 Older: P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
