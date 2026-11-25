@@ -576,6 +576,80 @@ static void test_partial_q8(void) {
   }
 }
 
+static void count_rows(void *ctx, int r0, int r1) {
+  int *seen = ctx;
+  for (int i = r0; i < r1; i++)
+    seen[i]++;
+}
+
+/* LLAMA_GEMV_STAGGER starts team member w at block w of its share and wraps: every output is bitwise the unstaggered
+ * one, for every epilogue, fused form and activation form, whatever the number of rows, and each worker reports its whole
+ * share to the rows-done callback exactly once. */
+static void test_gemv_stagger(void) {
+  const int n = 256, rows[] = {1, 3, 4, 5, 13, 100, 257};
+  for (int gs = 32; gs <= 64; gs *= 2)
+    for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++)
+      for (int mode = 0; mode < 2; mode++) {
+        const int d = rows[r], groups = n / gs;
+        float *x = zeroed(n, sizeof(float)), *ws = zeroed((size_t)3 * d * groups, sizeof(float));
+        int8_t *wq = zeroed((size_t)3 * d * n, 1), *xq = zeroed(n, 1);
+        float *xs = zeroed(groups, sizeof(float));
+        fill(x, n, 3);
+        for (size_t i = 0; i < (size_t)3 * d * n; i++)
+          wq[i] = (int8_t)(uniform() * 127.0f);
+        for (int i = 0; i < 3 * d * groups; i++)
+          ws[i] = 0.001f + 0.01f * fabsf(uniform());
+        k_quantize(xq, xs, x, n, gs);
+        K8Input in = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq, xs, x};
+        K8Weight w[3] = {{wq, ws}, {wq + (size_t)d * n, ws + (size_t)d * groups},
+                         {wq + (size_t)2 * d * n, ws + (size_t)2 * d * groups}};
+        float *out[2][5];
+        for (int on = 0; on < 2; on++) {
+          k_gemv_stagger(on);
+          for (int k = 0; k < 5; k++) {
+            out[on][k] = zeroed(3 * (size_t)d, sizeof(float));
+            for (int i = 0; i < 3 * d; i++)
+              out[on][k][i] = 0.25f * (float)(i % 7);
+          }
+          k_matmul_q8(out[on][0], &in, w[0], n, d, gs);
+          k_matmul_q8_add(out[on][1], &in, w[1], n, d, gs);
+          k_matmul_q8_qkv(out[on][2], out[on][2] + d, out[on][2] + 2 * d, &in, w[0], w[1], w[2], n, d, d, gs);
+          k_matmul_q8_swiglu(out[on][3], &in, w[0], w[1], n, d, gs);
+          k_matmul_q8_ld(out[on][4], &in, &w[2], (size_t)n, n, d, gs, K_PARTIAL);
+        }
+        k_gemv_stagger(0);
+        for (int k = 0; k < 5; k++) {
+          checks++;
+          if (memcmp(out[0][k], out[1][k], 3 * (size_t)d * sizeof(float)) && failures++ < 20)
+            fprintf(stderr, "gemv stagger [%s]: form %d d=%d gs=%d differs from the unstaggered result\n", current, k, d,
+                    gs);
+        }
+        for (int workers = 1; workers <= 9; workers += 4) {
+          float *serial = zeroed(d, sizeof(float));
+          int *seen = zeroed(d, sizeof(int));
+          k_gemv_stagger(1);
+          for (int worker = 0; worker < workers; worker++)
+            k_matmul_q8_ld_worker(serial, &in, &w[2], (size_t)n, n, d, gs, K_PARTIAL, worker, workers, NULL, count_rows,
+                                  seen);
+          k_gemv_stagger(0);
+          checks++;
+          if (memcmp(serial, out[0][4], d * sizeof(float)) && failures++ < 20)
+            fprintf(stderr, "gemv stagger [%s]: worker entry d=%d workers=%d differs\n", current, d, workers);
+          for (int i = 0; i < d; i++) {
+            checks++;
+            if (seen[i] != 1 && failures++ < 20)
+              fprintf(stderr, "gemv stagger [%s]: row %d reported %d times (d=%d workers=%d)\n", current, i, seen[i], d,
+                      workers);
+          }
+          free(serial), free(seen);
+        }
+        for (int on = 0; on < 2; on++)
+          for (int k = 0; k < 5; k++)
+            free(out[on][k]);
+        free(x), free(ws), free(wq), free(xq), free(xs);
+      }
+}
+
 static void test_partial(void) {
   test_partial_f32();
   test_partial_q8();
@@ -1681,6 +1755,7 @@ int main(int argc, char **argv) {
       test_attention_batch_head_layout(0);
       test_attention_amx(pool_team(0));
       test_partial();
+      test_gemv_stagger();
       test_row_parallel();
       k_gemv_force_hybrid(1); /* the hybrid split of large FP32 jobs, on these small matrices */
       test_f32();

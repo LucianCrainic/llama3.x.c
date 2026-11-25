@@ -22,6 +22,8 @@ int kernels_kv_layout_select(const char *name);
 /* Run every FP32 team GEMV with the hybrid split (contiguous shares, then claimed chunks), which the engine uses only
  * for jobs of 96 MiB and more, so the unit tests reach it on small matrices. Results are bitwise unchanged. */
 void k_gemv_force_hybrid(int on);
+/* LLAMA_GEMV_STAGGER from a test: the Q8 team GEMV starts member w at block w of its share. Results are bitwise unchanged. */
+void k_gemv_stagger(int on);
 
 /* ---- Attention ----------------------------------------------------------------------------------------------------- */
 
