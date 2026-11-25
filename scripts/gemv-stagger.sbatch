@@ -140,7 +140,9 @@ run_cell() { # run_cell LABEL CELL [EXTRA_ENV...]
 stage_ab() {
   mkdir "$OUT/bin"
   build "$ROOT" "$OUT/bin"
-  clean "${cfg[@]}" "$OUT/bin/runq" "$CHECKPOINT" --context-length "$context" --plan-only --json "$OUT/plan.json"
+  if [[ $CONFIG == 70b-2s ]]; then # a plan that does not fit HBM fails here, before the first run (--plan-only needs a planned placement)
+    clean "${cfg[@]}" "$OUT/bin/runq" "$CHECKPOINT" --context-length "$context" --plan-only --json "$OUT/plan.json"
+  fi
   for ((rep = 0; rep < repeats; rep++)); do
     for ((i = 0; i < ${#cells[@]}; i++)); do
       cell=${cells[(rep + i) % ${#cells[@]}]}
