@@ -1,6 +1,6 @@
 # C1 local validation
 
-Date: 1 November 2026. Branch: `codex/prefill-c1-batch-api`.
+Date: 1 November 2026. Branch: the C1 batch-API branch.
 Base: `develop` at `446b680`; reused tensor-manifest implementation: `962dc11`.
 Platform: macOS arm64, Apple Clang 21.0.0, `OPENMP=0`, scalar kernels.
 
