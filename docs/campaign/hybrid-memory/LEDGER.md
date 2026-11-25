@@ -17,8 +17,9 @@ DDR, with the spill case (70B 1S, long-context 2S) as the main motivation: model
 
 ## Next action
 
-25 Nov: G1 reported (marginal). Running: gate on develop tip (hbm14), perf/gemv-stagger (hbm13), P2b port (local),
-TSAN q8-emul 5929318 (cpu). Push develop after gate + TSAN are clean. Then P3 prototype and P4 limits doc.
+25 Nov: G1 reported (marginal). Running: gate on develop tip 5929332 (hbm14), perf/gemv-stagger 5929336 (hbm13),
+TSAN q8-emul 5929318 (cpu), P2b cluster checks (hbm14, queued after 5929332). Push develop after gate + TSAN are clean.
+P2b port done locally (8 commits, 04b148f): merge after its cluster checks pass. Then 70B C Q8 re-run (step 7), P3, P4.
 
 Older: P1 engineer, P0 recon (inventory, docs), P2 merge and P2b inventory agents launched 24 Nov. Wait for their returns;
 verify P1 (§8) and run the independent review before G1; start downloads and the 70B gs64 conversion once P0 reports
@@ -43,7 +44,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P1 concurrent bandwidth | **done**, merged 8fec0c8 (local); gate on develop tip running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B), 5923181 (D), 5923753 (summary) | ~2.0 + B |
 | G1 decision | **MARGINAL** (25 Nov, verified): engine GEMV row split +1.4/+2.3% (node A), +3.9% (node B); raw reads no gain beyond 1-3% | | manager | | |
 | P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; gate 5916531: TSAN 0 race reports; test-tp and test-q8 clean, test-q8-emul timed out (rc 124) and reruns on cresco8_cpu; make test fails only on the stale guard test fixed in ce43988; 5923182 on ce43988: make test rc 0, A/B equal (1S HBM decode 44.74 vs 44.77, 2S 89.55 vs 89.72; manager-verified); carry-over diff 719232e..ce43988 = tests + docs only. **Open: test-q8-emul TSAN never completed; 20 h cpu-partition rerun refused by the permission system, asked owner** | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
-| P2b 70B port | porting in work (steps 1-6, local gates; cluster checks later) | `feature/70b-comparison` | sonnet | | |
+| P2b 70B port | steps 1-6 ported (04b148f on develop 8fec0c8): profile warm-up fix, opt-in SYNTHETIC_KV (BF16 copy invalidated, kv_layer only), research + xengine70 tools/scripts/docs; local `make test` and `make SYNTHETIC_KV=1 test` rc 0; codex greps empty (manager-checked); default-path change only under LLAMA_PROFILE=1. `--local-pair` not ported (superseded by P1 stream_bench). Cluster checks (bitwise, profile, synthetic vs real) queued on hbm14 | `feature/70b-comparison` | sonnet | | 0 |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | bounded prototype (G1 marginal); starts after the GEMV stagger lands (baseline) | `feature/concurrent-tiers` | | | |
 | P4 limits + baseline | not started | | | | |
