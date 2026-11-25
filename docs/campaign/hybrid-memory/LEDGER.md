@@ -32,7 +32,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P0 recon | done (reference page: `reference-numbers.md`, spot-checked) | none | haiku x2 | 5916176-78 (debug, ~0.05) | ~0.05 |
 | P1 concurrent bandwidth | in work: A (hbm14) and C (hbm13) done, B (E3/E4/E5 r-sweep) running | `perf/concurrent-tier-bandwidth` | sonnet | 5916187, 5916190, 5916193 (smoke), 5916195 (A), 5916213 (C), 5916429 (B) | ~2.0 + B |
 | G1 decision | open | | manager | | |
-| P2 merge placement | in work | `merge/hbm-ddr-placement` | sonnet | | |
+| P2 merge placement | fixes done (7 hazards, test each), A/B bitwise PASS 122/122; final TSAN gate 5916531 result unknown (SSH drop) | `merge/hbm-ddr-placement` @719232e | sonnet | 5916198, 5916200 (TSAN caught a real race, fixed 32d93c2), 5916430, 5916531 | ~3.5 |
 | P2b 70B port | approved; porting starts once P2 is merged into develop | `feature/70b-comparison` | sonnet | | |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | waiting on G1 | `feature/concurrent-tiers` | | | |
@@ -49,6 +49,8 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | 24 Nov | No downloads: the 70B HF snapshot (community mirror, rev d50656ee, 30 shards hashed at download) and the gs64 (22 Nov) and gs32 (24 Nov) engine files already exist; only a sha256 manifest and provenance check are run | D1 asks for files, not for re-downloads |
 | 24 Nov | Engine checkpoints stay in scratch; protection against a purge is the manifest plus the recipe (HF rev d50656ee, whose 30 shard hashes match the hub's; conversion jobs 5892714 gs64, 5910127/5910128/5910181 FP32/GGUF/gs32) | Store area quota is 100 GB hard with ~47 GB free; the two 70B Q8 files are 154 GB |
 | 24 Nov | E3 uses `mbind` per chunk | Flat-node kernel is 5.14 (RHEL 9.4), no `weighted_interleave` sysfs |
+| 25 Nov | P2 lands by `merge --no-ff merge/hbm-ddr-placement` into develop with the gate id in that message; no history rewrite of the branch | §10: no rewrites |
+| 25 Nov | P2 needs an extra A/B on the HBM path (1S HBM, ~51 tok/s) | Its 1S A/B used the default file/DDR placement (~14 tok/s) |
 | 24 Nov | Node allocation: P1 owns Flat node hbm14; P2 gates use hbm13; P1's cross-node replication on hbm13 is scheduled by the manager | One job per Flat node; benchmark A/Bs stay on one node |
 
 ## P0 findings (24 Nov)
@@ -100,6 +102,12 @@ the mirror's file list and sizes match it.
 - E5 all-HBM GEMV gs64: 317 (32 w), 398 (48), 418 (52), 401 (56) GB/s: below stream ceiling, 56 < 52 workers.
 - Counter/computed exceptions: 6 base windows up to 1.47, 7 DDR windows up to 1.07: must be explained in validation.
 - Loaded latency: DDR probe 132 -> 366 ns under 55 DDR streaming cores.
+
+## P2 notes for P4
+
+- 70B plan-only: `hbm-only` refused at ctx 8192 and 98304 (agent says over budget; arena to confirm, likely the AMX packed
+  copy). `hybrid` admits gs64 and gs32 at ctx 98304 with HBM 55/56 GiB, auto KV layers 37 (gs64) / 33 (gs32).
+- The 2S planned prefault writes the whole DDR-tier KV and BF16 arenas at setup (as legacy): setup cost at 70B.
 
 ## P1 verification of A/C (independent haiku re-derivation, 25 Nov)
 
