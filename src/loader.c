@@ -16,13 +16,26 @@ const char *placement_mode(void) {
   const char *mode = getenv("LLAMA_PLACEMENT");
   if (!mode || !*mode) /* two sockets own their shards: on an HBM node they go to HBM, as D2 measured them */
     return tp_sockets_requested() == 2 && tp_hbm_pair() ? "hbm" : "file";
+  if (!strcmp(mode, "hbm-only"))
+    return "hbm-only";
+  if (!strcmp(mode, "hybrid"))
+    return "hybrid";
   if (!strcmp(mode, "file") || !strcmp(mode, "ddr") || !strcmp(mode, "hbm"))
     return mode[0] == 'f' ? "file" : mode[0] == 'd' ? "ddr" : "hbm";
-  fail("LLAMA_PLACEMENT must be file, ddr or hbm");
+  fail("LLAMA_PLACEMENT must be file, ddr or hbm, hbm-only, or hybrid");
+}
+
+int placement_planned(void) {
+  const char *mode = placement_mode();
+  return !strcmp(mode, "hbm-only") || !strcmp(mode, "hybrid") || (!strcmp(mode, "ddr") && placement_strict(mode));
 }
 
 const char *placement_active(void) {
-  return tp_sockets_requested() == 2 ? placement_mode() : active_mode; /* tp_create places the shards itself */
+  return active_mode;
+}
+
+void placement_record(const char *mode) {
+  active_mode = mode;
 }
 
 size_t placement_hbm_budget(void) {

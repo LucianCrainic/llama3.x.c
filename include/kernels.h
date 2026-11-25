@@ -140,17 +140,24 @@ typedef struct {
   int kv_layers, kv_used;
   const float *kv_key[256];
   int kv_valid[256];
+  uint16_t *kv_slot[256]; /* k_attention_set_kv_bf16_layers: the BF16 copy of each layer in memory of its own (else NULL) */
 } AttentionWork;
 /* Bytes of the persistent BF16 K/V copy of `layers` layers for LLAMA_ATTN=amx (0 when not selected), and its setup. */
 size_t k_attention_kv_bf16_bytes(int n_kv_heads, int head_dim, int seq_len, int layers);
 void k_attention_set_kv_bf16(AttentionWork *work, uint16_t *memory, int n_kv_heads, int head_dim, int seq_len,
                              int layers);
+/* The same with each layer's copy in memory of its own (a placement tier per layer): layer l's key cache is
+ * key_caches[l] and its copy memory[l] (k_attention_kv_bf16_bytes(.., 1) bytes each). The cache pointers are bound now,
+ * so a layer's slot never depends on the order the layers first run in. */
+void k_attention_set_kv_bf16_layers(AttentionWork *work, uint16_t *const *memory, const float *const *key_caches,
+                                    int n_kv_heads, int head_dim, int seq_len, int layers);
 void k_attention_init(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len);
 /* Same, with the split-K workspace in caller memory of k_attention_bytes() bytes (zeroed, float-aligned). */
 size_t k_attention_bytes(int n_heads, int n_kv_heads, int head_dim, int seq_len);
 void k_attention_init_in(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, float *memory);
 /* The same for batched prefill of up to `rows` rows per call: room for as many rows of split-K partials as the budget
  * (32 MiB) allows, never less than one row. Longer batches run in waves of that many rows. */
+size_t k_attention_bytes_rows_for(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows, int workers);
 size_t k_attention_bytes_rows(int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows);
 void k_attention_init_rows(AttentionWork *work, int n_heads, int n_kv_heads, int head_dim, int seq_len, int rows,
                            float *memory);

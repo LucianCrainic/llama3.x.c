@@ -30,6 +30,10 @@ static void work_region(void) {
   size_t padded_row = 4096 + 4096 / 128 * sizeof(float) + 7168 + 7168 / 128 * sizeof(float);
   assert(q - w64 == 64 * padded_row); /* 64 rows are already whole 32-row blocks */
   assert(tp_work_bytes(&c, 1, 128, 33) - tp_work_bytes(&c, 0, 0, 33) == 64 * padded_row); /* 33 rows pad to 64 */
+  /* Per-channel INT8 (gs 0): one scale per row for each of the two quantized inputs, and no division by the group size. */
+  size_t channel_row = 4096 + 7168 + 2 * sizeof(float);
+  assert(tp_work_bytes(&c, 1, 0, 64) - w64 == 64 * channel_row);
+  assert(tp_work_bytes(&c, 1, 0, 33) - tp_work_bytes(&c, 0, 0, 33) == 64 * channel_row);
 }
 
 int main(void) {

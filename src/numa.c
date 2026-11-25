@@ -674,7 +674,8 @@ void region_record_verification(const NumaRegion *r, const PageCheck *check, siz
 }
 
 const char *region_role_name(RegionRole role) {
-  static const char *const names[] = {"weights", "packed", "embedding", "kv.k", "kv.v", "work", "scratch"};
+  static const char *const names[] = {"weights", "packed",  "embedding", "kv.k",  "kv.v",
+                                      "work",    "scratch", "exchange",  "logits", "kv.bf16"};
   return (unsigned)role < sizeof(names) / sizeof(*names) ? names[role] : "?";
 }
 
@@ -699,6 +700,10 @@ int region_round(size_t bytes, size_t align, size_t *rounded) {
     return -1;
   *rounded = (bytes + align - 1) / align * align;
   return 0;
+}
+
+size_t region_alignment(int node, int thp) {
+  return node >= 0 && thp ? (size_t)THP_BYTES : (size_t)sysconf(_SC_PAGESIZE);
 }
 
 int region_thp_default(void) {
@@ -808,7 +813,7 @@ int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, Region
   if (bound)
     FAIL("cannot bind memory to NUMA node %d: explicit placement requires Linux", node);
 #endif
-  size_t page = (size_t)sysconf(_SC_PAGESIZE), align = bound && thp ? (size_t)THP_BYTES : page, rounded;
+  size_t page = (size_t)sysconf(_SC_PAGESIZE), align = region_alignment(node, thp), rounded;
   if (region_round(bytes, align, &rounded))
     FAIL("invalid region size %zu bytes (zero, or overflows when rounded to %zu)", bytes, align);
   size_t slack = align > page ? align : 0, mapping;
@@ -824,7 +829,7 @@ int region_reserve_try(NumaRegion *r, size_t bytes, int socket, int node, Region
     size_t capacity = node_capacity(node), reserved = 0;
     for (int i = 0; i < live_count; i++)
       reserved += live[i].node == node ? live[i].data_bytes : 0;
-    if (capacity && reserved + rounded > capacity)
+    if (capacity && (reserved > capacity || rounded > capacity - reserved))
       FAIL("region of %zu bytes would exceed node %d capacity (%zu bytes total, %zu already reserved)", rounded, node,
            capacity, reserved);
   }
@@ -1027,7 +1032,8 @@ int placement_strict(const char *placement) {
   const char *value = getenv("LLAMA_PLACEMENT_STRICT");
   if (value && *value)
     return strcmp(value, "0") != 0;
-  return placement && (!strcmp(placement, "hbm") || !strcmp(placement, "ddr"));
+  return placement && (!strcmp(placement, "hbm") || !strcmp(placement, "ddr") || !strcmp(placement, "hbm-only") ||
+                       !strcmp(placement, "hybrid"));
 }
 
 #ifdef __linux__
@@ -1120,6 +1126,65 @@ int region_verify(const NumaRegion *r, size_t max_samples, PageCheck *out) {
   return 0;
 #else
   (void)r;
+  (void)max_samples;
+  return -1;
+#endif
+}
+
+int region_verify_prefixes(const NumaRegion *r, size_t count, size_t stride, size_t used, size_t max_samples,
+                           PageCheck *out, size_t *pages) {
+  *out = (PageCheck){.scheme = "full", .full = 1};
+  *pages = 0;
+#ifdef __linux__
+  if (!r->mapping_base || r->node < 0 || used > stride ||
+      (count && (checked_add(checked_mul(count - 1, stride), used) > r->logical_bytes)))
+    return -1;
+  if (!used || !count)
+    return 0;
+  enum { BATCH = 4096 };
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  void *addresses[BATCH];
+  int status[BATCH];
+  size_t n = 0, previous_end = 0, per_span = max_samples / count;
+  if (per_span < 2)
+    per_span = 2;
+  for (size_t i = 0; i < count; i++) {
+    size_t begin = i * stride / page;
+    size_t end = (i * stride + used - 1) / page + 1;
+    if (begin < previous_end)
+      begin = previous_end;
+    if (begin >= end)
+      continue;
+    previous_end = end;
+    size_t extent = end - begin;
+    *pages = checked_add(*pages, extent);
+    size_t samples = max_samples && per_span < extent ? per_span : extent;
+    if (samples < extent) {
+      out->full = 0;
+      out->scheme = "active-prefix-endpoints";
+    }
+    for (size_t j = 0; j < samples; j++) {
+      size_t at = begin + (samples == extent ? j : j * (extent - 1) / (samples - 1));
+      addresses[n++] = (char *)r->data + at * page;
+      if (n == BATCH) {
+        if (syscall(SYS_move_pages, 0, (unsigned long)n, addresses, NULL, status, 0))
+          return -1;
+        page_check_classify(status, n, r->node, out);
+        n = 0;
+      }
+    }
+  }
+  if (n) {
+    if (syscall(SYS_move_pages, 0, (unsigned long)n, addresses, NULL, status, 0))
+      return -1;
+    page_check_classify(status, n, r->node, out);
+  }
+  return 0;
+#else
+  (void)r;
+  (void)count;
+  (void)stride;
+  (void)used;
   (void)max_samples;
   return -1;
 #endif

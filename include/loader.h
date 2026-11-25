@@ -40,6 +40,8 @@ int loader_read_exact(int fd, char *dst, size_t length, size_t offset, size_t ma
 
 /* LLAMA_PLACEMENT validated: "file" when unset; fails on anything but file, ddr or hbm. */
 const char *placement_mode(void);
+int placement_planned(void);
+void placement_record(const char *mode);
 /* The mode the loaded model actually uses ("file" before any load), for the report. */
 const char *placement_active(void);
 /* LLAMA_HBM_BUDGET_GIB (default 56) in bytes. */

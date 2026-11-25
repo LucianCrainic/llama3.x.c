@@ -40,6 +40,10 @@ const char *tp_batch_reduce_name(void);
 /* Plans the shards, reserves and loads the regions, and starts the socket-1 coordinator. The pool must hold two
  * teams. `quantized` selects the Q8_0 path with group size gs; fp32_activations is W8A32 (LLAMA_Q8_ACTIVATIONS=fp32).
  */
+Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
+                      TpPack pack, int plan_only);
+void tp_placement_report(FILE *f);
+float *tp_all_logits(Tp *tp, int rows);
 Tp *tp_create(const Config *p, const TensorManifest *m, int fd, int quantized, int gs, int fp32_activations,
               int max_batch, TpPack pack);
 /* One socket: the shards are views into `store` (which must outlive the engine), the KV caches and work buffers live in

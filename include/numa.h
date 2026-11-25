@@ -66,7 +66,18 @@ int numa_online_nodes(char *buf, size_t size);
  * populates it, the coordinator accounts for it, and it is released exactly once; the registry of live regions
  * releases whatever is left at exit, so fail() paths and partial startups leak nothing. */
 typedef enum { BACKEND_PORTABLE, BACKEND_LINUX_BOUND } RegionBackend;
-typedef enum { ROLE_WEIGHTS, ROLE_PACKED, ROLE_EMBEDDING, ROLE_KV_K, ROLE_KV_V, ROLE_WORK, ROLE_SCRATCH } RegionRole;
+typedef enum {
+  ROLE_WEIGHTS,
+  ROLE_PACKED,
+  ROLE_EMBEDDING,
+  ROLE_KV_K,
+  ROLE_KV_V,
+  ROLE_WORK,
+  ROLE_SCRATCH,
+  ROLE_EXCHANGE,
+  ROLE_LOGITS,
+  ROLE_KV_BF16 /* the persistent BF16 copy of K and V of LLAMA_ATTN=amx */
+} RegionRole;
 
 typedef struct {
   void *mapping_base;
@@ -104,6 +115,11 @@ typedef struct {
  * region has no requested node or the query is unavailable (non-Linux, or move_pages blocked): then use
  * region_numa_maps and label the run unverified. */
 int region_verify(const NumaRegion *r, size_t max_samples, PageCheck *out);
+/* Query the page union of [i * stride, i * stride + used) at every prefix, 0 <= i < count.
+ * Sampling keeps both endpoints of each nonempty span. Returns the total number of pages in the union. */
+int region_verify_prefixes(const NumaRegion *r, size_t count, size_t stride, size_t used, size_t max_samples,
+                           PageCheck *out, size_t *pages);
+size_t region_alignment(int node, int thp);
 int region_thp_bytes(const NumaRegion *r, size_t *bytes); /* AnonHugePages overlapping the region, from smaps */
 int region_numa_maps(const NumaRegion *r, char *policy, size_t policy_size, size_t *node_pages, int nodes);
 size_t region_verify_samples_default(void);  /* LLAMA_VERIFY_SAMPLES, 0 = full */

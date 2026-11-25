@@ -825,6 +825,31 @@ class CheckPlacementTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn('FAIL', out)
 
+    def test_planned_report_requires_the_bf16_kv_copy_to_be_reported(self):
+        """--planned: a plan with kv.bf16 arenas (LLAMA_ATTN=amx) needs the copy's regions verified like any region and
+        the kv snapshots to report bf16_copy with the planned bytes and an active part that is resident."""
+        arenas = [dict(socket=0, node=2, role='kv.bf16', bytes=8192), dict(socket=0, node=0, role='kv.bf16', bytes=4096)]
+        regions = [dict(role='kv.bf16', node=a['node'], socket=0, bytes=a['bytes'], verified='full', pages_queried=2,
+                        pages_mismatched=0, pages_missing=0) for a in arenas]
+        copy = dict(reserved_bytes=12288, active_bytes=6000, resident_bytes=8192)
+
+        def planned(**changes):
+            report = self.report(regions=regions, runtime=dict(sockets=1),
+                                 placement_plan=dict(admitted=True, simulated=False, arenas=arenas),
+                                 teams=[dict(affinity_verified=True)])
+            for snapshot in (report['kv'], report['kv']['after_prompt']):
+                snapshot.update(pages_missing=0, bf16_copy=dict(copy, **changes))
+            return report
+
+        code, out = self.run_tool(planned(), '--planned')
+        self.assertEqual(code, 0, out)
+        self.assertIn('BF16 K/V copy reported', out)
+        for changes in (dict(reserved_bytes=8192), dict(active_bytes=0), dict(active_bytes=9000)):
+            self.assertEqual(self.run_tool(planned(**changes), '--planned')[0], 1, changes)
+        report = planned()
+        del report['kv']['bf16_copy']
+        self.assertEqual(self.run_tool(report, '--planned')[0], 1)
+
     def test_head_layout_slack_is_a_page_per_layer_and_kv_head(self):
         """E5.4: with LLAMA_KV_LAYOUT=head the touched pages are a prefix of each head's span, so the resident figure may
         exceed the reserved one by a page per layer and KV head (a page per layer for the rows layout)."""
