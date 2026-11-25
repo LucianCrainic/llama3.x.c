@@ -120,6 +120,11 @@ the mirror's file list and sizes match it.
   'not alignment' untested: likely lockstep stripe aliasing (w1/w3 rows per worker = exactly 2 MiB at 28/56 workers).
 - Decision: before G1, P1 runs job E (E6 at real splits, pf 32-128K, aliasing test, cdw +-2) on hbm14 and job F
   (E3/E4/E5c replication) on hbm13, after fixing best_points, CPU-observed record, perf pinning. P1 cap +15 node-h.
+- **Job E (5924010, agent-reported, verification running):** extended HBM-only best 567.3 (reference 569.1 stands);
+  E6 at real splits: spreading DDR cores +1-2%, still <= HBM-only. E5 +/-2 DDR workers, 4K: all-HBM 459.0, best split
+  r=0.2 / 14 DDR workers 469.8 (+2.3%, p=0.006); 12 or 16 DDR workers lose. Engine-shaped gain now +0.8 to +2.3% in four
+  runs: small, reproducible, needs an exact worker split. **Aliasing confirmed:** 2M all-HBM GEMV 411 at 56 workers,
+  437-447 at 53-55, 447.5 with a 4 KiB x worker stagger; raw lockstep 2M-aligned stripes 403 vs 554-577 staggered.
 - Manager's provisional G1 reading: **No** (E5 +1.4% within noise, far below 10%; raw streams no gain). Final after review.
 
 ## P1 interim from job B (agent-reported, unverified)
