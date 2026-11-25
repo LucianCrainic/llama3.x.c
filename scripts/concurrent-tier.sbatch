@@ -28,6 +28,7 @@
 #   PRIOR    results directories of earlier jobs, read by e4 and e6 to find the best E1/E2/E3 points
 #   FILL     random (default), zero or ones: the content of the tier regions (stream-bench --fill); SHUFFLE=1 shuffles the order of
 #            the configurations inside every process
+#   SUMMARY_ARGS  extra arguments of the final summarize step (for example --zero-fill DIR); with PRIOR it pools earlier results
 #   REGION_MIB  tier region per socket (default 20480 = 20 GiB, above the 16 GiB floor); INTER_MIB (32768)
 #   DRY_RUN=1   print the commands of the processes, run nothing
 # Each process runs every configuration of a stage once; the repetitions loop outside it with the page sizes alternating, so
@@ -52,6 +53,7 @@ BEST_ENV=${BEST_ENV:-}
 STAGES=${STAGES//+/ }
 PAGES=${PAGES//+/ }
 PRIOR=${PRIOR//+/ }
+SUMMARY_ARGS=${SUMMARY_ARGS//+/ }
 job_begin
 # Fixed explicit map: S0 = cores 0-55, DDR node 0, HBM node 2; S1 = cores 56-111, DDR node 1, HBM node 3.
 TOPOLOGY='explicit:0/2/0,1/3/1'
@@ -228,6 +230,6 @@ for stage in $STAGES; do
     *) die "unknown stage '$stage'" ;;
   esac
 done
-dry_run || ct summarize "$OUT" -o "$OUT/summary" || printf 'summarize failed (the raw files are complete)\n' >&2
+dry_run || ct summarize "$OUT" $PRIOR ${SUMMARY_ARGS:-} -o "$OUT/summary" || printf 'summarize failed (the raw files are complete)\n' >&2
 printf 'failed processes: %s\n' "$failures"
 [[ $failures == 0 ]]

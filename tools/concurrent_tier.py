@@ -532,7 +532,9 @@ def idle_power(results):
 
 
 def hbm_only_reference(agg, min_reps=7):
-    cands = [e for e in agg.values() if is_hbm_only(e) and e['sockets'] == 1 and e['reps'] >= min_reps and e['cfg']['kind'] != 3]
+    # pseudo-random data only: zero-filled regions read faster under the power cap (see the data-content table)
+    cands = [e for e in agg.values() if is_hbm_only(e) and e['sockets'] == 1 and e['reps'] >= min_reps and e['cfg']['kind'] != 3
+             and not e['name'].startswith(('fczero', 'zfill'))]
     return max(cands, key=lambda e: e['combined_gbps']['median']) if cands else None
 
 
@@ -626,30 +628,47 @@ def tables(agg, windows, idle):
                             [(f'{e["cfg"]["a"]}:{e["cfg"]["b"]}', f'{e["cfg"]["b"] / (e["cfg"]["a"] + e["cfg"]["b"]):.2f}', mm(e['combined_gbps']),
                               mm(e.get('counter_hbm_gbps')), mm(e.get('counter_ddr_gbps')), e['reps']) for e in es]))
             md.append('')
+    es = sorted((e for e in agg.values() if e['name'].startswith(('zfill-e3-', 'zfill-e4-'))), key=lambda e: (e['sockets'], e['page'], e['name']))
+    if es:
+        md.append('## E3 and E4 of the first run, whose interleaved region held zeros (NOT comparable with E1; kept for the data-content finding)\n')
+        md.append(table(['config', 'page', 'combined GB/s (node total if two sockets)', 'reps'], [(e['name'], e['page'], mm(e['combined_gbps']), e['reps']) for e in es]))
+        md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith('e4-') and e['sockets'] == 2), key=lambda e: (e['page'], e['name']))
     if es:
         md.append('## E4 both sockets at once (node totals, GB/s; UPI traffic from the counters)\n')
         md.append(table(['config', 'page', 'node combined GB/s', 'socket-0 GB/s', 'UPI GB/s (rx+tx)', 'reps'],
                         [(e['name'], e['page'], mm(e['combined_gbps']), mm(e['socket0_combined']), mm(e.get('upi_gbps'), 2), e['reps']) for e in es]))
         md.append('')
-    for gs in (64, 32):
-        for page in ('2m', '4k'):
-            es = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['page'] == page and e['sockets'] == 1]
-            if not es:
-                continue
+    def gemv_rows(es, ref_gbps, gs):
+        rows = []
+        for e in sorted(es, key=lambda e: (e['cfg']['r'], e['cfg']['gshared'], e['cfg']['act'], e['cfg']['cdw'])):
+            tok = e['combined_gbps']['median'] * 1e9 / bytes_per_token(gs)
+            gain = e['combined_gbps']['median'] / ref_gbps - 1
+            act = e['cfg']['act'] or 56
+            who = 'every worker' if e['cfg']['gshared'] else (f'{e["cfg"]["cdw"]} of {act}' if e['cfg']['r'] else f'none ({act} workers)')
+            rows.append((e['page'], e['cfg']['r'], who, mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), f'{tok:.2f}',
+                         f'{gain * 100:+.1f}%', e['reps']))
+        return rows
+
+    hdr = ['page', 'DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM (both pages, any worker count)', 'reps']
+    for prefixes, title in ((('e5-', 'e5hbm-'), 'E5 Q8 GEMV over the 70B per-socket shard, file order'),
+                            (('e5c-',), 'E5 confirmation, every process in its own shuffled order')):
+        for gs in (64, 32):
+            es = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['sockets'] == 1 and e['name'].startswith(prefixes)
+                  and not e['name'].startswith('e5off-')]
             hb = [e for e in es if e['cfg']['r'] == 0]
-            href = max(hb, key=lambda e: e['combined_gbps']['median']) if hb else None
-            md.append(f'## E5 Q8 GEMV over the 70B per-socket shard, gs{gs}, {page} pages (GB/s = bytes read per pass / pass time; '
-                      f'tok/s-eq. = GB/s / {bytes_per_token(gs) / 1e9:.1f} GB per token)\n')
-            rows = []
-            for e in sorted(es, key=lambda e: (e['cfg']['r'], e['cfg']['gshared'], e['cfg']['act'], e['cfg']['cdw'])):
-                tok = e['combined_gbps']['median'] * 1e9 / bytes_per_token(gs)
-                gain = e['combined_gbps']['median'] / href['combined_gbps']['median'] - 1 if href else float('nan')
-                act = e['cfg']['act'] or 56
-                who = 'every worker' if e['cfg']['gshared'] else (f'{e["cfg"]["cdw"]} of {act}' if e['cfg']['r'] else f'none ({act} workers)')
-                rows.append((e['cfg']['r'], who, mm(e['hbm_gbps']), mm(e['ddr_gbps']), mm(e['combined_gbps']), f'{tok:.2f}', f'{gain * 100:+.1f}%', e['reps']))
-            md.append(table(['DDR row fraction r', 'DDR workers', 'HBM GB/s', 'DDR GB/s', 'total GB/s', 'tok/s-eq.', 'vs best all-HBM', 'reps'], rows))
+            if not es or not hb:
+                continue
+            href = max(hb, key=lambda e: e['combined_gbps']['median'])
+            md.append(f'## {title}, gs{gs} (GB/s = bytes read per pass / pass time; tok/s-eq. = GB/s / {bytes_per_token(gs) / 1e9:.1f} GB per token)\n')
+            md.append(f'Best all-HBM point: {mm(href["combined_gbps"])} GB/s ({href["name"]}, {href["page"]}, {href["cfg"]["act"] or 56} workers).\n')
+            md.append(table(hdr, gemv_rows(es, href['combined_gbps']['median'], gs)))
             md.append('')
+    es = sorted((e for e in agg.values() if e['name'].startswith('e5off-')), key=lambda e: (e['cfg']['gs'], e['page'], int(e['name'].rsplit('off', 1)[1])))
+    if es:
+        md.append('## GEMV alignment test: every weight address moved up by `off` bytes (all-HBM, 56 workers)\n')
+        md.append(table(['gs', 'page', 'offset bytes', 'GB/s', 'reps'], [(e['cfg']['gs'], e['page'], e['name'].rsplit('off', 1)[1], mm(e['combined_gbps']), e['reps']) for e in es]))
+        md.append('')
     es = sorted((e for e in agg.values() if e['name'].startswith('e6-')), key=lambda e: (e['page'], e['name']))
     if es:
         md.append('## E6 sensitivity (per-socket GB/s)\n')
@@ -827,7 +846,7 @@ def make_figure(agg, path):
     for gs, color in ((64, 'tab:green'), (32, 'tab:red')):
         for page, ls in (('2m', '-'), ('4k', '--')):
             es = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['page'] == page and e['sockets'] == 1
-                  and e['name'].startswith('e5-')]
+                  and e['name'].startswith('e5c-')]
             best = {}
             for e in es:
                 r = e['cfg']['r']
@@ -837,13 +856,14 @@ def make_figure(agg, path):
                 xs_ = sorted(best)
                 a.plot(xs_, [best[r]['combined_gbps']['median'] * 1e9 / bytes_per_token(gs) for r in xs_], ls + 'o', color=color,
                        label=f'gs{gs}, {page} (best worker split)')
-        hb = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['cfg']['r'] == 0 and e['sockets'] == 1]
+        hb = [e for e in agg.values() if e['cfg']['kind'] == 3 and e['cfg']['gs'] == gs and e['cfg']['r'] == 0 and e['sockets'] == 1
+              and e['name'].startswith(('e5-', 'e5hbm-', 'e5c-'))]
         if hb:
             a.axhline(max(e['combined_gbps']['median'] for e in hb) * 1e9 / bytes_per_token(gs), color=color, lw=1, ls=':',
                       label=f'best all-HBM gs{gs}')
     a.set_xlabel("fraction r of every matrix's rows read from DDR")
     a.set_ylabel('decode tok/s-equivalent (GB/s / bytes per token)')
-    a.set_title('E5 engine Q8 GEMV, 70B shard')
+    a.set_title('E5 engine Q8 GEMV, 70B shard (shuffled confirmation)')
     a.legend(fontsize=7)
     a.grid(alpha=0.3)
     fig.tight_layout()
@@ -855,8 +875,14 @@ def make_figure(agg, path):
 def cmd_summarize(args):
     windows = []
     idle = {0: None, 1: None}
+    zero = {str(Path(z)) for z in (args.zero_fill or [])}
     for d in args.results:
-        windows += attach(d)
+        ws = attach(d)
+        if str(Path(d)) in zero:  # E3/E4 whose interleaved region was never written: kept apart, out of the headline tables
+            for w in ws:
+                if w['stage'] in ('e3', 'e4'):
+                    w['name'] = 'zfill-' + w['name']
+        windows += ws
         ip = idle_power(d)
         for s in (0, 1):
             if ip[s][0] is not None:
@@ -915,6 +941,7 @@ def main(argv=None):
     p.add_argument('results', nargs='+')
     p.add_argument('-o', '--output', required=True)
     p.add_argument('--figure')
+    p.add_argument('--zero-fill', nargs='*', help='results directories whose E3/E4 regions were zero-filled')
     p.set_defaults(fn=cmd_summarize)
     p = sub.add_parser('replicate-check')
     p.add_argument('results')
