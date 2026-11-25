@@ -387,8 +387,11 @@ static int warm_up(const int *tokens, int n) {
          options.steps);
   int max = engine_max_batch(&model);
   int *chunk = memory_alloc((size_t)max, sizeof(int), MEM_PROMPT);
+  /* engine_set_profiling also stops the tensor-parallel exchange clock: it keeps running when only profile_enabled
+   * is cleared, and the first timed batch would then absorb the whole warm-up into its exchange components. */
   int saved_profile = profile_enabled;
-  profile_enabled = 0;
+  if (saved_profile)
+    engine_set_profiling(&model, 0);
   double start = monotonic_seconds();
   for (int pos = 0; pos < warm;) {
     int count = warm - pos < max ? warm - pos : max;
@@ -403,7 +406,8 @@ static int warm_up(const int *tokens, int n) {
     pos += count;
   }
   metrics.warm_s = monotonic_seconds() - start;
-  profile_enabled = saved_profile;
+  if (saved_profile)
+    engine_set_profiling(&model, saved_profile);
   memory_free(chunk);
   return warm;
 }

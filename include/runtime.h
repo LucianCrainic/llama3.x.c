@@ -115,6 +115,8 @@ float *engine_forward(Model *model, int token, int position);
  * Planned placement admits ALL storage with LLAMA_PREFILL_LOGITS=all. Legacy placement allocates it lazily. */
 float *engine_forward_batch(Model *model, const int *tokens, int count, int pos0, LogitsWanted want);
 int engine_max_batch(const Model *model);
+/* Turns the phase profile (LLAMA_PROFILE) and the tensor-parallel exchange clock on or off together. */
+void engine_set_profiling(Model *model, int enabled);
 /* Accounting for the first `position` cache positions; verify=1 also queries where the cache pages live. Fails when
  * strict placement is on and a cache page sits on the wrong node. Call it outside timed regions. */
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out);

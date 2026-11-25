@@ -6,6 +6,7 @@
  * socket over whole-tensor shards viewed in the weight store (tp_create_local), on two tensor-parallel (tp_create). */
 #include "loader.h"
 #include "prefill.h"
+#include "profile.h"
 #include "runtime.h"
 #include "shards.h"
 #include "tp.h"
@@ -200,6 +201,11 @@ void engine_load_context(Model *model, const char *path, int context) {
 }
 void engine_plan_context(Model *model, const char *path, int context) {
   load_context(model, path, context, 1);
+}
+void engine_set_profiling(Model *model, int enabled) {
+  Transformer *t = model->implementation;
+  profile_enabled = enabled;
+  tp_set_exchange_timing(t->tp, enabled);
 }
 void engine_kv_stats(Model *model, int position, int verify, KvStats *out) {
   Transformer *t = model->implementation;

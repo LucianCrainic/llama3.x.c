@@ -1900,6 +1900,11 @@ Tp *tp_create_planned(const Model *model, const TensorManifest *m, int fd, int q
   return tp;
 }
 
+void tp_set_exchange_timing(Tp *tp, int enabled) {
+  if (tp->exchange)
+    exchange_set_timing(tp->exchange, enabled);
+}
+
 /* LLAMA_PROFILE=1: one line per stage and socket, in milliseconds per forward pass. wo/w2 are the whole projection
  * including its reduction, wo_mm/w2_mm the leader's own share of the projection (batched: the whole GEMM, its reduction
  * apart in the `exchange` line), so the slowest member's lateness shows up as `straggler`. The exchange components are

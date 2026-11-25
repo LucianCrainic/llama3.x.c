@@ -3,6 +3,7 @@ backend, on fixtures that can be split (two KV heads)."""
 import array
 import json
 import os
+import re
 import struct
 from pathlib import Path
 import subprocess
@@ -132,6 +133,29 @@ class TensorParallelTests(unittest.TestCase):
         self.assertLess(phase['decode_start'], phase['decode_end'])
         self.assertEqual(data['kv']['residency_scope'], 'active_prefix')
         self.assertTrue(data['placement_plan']['simulated'])
+
+    def test_warm_up_stays_out_of_exchange_timing(self):
+        """--warm-context runs untimed: with LLAMA_PROFILE=1 the exchange clock must not run through it. When only the
+        phase profile was switched off, the first timed batch absorbed the whole warm-up (about 10x the cold value here)."""
+        fixture = self.fixtures['wide']
+
+        def exchange_ms_per_token(warm):
+            command = [str(BUILD/'runq'), str(fixture/'int8.bin'), '-z', str(fixture/'tokenizer.bin'), '--benchmark',
+                       '--no-text', '-t', '0', '-n', '0', '-i', 'A', '--warm-context', str(warm),
+                       '--context-length', '64', '--generation-length', '2']
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                    env=environment(2, LLAMA_KERNELS='scalar', LLAMA_PROFILE='1',
+                                                    LLAMA_PREFILL_BATCH='4'))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = [line for line in result.stderr.splitlines() if line.startswith('[INFO] tp prefill socket 0 (')]
+            self.assertEqual(len(lines), 1, result.stderr)
+            return sum(float(v) for v in re.findall(r' x_\w+=([0-9.]+)', lines[0]))
+
+        cold = sorted(exchange_ms_per_token(0) for _ in range(3))[1]
+        warm = sorted(exchange_ms_per_token(60) for _ in range(3))[1]
+        # Each value is the median of three runs and printed to 1 us; measured here: cold <= 0.001, warm 0.000-0.001 with
+        # the fix and 0.007-0.012 without it.
+        self.assertLess(warm, cold + 0.004)
 
     def test_plan_only_checks_rounded_budget_and_spills(self):
         report = Path(self.temp.name)/'tier-plan.json'
