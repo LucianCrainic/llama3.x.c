@@ -1494,6 +1494,14 @@ static int research_main(int argc, char **argv) {
          label, realtime_now(), ncfg * reps, reps, threads, sockets, page, region_mib, R->real, perf_cmd != NULL,
          need_gemv ? gemv_layers(&R->sock[0]) : 0, layer_stride);
   fflush(stdout);
+  /* The exact command line and the content/ordering options are part of the record. */
+  printf("{\"event\": \"args\", \"fill\": \"%s\", \"shuffle\": %d, \"argv\": \"", fill == 0 ? "random" : fill == 1 ? "zero" : "ones",
+         shuffle);
+  for (int i = 1; i < argc; i++)
+    for (const char *c = argv[i]; *c; c++)
+      printf("%s%c", *c == '"' || *c == '\\' ? "\\" : "", *c == '\n' ? ' ' : *c), i + 1 < argc && !c[1] ? (void)putchar(' ') : (void)0;
+  printf("\"}\n");
+  fflush(stdout);
   int index = 0;
   /* --shuffle N (N > 0): every repetition runs the configurations in its own pseudo-random order (seeded by N and the
    * repetition), otherwise they run in file order. */

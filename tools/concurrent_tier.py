@@ -433,6 +433,10 @@ def aggregate(windows):
             e['upi_gbps'] = med_min_max([(v['upi_rx_bytes'] + v['upi_tx_bytes']) / v['burst_s'] / 1e9 for v in per.values()])
             e['pkg_w'] = med_min_max([v['pkg_w'] for v in per.values()])
             e['pkg_w0'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 0])
+            e['pkg_w1'] = med_min_max([w['counters']['pkg_w'] for w in cw if w['socket'] == 1])
+            e['ram_w1'] = med_min_max([w['counters']['ram_w'] for w in cw if w['socket'] == 1])
+            e['upi_flits_s'] = med_min_max([(w['counters']['upi_rx_bytes'] + w['counters']['upi_tx_bytes']) / (64 / 9) / w['counters']['burst_s']
+                                            for w in cw if w['socket'] == 0])
             e['ram_w0'] = med_min_max([w['counters']['ram_w'] for w in cw if w['socket'] == 0])
             e['freq_ghz'] = med_min_max([w['counters']['freq_ghz'] for w in cw if w['socket'] == 0 and w['counters']['freq_ghz']])
             e['ram_w'] = med_min_max([v['ram_w'] for v in per.values()])
@@ -636,8 +640,11 @@ def tables(agg, windows, idle):
     es = sorted((e for e in agg.values() if e['name'].startswith('e4-') and e['sockets'] == 2), key=lambda e: (e['page'], e['name']))
     if es:
         md.append('## E4 both sockets at once (node totals, GB/s; UPI traffic from the counters)\n')
-        md.append(table(['config', 'page', 'node combined GB/s', 'socket-0 GB/s', 'UPI GB/s (rx+tx)', 'reps'],
-                        [(e['name'], e['page'], mm(e['combined_gbps']), mm(e['socket0_combined']), mm(e.get('upi_gbps'), 2), e['reps']) for e in es]))
+        md.append(table(['config', 'page', 'node combined GB/s', 'socket-0 GB/s', 'package W socket 0 / socket 1', 'UPI GB/s (rx+tx, 64/9 B per flit assumed)',
+                         'UPI Mflit/s (rx+tx, both directions of socket 0 and 1 summed)', 'reps'],
+                        [(e['name'], e['page'], mm(e['combined_gbps']), mm(e['socket0_combined']),
+                          f'{e["pkg_w0"]["median"]:.0f} / {e["pkg_w1"]["median"]:.0f}' if e.get('pkg_w0') else '-', mm(e.get('upi_gbps'), 2),
+                          f'{e["upi_gbps"]["median"] * 1e9 * 9 / 64 / 1e6:.1f}' if e.get('upi_gbps') else '-', e['reps']) for e in es]))
         md.append('')
     def gemv_rows(es, ref_gbps, gs):
         rows = []
@@ -701,6 +708,27 @@ def tables(agg, windows, idle):
     md.append('')
     unattributed = sorted({(w['label'], w.get('counter_note')) for w in windows if 'counters' not in w})
     md.append(f'Runs without counters: {len(unattributed)} {unattributed[:6]}\n')
+    # absolute closure per window family: counter GB against computed GB of each tier, and the excess
+    fam = defaultdict(list)
+    for w in windows:
+        if 'counters' not in w:
+            continue
+        key = w['name'] if w['stage'] in ('e3', 'e4') or w['name'].startswith(('fcrandom', 'fczero')) else stage_of(w['name'])
+        fam[(key.replace('zfill-', ''), w['sockets'], w['kind'] == 2)].append(w)
+    rows = []
+    for (key, sockets, inter), ws in sorted(fam.items()):
+        h = [w['counters']['hbm_bytes'] / 1e9 for w in ws]
+        d = [w['counters']['ddr_bytes'] / 1e9 for w in ws]
+        eh = [w['expected']['hbm_bytes'] / 1e9 for w in ws]
+        ed = [w['expected']['ddr_bytes'] / 1e9 for w in ws]
+        tot = [(a + b) / (c + e) for a, b, c, e in zip(h, d, eh, ed)]
+        rows.append((key, sockets, len(ws), f'{statistics.median(eh):.1f}', f'{statistics.median(h):.1f}', f'{statistics.median(ed):.1f}',
+                     f'{statistics.median(d):.1f}', f'{statistics.median(a - b for a, b in zip(d, ed)):+.2f}', f'{max(a - b for a, b in zip(d, ed)):+.2f}',
+                     f'{statistics.median(tot):.3f}'))
+    md.append('### CAS closure in absolute GB per window (median over windows; sockets = 2 counts each socket separately)\n')
+    md.append(table(['config or stage', 'sockets', 'windows', 'computed HBM GB', 'HBM CAS GB', 'computed DDR GB', 'DDR CAS GB',
+                     'DDR excess GB median', 'DDR excess GB max', '(HBM+DDR CAS)/(computed total)'], rows))
+    md.append('')
     # aggregate check per run: all counter bytes of every attributed window of the process against all computed bytes
     runs = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0])
     for w in windows:
