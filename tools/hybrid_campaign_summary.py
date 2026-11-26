@@ -28,6 +28,8 @@ import hbm_ddr_results  # noqa: E402
 from xengine_summary import UPI_DATA_FLIT_BYTES  # noqa: E402
 import hybrid_limits as HL  # noqa: E402
 
+IDLE_FRACTION = 0.10   # pause scan: a 100 ms sample whose HBM+DDR reads are below this fraction of the run's busy median is idle
+IDLE_FLAG_S = 0.3      # a run with more idle seconds than this in its measured window is excluded from the clean medians
 FLAG = 0.30            # the stop rule of the campaign: a step more than 30% from its model needs a diagnosis
 GIB = 2 ** 30
 PHASES = ['qkv', 'wo', 'w1_w3_swiglu', 'w2', 'attention', 'classifier', 'other', 'forward']
@@ -97,9 +99,14 @@ def decode_ceiling(report):
         bh, bd = interpolate_e1(plan['ddr_cores'])
         out['kind'] = 'concurrent'
         for label, e in (('peak', HL.PEAK), ('cal', eta)):
+            # library form (tools/hybrid_limits.py t_concurrent): each tier's K/V is read at that tier's group rate
             t_h = wh / (e.hw * bh * HL.GB) + kh / (e.ha * bh * HL.GB)
             t_d = wd / (e.dw * bd * HL.GB) + kd / (e.da * bd * HL.GB)
             out[label] = 1.0 / max(t_h, t_d)
+            # engine form: only the GEMV is split; attention runs on all 56 cores, so K/V is read at the full-socket rates after it
+            t_w = max(wh / (e.hw * bh * HL.GB), wd / (e.dw * bd * HL.GB))
+            t_k = kh / (e.ha * HL.HBM_STREAM * HL.GB) + kd / (e.da * HL.DDR_STREAM * HL.GB)
+            out[label + '_engine'] = 1.0 / (t_w + t_k)
         return out
     for label, e in (('peak', HL.PEAK), ('cal', eta)):
         out[label] = 1.0 / (HL.t_tier(wh, kh, HL.HBM_STREAM, e.hw, e.ha) + HL.t_tier(wd, kd, HL.DDR_STREAM, e.dw, e.da))
@@ -127,6 +134,35 @@ def counters_of(directory, guard):
     return {r['run']: r['counters'] for r in hbm_ddr_results.results(directory, guard)}
 
 
+def pause_scan(directory, label, report, guard, phase):
+    """Idle seconds of one phase window: the time of the joint HBM+DDR read bins (32-byte HBM and 64-byte DDR CAS lines, summed over
+    the sockets; tools/hbm_ddr_results.py) below IDLE_FRACTION of the window's median bin. Returns (idle s, longest idle span s,
+    busy median GB/s) or None without counters. The window is cut with the same clock anchors as the byte counters."""
+    prefix = directory / label
+    series = hbm_ddr_results.parse_perf(Path(f'{prefix}.perf.csv'))
+    markers = report['phase_epoch_ns']
+    if not series or not markers.get(f'{phase}_start') or not markers.get(f'{phase}_end'):
+        return None
+    start, end = int((directory / f'{label}.perf-start').read_text()), int((directory / f'{label}.end').read_text())
+    final = max(bins[-1][1] for bins in series.values())
+    half_poll = 25_000_000 if (directory / f'{label}.perf-end').exists() else 50_000_000
+    anchors = (start, end - round(final * 1e9) + half_poll)
+    bins = list(hbm_ddr_results.joint_read_bins(series, markers[f'{phase}_start'], markers[f'{phase}_end'], anchors, guard))
+    if not bins:
+        return None
+    busy = statistics.median(h + d for _, _, h, d in bins)
+    idle, longest, current, last_end = 0.0, 0.0, 0.0, None
+    for t0, t1, h, d in bins:
+        if h + d < IDLE_FRACTION * busy:
+            idle += t1 - t0
+            current = current + (t1 - t0) if last_end == t0 else t1 - t0
+            longest = max(longest, current)
+        else:
+            current = 0.0
+        last_end = t1
+    return idle, longest, busy
+
+
 def tier_sum(window, key):
     if not window or not window.get('sockets'):
         return None
@@ -141,7 +177,7 @@ def placement_checks(path):
     return sum(l.startswith('PASS') for l in lines), sum(l.startswith('FAIL') for l in lines)
 
 
-def run_metrics(directory, row, counters):
+def run_metrics(directory, row, counters, guard=0.05):
     path = directory / f"{row['label']}.json"
     if not path.exists():
         return None
@@ -172,6 +208,12 @@ def run_metrics(directory, row, counters):
         run['ddr_share'] = run['ddr_gb_per_token'] / (run['hbm_gb_per_token'] + run['ddr_gb_per_token'])
     else:
         run['ddr_share'] = None
+    scans = {phase: pause_scan(directory, row['label'], report, guard, phase) for phase in ('prefill', 'decode')}
+    run['idle_prefill_s'] = None if scans['prefill'] is None else scans['prefill'][0]
+    run['idle_decode_s'] = None if scans['decode'] is None else scans['decode'][0]
+    run['idle_longest_s'] = None if scans['decode'] is None else scans['decode'][1]
+    measured = run['idle_decode_s'] if row['kind'] == 'decode' else run['idle_prefill_s']
+    run['paused'] = measured is not None and measured > IDLE_FLAG_S
     run['decode_ceiling'] = decode_ceiling(report) if row['kind'] == 'decode' else None
     run['ttft_ceiling'] = ttft_ceiling(report) if row['kind'] == 'ttft' else None
     return run
@@ -184,7 +226,7 @@ def collect(directories, guard):
         counters = counters_of(directory, guard)
         with open(directory / 'runs.tsv') as stream:
             for row in csv.DictReader(stream, delimiter='\t'):
-                run = run_metrics(directory, row, counters.get(row['label'], {}))
+                run = run_metrics(directory, row, counters.get(row['label'], {}), guard)
                 if run:
                     run['directory'] = directory.name
                     runs.append(run)
@@ -229,21 +271,26 @@ def decode_table(groups, stats):
         rs = groups[key]
         if rs[0]['row']['kind'] != 'decode':
             continue
-        tps = median(r['tps'] for r in rs)
+        clean = [r for r in rs if not r['paused']]
+        tps = median(r['tps'] for r in clean or rs)
         c = rs[0]['decode_ceiling']
         ratio = tps / c['cal']
-        flag = 'FLAG' if abs(ratio - 1) > FLAG else ''
+        engine = c.get('cal_engine', c['cal'])
+        ratio_engine = tps / engine
+        # the stop rule is on the library ceiling; a rows cell is also compared with the engine's own shape (only the GEMV is split)
+        flag = '' if abs(ratio - 1) <= FLAG else ('FLAG' if abs(ratio_engine - 1) > FLAG else 'library form only')
         share = median(r['ddr_share'] for r in rs)
-        rows.append([step, setting, meas, len(rs), med([r['tps'] for r in rs]), f'{1e3 / tps:.1f}',
+        rows.append([step, setting, meas, f'{len(clean)}/{len(rs)}', med([r['tps'] for r in rs]),
+                     med([r['tps'] for r in clean]), f'{1e3 / tps:.1f}',
                      '-' if share is None else f'{100 * share:.1f}%', f'{100 * c["ddr_byte_fraction"]:.1f}%',
                      med([r['hbm_gb_per_token'] for r in rs], 2, False), med([r['ddr_gb_per_token'] for r in rs], 2, False),
                      med([r['hbm_gbps'] for r in rs], 0, False), med([r['ddr_gbps'] for r in rs], 0, False),
                      med([r['upi_gb_per_token'] for r in rs], 2, False), med([r['pkg_j_per_token'] for r in rs], 1, False),
-                     f'{c["peak"]:.2f}', f'{c["cal"]:.2f}', f'{ratio:.3f}', flag])
-        stats[f'{step}/{setting}/{meas}'] = {'tps': [r['tps'] for r in rs], 'ratio_cal': ratio, 'ceiling': {k: c[k] for k in ('peak', 'cal', 'kind')}}
-    return md(['step', 'setting', 'meas', 'n', 'decode tok/s median [min-max]', 'ms/token', 'DDR share of CAS bytes',
+                     f'{c["peak"]:.2f}', f'{c["cal"]:.2f}', f'{ratio:.3f}', f'{engine:.2f}', f'{ratio_engine:.3f}', flag])
+        stats[f'{step}/{setting}/{meas}'] = {'tps': [r['tps'] for r in rs], 'tps_clean': [r['tps'] for r in clean], 'ratio_cal': ratio, 'ceiling': {k: c[k] for k in ('peak', 'cal', 'kind')}}
+    return md(['step', 'setting', 'meas', 'clean/all runs', 'decode tok/s all runs, median [min-max]', 'decode tok/s without paused runs', 'ms/token (clean)', 'DDR share of CAS bytes',
                'DDR share modelled', 'HBM GB/token', 'DDR GB/token', 'HBM GB/s', 'DDR GB/s', 'UPI GB/token (derived)', 'pkg J/token',
-               'ceiling peak tok/s', 'ceiling cal. tok/s', 'measured / cal.', 'flag'], rows)
+               'ceiling peak tok/s', 'ceiling cal. tok/s', 'measured / cal.', 'ceiling cal., engine form tok/s', 'measured / engine form', 'flag'], rows)
 
 
 def ttft_table(groups, stats):
@@ -253,18 +300,20 @@ def ttft_table(groups, stats):
         rs = groups[key]
         if rs[0]['row']['kind'] != 'ttft':
             continue
-        t = median(r['ttft'] for r in rs)
+        clean = [r for r in rs if not r['paused']]
+        t = median(r['ttft'] for r in clean or rs)
         c = rs[0]['ttft_ceiling']
         kern = rs[0]['report']['runtime'].get('kernels_prefill', '-')
         ratio = t / c['peak']
         scaled = '-' if c['scaled'] is None else f'{c["scaled"]:.2f}'
         flag = 'FLAG' if c['scaled'] is not None and abs(t / c['scaled'] - 1) > FLAG and kern != 'avx512' else ''
-        rows.append([step, setting, meas, len(rs), rs[0]['prompt_tokens'], kern, med([r['ttft'] for r in rs], 3),
+        rows.append([step, setting, meas, f'{len(clean)}/{len(rs)}', rs[0]['prompt_tokens'], kern, med([r['ttft'] for r in rs], 3),
+                     med([r['ttft'] for r in clean], 3, False),
                      med([r['prefill_s'] for r in rs], 3, False), med([r['hbm_prefill_gb'] for r in rs], 0, False),
                      med([r['ddr_prefill_gb'] for r in rs], 0, False), f'{c["peak"]:.3f}', f'{ratio:.1f}', scaled,
                      '-' if c['scaled'] is None else f'{t / c["scaled"]:.2f}', flag])
         stats[f'{step}/{setting}/{meas}'] = {'ttft': [r['ttft'] for r in rs], 'peak_s': c['peak'], 'scaled_s': c['scaled']}
-    return md(['step', 'setting', 'meas', 'n', 'prompt tokens', 'prefill kernels', 'TTFT s median [min-max]', 'prefill s',
+    return md(['step', 'setting', 'meas', 'clean/all runs', 'prompt tokens', 'prefill kernels', 'TTFT s all runs, median [min-max]', 'TTFT s without paused runs', 'prefill s',
                'HBM GB read+written', 'DDR GB read+written', 'AMX-peak s', 'measured / peak', '8B-scaled s', 'measured / scaled',
                'flag'], rows)
 
@@ -291,6 +340,23 @@ def profile_table(groups):
                 continue
             rows.append([*key] + [f'{p[ph] / p["forward_passes"] * 1e3:.2f}' if ph in p else '-' for ph in PHASES])
     return md(['step', 'setting', 'meas'] + [f'{ph} ms/token' for ph in PHASES], rows)
+
+
+def pause_table(groups):
+    """Per cell: runs, runs with more than IDLE_FLAG_S idle seconds in the measured window (the prefill window of a TTFT cell, the
+    decode window of a decode cell), the idle seconds of the runs, and for TTFT cells the idle seconds that fell in the decode."""
+    rows = []
+    for key in sorted(groups):
+        rs = groups[key]
+        ttft = rs[0]['row']['kind'] == 'ttft'
+        field = 'idle_prefill_s' if ttft else 'idle_decode_s'
+        idle = [r[field] for r in rs]
+        flagged = sum(r['paused'] for r in rs)
+        rows.append([*key, len(rs), flagged, med(idle, 2), '-' if ttft is False else med([r['idle_decode_s'] for r in rs], 2),
+                     '-' if ttft else med([r['idle_longest_s'] for r in rs], 2, False),
+                     'FLAG' if flagged else ''])
+    return md(['step', 'setting', 'meas', 'runs', 'runs with idle > 0.3 s', 'idle s in the measured window median [min-max]',
+               'idle s in the decode window (TTFT cells)', 'longest idle span s (decode)', 'flag'], rows)
 
 
 def synthetic_check(groups):
@@ -323,6 +389,7 @@ def main(argv=None):
     sections = [('Decode (median [min-max] over the interleaved repetitions; bytes from the CAS counters of the decode window)',
                  decode_table(plain, stats)),
                 ('Time to first token', ttft_table(plain, stats)),
+                ('Pause scan (100 ms samples of HBM+DDR CAS reads below 10% of the window median)', pause_table(plain)),
                 ('Load, placement and memory', setup_table(plain)),
                 ('Synthetic K/V against the real fill', synthetic_check(plain)),
                 ('Profiled decode, milliseconds per generated token (one profiled run per cell)', profile_table(profiled))]

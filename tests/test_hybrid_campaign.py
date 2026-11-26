@@ -45,23 +45,26 @@ def report(tps, plan_, warm=4096, steps=255, synthetic=False, profile=None):
                                'decode_end': T0 + int(10e9)}}
 
 
-def perf_csv(seconds=12.0):
+def perf_csv(seconds=12.0, pause=None):
     """Per-socket counts for 100 ms bins: 100 GB/s of DDR reads and 100 GB/s of HBM reads on each socket, 1.0e6 UPI flits, 5 J."""
     lines = []
     for k in range(1, int(seconds * 10) + 1):
         t = k / 10
+        quiet = pause is not None and pause[0] < t <= pause[1]
         for s in (0, 1):
             for event, value in (('ddr_cas_rd', 1.5625e8), ('hbm_cas_rd', 3.125e8), ('unc_upi_rxl_flits.all_data', 1e6),
                                  ('unc_upi_txl_flits.all_data', 1e6), ('power/energy-pkg/', 5.0)):
+                if quiet and event.endswith('cas_rd'):
+                    value = 1000.0
                 lines.append(f'{t:.3f},S{s},1,{value},,{event},{int(t * 1e9)},100.00,,')
     return '\n'.join(lines) + '\n'
 
 
 def write_run(directory, label, setting, meas, rep, tps, plan_, group, warm=4096, synthetic=False, profile=None, tokens=(1, 2, 3),
-              kind='decode', prof=0):
+              kind='decode', prof=0, pause=None):
     directory = Path(directory)
     (directory/f'{label}.json').write_text(json.dumps(report(tps, plan_, warm, 255, synthetic, profile)))
-    (directory/f'{label}.perf.csv').write_text(perf_csv())
+    (directory/f'{label}.perf.csv').write_text(perf_csv(pause=pause))
     (directory/f'{label}.perf-start').write_text(str(T0))
     (directory/f'{label}.end').write_text(str(T0 + int(12e9)))
     (directory/f'{label}.perf-end').write_text(str(T0 + int(12e9)))
@@ -169,14 +172,29 @@ class SummaryTests(unittest.TestCase):
             self.assertIn('-3.7%', text)  # synthetic 78 against the real median 81
             self.assertIn('2 PASS / 0 FAIL', text)
             self.assertIn('Time to first token', text)
-            self.assertIn('| c0-8b-2s | hbm-only | t2048 | 1 | 35 | amx-int8 | 0.450 |', text)
+            self.assertIn('| c0-8b-2s | hbm-only | t2048 | 1/1 | 35 | amx-int8 | 0.450 |', text)
+
+    def test_pause_scan_counts_idle_seconds_and_excludes_flagged_runs_from_clean_medians(self):
+        with tempfile.TemporaryDirectory() as temp:
+            rows = [write_run(temp, f'r{k}-a', 'hbm-only', 'd4096', k, tps, plan('hbm-only'), 'g', pause=pause)
+                    for k, tps, pause in ((1, 80.0, None), (2, 82.0, None), (3, 40.0, (4.0, 5.0)), (4, 81.0, (4.0, 4.2)))]
+            fixture(temp, rows)
+            runs = {r['row']['label']: r for r in summary.collect([temp], 0.05)}
+            self.assertAlmostEqual(runs['r1-a']['idle_decode_s'], 0.0)
+            self.assertAlmostEqual(runs['r3-a']['idle_decode_s'], 1.0, delta=0.11)
+            self.assertAlmostEqual(runs['r3-a']['idle_longest_s'], 1.0, delta=0.11)
+            self.assertTrue(runs['r3-a']['paused'])
+            self.assertFalse(runs['r4-a']['paused'])  # 0.2 s is under the 0.3 s limit
+            code, text = run_summary(temp)
+            self.assertIn('| 3/4 | 80.50 [40.00-82.00] | 81.00 [80.00-82.00] |', text)
+            self.assertIn('| c0-8b-2s | hbm-only | d4096 | 4 | 1 |', text)
 
     def test_flag_when_a_cell_is_more_than_30_percent_from_the_model(self):
         with tempfile.TemporaryDirectory() as temp:
             fixture(temp, [write_run(temp, 'r1-c0-8b-2s-ddr-d4096', 'ddr', 'd4096', 1, 40.0, plan('ddr', 0, 0), 'g'),
                            write_run(temp, 'r1-c0-8b-2s-hbm-only-d4096', 'hbm-only', 'd4096', 1, 10.0, plan('hbm-only'), 'g')])
             _, text = run_summary(temp)
-            decode = text.split('### Load')[0]
+            decode = text.split('###')[1]
             lines = {l.split('|')[2].strip(): l for l in decode.splitlines() if l.startswith('| c0-8b-2s')}
             self.assertTrue(lines['hbm-only'].rstrip().endswith('| FLAG |'), lines['hbm-only'])
             self.assertFalse(lines['ddr'].rstrip().endswith('| FLAG |'), lines['ddr'])
