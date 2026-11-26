@@ -220,3 +220,16 @@ the mirror's file list and sizes match it.
   synthetic cells (held), and the P3 long-context run 5949331 (its relative result is suspect and is so marked here).
   Real-fill cells (4096, 32768, TTFT) are unaffected.
 - Diagnosis agent on fix/synthetic-kv-fidelity (opt-in build only; default path untouched).
+
+## P4 C0 (8B) verified (26 Nov)
+
+- 5950120 (hbm14, tree 47c08fb, 1:37:00): 180 timed runs completed, placement PASS, traces 1 distinct per group, pause
+  scan 239/240 clean (one 2S TTFT run 0.31 s idle in prefill). Manager re-derived 8 decode and 3 TTFT medians from raw
+  JSON: all equal to the agent's table (e.g. 1S hbm-only d4096 44.13 [43.97-44.14], 2S ddr d32768 25.54, 1S rows r0.1
+  c14 d32768 21.25, 2S hbm-only TTFT 2048 0.822 [0.700-0.879]).
+- Serial model holds: serial cells 0.95-1.09 (1S) and 0.87-1.01 (2S) of the calibrated ceiling; CAS DDR share matches
+  the planned byte fraction within 0.5 pp. No concurrent cell beats all-HBM (best -3.0% 1S, -3.5% 2S), as in P3.
+- Stop rule: 1S rows r0.1/r0.2 at 32768 are 1.36/1.35 of the library concurrent ceiling (faster than modelled). Cause
+  (derived): the library charges K/V at the reduced per-group rate, the engine splits only the GEMV and runs attention
+  on all cores. Engine-form ceiling added to the summary tool (aae7b69), rows cells 0.92-1.15; library formula to be
+  corrected in hybrid-limits (pending).
