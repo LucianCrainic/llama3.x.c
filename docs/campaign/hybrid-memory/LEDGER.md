@@ -233,3 +233,8 @@ the mirror's file list and sizes match it.
   (derived): the library charges K/V at the reduced per-group rate, the engine splits only the GEMV and runs attention
   on all cores. Engine-form ceiling added to the summary tool (aae7b69), rows cells 0.92-1.15; library formula to be
   corrected in hybrid-limits (pending).
+- Fix fix/synthetic-kv-fidelity 571e182 + docs 813d222 (LLAMA_SYNTHETIC_KV_MIN_SECONDS, default 30; SYNTHETIC_KV build
+  only). Validation 5950963 (hbm14, diag script, manager-read): real 7.166/7.141, min30 7.188/7.230/7.197 (+0.9%),
+  but the min0 control 7.220 did **not** pause (0/6 runs idle > 0.1 s), against 4/4 paused runs under
+  hybrid-campaign.sbatch in 5950121. Suspect: something the campaign script runs next to the engine; analysis
+  delegated. Gate 5950966 on 813d222 (hbm14). P4 synthetic cells stay held.
