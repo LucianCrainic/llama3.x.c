@@ -28,9 +28,6 @@
 set -euo pipefail
 
 : "${ROOT:?}" "${OUT:?}" "${STAGE:?}" "${PYTHON:?}"
-for v in C_LIST R_LIST ONLY_CELLS EXTRA_CELLS; do # lists may arrive comma separated (sbatch --export cannot carry spaces)
-  [[ -z ${!v:-} ]] || printf -v "$v" '%s' "${!v//,/ }"
-done
 repeats=${REPEATS:-5}
 warm=${WARM:-4096}
 r_list=${R_LIST:-0.1 0.15 0.2 0.25 0.3}
