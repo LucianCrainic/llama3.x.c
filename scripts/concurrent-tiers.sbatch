@@ -23,6 +23,8 @@
 # the stage uses the one it needs).
 # Optional: REPEATS=5, WARM=4096, GENERATION (8B 256, 70B 96), R_LIST="0.1 0.15 0.2 0.25 0.3", C_LIST="8 14 20", EXTRA_CELLS,
 # CONTEXT and WARM for 70b-2s-long, ONLY_CELLS (a list of cell names, for a repeat), DRY_RUN=1.
+# List variables (R_LIST, C_LIST, EXTRA_CELLS, ONLY_CELLS) hold spaces: set them in the environment of the sbatch call
+# (`C_LIST="14 20" sbatch --export=ALL,ROOT=... script`), never inside --export, which splits its argument on commas.
 # Every cell has LLAMA_GEMV_STAGGER=1. Nothing here names a host, a path or a credential: locations arrive through the
 # environment.
 set -euo pipefail
@@ -109,6 +111,9 @@ select_config() { # sets cfg, bind, checkpoint, tokenizer, generation, context, 
       warm=${WARM:-65536}; context=${CONTEXT:-98304}; generation=${GENERATION:-64}
       syn_build=1; syn_env=(LLAMA_SYNTHETIC_KV=1 LLAMA_SYNTHETIC_KV_PRIME=1024)
       add_cell serial "LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_PACKED=ddr"
+      # control: the planner's KV split is replaced by every layer's K/V in HBM, as in the rows cells, so weights spill and
+      # are read serially; rows against this cell isolate the concurrency
+      add_cell serial-kv80 "LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_KV_HBM_LAYERS=$layers LLAMA_HYBRID_PACKED=ddr"
       for k in ${C_LIST:-14 20 28}; do
         add_cell "rows-auto-c$k" "LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_KV_HBM_LAYERS=$layers LLAMA_HYBRID_PACKED=ddr LLAMA_HYBRID_SPLIT=rows LLAMA_HYBRID_DDR_CORES=$k"
       done
