@@ -210,8 +210,12 @@ the mirror's file list and sizes match it.
 
 - 5950121 (70B 2S hyb80, tree 47c08fb, hbm13): decode at 32768 real 7.217/7.202/7.150 against synthetic (PRIME 1024)
   3.870/3.898/3.688 tok/s, **-46%**, not the documented ~3%. Same windows (35 prompt, 95 steps), same placement and 2 MiB
-  coverage, same CAS bytes per step (~47 GB per socket at 32 B per HBM CAS); synthetic streams at half the rate, so the
-  extra ~120 ms per token is data-dependent compute in decode attention.
+  coverage, same CAS bytes per step (~47 GB per socket at 32 B per HBM CAS); **corrected:** not slower compute. The
+  synthetic window holds one ~11-14 s near-idle span (HBM reads ~1 GB/s) starting ~5 s into decode; outside it both runs
+  stream at ~360 GB/s per socket (manager re-derived from r1 perf.csv; agent from the profiled run). The span starts
+  ~8.6 s after the process's first forward in both a synthetic run and the real t2048 run: the known unresolved "startup
+  pause" of hbm-ddr-research.md. A real 32768 warm-up (171 s) absorbs it; a short primer puts it inside the decode window.
+  Any short run whose timed window overlaps compute time ~8.6-23 s can be hit. Diagnostic 5950126 (8B 2S, hbm01 Cache mode).
 - Consequences: every synthetic cell is void until fixed: P4 c1 d65536s and c2 d131072s in 5950121, the planned c3/c4/c6
   synthetic cells (held), and the P3 long-context run 5949331 (its relative result is suspect and is so marked here).
   Real-fill cells (4096, 32768, TTFT) are unaffected.
