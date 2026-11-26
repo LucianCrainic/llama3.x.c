@@ -205,3 +205,14 @@ the mirror's file list and sizes match it.
 | Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
 | Q3 | test-q8-emul TSAN: owner said merge now; run afterwards | answered 25 Nov: merged 117cd0d; TSAN job 5929318 (cresco8_cpu, 12 h) submitted; push of develop held until it reports 0 races |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
+
+## Synthetic K/V fidelity failure (26 Nov, manager-read)
+
+- 5950121 (70B 2S hyb80, tree 47c08fb, hbm13): decode at 32768 real 7.217/7.202/7.150 against synthetic (PRIME 1024)
+  3.870/3.898/3.688 tok/s, **-46%**, not the documented ~3%. Same windows (35 prompt, 95 steps), same placement and 2 MiB
+  coverage, same CAS bytes per step (~47 GB per socket at 32 B per HBM CAS); synthetic streams at half the rate, so the
+  extra ~120 ms per token is data-dependent compute in decode attention.
+- Consequences: every synthetic cell is void until fixed: P4 c1 d65536s and c2 d131072s in 5950121, the planned c3/c4/c6
+  synthetic cells (held), and the P3 long-context run 5949331 (its relative result is suspect and is so marked here).
+  Real-fill cells (4096, 32768, TTFT) are unaffected.
+- Diagnosis agent on fix/synthetic-kv-fidelity (opt-in build only; default path untouched).
