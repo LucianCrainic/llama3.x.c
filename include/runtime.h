@@ -181,6 +181,11 @@ typedef struct {
   size_t prefill_microbatches, prefill_logits_rows;
   uint64_t prefill_start_ns, prefill_end_ns, decode_start_ns, decode_end_ns; /* epoch markers for generate mode */
   double placement_populate_s, placement_verify_s, verify_excluded_s;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+  double synthetic_step_max_s; /* slowest decode step (SYNTHETIC_KV=1 builds) and its index in the decode window */
+  size_t synthetic_step_max_at;
+  double synthetic_primer_s; /* real compute spent before the fill (primer plus the minimum-time repeats) */
+#endif
   double warm_s;        /* untimed --warm-context prefill (B7); excluded from prefill, TTFT and inference time */
   double weight_pack_s; /* BF16 packing at load (C5) */
   int weight_packed;

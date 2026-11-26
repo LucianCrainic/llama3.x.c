@@ -8,6 +8,7 @@ typedef struct {
   int warm_context; /* --warm-context N: forward N untimed tokens before the prompt (B7), 0 = off */
 #ifdef LLAMA_ENABLE_SYNTHETIC_KV
   int synthetic_kv, synthetic_kv_prime; /* SYNTHETIC_KV=1 builds: LLAMA_SYNTHETIC_KV, LLAMA_SYNTHETIC_KV_PRIME */
+  double synthetic_kv_min_s;            /* LLAMA_SYNTHETIC_KV_MIN_SECONDS: least real compute before the fill */
 #endif
   unsigned long long seed;
   float temperature, topp;

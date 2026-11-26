@@ -417,7 +417,11 @@ void write_report(void) {
 #ifdef LLAMA_ENABLE_SYNTHETIC_KV
   fprintf(f, ",\n    \"synthetic_kv\": %s", options.synthetic_kv ? "true" : "false");
   if (options.synthetic_kv)
-    fprintf(f, ",\n    \"synthetic_kv_prime\": %d", options.synthetic_kv_prime);
+    fprintf(f,
+            ",\n    \"synthetic_kv_prime\": %d,\n    \"synthetic_kv_min_seconds\": %.3f,\n    \"synthetic_primer_seconds\": "
+            "%.3f,\n    \"synthetic_slowest_decode_step_seconds\": %.6f,\n    \"synthetic_slowest_decode_step_index\": %zu",
+            options.synthetic_kv_prime, options.synthetic_kv_min_s, metrics.synthetic_primer_s,
+            metrics.synthetic_step_max_s, metrics.synthetic_step_max_at);
 #endif
   fprintf(f,
           "\n  },\n  \"tokens\": {\n    \"input_prompt\": %zu,\n    \"processed_prompt\": %zu,\n    "

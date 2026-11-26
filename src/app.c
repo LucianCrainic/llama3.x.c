@@ -180,6 +180,19 @@ static void parse(int argc, char **argv) {
       fail("LLAMA_SYNTHETIC_KV_PRIME requires an integer from 0 through --warm-context");
     options.synthetic_kv_prime = (int)integer(prime, "LLAMA_SYNTHETIC_KV_PRIME", options.warm_context);
   }
+  /* A node can stall every worker for about 12 to 14 s, starting roughly 8.6 s after the process's first forward pass
+   * (docs/hbm-ddr-research.md, "Startup pause"). A real warm-up of minutes absorbs it before the timed window; a
+   * synthetic fill takes seconds, so the stall would fall inside the measured decode. The primer therefore keeps
+   * forwarding real positions until this much compute time has passed. 0 turns the minimum off. */
+  options.synthetic_kv_min_s = 30.0;
+  const char *minimum = getenv("LLAMA_SYNTHETIC_KV_MIN_SECONDS");
+  if (minimum) {
+    char *end;
+    double seconds = strtod(minimum, &end);
+    if (!options.synthetic_kv || !*minimum || *end || !(seconds >= 0.0) || seconds > 3600.0)
+      fail("LLAMA_SYNTHETIC_KV_MIN_SECONDS requires LLAMA_SYNTHETIC_KV=1 and a number of seconds from 0 through 3600");
+    options.synthetic_kv_min_s = seconds;
+  }
 #endif
   if (!seed_set)
     options.seed = options.benchmark ? 1 : (unsigned long long)time(NULL);
@@ -395,7 +408,14 @@ static int run_sequence(Tokenizer *t, Sampler *sampler, const int *tokens, int n
       metrics.decode_start_ns = epoch_ns();
     double start = monotonic_seconds();
     logits = engine_forward(&model, next, (*position)++);
-    metrics.decode_s += monotonic_seconds() - start;
+    double step = monotonic_seconds() - start;
+#ifdef LLAMA_ENABLE_SYNTHETIC_KV
+    if (step > metrics.synthetic_step_max_s) {
+      metrics.synthetic_step_max_s = step;
+      metrics.synthetic_step_max_at = metrics.decode_steps;
+    }
+#endif
+    metrics.decode_s += step;
     metrics.decode_steps++;
     metrics.forward_passes++;
   }
@@ -449,8 +469,14 @@ static int warm_up(const int *tokens, int n) {
 #ifdef LLAMA_ENABLE_SYNTHETIC_KV
   if (options.synthetic_kv) {
     double start = monotonic_seconds();
-    if (options.synthetic_kv_prime)
-      forward_warm_prefix(tokens, n, options.synthetic_kv_prime, 0);
+    /* The primer, then repeats of it (the same real positions, rewritten by the fill) until the minimum compute time
+     * has passed. Without a primer the repeats use the first 1024 positions of the warm context or fewer. */
+    int unit = options.synthetic_kv_prime ? options.synthetic_kv_prime : warm < 1024 ? warm : 1024;
+    if (options.synthetic_kv_prime || options.synthetic_kv_min_s > 0)
+      forward_warm_prefix(tokens, n, unit, 0);
+    while (monotonic_seconds() - start < options.synthetic_kv_min_s)
+      forward_warm_prefix(tokens, n, unit, 0);
+    metrics.synthetic_primer_s = monotonic_seconds() - start;
     engine_synthetic_kv(&model, warm);
     metrics.warm_s = monotonic_seconds() - start;
     return warm;
