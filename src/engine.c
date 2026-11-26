@@ -138,7 +138,8 @@ static void load_context(Model *model, const char *path, int context, int plan_o
   const char *mode = placement_mode();
   placement_record(mode);
   const char *hybrid_knobs[] = {"LLAMA_HYBRID_WEIGHTS_HBM_LAYERS", "LLAMA_HYBRID_KV_HBM_LAYERS",
-                                "LLAMA_HYBRID_CLASSIFIER", "LLAMA_HYBRID_PACKED"};
+                                "LLAMA_HYBRID_CLASSIFIER", "LLAMA_HYBRID_PACKED", "LLAMA_HYBRID_SPLIT",
+                                "LLAMA_HYBRID_DDR_FRACTION", "LLAMA_HYBRID_DDR_CORES"};
   if (strcmp(mode, "hybrid"))
     for (size_t i = 0; i < sizeof(hybrid_knobs) / sizeof(*hybrid_knobs); i++) {
       const char *value = getenv(hybrid_knobs[i]);

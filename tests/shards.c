@@ -226,6 +226,188 @@ static void run_case(const Case *c) {
     assert(memory_current[i] == 0);
 }
 
+/* ---- LLAMA_HYBRID_SPLIT=rows: row-split shards ---------------------------------------------------------------------- */
+
+static size_t aligned64(size_t n) {
+  return (n + 63) & ~(size_t)63;
+}
+
+/* The shard's row r, wherever it lives. */
+static const int8_t *split_row_q(const Shard *sh, int r) {
+  int first = sh->rows - sh->ddr_rows;
+  return r < first ? (const int8_t *)sh->q + (size_t)r * sh->ld : (const int8_t *)sh->q2 + (size_t)(r - first) * sh->ld;
+}
+static const float *split_row_s(const Shard *sh, int r) {
+  int first = sh->rows - sh->ddr_rows, groups = shard_groups(sh);
+  return r < first ? sh->s + (size_t)r * (size_t)groups : sh->s2 + (size_t)(r - first) * (size_t)groups;
+}
+
+/* One placement of a Q8 checkpoint with a DDR fraction: the arena sizes are exactly the aligned parts, every row of
+ * every shard reads back from the file, and packing the two parts gives the bytes of packing the whole matrix. */
+static void run_split_case(int sockets, int threads, int gs, unsigned ppm, int classifier_tier) {
+  Config config = make_config(128, 256, 2, 4, 2, 64, 1);
+  TensorManifest m;
+  manifest_build(&m, &config, 1, gs, HEADER);
+  int fd = random_file(m.file_bytes);
+  ShardSet set;
+  shards_plan(&set, &m, &config, sockets, gs);
+  size_t bytes[2][2];
+  shards_place(&set, config.n_layers, classifier_tier, 0, ppm, bytes);
+
+  /* Budget arithmetic: each tier's bytes are the sum of the aligned parts placed there, recomputed here independently. */
+  for (int s = 0; s < sockets; s++) {
+    size_t want[2] = {0, 0};
+    for (int i = 0; i < set.count; i++) {
+      const Shard *sh = &set.t[i];
+      if (sh->socket != s || sh->kind == SHARD_GLOBAL)
+        continue;
+      int q8 = sh->src->dtype == DT_Q8, ddr = sh->ddr_rows, first = sh->rows - ddr;
+      size_t groups = q8 ? (size_t)shard_groups(sh) : 0;
+      want[sh->tier] = aligned64(want[sh->tier]) + (size_t)first * (size_t)sh->cols * (q8 ? 1 : 4);
+      if (q8)
+        want[sh->tier] = aligned64(want[sh->tier]) + (size_t)first * groups * 4;
+      if (ddr) {
+        want[1] = aligned64(want[1]) + (size_t)ddr * (size_t)sh->cols;
+        want[1] = aligned64(want[1]) + (size_t)ddr * groups * 4;
+      }
+      assert(!ddr || (sh->tier == 0 && sh->kind != SHARD_COPY && sh->src->role != T_WCLS && q8 &&
+                      ddr % SHARD_SPLIT_ALIGN == 0 && ddr <= sh->rows * 15 / 16 &&
+                      ddr == shards_ddr_rows(sh, ppm)));
+    }
+    assert(bytes[s][0] == want[0] && bytes[s][1] == want[1]);
+  }
+
+  NumaRegion region[2][2] = {{{0}, {0}}, {{0}, {0}}}, global = {0};
+  void *base[2][2] = {{NULL, NULL}, {NULL, NULL}};
+  for (int s = 0; s < sockets; s++)
+    for (int t = 0; t < 2; t++)
+      base[s][t] = area(&region[s][t], bytes[s][t], s, ROLE_WEIGHTS);
+  void *global_base = area(&global, set.global_bytes, 0, ROLE_EMBEDDING);
+  /* The arenas are the plan's: every row-split shard has both places bound inside them, distinct and aligned. */
+  shards_bind_placed(&set, base, global_base);
+  int split = 0;
+  for (int i = 0; i < set.count; i++) {
+    const Shard *sh = &set.t[i];
+    if (sh->kind == SHARD_GLOBAL || !sh->ddr_rows)
+      continue;
+    split++;
+    int first = sh->rows - sh->ddr_rows;
+    assert(contained(&region[sh->socket][0], sh->q, (size_t)first * sh->cols) &&
+           contained(&region[sh->socket][0], sh->s, (size_t)first * (size_t)shard_groups(sh) * 4) &&
+           contained(&region[sh->socket][1], sh->q2, (size_t)sh->ddr_rows * sh->cols) &&
+           contained(&region[sh->socket][1], sh->s2, (size_t)sh->ddr_rows * (size_t)shard_groups(sh) * 4));
+    assert((uintptr_t)sh->q2 % 64 == 0 && (uintptr_t)sh->s2 % 64 == 0);
+  }
+  assert(ppm ? split > 0 : split == 0);
+
+  PoolConfig pool = {.teams = sockets, .threads = {threads, threads}, .cpus = {NULL, NULL}};
+  if (threads > 1)
+    pool_start(&pool);
+  for (int s = 0; s < sockets; s++)
+    shards_load_placed(&set, fd, s, threads > 1 ? pool_team(s) : NULL, NULL);
+  if (threads > 1)
+    pool_stop();
+
+  for (int i = 0; i < set.count; i++) {
+    const Shard *sh = &set.t[i];
+    if (sh->kind == SHARD_GLOBAL || sh->kind == SHARD_COPY)
+      continue;
+    const TensorDesc *t = sh->src;
+    size_t row_values = (size_t)t->cols, groups = (size_t)(t->cols / t->group_size);
+    for (int r = 0; r < sh->rows; r++) {
+      size_t src_row = (size_t)(sh->row0 + r);
+      unsigned char want_q[1024], want_s[256];
+      assert((size_t)sh->cols <= sizeof(want_q) && (size_t)shard_groups(sh) * 4 <= sizeof(want_s));
+      assert(pread(fd, want_q, (size_t)sh->cols, (off_t)(t->offset + src_row * row_values + (size_t)sh->col0)) ==
+             (ssize_t)sh->cols);
+      assert(pread(fd, want_s, (size_t)shard_groups(sh) * 4,
+                   (off_t)(t->scale_offset + src_row * groups * 4 + (size_t)shard_group0(sh) * 4)) ==
+             (ssize_t)((size_t)shard_groups(sh) * 4));
+      assert(!memcmp(split_row_q(sh, r), want_q, (size_t)sh->cols));
+      assert(!memcmp(split_row_s(sh, r), want_s, (size_t)shard_groups(sh) * 4));
+    }
+    /* packing: the two jobs write the bytes of packing the matrix whole (and its transposed scales the same) */
+    if (sh->kind == SHARD_ROWS || sh->kind == SHARD_COLS) {
+      size_t pbytes = s8_vnni_bytes(sh->rows, sh->cols);
+      int8_t *via_jobs = calloc(pbytes, 1), *whole = calloc(pbytes, 1), *rows_copy = malloc((size_t)sh->rows * sh->cols);
+      for (int r = 0; r < sh->rows; r++)
+        memcpy(rows_copy + (size_t)r * sh->cols, split_row_q(sh, r), (size_t)sh->cols);
+      PackS8 jobs[2];
+      int n = pack_s8_jobs_from_shard(via_jobs, sh, jobs);
+      assert(n == (sh->ddr_rows ? 2 : 1));
+      int groups_per_row = shard_groups(sh);
+      size_t tbytes = s8_scales_t_bytes(sh->rows, sh->cols, sh->cols / groups_per_row);
+      float *st_jobs = calloc(tbytes / 4 + 1, 4), *st_whole = calloc(tbytes / 4 + 1, 4),
+            *dense = malloc((size_t)sh->rows * (size_t)groups_per_row * 4);
+      for (int r = 0; r < sh->rows; r++)
+        memcpy(dense + (size_t)r * (size_t)groups_per_row, split_row_s(sh, r), (size_t)groups_per_row * 4);
+      size_t first = (size_t)(sh->rows - sh->ddr_rows);
+      for (int j = 0; j < n; j++) {
+        jobs[j].st = j ? st_jobs + first / 32 * (size_t)groups_per_row * 32 : st_jobs;
+        jobs[j].s = j ? sh->s2 : sh->s;
+        jobs[j].groups = groups_per_row;
+      }
+      pack_s8_vnni_many(jobs, n);
+      pack_s8_vnni(whole, rows_copy, sh->rows, sh->cols, (size_t)sh->cols);
+      pack_s8_scales_t(st_whole, dense, sh->rows, groups_per_row, 0, (sh->rows + 15) / 16);
+      assert(!memcmp(via_jobs, whole, pbytes) && !memcmp(st_jobs, st_whole, tbytes));
+      free(via_jobs), free(whole), free(rows_copy), free(st_jobs), free(st_whole), free(dense);
+    }
+  }
+  for (int s = 0; s < sockets; s++)
+    for (int t = 0; t < 2; t++)
+      region_release(&region[s][t]);
+  region_release(&global);
+  shards_free(&set);
+  manifest_free(&m);
+  close(fd);
+  for (int i = 0; i < MEM_COUNT; i++)
+    assert(memory_current[i] == 0);
+}
+
+/* The rule that picks the rows: only Q8 shards of the seven large matrices, rounded down to whole 32-row steps, at most 15/16
+ * of the rows, none for a zero fraction; and the DDR bytes grow with the fraction while the HBM bytes fall. */
+static void test_split_rule(void) {
+  Config config = make_config(128, 256, 2, 4, 2, 64, 1);
+  TensorManifest m;
+  manifest_build(&m, &config, 1, 32, HEADER);
+  ShardSet set;
+  shards_plan(&set, &m, &config, 2, 32);
+  size_t previous[2] = {SIZE_MAX, 0}, bytes[2][2];
+  for (unsigned ppm = 0; ppm <= 900000; ppm += 100000) {
+    shards_place(&set, config.n_layers, 0, 0, ppm, bytes);
+    assert(bytes[0][0] <= previous[0] && bytes[0][1] >= previous[1]);
+    previous[0] = bytes[0][0], previous[1] = bytes[0][1];
+    for (int i = 0; i < set.count; i++) {
+      const Shard *sh = &set.t[i];
+      int rows = sh->ddr_rows;
+      if (sh->kind == SHARD_COPY || sh->kind == SHARD_GLOBAL || sh->src->role == T_WCLS) {
+        assert(!rows);
+        continue;
+      }
+      assert(rows == shards_ddr_rows(sh, ppm) && rows % 32 == 0 && rows <= sh->rows * 15 / 16);
+      assert(rows <= (int)((long long)sh->rows * ppm / 1000000));
+      assert(!ppm || (long long)sh->rows * ppm / 1000000 - rows < 32 || rows == (sh->rows * 15 / 16) / 32 * 32);
+    }
+  }
+  shards_place(&set, config.n_layers, 0, 0, 0, bytes);
+  size_t whole[2] = {bytes[0][0], bytes[0][1]};
+  shards_place(&set, config.n_layers, 0, 0, 500000, bytes);
+  /* splitting moves bytes, up to 4 lines of alignment slack per split shard (two parts, values and scales) */
+  assert(bytes[0][0] + bytes[0][1] >= whole[0] - 64 * 1000 && bytes[0][1] > whole[1]);
+  shards_place(&set, config.n_layers, 0, 0, 0, bytes);
+  shards_free(&set);
+  manifest_free(&m);
+  /* FP32 shards are never split */
+  manifest_build(&m, &config, 0, 0, HEADER);
+  shards_plan(&set, &m, &config, 2, 0);
+  shards_place(&set, config.n_layers, 0, 0, 900000, bytes);
+  for (int i = 0; i < set.count; i++)
+    assert(!set.t[i].ddr_rows);
+  shards_free(&set);
+  manifest_free(&m);
+}
+
 static void expect_rejected(const Config *p, int quantized, int gs, int sockets, int plan_gs, const char *text) {
   TensorManifest m;
   manifest_build(&m, p, quantized, gs, HEADER);
@@ -411,6 +593,15 @@ int main(int argc, char **argv) {
   assert(shards_plan_try(&set, &m, &groups_split, 2, 0, err, sizeof(err)) == 0);
   shards_free(&set);
   manifest_free(&m);
+  test_split_rule();
+  for (int sockets = 1; sockets <= 2; sockets++)
+    for (int threads = 1; threads <= 3; threads += 2)
+      for (int gs = 32; gs <= 64; gs *= 2)
+        for (int step = 0; step < 3; step++)
+          for (int cls = 0; cls < 2; cls++) {
+            run_split_case(sockets, threads, gs, step == 0 ? 0u : step == 1 ? 500000u : 900000u, cls);
+            count++;
+          }
   printf("shards: %d reconstruction cases ok\n", count);
   return 0;
 }

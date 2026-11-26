@@ -478,11 +478,22 @@ static void q8_dots(K8Weight w, size_t ld, int row, int rows, const K8Input *x, 
   }
 }
 
+/* A segment's weights may live in two places (LLAMA_HYBRID_SPLIT=rows): output rows [0, split) are read through w/w3,
+ * rows [split, d) through w_hi/w3_hi, whose row 0 is row `split` of the matrix. split == d: one place, as always. */
 typedef struct {
   float *out;
-  K8Weight w, w3;
-  int d;
+  K8Weight w, w3, w_hi, w3_hi;
+  int d, split;
 } Q8Segment;
+
+static Q8Segment q8_seg(float *out, K8Weight w, K8Weight w3, int d) {
+  return (Q8Segment){.out = out, .w = w, .w3 = w3, .d = d, .split = d};
+}
+static Q8Segment q8_seg_rows(float *out, K8Rows w, K8Rows w3, int d) {
+  if (w.split < 0 || w.split > d || (w3.hi.q && w3.split != w.split))
+    fail("q8 row split %d of %d rows is invalid (the paired matrix splits at %d)", w.split, d, w3.split);
+  return (Q8Segment){.out = out, .w = w.lo, .w3 = w3.lo, .w_hi = w.hi, .w3_hi = w3.hi, .d = d, .split = w.split};
+}
 typedef struct {
   const K8Input *x;
   int n, gs, kind, count;
@@ -495,16 +506,18 @@ typedef struct {
 /* The row loop of one range, from block `rot` (counted from r0) round to block rot - 1. Every block is the same BLOCK
  * rows at the same offset from r0 as in the unrotated loop and writes its own outputs, so the results are bitwise those of
  * rot = 0; only the order in which the blocks are read changes. */
-static void q8_blocks(const Q8Job *job, const Q8Segment *seg, int r0, int r1, int rot) {
+static void q8_blocks(const Q8Job *job, const Q8Segment *seg, int r0, int r1, int rot, int hi) {
   float dots[BLOCK], gates[BLOCK];
+  const K8Weight w = hi ? seg->w_hi : seg->w, w3 = hi ? seg->w3_hi : seg->w3;
+  const int base = hi ? seg->split : 0; /* the first row of the place the weights are read from */
   size_t ld = job->ld ? job->ld : (size_t)job->n;
   int blocks = (r1 - r0 + BLOCK - 1) / BLOCK;
   for (int k = 0; k < blocks; k++) {
     int i = r0 + (k + rot < blocks ? k + rot : k + rot - blocks) * BLOCK;
     int rows = r1 - i < BLOCK ? r1 - i : BLOCK;
-    q8_dots(seg->w, ld, i, rows, job->x, job->n, job->gs, dots);
+    q8_dots(w, ld, i - base, rows, job->x, job->n, job->gs, dots);
     if (job->kind == SWIGLU)
-      q8_dots(seg->w3, ld, i, rows, job->x, job->n, job->gs, gates);
+      q8_dots(w3, ld, i - base, rows, job->x, job->n, job->gs, gates);
     for (int r = 0; r < rows; r++) {
       if (job->kind == ADD)
         seg->out[i + r] += dots[r];
@@ -518,8 +531,12 @@ static void q8_blocks(const Q8Job *job, const Q8Segment *seg, int r0, int r1, in
     job->done(job->done_ctx, r0, r1);
 }
 
+/* Rows [r0, r1) of a segment, each place's rows on their own (a block of rows never spans the split). */
 static void q8_range(const Q8Job *job, const Q8Segment *seg, int r0, int r1) {
-  q8_blocks(job, seg, r0, r1, 0);
+  if (r0 < seg->split)
+    q8_blocks(job, seg, r0, r1 < seg->split ? r1 : seg->split, 0, 0);
+  if (r1 > seg->split)
+    q8_blocks(job, seg, r0 > seg->split ? r0 : seg->split, r1, 0, 1);
 }
 
 static void q8_rows(const void *p, int r0, int r1) {
@@ -557,13 +574,56 @@ int k_gemv_stagger_active(void) {
   return gemv_stagger;
 }
 
+/* LLAMA_HYBRID_DDR_CORES: how many members of a team serve the rows of a split segment that live in DDR (the last ones;
+ * the others serve the HBM rows). 0 = the default of docs/concurrent-tier-bandwidth.md E5, 14 of 56, scaled to the team. */
+static int gemv_ddr_cores;
+
+void k_gemv_ddr_cores(int n) {
+  gemv_ddr_cores = n > 0 ? n : 0;
+}
+
+int k_gemv_ddr_workers(int workers) {
+  if (workers < 2)
+    return 0;
+  int n = gemv_ddr_cores > 0 ? gemv_ddr_cores : (14 * workers + 28) / 56;
+  return n < 1 ? 1 : n > workers - 1 ? workers - 1 : n;
+}
+
+/* One member's rows of a segment whose weights live in two places. The members split into the ones that serve the
+ * HBM rows and the last k_gemv_ddr_workers() ones that serve the DDR rows, each group sharing its rows statically, so
+ * both tiers stream at once inside one team job. Every row is still computed by q8_dots alone, so the results are
+ * bitwise those of the unsplit segment. A team of one serves both places itself. */
+static void q8_team_split(const Q8Job *job, const Q8Segment *seg, int worker, int workers) {
+  int nd = k_gemv_ddr_workers(workers), nh = workers - nd;
+  int lo_rows = seg->split, hi_rows = seg->d - seg->split;
+  if (nd == 0) {
+    int r0 = (int)((long long)lo_rows * worker / workers), r1 = (int)((long long)lo_rows * (worker + 1) / workers);
+    if (r1 > r0)
+      q8_blocks(job, seg, r0, r1, 0, 0);
+    r0 = seg->split + (int)((long long)hi_rows * worker / workers);
+    r1 = seg->split + (int)((long long)hi_rows * (worker + 1) / workers);
+    if (r1 > r0)
+      q8_blocks(job, seg, r0, r1, 0, 1);
+    return;
+  }
+  int hi = worker >= nh, member = hi ? worker - nh : worker, group = hi ? nd : nh, rows = hi ? hi_rows : lo_rows;
+  int r0 = (hi ? seg->split : 0) + (int)((long long)rows * member / group);
+  int r1 = (hi ? seg->split : 0) + (int)((long long)rows * (member + 1) / group);
+  if (r1 > r0)
+    q8_blocks(job, seg, r0, r1, gemv_stagger ? member % ((r1 - r0 + BLOCK - 1) / BLOCK) : 0, hi);
+}
+
 static void q8_team_static(const Q8Job *job, int worker, int workers) {
   for (int s = 0; s < job->count; s++) {
     const Q8Segment *seg = &job->segment[s];
+    if (seg->split < seg->d) {
+      q8_team_split(job, seg, worker, workers);
+      continue;
+    }
     int r0 = (int)((long long)seg->d * worker / workers), r1 = (int)((long long)seg->d * (worker + 1) / workers);
     if (r1 > r0) {
       int blocks = (r1 - r0 + BLOCK - 1) / BLOCK;
-      q8_blocks(job, seg, r0, r1, gemv_stagger ? worker % blocks : 0);
+      q8_blocks(job, seg, r0, r1, gemv_stagger ? worker % blocks : 0, 0);
     }
   }
 }
@@ -584,20 +644,40 @@ static void q8_run(Q8Job *job) {
 }
 
 void k_matmul_q8(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, STORE, 1, {{out, w, {0}, d}}, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, STORE, 1, {q8_seg(out, w, (K8Weight){0}, d)}, 0, NULL, NULL};
+  q8_run(&job);
+}
+void k_matmul_q8_rows(float *out, const K8Input *x, K8Rows w, int n, int d, int gs) {
+  Q8Job job = {x, n, gs, STORE, 1, {q8_seg_rows(out, w, (K8Rows){0}, d)}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_add(float *out, const K8Input *x, K8Weight w, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, ADD, 1, {{out, w, {0}, d}}, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, ADD, 1, {q8_seg(out, w, (K8Weight){0}, d)}, 0, NULL, NULL};
+  q8_run(&job);
+}
+void k_matmul_q8_add_rows(float *out, const K8Input *x, K8Rows w, int n, int d, int gs) {
+  Q8Job job = {x, n, gs, ADD, 1, {q8_seg_rows(out, w, (K8Rows){0}, d)}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_qkv(float *q, float *k, float *v, const K8Input *x, K8Weight wq, K8Weight wk, K8Weight wv, int n,
                      int dq, int dkv, int gs) {
-  Q8Job job = {x, n, gs, STORE, 3, {{q, wq, {0}, dq}, {k, wk, {0}, dkv}, {v, wv, {0}, dkv}}, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, STORE, 3, {q8_seg(q, wq, (K8Weight){0}, dq), q8_seg(k, wk, (K8Weight){0}, dkv),
+                                    q8_seg(v, wv, (K8Weight){0}, dkv)}, 0, NULL, NULL};
+  q8_run(&job);
+}
+void k_matmul_q8_qkv_rows(float *q, float *k, float *v, const K8Input *x, K8Rows wq, K8Rows wk, K8Rows wv, int n,
+                          int dq, int dkv, int gs) {
+  K8Rows none = {0};
+  Q8Job job = {x, n, gs, STORE, 3, {q8_seg_rows(q, wq, none, dq), q8_seg_rows(k, wk, none, dkv),
+                                    q8_seg_rows(v, wv, none, dkv)}, 0, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_swiglu(float *out, const K8Input *x, K8Weight w1, K8Weight w3, int n, int d, int gs) {
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, w1, w3, d}}, 0, NULL, NULL};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {q8_seg(out, w1, w3, d)}, 0, NULL, NULL};
+  q8_run(&job);
+}
+void k_matmul_q8_swiglu_rows(float *out, const K8Input *x, K8Rows w1, K8Rows w3, int n, int d, int gs) {
+  Q8Job job = {x, n, gs, SWIGLU, 1, {q8_seg_rows(out, w1, w3, d)}, 0, NULL, NULL};
   q8_run(&job);
 }
 
@@ -640,7 +720,7 @@ void k_matmul_q8_ld(float *out, const K8Input *x, const K8Weight *w, size_t ld, 
   check_epilogue(kind, "k_matmul_q8_ld");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, NULL, NULL};
+  Q8Job job = {x, n, gs, kind, 1, {q8_seg(out, *w, (K8Weight){0}, d)}, ld, NULL, NULL};
   q8_run(&job);
 }
 void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size_t ld, int n, int d, int gs, int kind,
@@ -648,15 +728,25 @@ void k_matmul_q8_ld_worker(float *out, const K8Input *x, const K8Weight *w, size
   check_epilogue(kind, "k_matmul_q8_ld_worker");
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_ld_worker: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, kind, 1, {{out, *w, {0}, d}}, ld, done, done_ctx};
+  Q8Job job = {x, n, gs, kind, 1, {q8_seg(out, *w, (K8Weight){0}, d)}, ld, done, done_ctx};
   (void)claim; /* Q8 always splits statically (see GemvSched) */
+  q8_team_static(&job, worker, workers);
+}
+/* The same for a weight whose rows live in two places (LLAMA_HYBRID_SPLIT=rows): the members serving each place's rows. */
+void k_matmul_q8_ld_worker_rows(float *out, const K8Input *x, const K8Rows *w, size_t ld, int n, int d, int gs, int kind,
+                                int worker, int workers, atomic_int *claim, RowsDoneFn done, void *done_ctx) {
+  check_epilogue(kind, "k_matmul_q8_ld_worker_rows");
+  if (ld < (size_t)n || ld % (size_t)gs)
+    fail("k_matmul_q8_ld_worker_rows: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
+  Q8Job job = {x, n, gs, kind, 1, {q8_seg_rows(out, *w, (K8Rows){0}, d)}, ld, done, done_ctx};
+  (void)claim;
   q8_team_static(&job, worker, workers);
 }
 void k_matmul_q8_swiglu_ld(float *out, const K8Input *x, const K8Weight *w1, const K8Weight *w3, size_t ld, int n,
                            int d, int gs) {
   if (ld < (size_t)n || ld % (size_t)gs)
     fail("k_matmul_q8_swiglu_ld: row stride %zu must be at least %d and a multiple of the group size %d", ld, n, gs);
-  Q8Job job = {x, n, gs, SWIGLU, 1, {{out, *w1, *w3, d}}, ld, NULL, NULL};
+  Q8Job job = {x, n, gs, SWIGLU, 1, {q8_seg(out, *w1, *w3, d)}, ld, NULL, NULL};
   q8_run(&job);
 }
 

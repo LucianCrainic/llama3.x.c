@@ -107,6 +107,20 @@ prefill weights to DDR. The two layer controls accept `auto` or an exact count o
 `LLAMA_HYBRID_PACKED=hbm|ddr` applies only with packed prefill. Auto commits exact layer counts first, then prioritizes
 the classifier, original weights, and KV in that order. Each layer choice is symmetric across TP sockets.
 
+`LLAMA_HYBRID_SPLIT=layers|rows` (default `layers`, today's serial layer split) chooses what `hybrid` splits. With `rows`
+(Q8 checkpoints; [concurrent-tiers.md](concurrent-tiers.md)) every layer's weights are in HBM except the last rows of each
+large matrix (Wq, Wk, Wv, Wo, W1, W3, W2), which sit in the socket's DDR arena, and the decode GEMV serves both tiers
+at once inside one team job. Output is bitwise that of the unsplit weights.
+
+- `LLAMA_HYBRID_DDR_FRACTION=auto|x`: the share of each matrix's per-socket output rows in DDR, `0 <= x <= 0.9` (rounded
+  down to 32 rows per matrix). `auto` (default with `rows`) takes the smallest fraction at which HBM fits its budget, and
+  0.2 (the measured balance of the P1 study) when everything fits anyway.
+- `LLAMA_HYBRID_DDR_CORES=n`: the last `n` members of each socket's team serve the DDR rows (default 14 of 56, scaled to
+  the team, at least 1; `1 <= n < threads`).
+- With `rows`, `LLAMA_HYBRID_WEIGHTS_HBM_LAYERS` is refused, the classifier defaults to HBM, and `auto` KV layers stay all
+  in HBM when the fraction is `auto`. `rows` needs `LLAMA_PLACEMENT=hybrid` and a Q8 checkpoint; the two other knobs need
+  `rows`. The plan and report carry `split`, `ddr_fraction`, `ddr_fraction_auto` and `ddr_cores`.
+
 `LLAMA_HBM_BUDGET_GIB` defaults to 56 per socket. `LLAMA_DDR_BUDGET_GIB` optionally lowers the DDR ceiling. Both
 tiers account for rounded arena bytes and full configured KV capacity. Use `--plan-only` to print the plan as JSON
 without reading weight payloads, starting teams, or loading a tokenizer. With `--json PATH`, the plan is in the report's

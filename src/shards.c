@@ -149,8 +149,11 @@ static size_t align_up(size_t value) {
   return checked_add(value, SHARD_ALIGN - 1) & ~(size_t)(SHARD_ALIGN - 1);
 }
 
+static size_t value_bytes_rows(const Shard *sh, int rows) {
+  return checked_mul(checked_mul((size_t)rows, (size_t)sh->cols), sh->src->dtype == DT_Q8 ? 1 : sizeof(float));
+}
 static size_t value_bytes(const Shard *sh) {
-  return checked_mul(checked_mul((size_t)sh->rows, (size_t)sh->cols), sh->src->dtype == DT_Q8 ? 1 : sizeof(float));
+  return value_bytes_rows(sh, sh->rows);
 }
 /* Scales per row of a shard: its groups, or the row's one scale when a group spans the whole row (per-channel INT8,
  * where a column shard keeps that full-row scale). */
@@ -158,9 +161,11 @@ static int shard_groups(const Shard *sh) {
   const TensorDesc *t = sh->src;
   return t->group_size == t->cols ? 1 : sh->cols / t->group_size;
 }
+static size_t scale_bytes_rows(const Shard *sh, int rows) {
+  return sh->src->dtype == DT_Q8 ? checked_mul(checked_mul((size_t)rows, (size_t)shard_groups(sh)), sizeof(float)) : 0;
+}
 static size_t scale_bytes(const Shard *sh) {
-  return sh->src->dtype == DT_Q8 ? checked_mul(checked_mul((size_t)sh->rows, (size_t)shard_groups(sh)), sizeof(float))
-                                 : 0;
+  return scale_bytes_rows(sh, sh->rows);
 }
 
 static int reject(char *err, size_t err_size, const char *format, ...) __attribute__((format(printf, 3, 4)));
@@ -319,10 +324,33 @@ void shards_bind(ShardSet *set, void *const socket_base[2], void *global_base) {
 }
 
 /* Reassign offsets within each socket's per-tier arena. The embedding keeps its separate global area. */
-void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, size_t bytes[2][2]) {
+int shards_ddr_rows(const Shard *sh, unsigned ddr_ppm) {
+  if (!ddr_ppm || sh->src->dtype != DT_Q8 || (sh->kind != SHARD_ROWS && sh->kind != SHARD_COLS) || sh->alias)
+    return 0;
+  switch (sh->src->role) {
+  case T_WQ:
+  case T_WK:
+  case T_WV:
+  case T_WO:
+  case T_W1:
+  case T_W2:
+  case T_W3:
+    break;
+  default:
+    return 0;
+  }
+  long long rows = (long long)sh->rows * (long long)ddr_ppm / 1000000;
+  rows -= rows % SHARD_SPLIT_ALIGN;
+  long long most = (long long)sh->rows * 15 / 16;
+  return (int)(rows > most ? most - most % SHARD_SPLIT_ALIGN : rows);
+}
+
+void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_tier, unsigned ddr_ppm,
+                  size_t bytes[2][2]) {
   memset(bytes, 0, sizeof(size_t) * 4);
   for (int i = 0; i < set->count; i++) {
     Shard *sh = &set->t[i];
+    sh->ddr_rows = 0;
     if (sh->kind == SHARD_GLOBAL)
       continue;
     if (sh->kind == SHARD_COPY)
@@ -331,12 +359,22 @@ void shards_place(ShardSet *set, int hbm_layers, int classifier_tier, int norm_t
       sh->tier = classifier_tier;
     else
       sh->tier = sh->src->layer < hbm_layers ? 0 : 1;
+    if (sh->tier == 0 && sh->kind != SHARD_COPY && sh->src->role != T_WCLS)
+      sh->ddr_rows = shards_ddr_rows(sh, ddr_ppm);
+    int first = sh->rows - sh->ddr_rows;
     size_t *next = &bytes[sh->socket][sh->tier];
     sh->q_offset = align_up(*next);
-    *next = checked_add(sh->q_offset, value_bytes(sh));
+    *next = checked_add(sh->q_offset, value_bytes_rows(sh, first));
     if (sh->src->dtype == DT_Q8) {
       sh->s_offset = align_up(*next);
-      *next = checked_add(sh->s_offset, scale_bytes(sh));
+      *next = checked_add(sh->s_offset, scale_bytes_rows(sh, first));
+    }
+    if (sh->ddr_rows) { /* the last rows, in the socket's DDR arena */
+      next = &bytes[sh->socket][1];
+      sh->q2_offset = align_up(*next);
+      *next = checked_add(sh->q2_offset, value_bytes_rows(sh, sh->ddr_rows));
+      sh->s2_offset = align_up(*next);
+      *next = checked_add(sh->s2_offset, scale_bytes_rows(sh, sh->ddr_rows));
     }
   }
 }
@@ -349,6 +387,15 @@ void shards_bind_placed(ShardSet *set, void *base[2][2], void *global_base) {
       fail("planned shard area is missing or unaligned");
     sh->q = area + sh->q_offset;
     sh->s = sh->src->dtype == DT_Q8 ? (float *)(area + sh->s_offset) : NULL;
+    sh->q2 = NULL;
+    sh->s2 = NULL;
+    if (sh->ddr_rows) {
+      char *ddr = base[sh->socket][1];
+      if (!ddr || (uintptr_t)ddr % SHARD_ALIGN)
+        fail("planned DDR shard area for a row-split shard is missing or unaligned");
+      sh->q2 = ddr + sh->q2_offset;
+      sh->s2 = (float *)(ddr + sh->s2_offset);
+    }
   }
 }
 
@@ -420,10 +467,15 @@ static void cols_pack(const void *job_, int worker, int workers) {
       job->status[worker] = status;
       for (int r = a; !status && r < b; r++) {
         size_t dst_row = (size_t)(r0 + r);
-        memcpy((char *)sh->q + dst_row * sh->ld * elem,
+        /* a row-split shard keeps its last ddr_rows rows in the DDR arena */
+        int in_ddr = sh->ddr_rows && dst_row >= (size_t)(sh->rows - sh->ddr_rows);
+        size_t first = in_ddr ? (size_t)(sh->rows - sh->ddr_rows) : 0;
+        char *dq = in_ddr ? (char *)sh->q2 : (char *)sh->q;
+        float *ds = in_ddr ? sh->s2 : sh->s;
+        memcpy(dq + (dst_row - first) * sh->ld * elem,
                scratch_v + (size_t)r * job->row_value_bytes + (size_t)sh->col0 * elem, (size_t)sh->cols * elem);
         if (q8) /* the shard's groups; per-channel: the row's one scale, whatever the columns */
-          memcpy(sh->s + dst_row * (size_t)groups,
+          memcpy(ds + (dst_row - first) * (size_t)groups,
                  (const char *)(scratch_s + (size_t)r * job->row_scale_bytes) +
                      (size_t)(gs == t->cols ? 0 : sh->col0 / gs) * sizeof(float),
                  (size_t)groups * sizeof(float));
@@ -475,7 +527,7 @@ void shards_load_placed(ShardSet *set, int fd, int socket, Team *team, void *scr
   int *status = calloc((size_t)workers, sizeof(int));
 
   /* Contiguous shards first: one read of the values and one of the scales each, split among the workers. */
-  Piece *pieces = calloc((size_t)set->count * 2, sizeof(Piece));
+  Piece *pieces = calloc((size_t)set->count * 4, sizeof(Piece));
   if (!status || !pieces)
     fail("cannot allocate shard read descriptors");
   int count = 0;
@@ -489,12 +541,24 @@ void shards_load_placed(ShardSet *set, int fd, int socket, Team *team, void *scr
     const TensorDesc *t = sh->src;
     size_t elem = t->dtype == DT_Q8 ? 1 : sizeof(float);
     size_t row_values = checked_mul((size_t)t->cols, elem);
-    pieces[count++] = (Piece){t->offset + (size_t)sh->row0 * row_values, sh->q, value_bytes(sh)};
-    total += value_bytes(sh);
+    int first = sh->rows - sh->ddr_rows;
+    pieces[count++] = (Piece){t->offset + (size_t)sh->row0 * row_values, sh->q, value_bytes_rows(sh, first)};
+    total += value_bytes_rows(sh, first);
+    if (sh->ddr_rows) {
+      pieces[count++] = (Piece){t->offset + (size_t)(sh->row0 + first) * row_values, sh->q2,
+                                value_bytes_rows(sh, sh->ddr_rows)};
+      total += value_bytes_rows(sh, sh->ddr_rows);
+    }
     if (t->dtype == DT_Q8) {
       size_t row_scales = checked_mul((size_t)(t->cols / t->group_size), sizeof(float));
-      pieces[count++] = (Piece){t->scale_offset + (size_t)sh->row0 * row_scales, (char *)sh->s, scale_bytes(sh)};
-      total += scale_bytes(sh);
+      pieces[count++] = (Piece){t->scale_offset + (size_t)sh->row0 * row_scales, (char *)sh->s,
+                                scale_bytes_rows(sh, first)};
+      total += scale_bytes_rows(sh, first);
+      if (sh->ddr_rows) {
+        pieces[count++] = (Piece){t->scale_offset + (size_t)(sh->row0 + first) * row_scales, (char *)sh->s2,
+                                  scale_bytes_rows(sh, sh->ddr_rows)};
+        total += scale_bytes_rows(sh, sh->ddr_rows);
+      }
     }
   }
   RowsJob rows = {.fd = fd, .pieces = pieces, .count = count, .total = total, .status = status};

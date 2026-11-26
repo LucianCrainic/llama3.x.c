@@ -650,6 +650,127 @@ static void test_gemv_stagger(void) {
       }
 }
 
+/* LLAMA_HYBRID_SPLIT=rows: a weight whose last rows live in a second allocation (the DDR arena) gives bitwise the output
+ * of the same weight in one piece, in every fused form and epilogue, at every split (also the ends), with and without
+ * the stagger, through the team-less path and through the per-member entry point for every team size and number of
+ * members serving the second place; every row is reported done exactly once. */
+static void test_gemv_rows(void) {
+  const int n = 256, rows[] = {32, 64, 100, 257};
+  for (int gs = 32; gs <= 64; gs *= 2)
+    for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++)
+      for (int mode = 0; mode < 2; mode++) {
+        const int d = rows[r], groups = n / gs;
+        float *x = zeroed(n, sizeof(float)), *ws = zeroed((size_t)2 * d * groups, sizeof(float));
+        int8_t *wq = zeroed((size_t)2 * d * n, 1), *xq = zeroed(n, 1);
+        float *xs = zeroed(groups, sizeof(float));
+        fill(x, n, 3);
+        for (size_t i = 0; i < (size_t)2 * d * n; i++)
+          wq[i] = (int8_t)(uniform() * 127.0f);
+        for (int i = 0; i < 2 * d * groups; i++)
+          ws[i] = 0.001f + 0.01f * fabsf(uniform());
+        k_quantize(xq, xs, x, n, gs);
+        K8Input in = mode ? (K8Input){NULL, NULL, x} : (K8Input){xq, xs, x};
+        K8Weight whole[2] = {{wq, ws}, {wq + (size_t)d * n, ws + (size_t)d * groups}};
+        float *want[4];
+        for (int k = 0; k < 4; k++) {
+          want[k] = zeroed(d, sizeof(float));
+          for (int i = 0; i < d; i++)
+            want[k][i] = 0.25f * (float)(i % 7);
+        }
+        k_matmul_q8(want[0], &in, whole[0], n, d, gs);
+        k_matmul_q8_add(want[1], &in, whole[0], n, d, gs);
+        k_matmul_q8_swiglu(want[2], &in, whole[0], whole[1], n, d, gs);
+        k_matmul_q8_ld(want[3], &in, &whole[1], (size_t)n, n, d, gs, K_PARTIAL);
+        int splits[] = {0, 32, d / 2 / 32 * 32, d - 32, d};
+        for (size_t si = 0; si < sizeof(splits) / sizeof(*splits); si++) {
+          const int h = splits[si];
+          /* the rows from h on, copied to their own allocations, so a wrong base or row index reads other bytes */
+          K8Rows rw[2];
+          int8_t *hq[2];
+          float *hs[2];
+          for (int m = 0; m < 2; m++) {
+            hq[m] = zeroed((size_t)(d - h) * n + 64, 1);
+            hs[m] = zeroed((size_t)(d - h) * groups + 16, sizeof(float));
+            memcpy(hq[m], whole[m].q + (size_t)h * n, (size_t)(d - h) * n);
+            memcpy(hs[m], whole[m].s + (size_t)h * groups, (size_t)(d - h) * groups * sizeof(float));
+            rw[m] = (K8Rows){.lo = whole[m], .hi = {hq[m], hs[m]}, .split = h};
+          }
+          for (int on = 0; on < 2; on++) {
+            k_gemv_stagger(on);
+            float *got[3];
+            for (int k = 0; k < 3; k++) {
+              got[k] = zeroed(d, sizeof(float));
+              for (int i = 0; i < d; i++)
+                got[k][i] = 0.25f * (float)(i % 7);
+            }
+            k_matmul_q8_rows(got[0], &in, rw[0], n, d, gs);
+            k_matmul_q8_add_rows(got[1], &in, rw[0], n, d, gs);
+            k_matmul_q8_swiglu_rows(got[2], &in, rw[0], rw[1], n, d, gs);
+            for (int k = 0; k < 3; k++) {
+              checks++;
+              if (memcmp(got[k], want[k], (size_t)d * sizeof(float)) && failures++ < 20)
+                fprintf(stderr, "gemv rows [%s]: form %d d=%d split=%d gs=%d stagger=%d differs from the unsplit result\n",
+                        current, k, d, h, gs, on);
+            }
+            /* qkv: three projections of one input, each split at its own place */
+            float *qkv = zeroed(3 * (size_t)d, sizeof(float)), *qkv_want = zeroed(3 * (size_t)d, sizeof(float));
+            k_matmul_q8_qkv_rows(qkv, qkv + d, qkv + 2 * d, &in, rw[0], rw[1], rw[0], n, d, d, gs);
+            k_matmul_q8_qkv(qkv_want, qkv_want + d, qkv_want + 2 * d, &in, whole[0], whole[1], whole[0], n, d, d, gs);
+            checks++;
+            if (memcmp(qkv, qkv_want, 3 * (size_t)d * sizeof(float)) && failures++ < 20)
+              fprintf(stderr, "gemv rows [%s]: qkv d=%d split=%d gs=%d differs\n", current, d, h, gs);
+            free(qkv), free(qkv_want);
+            for (int workers = 1; workers <= 9; workers += 2)
+              for (int cores = 0; cores <= 4; cores += 2) {
+                k_gemv_ddr_cores(cores);
+                float *serial = zeroed(d, sizeof(float));
+                int *seen = zeroed(d, sizeof(int));
+                for (int worker = 0; worker < workers; worker++)
+                  k_matmul_q8_ld_worker_rows(serial, &in, &rw[1], (size_t)n, n, d, gs, K_PARTIAL, worker, workers, NULL,
+                                             count_rows, seen);
+                checks++;
+                if (memcmp(serial, want[3], (size_t)d * sizeof(float)) && failures++ < 20)
+                  fprintf(stderr, "gemv rows [%s]: worker entry d=%d split=%d workers=%d cores=%d differs\n", current, d,
+                          h, workers, cores);
+                for (int i = 0; i < d; i++) {
+                  checks++;
+                  if (seen[i] != 1 && failures++ < 20)
+                    fprintf(stderr, "gemv rows [%s]: row %d reported %d times (d=%d split=%d workers=%d cores=%d)\n",
+                            current, i, seen[i], d, h, workers, cores);
+                }
+                free(serial), free(seen);
+              }
+            k_gemv_ddr_cores(0);
+            k_gemv_stagger(0);
+            for (int k = 0; k < 3; k++)
+              free(got[k]);
+          }
+          for (int m = 0; m < 2; m++)
+            free(hq[m]), free(hs[m]);
+        }
+        for (int k = 0; k < 4; k++)
+          free(want[k]);
+        free(x), free(ws), free(wq), free(xq), free(xs);
+      }
+  /* The members that serve the DDR rows: the default scales 14 of 56 to the team, an explicit count is clamped to leave
+   * at least one member for the HBM rows, and a team of one serves both places itself. */
+  checks += 5;
+  if ((k_gemv_ddr_workers(56) != 14 || k_gemv_ddr_workers(1) != 0 || k_gemv_ddr_workers(2) != 1 ||
+       k_gemv_ddr_workers(8) != 2 || k_gemv_ddr_workers(112) != 28) &&
+      failures++ < 20)
+    fprintf(stderr, "gemv rows [%s]: default DDR members %d %d %d %d %d\n", current, k_gemv_ddr_workers(56),
+            k_gemv_ddr_workers(1), k_gemv_ddr_workers(2), k_gemv_ddr_workers(8), k_gemv_ddr_workers(112));
+  k_gemv_ddr_cores(100);
+  checks++;
+  if (k_gemv_ddr_workers(56) != 55 && failures++ < 20)
+    fprintf(stderr, "gemv rows [%s]: explicit count not clamped (%d)\n", current, k_gemv_ddr_workers(56));
+  k_gemv_ddr_cores(20);
+  checks++;
+  if (k_gemv_ddr_workers(56) != 20 && failures++ < 20)
+    fprintf(stderr, "gemv rows [%s]: explicit count 20 gave %d\n", current, k_gemv_ddr_workers(56));
+  k_gemv_ddr_cores(0);
+}
+
 static void test_partial(void) {
   test_partial_f32();
   test_partial_q8();
@@ -1756,6 +1877,7 @@ int main(int argc, char **argv) {
       test_attention_amx(pool_team(0));
       test_partial();
       test_gemv_stagger();
+      test_gemv_rows();
       test_row_parallel();
       k_gemv_force_hybrid(1); /* the hybrid split of large FP32 jobs, on these small matrices */
       test_f32();
