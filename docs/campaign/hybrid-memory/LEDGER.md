@@ -238,3 +238,12 @@ the mirror's file list and sizes match it.
   but the min0 control 7.220 did **not** pause (0/6 runs idle > 0.1 s), against 4/4 paused runs under
   hybrid-campaign.sbatch in 5950121. Suspect: something the campaign script runs next to the engine; analysis
   delegated. Gate 5950966 on 813d222 (hbm14). P4 synthetic cells stay held.
+- **Correction (manager re-read):** the min0 control of 5950963 did pause, in its prefill (6.34 s against 0.70-0.82 s in
+  the other 5 runs; TTFT 6.40 s). Per-0.5 s /proc samples show one all-CPU kernel-mode span (sys ~80% of ticks, all
+  threads R, no vmstat counter moving) in every run of 5950963, 5950121 and the 8B hbm01 jobs: 6.5-14 s long, starting
+  3.4-10.3 s after the first forward; not script-, perf-, node- or data-specific. Cause open (needs root for stacks).
+  The fix is validated: min30 put the span in the primer in 3/3 runs (prefill 0.81-0.82 s, decode 7.188-7.230,
+  slowest step <= 0.19 s). Docs correction 888e676.
+- **Consequence for TTFT cells:** a short default-build run can have the span inside its timed prefill (70B 6.4 s TTFT
+  against 0.8 s). Every TTFT cell must pass the pause scan on its prefill window; a guard for the default build is a
+  design question for P4 (opt-in only).
