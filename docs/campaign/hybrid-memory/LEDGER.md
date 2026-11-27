@@ -247,3 +247,17 @@ the mirror's file list and sizes match it.
 - **Consequence for TTFT cells:** a short default-build run can have the span inside its timed prefill (70B 6.4 s TTFT
   against 0.8 s). Every TTFT cell must pass the pause scan on its prefill window; a guard for the default build is a
   design question for P4 (opt-in only).
+
+## P4 C1/C2/C7 verified (27 Nov)
+
+- 5950121 (hbm13, 47c08fb, 2:02:25, 64 runs, 0 failed, traces equal, placement PASS). Manager re-derived all 14 cell
+  medians from raw JSON; all equal the agent's table. Decode (clean, real fills): c1 hyb80 d4096 10.51 [10.41-10.52]
+  (0.95 of calibrated ceiling), d32768 7.20 (0.89); c2 ddr d4096 5.89 (0.98), d32768 4.65 (0.95). CAS bytes per token
+  at 32768 ~13% above weights + K/V (96 vs 84.6 GB, derived, unexplained: open item).
+- c1 at 65536 is not admitted by the planner (K/V + BF16 copy 9.6 GB over the 56 GiB budget): the all-HBM baseline ends
+  below 65536. Synthetic cells of this job void (old build).
+- TTFT: pause inside the timed prefill of all t8192 and avx512 runs (0/18 clean) and 2/5 c7 amx t2048. Clean t2048:
+  c1 6.556 (3/3), c2 ddr 6.210 (2/3), c7 amx 7.038 (3/5). Decision (manager): opt-in LLAMA_BENCH_PREWARM_SECONDS
+  (feature/bench-prewarm, bitwise-equivalence test required), TTFT cells rerun with it; cold-process TTFT reported
+  separately.
+- Running: 5962577 (hbm13: c3, c4, synthetic reruns; tree 787a714), 5962578 (hbm14: c6). ~11 of 40 node-h committed.
