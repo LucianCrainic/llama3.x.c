@@ -235,6 +235,59 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(summary.collect([temp], 0.05), [])
 
 
+FAKE_PLANNER = """#!/usr/bin/env bash
+# a planner that admits up to FAKE_LIMIT K/V layers in HBM: writes the --plan-only report to the path after --json
+set -u
+out=
+while [ $# -gt 0 ]; do [ "$1" = --json ] && out=$2; shift; done
+if [ "${LLAMA_HYBRID_KV_HBM_LAYERS:-0}" -le "${FAKE_LIMIT:-0}" ]; then ok=true; else ok=false; fi
+printf '{"placement_plan": {"admitted": %s, "kv_hbm_layers": %s}}\\n' "$ok" "${LLAMA_HYBRID_KV_HBM_LAYERS:-0}" > "$out"
+[ "$ok" = true ] || exit 1
+"""
+
+
+class KvFitTests(unittest.TestCase):
+    def test_largest_admitted(self):
+        for limit in (0, 1, 37, 79, 80):
+            self.assertEqual(summary.largest_admitted(lambda n, k=limit: n <= k, 0, 80), limit)
+        self.assertEqual(summary.largest_admitted(lambda n: n <= 3, 0, 1), 1)
+        with self.assertRaises(ValueError):
+            summary.largest_admitted(lambda n: False, 0, 80)
+
+    def resolve(self, limit, layers=80, env='FAKE_LIMIT=%d LLAMA_HYBRID_KV_HBM_LAYERS=@KVFIT@ LLAMA_HYBRID_DDR_FRACTION=0.28'):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = Path(temp)/'runq'
+            engine.write_text(FAKE_PLANNER)
+            engine.chmod(0o755)
+            out = Path(temp)/'cell.kvfit'
+            code, text = run_summary('--kvfit', '--engine', engine, '--checkpoint', 'ckpt', '--context', 98560, '--layers', layers,
+                                     '--env-line', env % limit, '--out', out)
+            files = sorted(p.name for p in Path(temp).glob('cell.kvfit*'))
+            plan = json.loads((Path(temp)/'cell.kvfit.json').read_text()) if code == 0 else None
+            record = out.read_text().splitlines() if code == 0 else None
+        return code, text.strip(), plan, record, files
+
+    def test_kvfit_finds_the_largest_admitted_count_with_a_fake_planner(self):
+        for limit in (0, 28, 46, 62, 79, 80):
+            code, text, plan, record, _ = self.resolve(limit)
+            self.assertEqual((code, text), (0, str(limit)))
+            self.assertEqual(plan['placement_plan']['kv_hbm_layers'], limit)  # the plan of the answer is kept
+            self.assertEqual(record[0], str(limit))
+            probes = json.loads(record[1])
+            self.assertLessEqual(len(probes), 9)  # a bisection of 80 layers, not a scan
+            self.assertTrue(probes[str(limit)])
+            self.assertFalse(probes.get(str(limit + 1), False))
+
+    def test_kvfit_fails_when_nothing_is_admitted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = Path(temp)/'runq'
+            engine.write_text('#!/usr/bin/env bash\nexit 1\n')
+            engine.chmod(0o755)
+            code, _ = run_summary('--kvfit', '--engine', engine, '--checkpoint', 'c', '--context', 1, '--env-line',
+                                  'LLAMA_HYBRID_KV_HBM_LAYERS=@KVFIT@', '--out', Path(temp)/'x')
+        self.assertEqual(code, 1)
+
+
 class PredictTests(unittest.TestCase):
     def test_prediction_matches_the_ceiling_of_the_same_plan(self):
         r = report(40.0, plan('hybrid', 32, 32, 'rows', 0.2, 14), warm=4096)
@@ -291,14 +344,15 @@ class ScriptTests(unittest.TestCase):
         self.assertIn('setting auto-min: LLAMA_PLACEMENT=hybrid', text)
         self.assertIn('HC_PERF=min HC_TOPO=auto', text)
 
-    def test_c4g_grid_expansion(self):
+    def test_c4g_cells_expand_to_fit_match_and_anchor(self):
         text = self.dry_run('c4g').stdout
         settings = [l.split()[1].rstrip(':') for l in text.splitlines() if l.startswith('  setting ')]
-        self.assertEqual(settings, ['serial-w80', 'rows-kvmatch-c8-f0.15', 'rows-kvmatch-c12-f0.15', 'rows-kvmatch-c12-f0.2',
-                                    'rows-kvmatch-c16-f0.2', 'rows-kvmatch-c16-f0.28'])
-        self.assertIn('setting rows-kvmatch-c12-f0.2: LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_PACKED=ddr '
-                      'LLAMA_HYBRID_SPLIT=rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=0.2 '
-                      'LLAMA_HYBRID_DDR_CORES=12', text)
+        self.assertEqual(settings, ['serial-w80', 'rows-kvfit-c16-f0.28', 'rows-kvfit-c8-f0.15', 'rows-kvmatch-c16-f0.28',
+                                    'rows-kvmatch-c8-f0.15'])
+        self.assertIn('setting rows-kvfit-c16-f0.28: LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_PACKED=ddr '
+                      'LLAMA_HYBRID_SPLIT=rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVFIT@ LLAMA_HYBRID_DDR_FRACTION=0.28 '
+                      'LLAMA_HYBRID_DDR_CORES=16', text)
+        self.assertIn('LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=0.15 LLAMA_HYBRID_DDR_CORES=8', text)
         measurements = [l for l in text.splitlines() if l.startswith('  measurement')]
         self.assertEqual(len(measurements), 2)
         for line, name in zip(measurements, ('d98304s', 'd131072s')):
@@ -307,7 +361,7 @@ class ScriptTests(unittest.TestCase):
             self.assertIn('reps=5', line)
             self.assertEqual(line.split('settings=')[1].split(), settings)  # serial-w80 first: its plan gives the K/V layers
         self.assertIn('warm=130816 context=131072', measurements[1])
-        self.assertIn('runs (repetitions plus one profiled run per cell, before any plan gate): 62', text)  # 6 x 2 x 5 plus one profiled serial-w80 run per context
+        self.assertIn('runs (repetitions plus one profiled run per cell, before any plan gate): 52', text)  # 5 x 2 x 5 plus the serial-w80 profile
 
     def test_one_socket_cells_are_bound_to_socket_zero(self):
         text = self.dry_run('c6').stdout

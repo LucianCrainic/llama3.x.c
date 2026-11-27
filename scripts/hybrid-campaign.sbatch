@@ -36,7 +36,8 @@
 #   c3                  70B 2S: serial hybrid against concurrent rows at 32768 (real) and 65536 (synthetic)
 #   c4                  70B 2S: serial hybrid (weights in HBM, K/V by the planner) against concurrent rows at 65536, 98304 and
 #                       131072 (synthetic); a cell the planner does not admit is recorded in skipped.tsv
-#   c4g                 70B 2S: DDR cores x fraction grid of the row split at the K/V layers of serial-w80 (98304 and 131072, synthetic)
+#   c4g                 70B 2S: row split at the model's balance points (16 cores f 0.28, 8 cores f 0.15) with the most K/V layers the planner admits,
+#                       and at serial-w80's K/V layers (control), against serial-w80 (98304 and 131072, synthetic)
 #   c6                  70B 1S: serial hybrid (twice, as the drift anchor), concurrent rows with the K/V of the whole HBM and with the
 #                       serial cell's own K/V layers, and ddr, at 32768 (synthetic; real fills of the serial cell as check) and 4096
 #   h1                  70B 2S harness check: the c1 TTFT cell under explicit or discovered topology and full or reduced perf events
@@ -167,17 +168,16 @@ select_step() {
       needs_syn=1
       ;;
     c4g)
-      # DDR cores x fraction grid of the row split at the serial cell's own K/V layers (@KVMATCH@: 37 at 98304, 28 at 131072), against serial-w80
-      # in the same job. Cells follow the diagonal where the limits model puts the balance (8 cores f 0.15, 12 f 0.2, 16 f 0.28) and its
-      # two neighbours (12 f 0.15, 16 f 0.2); dropped for the time budget: 8 f 0.2, 8 f 0.28, 12 f 0.28, 16 f 0.15 (modelled lower).
+      # Row split at the two balance points the limits model finds (16 DDR cores with fraction 0.28, 8 cores with 0.15), at the most K/V
+      # layers the planner admits with that much weight in DDR (@KVFIT@, resolved in the plan gate by a search over --plan-only), against
+      # the same cells at the serial cell's own K/V layers (@KVMATCH@: 37 at 98304, 28 at 131072; the null control) and serial-w80.
       kvref=serial-w80
       prof_only=serial-w80
       add_set serial-w80 "$hyb LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80"
-      local g c f grid="8:0.15 12:0.15 12:0.2 16:0.2 16:0.28"
-      for g in $grid; do
-        c=${g%%:*}; f=${g##*:}
-        add_set "rows-kvmatch-c$c-f$f" "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=$f LLAMA_HYBRID_DDR_CORES=$c"
-      done
+      add_set rows-kvfit-c16-f0.28 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVFIT@ LLAMA_HYBRID_DDR_FRACTION=0.28 LLAMA_HYBRID_DDR_CORES=16"
+      add_set rows-kvfit-c8-f0.15 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVFIT@ LLAMA_HYBRID_DDR_FRACTION=0.15 LLAMA_HYBRID_DDR_CORES=8"
+      add_set rows-kvmatch-c16-f0.28 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=0.28 LLAMA_HYBRID_DDR_CORES=16"
+      add_set rows-kvmatch-c8-f0.15 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=0.15 LLAMA_HYBRID_DDR_CORES=8"
       add_decode 98304 d98304s 1 "${set_names[*]}"
       add_decode 131072 d131072s 1 "${set_names[*]}"
       needs_syn=1
@@ -403,6 +403,15 @@ plan_cell() {
     [[ -s $plan ]] || { echo "kvmatch: no plan of $kvref for $meas" >&2; return 1; }
     kv=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["placement_plan"]["kv_hbm_layers"])' "$plan") || return 1
     env_line=${env_line//@KVMATCH@/$kv}
+  fi
+  if [[ $env_line == *@KVFIT@* ]]; then # the most K/V layers HBM admits with this fraction of the weight rows in DDR
+    hc_split "$env_line"
+    # shellcheck disable=SC2086
+    kv=$("$PYTHON" "$ROOT/tools/hybrid_campaign_summary.py" --kvfit --engine "$(engine_bin "${m_syn[i]}")" --checkpoint "$checkpoint" \
+      --context "${m_ctx[i]}" --layers "$layers" --env-line "${cfg_run[*]} $env_clean" --launcher "${bind[*]-}" \
+      --out "$OUT/plan/$step-$setting-$meas.kvfit") || return 1
+    env_line=${env_line//@KVFIT@/$kv}
+    printf '%s kvfit %s %s %s: %s K/V layers\n' "$(date -Is)" "$step" "$setting" "$meas" "$kv"
   fi
   printf '%s\n' "$env_line" > "$OUT/plan/$step-$setting-$meas.env"
   plan="$OUT/plan/$step-$setting-$meas"

@@ -67,6 +67,52 @@ def predict(plan_path, warm, prompt_tokens, steps):
             'ddr_byte_fraction': round(c['ddr_byte_fraction'], 4), 'mean_depth': c['depth']}
 
 
+def largest_admitted(admits, low, high):
+    """The largest n in [low, high] with admits(n) true, for an admission that holds up to a limit (more K/V layers in HBM only add
+    charge). Raises ValueError when not even `low` is admitted. Probes the top first, then bisects."""
+    if not admits(low):
+        raise ValueError(f'not even {low} is admitted')
+    if admits(high):
+        return high
+    while high - low > 1:
+        mid = (low + high) // 2
+        if admits(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def kvfit(engine, checkpoint, context, layers, env_line, launcher, out):
+    """Resolve @KVFIT@ in env_line: the most K/V layers in HBM that `--plan-only` admits. Writes OUT.json (the plan of the answer) and
+    OUT (the layer count, with the probes). The caller's LLAMA_* variables are not passed on; env_line holds every assignment."""
+    import os
+    import shlex
+    import subprocess
+    environment = {k: v for k, v in os.environ.items() if not k.startswith('LLAMA_')}
+    probes = {}
+
+    def admits(n):
+        words = shlex.split(env_line.replace('@KVFIT@', str(n)))
+        env = dict(environment, **dict(w.split('=', 1) for w in words))
+        target = f'{out}.probe{n}.json'
+        command = shlex.split(launcher or '') + [str(engine), str(checkpoint), '--context-length', str(context), '--plan-only', '--json', target]
+        done = subprocess.run(command, env=env, capture_output=True, text=True)
+        ok = False
+        if done.returncode == 0 and Path(target).exists():
+            ok = json.loads(Path(target).read_text()).get('placement_plan', {}).get('admitted') is True
+        probes[n] = ok
+        return ok
+
+    best = largest_admitted(admits, 0, layers)
+    Path(f'{out}.json').write_text(Path(f'{out}.probe{best}.json').read_text())
+    for n in probes:
+        if Path(f'{out}.probe{n}.json').exists():
+            Path(f'{out}.probe{n}.json').unlink()
+    Path(out).write_text(f'{best}\n' + json.dumps({str(k): v for k, v in sorted(probes.items())}) + '\n')
+    return best
+
+
 def interpolate_e1(cores):
     """(HBM GB/s, DDR GB/s) the P1 study measured with `cores` DDR cores (the other cores on HBM), linear between the table's rows."""
     rows = sorted((cd, bh, bd) for _, cd, bh, bd in HL.E1)
@@ -417,10 +463,25 @@ def main(argv=None):
     parser.add_argument('--warm', type=int, default=0, help='with --predict: warm-context positions')
     parser.add_argument('--prompt-tokens', type=int, default=35, help='with --predict: prompt tokens')
     parser.add_argument('--steps', type=int, default=95, help='with --predict: timed decode steps')
+    parser.add_argument('--kvfit', action='store_true', help='resolve @KVFIT@: print the most K/V layers --plan-only admits')
+    parser.add_argument('--engine')
+    parser.add_argument('--checkpoint')
+    parser.add_argument('--context', type=int)
+    parser.add_argument('--layers', type=int, default=80)
+    parser.add_argument('--env-line', default='')
+    parser.add_argument('--launcher', default='')
+    parser.add_argument('--out')
     parser.add_argument('--step')
     parser.add_argument('--guard', type=float, default=0.05)
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
+    if args.kvfit:
+        try:
+            print(kvfit(args.engine, args.checkpoint, args.context, args.layers, args.env_line, args.launcher, args.out))
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            return 1
+        return 0
     if args.predict:
         print(json.dumps(predict(args.predict, args.warm, args.prompt_tokens, args.steps)))
         return 0
