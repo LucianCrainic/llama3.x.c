@@ -29,13 +29,14 @@ def plan(mode='hbm-only', weights=32, kv=32, split=None, fraction=None, cores=No
     return p
 
 
-def report(tps, plan_, warm=4096, steps=255, synthetic=False, profile=None):
+def report(tps, plan_, warm=4096, steps=255, synthetic=False, profile=None, slow=0.05):
     return {'status': 'completed', 'stop_reason': 'generation_limit',
             'model': {'quantization_group_size': 64,
                       'configuration': {'dim': 4096, 'n_layers': 32, 'hidden_dim': 14336, 'n_kv_heads': 8, 'head_dim': 128,
                                         'vocab_size': 128256, 'shared_embeddings': False}},
             'system': {'hostname': 'node'}, 'build': {'kernels': 'amx'}, 'runtime': {'kernels_prefill': 'amx-int8'},
-            'parameters': {'warm_context': warm, 'synthetic_kv': synthetic},
+            'parameters': dict({'warm_context': warm, 'synthetic_kv': synthetic},
+                               **({'synthetic_slowest_decode_step_seconds': slow} if synthetic and slow is not None else {})),
             'tokens': {'processed_prompt': 35, 'decode_steps': steps},
             'timing_seconds': {'checkpoint_load': 0.5, 'runtime_init': 9.5, 'prefill': 0.4, 'decode': steps / tps,
                                'time_to_first_token': 0.45, 'warm_context': 3.0, 'placement_populate': 7.0},
@@ -61,9 +62,9 @@ def perf_csv(seconds=12.0, pause=None):
 
 
 def write_run(directory, label, setting, meas, rep, tps, plan_, group, warm=4096, synthetic=False, profile=None, tokens=(1, 2, 3),
-              kind='decode', prof=0, pause=None):
+              kind='decode', prof=0, pause=None, slow=0.05):
     directory = Path(directory)
-    (directory/f'{label}.json').write_text(json.dumps(report(tps, plan_, warm, 255, synthetic, profile)))
+    (directory/f'{label}.json').write_text(json.dumps(report(tps, plan_, warm, 255, synthetic, profile, slow)))
     (directory/f'{label}.perf.csv').write_text(perf_csv(pause=pause))
     (directory/f'{label}.perf-start').write_text(str(T0))
     (directory/f'{label}.end').write_text(str(T0 + int(12e9)))
@@ -189,6 +190,18 @@ class SummaryTests(unittest.TestCase):
             self.assertIn('| 3/4 | 80.50 [40.00-82.00] | 81.00 [80.00-82.00] |', text)
             self.assertIn('| c0-8b-2s | hbm-only | d4096 | 4 | 1 |', text)
 
+    def test_synthetic_run_with_a_slow_step_or_no_guard_field_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fixture(temp, [write_run(temp, 'r1-s', 'hbm-only', 'd4096s', 1, 80.0, plan('hbm-only'), 'g', synthetic=True),
+                           write_run(temp, 'r2-s', 'hbm-only', 'd4096s', 2, 40.0, plan('hbm-only'), 'g', synthetic=True, slow=12.0),
+                           write_run(temp, 'r3-s', 'hbm-only', 'd4096s', 3, 79.0, plan('hbm-only'), 'g', synthetic=True, slow=None)])
+            runs = {r['row']['label']: r for r in summary.collect([temp], 0.05)}
+            self.assertEqual([runs[k]['synthetic_bad'] for k in ('r1-s', 'r2-s', 'r3-s')], [False, True, True])
+            code, text = run_summary(temp)
+            self.assertEqual(code, 1)
+            self.assertIn('r2-s: slowest decode step 12.0 s', text)
+            self.assertIn('| 1/3 |', text)  # only the guarded run is clean
+
     def test_flag_when_a_cell_is_more_than_30_percent_from_the_model(self):
         with tempfile.TemporaryDirectory() as temp:
             fixture(temp, [write_run(temp, 'r1-c0-8b-2s-ddr-d4096', 'ddr', 'd4096', 1, 40.0, plan('ddr', 0, 0), 'g'),
@@ -254,7 +267,7 @@ class ScriptTests(unittest.TestCase):
                 if line.strip().startswith('measurement') and ('c3' in text)}
         self.assertEqual(reps['d4096'], '3')
         self.assertEqual(reps['t8192'], '5')
-        self.assertEqual(self.dry_run('c1', REPEATS='1').stdout.count('reps=1'), 6)
+        self.assertEqual(self.dry_run('c1', REPEATS='1').stdout.count('reps=1'), 5)  # the t2048 cell keeps 5 repetitions
 
     def test_one_socket_cells_are_bound_to_socket_zero(self):
         text = self.dry_run('c6').stdout

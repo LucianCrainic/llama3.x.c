@@ -17,8 +17,8 @@
 #
 # Required: ROOT (staged tree), OUT (new directory), PYTHON, STEPS (words of the steps below), and MODEL_8B / MODEL_70B (directories
 # holding int8-v3.bin and tokenizer-v2.bin) for the steps that load that model. Optional: REPEATS=3 (interleaved repetitions per
-# cell), REPEATS_AB=5 (the steps whose cells form an A/B pair: c3 c4 c6 c7), ONLY_MEAS (words: measurement names to keep, for a
-# repeat), PLAN_ONLY=1 (build, admit every cell with --plan-only, write the cell list, stop), DRY_RUN=1 (print the cells, nothing
+# cell), REPEATS_AB=5 (the steps whose cells form an A/B pair: c3 c4 c6 c7), ONLY_MEAS (words: measurement names to keep, or step:name to keep one
+# step's, for a repeat), PLAN_ONLY=1 (build, admit every cell with --plan-only, write the cell list, stop), DRY_RUN=1 (print the cells, nothing
 # else). List variables hold spaces: set them in the environment of the sbatch call, never inside --export, which splits its
 # argument on commas. Nothing here names a host, a path or a credential: locations arrive through the environment.
 #
@@ -70,7 +70,7 @@ add_decode() {
   m_prompt+=(prime); m_reps+=("${5:-$reps_default}"); m_sets+=("$4")
 }
 # add_ttft NAME PROMPT_TOKENS "SETTINGS": prefill of a prompt file of that many tokens (chat template included), no warm context
-add_ttft() {
+add_ttft() { # NAME PROMPT_TOKENS "SETTINGS" [REPS]
   m_name+=("$1"); m_kind+=(ttft); m_warm+=(0); m_ctx+=("$(ctx_for "$2")"); m_gen+=("$ttft_generation"); m_syn+=(0)
   m_prompt+=("$2"); m_reps+=("${4:-$reps_default}"); m_sets+=("$3")
 }
@@ -118,7 +118,7 @@ select_step() {
       add_decode 32768 d32768 0 hyb80
       add_decode 32768 d32768s 1 hyb80
       add_decode 65536 d65536s 1 hyb80
-      add_ttft t2048 2048 hyb80
+      add_ttft t2048 2048 hyb80 5 # 5: a TTFT run that overlaps the startup pause is dropped (tools/hybrid_campaign_summary.py)
       add_ttft t8192 8192 hyb80
       needs_syn=1
       ;;
@@ -128,7 +128,7 @@ select_step() {
       add_decode 32768 d32768 0 ddr
       add_decode 32768 d32768s 1 ddr
       add_decode 131072 d131072s 1 ddr
-      add_ttft t2048 2048 ddr
+      add_ttft t2048 2048 ddr 5
       needs_syn=1
       ;;
     c3)
@@ -140,6 +140,7 @@ select_step() {
       add_set rows-auto-c20 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=$layers LLAMA_HYBRID_DDR_CORES=20"
       add_decode 32768 d32768 0 "serial rows-f0.1-c8 rows-f0.2-c14"
       add_decode 65536 d65536s 1 "serial serial-kv80 rows-auto-c14 rows-auto-c20"
+      add_decode 32768 d32768s 1 serial "$repeats" # the synthetic check of the serial cell
       needs_syn=1
       ;;
     c4)
@@ -173,7 +174,7 @@ select_step() {
   if [[ -n ${ONLY_MEAS:-} ]]; then # keep the measurements named in ONLY_MEAS
     local k keep_name=() keep_kind=() keep_warm=() keep_ctx=() keep_gen=() keep_syn=() keep_prompt=() keep_reps=() keep_sets=()
     for ((k = 0; k < ${#m_name[@]}; k++)); do
-      [[ " $ONLY_MEAS " == *" ${m_name[k]} "* ]] || continue
+      [[ " $ONLY_MEAS " == *" ${m_name[k]} "* || " $ONLY_MEAS " == *" $step:${m_name[k]} "* ]] || continue
       keep_name+=("${m_name[k]}"); keep_kind+=("${m_kind[k]}"); keep_warm+=("${m_warm[k]}"); keep_ctx+=("${m_ctx[k]}")
       keep_gen+=("${m_gen[k]}"); keep_syn+=("${m_syn[k]}"); keep_prompt+=("${m_prompt[k]}"); keep_reps+=("${m_reps[k]}")
       keep_sets+=("${m_sets[k]}")

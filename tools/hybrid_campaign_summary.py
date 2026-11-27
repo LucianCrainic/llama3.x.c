@@ -29,8 +29,12 @@ from xengine_summary import UPI_DATA_FLIT_BYTES  # noqa: E402
 import hybrid_limits as HL  # noqa: E402
 
 IDLE_FRACTION = 0.10   # pause scan: a 100 ms sample whose HBM+DDR reads are below this fraction of the run's busy median is idle
+IDLE_MIN_SPAN_S = 0.5  # only idle spans at least this long count (a stall is seconds; the ramp of a prefill is a few samples)
 IDLE_FLAG_S = 0.3      # a run with more idle seconds than this in its measured window is excluded from the clean medians
-FLAG = 0.30            # the stop rule of the campaign: a step more than 30% from its model needs a diagnosis
+SLOW_STEP_S = 1.0      # a synthetic run whose slowest decode step is longer than this (seconds) failed: a stall landed in the window
+OUTLIER_RATIO = 1.5    # a TTFT run slower than this multiple of its cell's fastest (and by more than OUTLIER_MIN_S) is paused
+OUTLIER_MIN_S = 1.0
+FLAG = 0.30           # the stop rule of the campaign: a step more than 30% from its model needs a diagnosis
 GIB = 2 ** 30
 PHASES = ['qkv', 'wo', 'w1_w3_swiglu', 'w2', 'attention', 'classifier', 'other', 'forward']
 
@@ -151,15 +155,17 @@ def pause_scan(directory, label, report, guard, phase):
     if not bins:
         return None
     busy = statistics.median(h + d for _, _, h, d in bins)
-    idle, longest, current, last_end = 0.0, 0.0, 0.0, None
+    spans = []  # contiguous idle bins [start, end]
     for t0, t1, h, d in bins:
         if h + d < IDLE_FRACTION * busy:
-            idle += t1 - t0
-            current = current + (t1 - t0) if last_end == t0 else t1 - t0
-            longest = max(longest, current)
-        else:
-            current = 0.0
-        last_end = t1
+            if spans and abs(spans[-1][1] - t0) < 1e-6:
+                spans[-1][1] = t1
+            else:
+                spans.append([t0, t1])
+    # single idle samples at the start of a prefill (activation set-up) are not the stall: count spans of IDLE_MIN_SPAN_S or more
+    lengths = [t1 - t0 for t0, t1 in spans]
+    idle = sum(n for n in lengths if n >= IDLE_MIN_SPAN_S - 1e-9)
+    longest = max(lengths, default=0.0)
     return idle, longest, busy
 
 
@@ -214,6 +220,11 @@ def run_metrics(directory, row, counters, guard=0.05):
     run['idle_longest_s'] = None if scans['decode'] is None else scans['decode'][1]
     measured = run['idle_decode_s'] if row['kind'] == 'decode' else run['idle_prefill_s']
     run['paused'] = measured is not None and measured > IDLE_FLAG_S
+    # a synthetic run must report its slowest decode step (builds with LLAMA_SYNTHETIC_KV_MIN_SECONDS) and it must be under 1 s
+    slow = report['parameters'].get('synthetic_slowest_decode_step_seconds')
+    run['slowest_step_s'] = slow
+    run['synthetic_bad'] = bool(report['parameters'].get('synthetic_kv')) and (slow is None or slow > SLOW_STEP_S)
+    run['paused'] = run['paused'] or run['synthetic_bad']
     run['decode_ceiling'] = decode_ceiling(report) if row['kind'] == 'decode' else None
     run['ttft_ceiling'] = ttft_ceiling(report) if row['kind'] == 'ttft' else None
     return run
@@ -230,7 +241,22 @@ def collect(directories, guard):
                 if run:
                     run['directory'] = directory.name
                     runs.append(run)
+    mark_slow_outliers(runs)
     return runs
+
+
+def mark_slow_outliers(runs):
+    """A stall inside a prefill does not always show as idle memory (a TTFT run of 14.8 s among runs of 6.4-7.1 s had none): a TTFT
+    run whose prefill is OUTLIER_RATIO times the fastest of its cell, and over OUTLIER_MIN_S longer, counts as paused too."""
+    groups = {}
+    for run in runs:
+        if run['row']['kind'] == 'ttft' and run['row']['profile'] != '1':
+            groups.setdefault((run['directory'], run['row']['step'], run['row']['setting'], run['row']['meas']), []).append(run)
+    for rs in groups.values():
+        fastest = min(r['prefill_s'] for r in rs)
+        for r in rs:
+            r['slow_outlier'] = r['prefill_s'] > OUTLIER_RATIO * fastest and r['prefill_s'] - fastest > OUTLIER_MIN_S
+            r['paused'] = r['paused'] or r['slow_outlier']
 
 
 def cells(runs, profiled=False):
@@ -397,8 +423,15 @@ def main(argv=None):
         if len(lines) > 2:
             print(f'### {title}\n')
             print('\n'.join(lines) + '\n')
-    print('### Token traces\n')
     bad = 0
+    stalled = [r for r in runs if r['synthetic_bad']]
+    if stalled:
+        print('### Synthetic runs that failed the slowest-step guard (over 1 s, or the field is missing)\n')
+        for r in stalled:
+            print(f"* {r['directory']}/{r['row']['label']}: slowest decode step {r['slowest_step_s']} s")
+        print()
+        bad += 1
+    print('### Token traces\n')
     for group, traces in sorted(trace_groups(args.directory).items()):
         distinct = len(set(traces.values()))
         bad += distinct > 1
