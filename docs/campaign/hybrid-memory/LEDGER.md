@@ -247,3 +247,29 @@ the mirror's file list and sizes match it.
 - **Consequence for TTFT cells:** a short default-build run can have the span inside its timed prefill (70B 6.4 s TTFT
   against 0.8 s). Every TTFT cell must pass the pause scan on its prefill window; a guard for the default build is a
   design question for P4 (opt-in only).
+
+## P4 C1/C2/C7 verified (27 Nov)
+
+- 5950121 (hbm13, 47c08fb, 2:02:25, 64 runs, 0 failed, traces equal, placement PASS). Manager re-derived all 14 cell
+  medians from raw JSON; all equal the agent's table. Decode (clean, real fills): c1 hyb80 d4096 10.51 [10.41-10.52]
+  (0.95 of calibrated ceiling), d32768 7.20 (0.89); c2 ddr d4096 5.89 (0.98), d32768 4.65 (0.95). CAS bytes per token
+  at 32768 ~13% above weights + K/V (96 vs 84.6 GB, derived, unexplained: open item).
+- c1 at 65536 is not admitted by the planner (K/V + BF16 copy 9.6 GB over the 56 GiB budget): the all-HBM baseline ends
+  below 65536. Synthetic cells of this job void (old build).
+- TTFT: pause inside the timed prefill of all t8192 and avx512 runs (0/18 clean) and 2/5 c7 amx t2048. Clean t2048:
+  c1 6.556 (3/3), c2 ddr 6.210 (2/3), c7 amx 7.038 (3/5). Decision (manager): opt-in LLAMA_BENCH_PREWARM_SECONDS
+  (feature/bench-prewarm, bitwise-equivalence test required), TTFT cells rerun with it; cold-process TTFT reported
+  separately.
+- Running: 5962577 (hbm13: c3, c4, synthetic reruns; tree 787a714), 5962578 (hbm14: c6). ~11 of 40 node-h committed.
+- C6 5962578 (hbm14, 787a714, 1:02:27, manager-read, 5 reps, d32768): serial (w64 kv0) real 3.433 / synthetic 3.460
+  (+0.8%, fix holds, slowest step <= 0.42 s); serial-kv80 (w28 kv80) 2.975 (-14%); rows-auto-c20 (w80 kv80, f 0.643)
+  2.769 (-20%); ddr 2.480 (-28%). At 1S long context the planner default (weights HBM, K/V DDR) beats every K/V-in-HBM
+  cell; rows-kvmatch (K/V as serial) added for a fair test, queued on hbm14 after the prewarm gate.
+- Prewarm knob feature/bench-prewarm e73408d (opt-in LLAMA_BENCH_PREWARM_SECONDS): check 5962596 running (hbm14),
+  gate 5962597 queued.
+- Prewarm check 5962596 (hbm14, e73408d, 30:58, manager-read): 70B 2S TTFT S=0 vs S=30, 3 reps interleaved. amx t2048
+  5.26/5.99/5.28 vs 5.15/5.96/5.28 (pause falls in decode either way); amx t8192 33.8/37.6/32.2 vs 24.0/26.5/24.0;
+  avx512 t2048 44.6/49.7/47.1 vs 37.5/37.8/37.3. Kernel-mode spans of 7.5-12 s inside every S=0 t8192/avx512 window,
+  none with S=30. 9/9 S=30 traces identical to S=0. (Its CAS idle column is not usable for prefill: packed=ddr prefill
+  reads little HBM.) **Open:** clean amx t2048 here ~5.2 s against 6.4-7.1 s in P4 5950121 on the same engine:
+  harness difference to reconcile (P4 agent). Gate 5962597 next.
