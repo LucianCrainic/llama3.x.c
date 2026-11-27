@@ -307,3 +307,8 @@ the mirror's file list and sizes match it.
   f0.15 (null controls). Expected K/V layers 62/51 (98304), 46/38 (131072). Model (calibrated) predicts only +2.7% and
   +1.3% (98304), +2.0% and +1.0% (131072) for kvfit; the earlier +5 to +8% used the library's own layer placement, not
   the planner's. Submitted: plan 5963868 -> grid 5963869 (hbm13, afterok, ~1.9 node-h).
+- Plan 5963868 (hbm13, 0:41, manager-read): resolved kvfit K/V layers 54 (c16 f0.28) and 46 (c8 f0.15) at 98304, 40 and
+  34 at 131072: 5-8 layers below the agent's estimate (its HBM charge fit is off; question for the agent: what the
+  rows split keeps in HBM per layer). Predictions from the real plans (calibrated tok/s): 98304 serial 4.758, kvfit
+  4.839 (+1.7%) / 4.788 (+0.6%), kvmatch 4.736 / 4.735; 131072 serial 3.929, kvfit 3.980 (+1.3%) / 3.946 (+0.4%),
+  kvmatch 3.914 / 3.913. Grid 5963869 running; expected effect now at the edge of the C3/C4 run-to-run spread (<= 1%).
