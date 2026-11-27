@@ -66,18 +66,29 @@ Reading (derived from the table and the profile):
   rate, outside the concurrent part. Rows can only shuffle weight bytes into DDR, which adds DDR bytes the serial layout does not have (`rows-kvmatch` at 98304: 35.1% DDR bytes against
   24.7%) while taking 20 of the 56 cores from the HBM stream. It trades a 3 to 4% loss.
 * **The model agrees on the sign and the size.** The calibrated ceiling of the row split at its own fraction and cores is 4.31 tok/s at 98304 against 4.76 for the serial layout (-9.5%),
-  measured -3.6%. The limits model's best concurrent split (the `t_concurrent` search, `docs/plans/hybrid-limits.md`) is 48 + 8 cores with fraction 0.15 at 98304 (+5.3% over serial) and 40 + 16 cores
-  with fraction 0.28 at 131072 (+7.6%) (modelled). **Neither point was measured**: the campaign's row cells have 20 DDR cores and fraction 0.2 or the planner's. That grid is the open
-  question; the prediction is a gain of at most 5 to 8%, of the size of the run-to-run effects of P1 (3%).
+  measured -3.6%. With the planner's own layers (all 80 weight layers in HBM and 37 or 28 K/V layers) the model puts every row-split cell with the serial cell's K/V at or just below serial (4.31 to 4.74 against 4.76 at 98304),
+  because the bytes the split moves to DDR are weights that were already read at the HBM rate. The model gains only if the weight rows moved to DDR free HBM for more K/V layers: with
+  16 DDR cores and fraction 0.28 the planner admits 54 K/V layers at 98304 and 40 at 131072, which the model reads as +2.7% and +2.0% over serial (modelled); the campaign's grid job tests that.
+  The earlier figure of +5 to +8% came from the library's joint-layer placement, which is not the planner's.
 * **Stop rule.** Every C3/C4 cell is within 30% of its calibrated ceiling (0.87 to 1.02). The serial cells are 0.87 to 0.90 of it (a constant offset: the calibration anchor is
   the 611-position run; the 32768 and 65536 real cells give the same ratio). Before the correction of the concurrent formula (docs/plans/hybrid-limits.md, 27 November), the `rows-auto`
   cells at 98304 and `rows-kvmatch` at 98304 and 131072 read 0.74, 0.77 and 0.82 of the modelled value, which is why the formula was corrected; the old figure charged K/V at the HBM group's rate.
-* **The planner's capacity differs from the model's.** The limits model places 80 of 80 layers in HBM at 65536 positions (6.21 tok/s calibrated serial); the engine's planner admits only 56 K/V
-  layers (5.29 measured, 0.85), because the BF16 copy of K/V for AMX prefill takes another half of the K/V bytes. The library does not count it (a known simplification; HBM-only 80/80
-  is not admitted at 65536 either).
+* **The planner's capacity was the model's error, now fixed** (derived from the `--plan-only` reports of this campaign, section 5.3). The limits model placed 80 of 80 layers in HBM at
+  65536 positions (6.21 tok/s calibrated serial); the planner admits 56 K/V layers (5.29 measured, 0.85). The model had charged a K/V layer once; the planner charges three arenas per layer (K, V and
+  the BF16 copy of the AMX attention), sized for the whole context. With `plan_layers` the model reproduces every layer count of this campaign (section 5.3) and the serial cells read 0.92 to 0.96 of
+  the calibrated ceiling.
 
-### 5.3 What C3 and C4 do not show
+### 5.3 Planner capacity model (derived)
 
-* A grid of DDR cores (8 to 16) and fractions (0.15 to 0.30) at 98304 and 131072 positions: the model's best splits are in it.
+Each K/V layer in HBM costs three arenas of `kv_layer_bytes` (K, V and the BF16 copy), sized for the context (warm + 256 positions); weights cost the weights arena (layers, classifier and the
+5.3 MB of norms) less the DDR rows of the split (per matrix `floor(fraction x rows / 32) x 32` rows); work, exchange and logits are linear in the context. The budget is 60,129,542,144 bytes per
+socket. Against the planner's reports: all-HBM weights with 56, 37 and 28 K/V layers at 65536, 98304 and 131072; rows fraction 0.28 / 0.15 with 54 / 46 layers at 98304 and 40 / 34 at 131072
+(the grid job's resolved values, 4 of 4); 64 weight layers and none for K/V on one socket at 32768; and the smallest fractions the planner chose for "all K/V in HBM" (0.266 at 65536, 0.711 at
+98304 on two sockets, 0.643 on one), each of which fails one grid step lower. The planner charges HBM only for bytes that live in HBM: the DDR rows arena is exactly the rows moved, and the HBM
+weights arena shrinks by the same amount.
+
+### 5.4 What C3 and C4 do not show
+
+* A grid of DDR cores and fractions beyond the two balance points (that job is staged separately).
 * Real fills above 32768 positions (synthetic fills passed the slowest-step guard and equal the real fill within 1% at 32768).
 * 4096 positions (P3, cited, not rerun).

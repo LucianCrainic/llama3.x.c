@@ -73,6 +73,11 @@ def bytes_per_weight(gs):
     return 1.0 + 4.0 / gs
 
 
+def norm_bytes(m, sockets):
+    """FP32 RMS-norm weights, duplicated on every socket and part of the weights arena ((2 layers + 1) x dim x 4 bytes, 5.3 MB at 70B)."""
+    return (2 * m.layers + 1) * m.dim * 4.0
+
+
 def layer_weight_bytes(m, gs, sockets):
     return m.layer_params() * bytes_per_weight(gs) / sockets
 
@@ -113,7 +118,19 @@ E1 = [(56, 0, 569.1, 0.0), (54, 2, 542.1, 20.3), (52, 4, 518.7, 37.0), (48, 8, 4
 E1_COMBINED = {54: 562.4, 52: 555.9, 48: 554.8, 44: 537.1, 40: 542.2, 36: 521.2, 32: 483.4, 28: 501.1, 24: 434.7, 16: 375.1}
 
 HBM_BUDGET = 56 * GIB       # LLAMA_HBM_BUDGET_GIB default per socket (docs/plans/hbm-capacity-study.md section 2)
-WORK_BYTES = 0.5 * GIB      # work buffers per socket, 70B, 256-row batch: estimated in the same study (used for 8B too)
+WORK_BYTES = 0.5 * GIB      # work buffers per socket, 70B, 256-row batch: estimated in the same study (kept for models other than the 70B)
+
+# Planner capacity model (derived 28 November 2026 from the arenas of the --plan-only reports of the P4 campaign, 70B gs64: jobs 5962577, 5962578
+# and 5963868; docs/hybrid-memory-results.md section 5.3). What the planner charges to the HBM node of one socket:
+#   weights arena   weights (layers x layer + classifier) + the FP32 norms ((2 layers + 1) x dim x 4 bytes; the DDR copy is the rows split's)
+#   K/V             per layer THREE arenas of kv_layer_bytes each: kv.k, kv.v and the BF16 copy kv.bf16 (LLAMA_ATTN=amx, the default), which
+#                   is as large as K alone, so FP32 K/V costs 1.5 times its bytes; the arenas hold the CONTEXT (warm + 256 positions)
+#   work + exchange + logits   linear in the context (two plans: 520.04 MB at 98,560 positions, 584.31 MB at 131,072), twice the slope on one socket
+#   rows split      the DDR arena holds, per matrix (Wq, Wk, Wv, Wo, W1, W3, W2), floor(fraction x output rows / 32) x 32 rows of every layer
+#                   (rows_ddr_bytes: equal to the planner's arena to the megabyte for fractions 0.15, 0.2, 0.28 on two sockets and 0.643 on one); nothing else moves
+BF16_COPY_FACTOR = 0.5       # kv.bf16 / (kv.k + kv.v) for FP32 K/V
+WORK_BASE_2S = 325.2e6       # bytes: intercept of work + exchange + logits on two sockets (derived from the two plans above)
+WORK_PER_POS_2S = 1976.5     # bytes per context position on two sockets
 
 # Old calibrated model (docs/plans/hbm-capacity-study.md section 5): weight stream HBM 397 GB/s (8B W8A8 2S, 99.1 tok/s x 7.97 GB / 2),
 # DDR 238 GB/s (8B 1S DDR, 29.8 tok/s x 7.97 GB); K/V read HBM 200 GB/s (measured 186-225 on 8B 2S at 8192 and 32768 positions),
@@ -160,15 +177,63 @@ class Placement:
         return (self.Wd + self.Kd) / (self.Wh + self.Kh + self.Wd + self.Kd)
 
 
-def place(m, gs, sockets, ctx, dtype='fp32', budget=HBM_BUDGET, work=WORK_BYTES):
+def rows_ddr_bytes(m, gs, sockets, fraction):
+    """Bytes of the DDR arena of LLAMA_HYBRID_SPLIT=rows on one socket: for each of the seven matrices of a layer, the last
+    floor(fraction x output rows / 32) x 32 rows of the socket's share (output rows of Wo and W2 are all `dim`; their columns are split)."""
+    q, kv = m.heads * m.head_dim, m.kv_heads * m.head_dim
+    shapes = [(q // sockets, m.dim), (kv // sockets, m.dim), (kv // sockets, m.dim), (m.dim, q // sockets),
+              (m.hidden // sockets, m.dim), (m.hidden // sockets, m.dim), (m.dim, m.hidden // sockets)]
+    rows = sum(int(math.floor(fraction * n / 32.0)) * 32 * k for n, k in shapes)
+    return rows * bytes_per_weight(gs) * m.layers
+
+
+def work_bytes(m, sockets, alloc_ctx):
+    """Work, exchange and logits arenas of one socket for a context of alloc_ctx positions (70B: the fit above; other models: WORK_BYTES)."""
+    if m.name != '70B':
+        return WORK_BYTES
+    return WORK_BASE_2S + WORK_PER_POS_2S * alloc_ctx * 2.0 / sockets
+
+
+def kv_hbm_layer_bytes(m, sockets, alloc_ctx, dtype='fp32'):
+    """HBM bytes one K/V layer costs: K and V for alloc_ctx positions, plus the BF16 copy of the AMX attention when K/V is FP32."""
+    lk = kv_bytes_per_token(m, sockets, dtype) / m.layers * alloc_ctx
+    return lk * (1.0 + BF16_COPY_FACTOR) if dtype == 'fp32' else lk
+
+
+def plan_layers(m, gs, sockets, alloc_ctx, fraction=0.0, dtype='fp32', budget=HBM_BUDGET):
+    """The engine planner's automatic layer counts (docs/configuration.md: classifier, then weights, then K/V; each choice symmetric over the
+    sockets) for a context of alloc_ctx positions (warm context + 256). With fraction > 0 (LLAMA_HYBRID_SPLIT=rows) every weight layer is
+    in HBM except the DDR rows. Returns a dict with the weight layers and K/V layers in HBM and the HBM bytes charged, or None when even
+    the weights and work buffers do not fit."""
+    lw, cw = layer_weight_bytes(m, gs, sockets), classifier_bytes(m, gs, sockets)
+    fixed = work_bytes(m, sockets, alloc_ctx) + cw + norm_bytes(m, sockets)
+    if fraction > 0:
+        weight_layers, weights = m.layers, m.layers * lw - rows_ddr_bytes(m, gs, sockets, fraction)
+    else:
+        weight_layers = int(max(0.0, min(m.layers, (budget - fixed) // lw)))
+        weights = weight_layers * lw
+    left = budget - fixed - weights
+    if left < 0:
+        return None
+    kv_layer = kv_hbm_layer_bytes(m, sockets, alloc_ctx, dtype)
+    kv_layers = int(min(m.layers, left // kv_layer))
+    return {'weights_layers': weight_layers, 'kv_layers': kv_layers, 'hbm_bytes': fixed + weights + kv_layers * kv_layer}
+
+
+def place(m, gs, sockets, ctx, dtype='fp32', budget=HBM_BUDGET, work=None, alloc_ctx=None):
     """Whole layers (weights and K/V of the layer together) go to HBM until the budget is full; the classifier stays in HBM; the rest
     goes to DDR. Layer granularity is an approximation of the planner's two independent knobs (LLAMA_HYBRID_WEIGHTS_HBM_LAYERS and
-    LLAMA_HYBRID_KV_HBM_LAYERS): it differs from them by less than one layer of bytes."""
+    LLAMA_HYBRID_KV_HBM_LAYERS): it differs from them by less than one layer of bytes. The capacity charge is the planner's (plan_layers): the
+    K/V layer costs 1.5 times its bytes for FP32 K/V (the BF16 copy of the AMX attention), the work buffers grow with the context, and
+    alloc_ctx (default ctx) is the allocated context; the bytes read per token are those of ctx."""
     lw = layer_weight_bytes(m, gs, sockets)
     cw = classifier_bytes(m, gs, sockets)
     lk = kv_bytes_per_token(m, sockets, dtype) / m.layers * ctx
-    avail = budget - work - cw
-    n = max(0, min(m.layers, int(avail // (lw + lk))))
+    charge = kv_hbm_layer_bytes(m, sockets, alloc_ctx or ctx, dtype)
+    if work is None:
+        work = work_bytes(m, sockets, alloc_ctx or ctx)
+    avail = budget - work - cw - norm_bytes(m, sockets)
+    n = max(0, min(m.layers, int(avail // (lw + charge))))
     return Placement(n, m.layers, n * lw + cw, n * lk, (m.layers - n) * lw, (m.layers - n) * lk)
 
 

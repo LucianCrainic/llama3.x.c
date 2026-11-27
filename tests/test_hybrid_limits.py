@@ -85,7 +85,7 @@ class DecodeTests(unittest.TestCase):
                     prev = ser
 
     def test_peak_concurrent_never_beats_hbm_only_when_everything_fits(self):
-        for ctx in (4096, 32768, 65536):
+        for ctx in (4096, 32768):
             self.assertAlmostEqual(hl.t_concurrent(M70, 64, 2, ctx)[0], hl.t_hbm_only(M70, 64, 2, ctx))
 
     def test_concurrent_split_charges_kv_at_full_socket_rates(self):
@@ -128,8 +128,10 @@ class DecodeTests(unittest.TestCase):
             self.assertLess(abs(measured * t - 1), 0.15)
 
     def test_capacity(self):
-        # 70B on two sockets fits at 65,536 positions with FP32 K/V (69k edge) and spills at 131,072; one socket never holds the weights
-        self.assertTrue(hl.place(M70, 64, 2, 65536).fits)
+        # 70B on two sockets fits at 32,768 positions with FP32 K/V and its BF16 copy (46k edge) and spills at 65,536 and 131,072; BF16 K/V
+        # (no copy) fits at 131,072; one socket never holds the weights
+        self.assertTrue(hl.place(M70, 64, 2, 32768).fits)
+        self.assertFalse(hl.place(M70, 64, 2, 65536).fits)
         self.assertFalse(hl.place(M70, 64, 2, 131072).fits)
         self.assertTrue(hl.place(M70, 64, 2, 131072, 'bf16').fits)
         self.assertFalse(hl.place(M70, 64, 1, 128).fits)
@@ -139,6 +141,50 @@ class DecodeTests(unittest.TestCase):
         t = [hl.t_serial(M70, 64, 2, 131072, d) for d in ('fp32', 'bf16', 'int8')]
         self.assertGreater(t[0], t[1])
         self.assertGreater(t[1], t[2])
+
+
+class PlannerCapacityTests(unittest.TestCase):
+    """plan_layers against the engine planner's counts, read from the --plan-only reports of the P4 campaign (jobs 5962577, 5962578,
+    5963868): the allocated context is warm + 256 positions (131,072 at the limit)."""
+
+    def layers(self, sockets, ctx, fraction=0.0):
+        p = hl.plan_layers(M70, 64, sockets, ctx, fraction)
+        return p['weights_layers'], p['kv_layers']
+
+    def test_serial_counts_with_every_weight_layer_in_hbm(self):
+        self.assertEqual(self.layers(2, 65536 + 256), (80, 56))
+        self.assertEqual(self.layers(2, 98304 + 256), (80, 37))
+        self.assertEqual(self.layers(2, 131072), (80, 28))
+
+    def test_row_split_counts_of_the_grid(self):
+        self.assertEqual(self.layers(2, 98304 + 256, 0.28)[1], 54)     # job 5963868: c16 f 0.28, resolved 54
+        self.assertEqual(self.layers(2, 98304 + 256, 0.15)[1], 46)     # c8 f 0.15
+        self.assertEqual(self.layers(2, 131072, 0.28)[1], 40)
+        self.assertEqual(self.layers(2, 131072, 0.15)[1], 34)
+        # the f 0.2 control cells ran with the serial cell's 37 and 28 layers, which that fraction admits (it admits more)
+        self.assertGreaterEqual(self.layers(2, 98304 + 256, 0.2)[1], 37)
+        self.assertGreaterEqual(self.layers(2, 131072, 0.2)[1], 28)
+
+    def test_smallest_admitted_fractions_of_the_auto_cells(self):
+        # rows-auto kept every K/V layer in HBM at the smallest fraction on the planner's 0.1% grid: one step below does not fit
+        for sockets, ctx, fraction in ((2, 65536 + 256, 0.266), (2, 98304 + 256, 0.711), (1, 32768 + 256, 0.643)):
+            self.assertEqual(self.layers(sockets, ctx, fraction)[1], 80, (sockets, ctx, fraction))
+            self.assertLess(self.layers(sockets, ctx, fraction - 0.001)[1], 80, (sockets, ctx, fraction))
+        self.assertLess(self.layers(2, 131072, 0.9)[1], 80)            # not admitted at 131,072 (9.1 GB over the budget)
+
+    def test_one_socket_serial_counts(self):
+        self.assertEqual(self.layers(1, 32768 + 256), (64, 0))         # job 5962578: weights 64, K/V 0
+
+    def test_arena_bytes(self):
+        # the DDR rows arena of the plans, to the megabyte
+        for fraction, sockets, expected in ((0.2, 2, 7214e6), (0.28, 2, 10088e6), (0.15, 2, 5403e6), (0.643, 1, 46659.01056e6)):
+            self.assertAlmostEqual(hl.rows_ddr_bytes(M70, 64, sockets, fraction) / 1e6, expected / 1e6, delta=1.0)
+        self.assertAlmostEqual((hl.weight_bytes(M70, 64, 2) + hl.norm_bytes(M70, 2)) / 1e6, 36928.06, delta=0.01)   # the weights arena
+        # K/V arenas: 3 x kv_layer_bytes of the plan (201,850,880 at 98,560 positions on two sockets)
+        self.assertAlmostEqual(hl.kv_hbm_layer_bytes(M70, 2, 98560), 3 * 201850880, delta=1)
+
+    def test_bf16_copy_only_for_fp32_kv(self):
+        self.assertAlmostEqual(hl.kv_hbm_layer_bytes(M70, 2, 4096, 'fp32') / hl.kv_hbm_layer_bytes(M70, 2, 4096, 'bf16'), 3.0)
 
 
 class TtftTests(unittest.TestCase):
