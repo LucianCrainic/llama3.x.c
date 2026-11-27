@@ -319,3 +319,6 @@ the mirror's file list and sizes match it.
   rows, 1S 64/0, auto fractions 0.266/0.711/0.643); 54 unit tests pass, --check-doc passes, greps empty. 70B 2S
   HBM-resident edge with FP32 K/V + BF16 copy: 46k positions (was 69k). Open: agent quotes +2.7%/+2.0% for kvfit c16
   where the job's .pred files say +1.7%/+1.3%; reconciliation requested before the grid results are read.
+- Reconciled (48459ce, docs only): the +2.7%/+2.0% were the agent's pre-run layer guesses (62/46), not a library change.
+  96a20ed leaves the throughput formula unchanged; all ten c4g plan predictions recomputed at 96a20ed equal the job's
+  .pred files to the last digit. Predictions stand: kvfit c16 +1.7%/+1.3%, c8 +0.6%/+0.4%, kvmatch -0.4/-0.5%.
