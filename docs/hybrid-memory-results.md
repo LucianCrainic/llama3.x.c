@@ -68,7 +68,8 @@ Reading (derived from the table and the profile):
 * **The model agrees on the sign and the size.** The calibrated ceiling of the row split at its own fraction and cores is 4.31 tok/s at 98304 against 4.76 for the serial layout (-9.5%),
   measured -3.6%. With the planner's own layers (all 80 weight layers in HBM and 37 or 28 K/V layers) the model puts every row-split cell with the serial cell's K/V at or just below serial (4.31 to 4.74 against 4.76 at 98304),
   because the bytes the split moves to DDR are weights that were already read at the HBM rate. The model gains only if the weight rows moved to DDR free HBM for more K/V layers: with
-  16 DDR cores and fraction 0.28 the planner admits 54 K/V layers at 98304 and 40 at 131072, which the model reads as +2.7% and +2.0% over serial (modelled); the campaign's grid job tests that.
+  16 DDR cores and fraction 0.28 the planner admits 54 K/V layers at 98304 and 40 at 131072, which the model reads as +1.7% and +1.3% over serial; with 8 cores and fraction 0.15 (46 and 34 layers) +0.6% and +0.4% (modelled, calibrated
+  ceilings of `tools/hybrid_limits.py` at commit 96a20ed, computed from the resolved `--plan-only` reports of the grid job; table in section 5.2.1). The campaign's grid job tests that.
   The earlier figure of +5 to +8% came from the library's joint-layer placement, which is not the planner's.
 * **Stop rule.** Every C3/C4 cell is within 30% of its calibrated ceiling (0.87 to 1.02). The serial cells are 0.87 to 0.90 of it (a constant offset: the calibration anchor is
   the 611-position run; the 32768 and 65536 real cells give the same ratio). Before the correction of the concurrent formula (docs/plans/hybrid-limits.md, 27 November), the `rows-auto`
@@ -77,6 +78,25 @@ Reading (derived from the table and the profile):
   65536 positions (6.21 tok/s calibrated serial); the planner admits 56 K/V layers (5.29 measured, 0.85). The model had charged a K/V layer once; the planner charges three arenas per layer (K, V and
   the BF16 copy of the AMX attention), sized for the whole context. With `plan_layers` the model reproduces every layer count of this campaign (section 5.3) and the serial cells read 0.92 to 0.96 of
   the calibrated ceiling.
+
+#### 5.2.1 Predictions of the grid job (modelled)
+
+Calibrated ceilings, tok/s, of the cells of the grid job at the planner's resolved plans (weights 80 layers in HBM everywhere; `tools/hybrid_limits.py` at commit 96a20ed; the same function
+writes the job's `plan/*.pred` and the "measured / cal." column of `tools/hybrid_campaign_summary.py`). The capacity model of 96a20ed changes which K/V layer counts the library predicts
+for a fraction, not the throughput of a given plan: the predictions below are equal to the ones the plan job wrote before 96a20ed existed.
+
+| context | cell | K/V layers in HBM | modelled tok/s | vs serial-w80 |
+|---:|---|---:|---:|---:|
+| 98304 | serial-w80 | 37 | 4.758 | - |
+| 98304 | rows-kvfit c16 f 0.28 | 54 | 4.839 | +1.7% |
+| 98304 | rows-kvfit c8 f 0.15 | 46 | 4.788 | +0.6% |
+| 98304 | rows-kvmatch c16 f 0.28 (control) | 37 | 4.736 | -0.5% |
+| 98304 | rows-kvmatch c8 f 0.15 (control) | 37 | 4.735 | -0.5% |
+| 131072 | serial-w80 | 28 | 3.929 | - |
+| 131072 | rows-kvfit c16 f 0.28 | 40 | 3.980 | +1.3% |
+| 131072 | rows-kvfit c8 f 0.15 | 34 | 3.946 | +0.4% |
+| 131072 | rows-kvmatch c16 f 0.28 (control) | 28 | 3.914 | -0.4% |
+| 131072 | rows-kvmatch c8 f 0.15 (control) | 28 | 3.913 | -0.4% |
 
 ### 5.3 Planner capacity model (derived)
 
