@@ -267,3 +267,9 @@ the mirror's file list and sizes match it.
   cell; rows-kvmatch (K/V as serial) added for a fair test, queued on hbm14 after the prewarm gate.
 - Prewarm knob feature/bench-prewarm e73408d (opt-in LLAMA_BENCH_PREWARM_SECONDS): check 5962596 running (hbm14),
   gate 5962597 queued.
+- Prewarm check 5962596 (hbm14, e73408d, 30:58, manager-read): 70B 2S TTFT S=0 vs S=30, 3 reps interleaved. amx t2048
+  5.26/5.99/5.28 vs 5.15/5.96/5.28 (pause falls in decode either way); amx t8192 33.8/37.6/32.2 vs 24.0/26.5/24.0;
+  avx512 t2048 44.6/49.7/47.1 vs 37.5/37.8/37.3. Kernel-mode spans of 7.5-12 s inside every S=0 t8192/avx512 window,
+  none with S=30. 9/9 S=30 traces identical to S=0. (Its CAS idle column is not usable for prefill: packed=ddr prefill
+  reads little HBM.) **Open:** clean amx t2048 here ~5.2 s against 6.4-7.1 s in P4 5950121 on the same engine:
+  harness difference to reconcile (P4 agent). Gate 5962597 next.
