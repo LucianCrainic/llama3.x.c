@@ -273,3 +273,20 @@ the mirror's file list and sizes match it.
   none with S=30. 9/9 S=30 traces identical to S=0. (Its CAS idle column is not usable for prefill: packed=ddr prefill
   reads little HBM.) **Open:** clean amx t2048 here ~5.2 s against 6.4-7.1 s in P4 5950121 on the same engine:
   harness difference to reconcile (P4 agent). Gate 5962597 next.
+
+## P4 C3/C4 verified (27 Nov)
+
+- 5962577 (hbm13, 787a714, 3:36:26, 126 runs, 0 failed, traces equal). Manager re-derived every cell median from raw
+  JSON; 70B 2S decode tok/s, 5 reps unless noted, spread <= 1%. Synthetic slowest decode step <= 0.47 s in every run
+  (guard 1 s); CAS/kernel-mode pause scan on these windows left to the P4 agent's summary.
+- Fits case, real fill d32768: serial (w80 kv80) 7.199; rows f0.1 c8 7.115 (-1.2%); rows f0.2 c14 7.140 (-0.8%).
+  Drift anchors: synthetic serial d32768s 7.261 and c1 hyb80 d32768s 7.259 (3 reps each) equal; C1 real 7.20 in
+  5950121, so no drift between jobs.
+- C3 d65536s: planner default (w80 kv56) 5.291; rows auto c20 (w80 kv80, f 0.266) 5.284 (-0.1%); rows auto c14 5.112
+  (-3.4%); serial-kv80 (w58 kv80) 4.981 (-5.9%).
+- C4, planner default (w80, K/V in HBM up to the budget) against rows: d65536s 5.295 vs auto 5.283 (-0.2%), kvmatch
+  (f 0.2, same K/V layers) 5.085 (-4.0%); d98304s (kv37) 4.186 vs auto (f 0.711) 3.395 (-19%), kvmatch 4.035 (-3.6%);
+  d131072s (kv28) 3.420 vs kvmatch 3.307 (-3.3%). c4 rows-auto d131072s not admitted (9.1 GB over).
+- Reading: at 2S the rows split never beats the planner default. With K/V placement held equal it costs 3-4%; moving
+  weights to DDR to keep all K/V in HBM costs up to 19%. Same verdict as C6 at 1S and P3 (gain only for the 70B 1S
+  weight spill). c2 ddr anchors: d32768s 4.674, d131072s 2.739.
