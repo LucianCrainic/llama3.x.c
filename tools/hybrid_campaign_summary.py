@@ -140,7 +140,7 @@ def counters_of(directory, guard):
 
 def pause_scan(directory, label, report, guard, phase):
     """Idle seconds of one phase window: the time of the joint HBM+DDR read bins (32-byte HBM and 64-byte DDR CAS lines, summed over
-    the sockets; tools/hbm_ddr_results.py) below IDLE_FRACTION of the window's median bin. Returns (idle s, longest idle span s,
+    the sockets; tools/hbm_ddr_results.py) below IDLE_FRACTION of the window's busy level (90th percentile bin). Returns (idle s, longest idle span s,
     busy median GB/s) or None without counters. The window is cut with the same clock anchors as the byte counters."""
     prefix = directory / label
     series = hbm_ddr_results.parse_perf(Path(f'{prefix}.perf.csv'))
@@ -154,9 +154,16 @@ def pause_scan(directory, label, report, guard, phase):
     bins = list(hbm_ddr_results.joint_read_bins(series, markers[f'{phase}_start'], markers[f'{phase}_end'], anchors, guard))
     if not bins:
         return None
-    busy = statistics.median(h + d for _, _, h, d in bins)
+    # the busy level is the 90th percentile of the bins, not the median: a stall of most of the window (a TTFT run's decode) must not set the level
+    levels = sorted(h + d for _, _, h, d in bins)
+    busy = levels[min(len(levels) - 1, int(0.9 * len(levels)))]
     spans = []  # contiguous idle bins [start, end]
+    previous = None
     for t0, t1, h, d in bins:
+        # a stall can make perf drop its samples (a bin must have run 95% of the time on every counter): a hole between valid bins is idle
+        if previous is not None and t0 - previous >= IDLE_MIN_SPAN_S:
+            spans.append([previous, t0])
+        previous = t1
         if h + d < IDLE_FRACTION * busy:
             if spans and abs(spans[-1][1] - t0) < 1e-6:
                 spans[-1][1] = t1
