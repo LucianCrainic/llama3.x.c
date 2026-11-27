@@ -335,12 +335,13 @@ def ttft_table(groups, stats):
         flag = 'FLAG' if c['scaled'] is not None and abs(t / c['scaled'] - 1) > FLAG and kern != 'avx512' else ''
         rows.append([step, setting, meas, f'{len(clean)}/{len(rs)}', rs[0]['prompt_tokens'], kern, med([r['ttft'] for r in rs], 3),
                      med([r['ttft'] for r in clean], 3, False),
-                     med([r['prefill_s'] for r in rs], 3, False), med([r['hbm_prefill_gb'] for r in rs], 0, False),
+                     med([r['prefill_s'] for r in rs], 3, False),
+                     f"{rs[0]['report']['parameters'].get('bench_prewarm_seconds', 0):g}", med([r['hbm_prefill_gb'] for r in rs], 0, False),
                      med([r['ddr_prefill_gb'] for r in rs], 0, False), f'{c["peak"]:.3f}', f'{ratio:.1f}', scaled,
                      '-' if c['scaled'] is None else f'{t / c["scaled"]:.2f}', flag])
         stats[f'{step}/{setting}/{meas}'] = {'ttft': [r['ttft'] for r in rs], 'peak_s': c['peak'], 'scaled_s': c['scaled']}
     return md(['step', 'setting', 'meas', 'clean/all runs', 'prompt tokens', 'prefill kernels', 'TTFT s all runs, median [min-max]', 'TTFT s without paused runs', 'prefill s',
-               'HBM GB read+written', 'DDR GB read+written', 'AMX-peak s', 'measured / peak', '8B-scaled s', 'measured / scaled',
+               'prewarm s', 'HBM GB read', 'DDR GB read', 'AMX-peak s', 'measured / peak', '8B-scaled s', 'measured / scaled',
                'flag'], rows)
 
 

@@ -20,7 +20,8 @@
 # cell), REPEATS_AB=5 (the steps whose cells form an A/B pair: c3 c4 c6 c7), ONLY_MEAS (words: measurement names to keep, or step:name to keep one
 # step's, for a repeat), PLAN_ONLY=1 (build, admit every cell with --plan-only, write the cell list, stop), DRY_RUN=1 (print the cells, nothing
 # else). List variables hold spaces: set them in the environment of the sbatch call, never inside --export, which splits its
-# argument on commas. Nothing here names a host, a path or a credential: locations arrive through the environment.
+# argument on commas. BENCH_PREWARM=30 (seconds) is LLAMA_BENCH_PREWARM_SECONDS of every TTFT cell except those named t<N>c (cold process).
+# Nothing here names a host, a path or a credential: locations arrive through the environment.
 #
 # The engine takes one --warm-context per process: a "context ladder" is one process per (cell, context, repetition), each
 # loading the model again. Contexts above 32768 on the 70B fill the K/V synthetically (a SYNTHETIC_KV=1 build, 1024 real primer
@@ -37,6 +38,7 @@
 #                       131072 (synthetic); a cell the planner does not admit is recorded in skipped.tsv
 #   c6                  70B 1S: serial hybrid (twice, as the drift anchor), concurrent rows with the K/V of the whole HBM and with the
 #                       serial cell's own K/V layers, and ddr, at 32768 (synthetic; real fills of the serial cell as check) and 4096
+#   h1                  70B 2S harness check: the c1 TTFT cell under explicit or discovered topology and full or reduced perf events
 #   c7                  70B 2S: AMX packed prefill (hybrid 80/80, packed in DDR) against LLAMA_KERNELS=avx512, TTFT 2048 and 8192
 set -euo pipefail
 
@@ -83,7 +85,7 @@ select_step() {
   kvref=serial # the setting whose plan gives @KVMATCH@ (the K/V layers of the serial cell)
   case $step in
     c0-8b-1s | c0-8b-2s) model=8b ;;
-    c1 | c2 | c3 | c4 | c6 | c7) model=70b ;;
+    c1 | c2 | c3 | c4 | c6 | c7 | h1) model=70b ;;
     *) echo "unknown step '$step'" >&2; exit 2 ;;
   esac
   case $step in c0-8b-1s | c6) sockets=1 ;; *) sockets=2 ;; esac
@@ -120,8 +122,12 @@ select_step() {
       add_decode 32768 d32768 0 hyb80
       add_decode 32768 d32768s 1 hyb80
       add_decode 65536 d65536s 1 hyb80
-      add_ttft t2048 2048 hyb80 5 # 5: a TTFT run that overlaps the startup pause is dropped (tools/hybrid_campaign_summary.py)
-      add_ttft t8192 8192 hyb80
+      # TTFT after BENCH_PREWARM seconds of untimed compute (the startup stall of the node, docs/hbm-ddr-research.md, then lies outside
+      # the window); t2048c and t8192c are the cold-process variants, without it
+      add_ttft t2048 2048 hyb80 5
+      add_ttft t8192 8192 hyb80 5
+      add_ttft t2048c 2048 hyb80 5
+      add_ttft t8192c 8192 hyb80 5
       needs_syn=1
       ;;
     c2)
@@ -178,6 +184,16 @@ select_step() {
       add_set avx512 "LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80 LLAMA_HYBRID_KV_HBM_LAYERS=80 LLAMA_KERNELS=avx512"
       add_ttft t2048 2048 "amx avx512"
       add_ttft t8192 8192 "amx avx512"
+      ;;
+    h1)
+      # harness check: the same 70B TTFT cell (amx, hybrid 80/80, packed in DDR, prewarmed) under the script's explicit topology and
+      # full counters (as the first c1/c2/c7 job), the discovered topology, and the reduced counters of the prewarm check
+      local h="$hyb LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80 LLAMA_HYBRID_KV_HBM_LAYERS=80"
+      add_set explicit-full "$h HC_PERF=full"
+      add_set auto-full "$h HC_PERF=full HC_TOPO=auto"
+      add_set explicit-min "$h HC_PERF=min"
+      add_set auto-min "$h HC_PERF=min HC_TOPO=auto"
+      add_ttft t2048 2048 "explicit-full auto-full explicit-min auto-min" "$repeats"
       ;;
   esac
   if [[ -n ${ONLY_MEAS:-} ]]; then # keep the measurements named in ONLY_MEAS
@@ -236,6 +252,10 @@ writes='uncore_imc/event=0x05,umask=0xf0,name=ddr_cas_wr/,uncore_type_14/event=0
 events="$reads,$writes,unc_upi_rxl_flits.all_data,unc_upi_txl_flits.all_data,power/energy-pkg/,power/energy-ram/,cycles,ref-cycles"
 interval=100
 perf=(sudo -n "$perf_bin" stat -a --per-socket -I "$interval" -x, -e "$events")
+# The TTFT cells count only the CAS reads and the cycles (the event set of the prewarm check): the writes, UPI and energy counters
+# are for the decode cells. HC_PERF=full or HC_PERF=min in a setting overrides this, to test whether the counters change a TTFT.
+perf_min=(sudo -n "$perf_bin" stat -a --per-socket -I "$interval" -x, -e "$reads,cycles")
+bench_prewarm=${BENCH_PREWARM:-30}
 {
   printf 'job=%s\ncommit=%s\nsteps=%s\nrepeats=%s\nrepeats_ab=%s\ninterval_ms=%s\n' "${SLURM_JOB_ID:-}" "$commit" "$STEPS" "$repeats" \
     "$repeats_ab" "$interval"
@@ -340,6 +360,21 @@ printf 'label\tstatus\n' > "$OUT/failures.tsv"
 # ---- plan gate ----------------------------------------------------------------------------------------------------------------
 engine_bin() { [[ $1 == 1 ]] && echo "$OUT/bin-syn/runq" || echo "$OUT/bin/runq"; }
 
+# hc_split LINE: env_clean is LINE without the HC_* words, which steer this script and not the engine (HC_PERF=full|min: the perf
+# events; HC_TOPO=auto: the topology is discovered, not the explicit one); cfg_run is cfg adjusted by them
+hc_split() {
+  local w
+  env_clean=; hc_perf=; hc_topo=; cfg_run=()
+  for w in $1; do
+    case $w in
+      HC_PERF=*) hc_perf=${w#HC_PERF=} ;;
+      HC_TOPO=*) hc_topo=${w#HC_TOPO=} ;;
+      *) env_clean="$env_clean $w" ;;
+    esac
+  done
+  for w in "${cfg[@]}"; do [[ $hc_topo == auto && $w == LLAMA_TOPOLOGY=* ]] || cfg_run+=("$w"); done
+}
+
 # plan_cell STEP SETTING MEAS: --plan-only of the cell; the resolved environment goes to plan/STEP-SETTING-MEAS.env
 plan_cell() {
   local step=$1 setting=$2 meas=$3 i env_line plan kv status=0
@@ -353,8 +388,9 @@ plan_cell() {
   fi
   printf '%s\n' "$env_line" > "$OUT/plan/$step-$setting-$meas.env"
   plan="$OUT/plan/$step-$setting-$meas"
+  hc_split "$env_line"
   # shellcheck disable=SC2086
-  clean "${cfg[@]}" $env_line ${bind[@]+"${bind[@]}"} "$(engine_bin "${m_syn[i]}")" "$checkpoint" --context-length "${m_ctx[i]}" --plan-only \
+  clean "${cfg_run[@]}" $env_clean ${bind[@]+"${bind[@]}"} "$(engine_bin "${m_syn[i]}")" "$checkpoint" --context-length "${m_ctx[i]}" --plan-only \
     --json "$plan.json" > "$plan.stdout" 2> "$plan.stderr" || status=$?
   [[ $status == 0 ]] || return 1
   "$PYTHON" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["placement_plan"]["admitted"] is True else 1)' "$plan.json"
@@ -386,6 +422,11 @@ run_cell() {
   i=$(idx "$meas" "${m_name[@]}")
   env_line=$(cat "$OUT/plan/$step-$setting-$meas.env")
   [[ $env_line != *LLAMA_KERNELS=avx512* ]] || kern=avx512
+  hc_split "$env_line"
+  local perf_run=("${perf[@]}") pw_env=()
+  if [[ $hc_perf == min || ( ${m_kind[i]} == ttft && $hc_perf != full ) ]]; then perf_run=("${perf_min[@]}"); fi
+  # a TTFT cell runs after BENCH_PREWARM seconds of untimed compute, except the cold variants (names ending in c)
+  if [[ ${m_kind[i]} == ttft && ${m_name[i]} != *c ]]; then pw_env=("LLAMA_BENCH_PREWARM_SECONDS=$bench_prewarm"); fi
   group="$model-${sockets}S-$meas-$kern"
   if [[ ${m_kind[i]} == decode ]]; then
     prompt_args=(--prompt "$prime_prompt")
@@ -400,13 +441,13 @@ run_cell() {
   date +%s%N > "$prefix.launch"
   start=$(date +%s%N)
   # shellcheck disable=SC2086
-  clean "${cfg[@]}" $env_line ${syn_env[@]+"${syn_env[@]}"} ${extra[@]+"${extra[@]}"} LLAMA_TOKENS_OUT="$prefix.tokens.json" \
+  clean "${cfg_run[@]}" $env_clean ${syn_env[@]+"${syn_env[@]}"} ${extra[@]+"${extra[@]}"} ${pw_env[@]+"${pw_env[@]}"} LLAMA_TOKENS_OUT="$prefix.tokens.json" \
     ${bind[@]+"${bind[@]}"} "$(engine_bin "${m_syn[i]}")" "$checkpoint" -z "$tokenizer" --benchmark --chat-template --no-text -t 0 -n 0 \
     --context-length "${m_ctx[i]}" --warm-context "${m_warm[i]}" --generation-length "${m_gen[i]}" "${prompt_args[@]}" \
     --json "$prefix.json" > "$prefix.stdout" 2> "$prefix.stderr" &
   pid=$!
   date +%s%N > "$prefix.perf-start"
-  "${perf[@]}" -- tail -s 0.05 --pid="$pid" -f /dev/null > /dev/null 2> "$prefix.perf.csv" &
+  "${perf_run[@]}" -- tail -s 0.05 --pid="$pid" -f /dev/null > /dev/null 2> "$prefix.perf.csv" &
   perfpid=$!
   wait "$pid" || status=$?
   end=$(date +%s%N)

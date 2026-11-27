@@ -267,7 +267,14 @@ class ScriptTests(unittest.TestCase):
                 if line.strip().startswith('measurement') and ('c3' in text)}
         self.assertEqual(reps['d4096'], '3')
         self.assertEqual(reps['t8192'], '5')
-        self.assertEqual(self.dry_run('c1', REPEATS='1').stdout.count('reps=1'), 5)  # the t2048 cell keeps 5 repetitions
+        self.assertEqual(self.dry_run('c1', REPEATS='1').stdout.count('reps=1'), 4)  # the four TTFT cells keep 5 repetitions
+
+    def test_ttft_cells_have_a_cold_variant_and_the_harness_check_step_lists_its_settings(self):
+        text = self.dry_run('c1 h1').stdout
+        for name in ('t2048', 't8192', 't2048c', 't8192c'):
+            self.assertIn(f'measurement {name}: ttft', text)
+        self.assertIn('setting auto-min: LLAMA_PLACEMENT=hybrid', text)
+        self.assertIn('HC_PERF=min HC_TOPO=auto', text)
 
     def test_one_socket_cells_are_bound_to_socket_zero(self):
         text = self.dry_run('c6').stdout
