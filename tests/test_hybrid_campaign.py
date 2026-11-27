@@ -235,6 +235,21 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(summary.collect([temp], 0.05), [])
 
 
+class PredictTests(unittest.TestCase):
+    def test_prediction_matches_the_ceiling_of_the_same_plan(self):
+        r = report(40.0, plan('hybrid', 32, 32, 'rows', 0.2, 14), warm=4096)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'plan.json'
+            path.write_text(json.dumps(dict(r, tokens={'processed_prompt': 0, 'decode_steps': 0}, parameters={'warm_context': 0})))
+            code, text = run_summary('--predict', path, '--warm', 4096, '--prompt-tokens', 35, '--steps', 255)
+        self.assertEqual(code, 0)
+        got = json.loads(text)
+        c = summary.decode_ceiling(r)
+        self.assertAlmostEqual(got['predicted_tok_s_calibrated'], c['cal'], places=3)
+        self.assertAlmostEqual(got['predicted_tok_s_peak'], c['peak'], places=3)
+        self.assertEqual(got['kind'], 'concurrent')
+
+
 class ScriptTests(unittest.TestCase):
     def dry_run(self, steps, **extra):
         with tempfile.TemporaryDirectory() as temp:
@@ -275,6 +290,24 @@ class ScriptTests(unittest.TestCase):
             self.assertIn(f'measurement {name}: ttft', text)
         self.assertIn('setting auto-min: LLAMA_PLACEMENT=hybrid', text)
         self.assertIn('HC_PERF=min HC_TOPO=auto', text)
+
+    def test_c4g_grid_expansion(self):
+        text = self.dry_run('c4g').stdout
+        settings = [l.split()[1].rstrip(':') for l in text.splitlines() if l.startswith('  setting ')]
+        self.assertEqual(settings, ['serial-w80', 'rows-kvmatch-c8-f0.15', 'rows-kvmatch-c12-f0.15', 'rows-kvmatch-c12-f0.2',
+                                    'rows-kvmatch-c16-f0.2', 'rows-kvmatch-c16-f0.28'])
+        self.assertIn('setting rows-kvmatch-c12-f0.2: LLAMA_PLACEMENT=hybrid LLAMA_HYBRID_CLASSIFIER=hbm LLAMA_HYBRID_PACKED=ddr '
+                      'LLAMA_HYBRID_SPLIT=rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=0.2 '
+                      'LLAMA_HYBRID_DDR_CORES=12', text)
+        measurements = [l for l in text.splitlines() if l.startswith('  measurement')]
+        self.assertEqual(len(measurements), 2)
+        for line, name in zip(measurements, ('d98304s', 'd131072s')):
+            self.assertIn(f'measurement {name}: decode', line)
+            self.assertIn('synthetic=1', line)
+            self.assertIn('reps=5', line)
+            self.assertEqual(line.split('settings=')[1].split(), settings)  # serial-w80 first: its plan gives the K/V layers
+        self.assertIn('warm=130816 context=131072', measurements[1])
+        self.assertIn('runs (repetitions plus one profiled run per cell, before any plan gate): 62', text)  # 6 x 2 x 5 plus one profiled serial-w80 run per context
 
     def test_one_socket_cells_are_bound_to_socket_zero(self):
         text = self.dry_run('c6').stdout

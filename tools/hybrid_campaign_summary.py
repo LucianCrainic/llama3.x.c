@@ -56,6 +56,17 @@ def median(values):
 # Ceilings (tools/hybrid_limits.py at the cell's own placement)
 # ---------------------------------------------------------------------------------------------------------------------------
 
+def predict(plan_path, warm, prompt_tokens, steps):
+    """The ceilings of a decode cell before it runs: the --plan-only report of the cell, a warm context, the prompt and the number of
+    timed decode steps in place of the (still empty) token counts of the report. Same function as the table's ceilings."""
+    report = json.loads(Path(plan_path).read_text())
+    report['tokens'] = {'processed_prompt': prompt_tokens, 'decode_steps': steps}
+    report['parameters'] = dict(report.get('parameters') or {}, warm_context=warm)
+    c = decode_ceiling(report)
+    return {'predicted_tok_s_calibrated': round(c['cal'], 3), 'predicted_tok_s_peak': round(c['peak'], 3), 'kind': c['kind'],
+            'ddr_byte_fraction': round(c['ddr_byte_fraction'], 4), 'mean_depth': c['depth']}
+
+
 def interpolate_e1(cores):
     """(HBM GB/s, DDR GB/s) the P1 study measured with `cores` DDR cores (the other cores on HBM), linear between the table's rows."""
     rows = sorted((cd, bh, bd) for _, cd, bh, bd in HL.E1)
@@ -400,11 +411,21 @@ def synthetic_check(groups):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('directory', type=Path, nargs='+')
+    parser.add_argument('directory', type=Path, nargs='*')
+    parser.add_argument('--predict', type=Path, metavar='PLAN_JSON',
+                        help='print the limits-model prediction (JSON) of a decode cell from the --plan-only report of its plan')
+    parser.add_argument('--warm', type=int, default=0, help='with --predict: warm-context positions')
+    parser.add_argument('--prompt-tokens', type=int, default=35, help='with --predict: prompt tokens')
+    parser.add_argument('--steps', type=int, default=95, help='with --predict: timed decode steps')
     parser.add_argument('--step')
     parser.add_argument('--guard', type=float, default=0.05)
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
+    if args.predict:
+        print(json.dumps(predict(args.predict, args.warm, args.prompt_tokens, args.steps)))
+        return 0
+    if not args.directory:
+        parser.error('a results directory (or --predict) is required')
     runs = collect(args.directory, args.guard)
     if args.step:
         runs = [r for r in runs if r['row']['step'] == args.step]

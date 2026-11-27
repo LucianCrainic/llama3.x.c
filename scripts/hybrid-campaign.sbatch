@@ -36,6 +36,7 @@
 #   c3                  70B 2S: serial hybrid against concurrent rows at 32768 (real) and 65536 (synthetic)
 #   c4                  70B 2S: serial hybrid (weights in HBM, K/V by the planner) against concurrent rows at 65536, 98304 and
 #                       131072 (synthetic); a cell the planner does not admit is recorded in skipped.tsv
+#   c4g                 70B 2S: DDR cores x fraction grid of the row split at the K/V layers of serial-w80 (98304 and 131072, synthetic)
 #   c6                  70B 1S: serial hybrid (twice, as the drift anchor), concurrent rows with the K/V of the whole HBM and with the
 #                       serial cell's own K/V layers, and ddr, at 32768 (synthetic; real fills of the serial cell as check) and 4096
 #   h1                  70B 2S harness check: the c1 TTFT cell under explicit or discovered topology and full or reduced perf events
@@ -82,10 +83,11 @@ select_step() {
   local step=$1 n
   set_names=(); set_envs=(); m_name=(); m_kind=(); m_warm=(); m_ctx=(); m_gen=(); m_syn=(); m_prompt=(); m_reps=(); m_sets=()
   needs_syn=0
+  prof_only= # a step may profile one setting only (c4g)
   kvref=serial # the setting whose plan gives @KVMATCH@ (the K/V layers of the serial cell)
   case $step in
     c0-8b-1s | c0-8b-2s) model=8b ;;
-    c1 | c2 | c3 | c4 | c6 | c7 | h1) model=70b ;;
+    c1 | c2 | c3 | c4 | c4g | c6 | c7 | h1) model=70b ;;
     *) echo "unknown step '$step'" >&2; exit 2 ;;
   esac
   case $step in c0-8b-1s | c6) sockets=1 ;; *) sockets=2 ;; esac
@@ -97,7 +99,7 @@ select_step() {
     checkpoint=$MODEL_70B/int8-v3.bin; tokenizer=$MODEL_70B/tokenizer-v2.bin; layers=80; generation=96
   fi
   reps_default=$repeats
-  case $step in c3 | c4 | c6 | c7) reps_default=$repeats_ab ;; esac
+  case $step in c3 | c4 | c4g | c6 | c7) reps_default=$repeats_ab ;; esac
   cfg=("${base[@]}" "LLAMA_SOCKETS=$sockets")
   bind=()
   [[ $sockets == 2 ]] || bind=(numactl --cpunodebind=0)
@@ -162,6 +164,22 @@ select_step() {
       add_decode 65536 d65536s 1 "serial-w80 rows-auto-c20 rows-kvmatch-c20"
       add_decode 98304 d98304s 1 "serial-w80 rows-auto-c20 rows-kvmatch-c20"
       add_decode 131072 d131072s 1 "serial-w80 rows-auto-c20 rows-kvmatch-c20"
+      needs_syn=1
+      ;;
+    c4g)
+      # DDR cores x fraction grid of the row split at the serial cell's own K/V layers (@KVMATCH@: 37 at 98304, 28 at 131072), against serial-w80
+      # in the same job. Cells follow the diagonal where the limits model puts the balance (8 cores f 0.15, 12 f 0.2, 16 f 0.28) and its
+      # two neighbours (12 f 0.15, 16 f 0.2); dropped for the time budget: 8 f 0.2, 8 f 0.28, 12 f 0.28, 16 f 0.15 (modelled lower).
+      kvref=serial-w80
+      prof_only=serial-w80
+      add_set serial-w80 "$hyb LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80"
+      local g c f grid="8:0.15 12:0.15 12:0.2 16:0.2 16:0.28"
+      for g in $grid; do
+        c=${g%%:*}; f=${g##*:}
+        add_set "rows-kvmatch-c$c-f$f" "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_FRACTION=$f LLAMA_HYBRID_DDR_CORES=$c"
+      done
+      add_decode 98304 d98304s 1 "${set_names[*]}"
+      add_decode 131072 d131072s 1 "${set_names[*]}"
       needs_syn=1
       ;;
     c6)
@@ -233,7 +251,7 @@ if [[ ${DRY_RUN:-0} == 1 ]]; then
       n=$(wc -w <<< "${m_sets[i]}")
       printf '  measurement %s: %s warm=%s context=%s generation=%s synthetic=%s prompt=%s reps=%s settings=%s\n' "${m_name[i]}" \
         "${m_kind[i]}" "${m_warm[i]}" "${m_ctx[i]}" "${m_gen[i]}" "${m_syn[i]}" "${m_prompt[i]}" "${m_reps[i]}" "${m_sets[i]}"
-      total=$((total + n * (${m_reps[i]} + 1)))
+      total=$((total + n * ${m_reps[i]} + (${#prof_only} > 0 ? 1 : n)))
     done
   done
   printf 'runs (repetitions plus one profiled run per cell, before any plan gate): %s\n' "$total"
@@ -393,7 +411,13 @@ plan_cell() {
   clean "${cfg_run[@]}" $env_clean ${bind[@]+"${bind[@]}"} "$(engine_bin "${m_syn[i]}")" "$checkpoint" --context-length "${m_ctx[i]}" --plan-only \
     --json "$plan.json" > "$plan.stdout" 2> "$plan.stderr" || status=$?
   [[ $status == 0 ]] || return 1
-  "$PYTHON" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["placement_plan"]["admitted"] is True else 1)' "$plan.json"
+  "$PYTHON" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["placement_plan"]["admitted"] is True else 1)' "$plan.json" || return 1
+  # the limits model's prediction for a decode cell (calibrated and peak tok/s at the plan), kept next to the plan
+  if [[ ${m_kind[i]} == decode ]]; then
+    "$PYTHON" "$ROOT/tools/hybrid_campaign_summary.py" --predict "$plan.json" --warm "${m_warm[i]}" --prompt-tokens 35 \
+      --steps $((${m_gen[i]} - 1)) > "$plan.pred" 2> "$plan.pred.err" || true
+    printf '%s predicted %s %s %s: %s\n' "$(date -Is)" "$step" "$setting" "${m_name[i]}" "$(cat "$plan.pred")"
+  fi
 }
 
 # gate_step: admit every (setting, measurement); the admitted settings of a measurement go to plan/STEP-MEAS.sets in order
@@ -509,6 +533,7 @@ run_step() {
   for ((i = 0; i < ${#m_name[@]}; i++)); do # one profiled run per cell
     read -r -a list < "$OUT/plan/$step-${m_name[i]}.sets" || list=()
     for s in ${list[@]+"${list[@]}"}; do
+      [[ -z $prof_only || $s == "$prof_only" ]] || continue
       attempt "prof-$step-$s-${m_name[i]}" "$step" "$s" "${m_name[i]}" 0 1
     done
   done
