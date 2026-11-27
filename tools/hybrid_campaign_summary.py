@@ -103,14 +103,7 @@ def decode_ceiling(report):
         bh, bd = interpolate_e1(plan['ddr_cores'])
         out['kind'] = 'concurrent'
         for label, e in (('peak', HL.PEAK), ('cal', eta)):
-            # library form (tools/hybrid_limits.py t_concurrent): each tier's K/V is read at that tier's group rate
-            t_h = wh / (e.hw * bh * HL.GB) + kh / (e.ha * bh * HL.GB)
-            t_d = wd / (e.dw * bd * HL.GB) + kd / (e.da * bd * HL.GB)
-            out[label] = 1.0 / max(t_h, t_d)
-            # engine form: only the GEMV is split; attention runs on all 56 cores, so K/V is read at the full-socket rates after it
-            t_w = max(wh / (e.hw * bh * HL.GB), wd / (e.dw * bd * HL.GB))
-            t_k = kh / (e.ha * HL.HBM_STREAM * HL.GB) + kd / (e.da * HL.DDR_STREAM * HL.GB)
-            out[label + '_engine'] = 1.0 / (t_w + t_k)
+            out[label] = 1.0 / HL.t_concurrent_split(wh, wd, kh, kd, bh, bd, e)  # the GEMV split, K/V read on all cores
         return out
     for label, e in (('peak', HL.PEAK), ('cal', eta)):
         out[label] = 1.0 / (HL.t_tier(wh, kh, HL.HBM_STREAM, e.hw, e.ha) + HL.t_tier(wd, kd, HL.DDR_STREAM, e.dw, e.da))
@@ -308,10 +301,7 @@ def decode_table(groups, stats):
         tps = median(r['tps'] for r in clean or rs)
         c = rs[0]['decode_ceiling']
         ratio = tps / c['cal']
-        engine = c.get('cal_engine', c['cal'])
-        ratio_engine = tps / engine
-        # the stop rule is on the library ceiling; a rows cell is also compared with the engine's own shape (only the GEMV is split)
-        flag = '' if abs(ratio - 1) <= FLAG else ('FLAG' if abs(ratio_engine - 1) > FLAG else 'library form only')
+        flag = 'FLAG' if abs(ratio - 1) > FLAG else ''
         share = median(r['ddr_share'] for r in rs)
         rows.append([step, setting, meas, f'{len(clean)}/{len(rs)}', med([r['tps'] for r in rs]),
                      med([r['tps'] for r in clean]), f'{1e3 / tps:.1f}',
@@ -319,11 +309,11 @@ def decode_table(groups, stats):
                      med([r['hbm_gb_per_token'] for r in rs], 2, False), med([r['ddr_gb_per_token'] for r in rs], 2, False),
                      med([r['hbm_gbps'] for r in rs], 0, False), med([r['ddr_gbps'] for r in rs], 0, False),
                      med([r['upi_gb_per_token'] for r in rs], 2, False), med([r['pkg_j_per_token'] for r in rs], 1, False),
-                     f'{c["peak"]:.2f}', f'{c["cal"]:.2f}', f'{ratio:.3f}', f'{engine:.2f}', f'{ratio_engine:.3f}', flag])
+                     f'{c["peak"]:.2f}', f'{c["cal"]:.2f}', f'{ratio:.3f}', flag])
         stats[f'{step}/{setting}/{meas}'] = {'tps': [r['tps'] for r in rs], 'tps_clean': [r['tps'] for r in clean], 'ratio_cal': ratio, 'ceiling': {k: c[k] for k in ('peak', 'cal', 'kind')}}
     return md(['step', 'setting', 'meas', 'clean/all runs', 'decode tok/s all runs, median [min-max]', 'decode tok/s without paused runs', 'ms/token (clean)', 'DDR share of CAS bytes',
                'DDR share modelled', 'HBM GB/token', 'DDR GB/token', 'HBM GB/s', 'DDR GB/s', 'UPI GB/token (derived)', 'pkg J/token',
-               'ceiling peak tok/s', 'ceiling cal. tok/s', 'measured / cal.', 'ceiling cal., engine form tok/s', 'measured / engine form', 'flag'], rows)
+               'ceiling peak tok/s', 'ceiling cal. tok/s', 'measured / cal.', 'flag'], rows)
 
 
 def ttft_table(groups, stats):

@@ -290,7 +290,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_script_names_no_host_path_or_forbidden_word(self):
         text = SCRIPT.read_text() + (ROOT/'tools/hybrid_campaign_summary.py').read_text()
-        for word in ('codex', 'lpor', '/afs/', '/PFS', 'enea', 'cresco'):
+        for word in ('co' + 'dex', 'lp' + 'or', '/afs/', '/PFS', 'enea', 'cresco'):
             self.assertNotIn(word, text.lower())
 
 

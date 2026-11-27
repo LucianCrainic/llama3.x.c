@@ -88,6 +88,45 @@ class DecodeTests(unittest.TestCase):
         for ctx in (4096, 32768, 65536):
             self.assertAlmostEqual(hl.t_concurrent(M70, 64, 2, ctx)[0], hl.t_hbm_only(M70, 64, 2, ctx))
 
+    def test_concurrent_split_charges_kv_at_full_socket_rates(self):
+        # only the GEMV is split: K/V is read after it on all cores, so it does not depend on the core split
+        W, K = 40.0e9, 20.0e9
+        a = hl.t_concurrent_split(W, 0, K, 0, 569.1, 0, hl.PEAK)
+        b = hl.t_concurrent_split(W, 0, K, 0, 300.0, 0, hl.PEAK)
+        self.assertAlmostEqual(a - b, W / 569.1 / hl.GB - W / 300.0 / hl.GB)   # only the weight term moved
+        self.assertAlmostEqual(a, (W + K) / (hl.HBM_STREAM * hl.GB))           # no DDR bytes: the HBM-only time
+        # K/V in DDR is read at the 56-core DDR rate
+        self.assertAlmostEqual(hl.t_concurrent_split(0, 0, 0, K, 1.0, 1.0, hl.PEAK), K / (hl.DDR_STREAM * hl.GB))
+
+    def test_concurrent_split_weights_finish_together(self):
+        # the slower group sets the weight time: 30 GB at 400 GB/s against 10 GB at 200 GB/s
+        t = hl.t_concurrent_split(30e9, 10e9, 0, 0, 400.0, 200.0, hl.PEAK)
+        self.assertAlmostEqual(t, 30e9 / (400.0 * hl.GB))
+        self.assertAlmostEqual(hl.t_concurrent_split(30e9, 10e9, 0, 0, 400.0, 50.0, hl.PEAK), 10e9 / (50.0 * hl.GB))
+
+    def test_best_concurrent_balances_the_groups(self):
+        t, (ch, cd), f = hl.t_concurrent(M70, 64, 1, 131072)      # 70B 1S spills: the best split puts weights in both tiers
+        self.assertTrue(0 < f < 1 and cd > 0 and ch > 0)
+        p = hl.place(M70, 64, 1, 131072)
+        bh, bd = next((bh, bd) for c_h, c_d, bh, bd in hl.E1 if (c_h, c_d) == (ch, cd))
+        W = p.Wh + p.Wd
+        self.assertAlmostEqual(t, hl.t_concurrent_split(W * (1 - f), W * f, p.Kh, p.Kd, bh, bd, hl.PEAK))
+        # corrected form against the 27 November one: K/V is no longer slowed to the group rate, so 70B 1S at 131072 is lower than 6.0
+        self.assertTrue(1 / t < 6.0)
+
+    def test_measured_row_split_cells_sit_inside_the_corrected_ceiling(self):
+        # job 5950120 (8B 1S, 32768 real): rows r0.1 / r0.2 c14 measured 21.25 / 21.76 tok/s, 15 and 12% above the first
+        # formula's calibrated figures (15.6, 16.2); the corrected formula puts them within 15% of the measurement
+        m, eta = M8, hl.CAL['8B-1S'][0]
+        depth = 32768 + 35 + 128
+        W = hl.weight_bytes(m, 64, 1)
+        lk = hl.kv_bytes_per_token(m, 1, 'fp32') * depth
+        cw = hl.classifier_bytes(m, 64, 1)
+        bh, bd = 424.95, 115.45                                      # P1 E1 interpolated at 14 DDR cores
+        for frac, measured in ((0.1, 21.25), (0.2, 21.76)):
+            t = hl.t_concurrent_split(W - cw - (W - cw) * frac + cw, (W - cw) * frac, lk, 0, bh, bd, eta)
+            self.assertLess(abs(measured * t - 1), 0.15)
+
     def test_capacity(self):
         # 70B on two sockets fits at 65,536 positions with FP32 K/V (69k edge) and spills at 131,072; one socket never holds the weights
         self.assertTrue(hl.place(M70, 64, 2, 65536).fits)

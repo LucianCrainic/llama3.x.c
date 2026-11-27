@@ -20,14 +20,14 @@ package limit). Placement is `LLAMA_PLACEMENT=hbm-only|ddr|hybrid` (layer-granul
    (section 3.4).
 3. **Concurrent reading never beats HBM-only when everything fits** (P1: raw reads at best -1.2%; the engine GEMV +1.4% to +3.9%, an upper bound of 0.3-0.5 tok/s;
    section 4). Concurrency only matters for what does not fit: 70B on one socket (a forced 22-63% of the bytes in DDR, section 3.3) and 70B on two sockets beyond
-   about 69k positions of FP32 K/V. There the concurrent ceiling is 1.15-1.3 times the serial hybrid.
+   about 69k positions of FP32 K/V. There the concurrent ceiling is 1.05-1.2 times the serial hybrid (derived; 1.15-1.3 before the correction of 27 November, section 3.1).
 4. **TTFT: the compute ceiling is 0.656 s for 2113 tokens and 0.167 s for 547 (2 x 225 TOP/s AMX-INT8, derived), against 8.0-10.2 s and 2.1-2.7 s measured: the
    engine is 12 to 16 times above the ceiling**, and the 8B shows the same factor (9 to 15, section 5.4). So the gap is not 70B-specific. Prefill is
    compute-bound at every rate the engine reaches (the DDR packed-copy read floor, 1.3 s at 2113 tokens, is a sixth of the measured time, 0.42 s at 547 a fifth), which is why DDR and HBM TTFT differ by
    only 3%. The measured-minus-8B-scaled residual is 0.16-0.20 s **per prefill batch** in all eight 70B cells, not per token: that is the first thing to explain
    (section 5.5).
 5. **Biggest levers by size, derived:** the in-situ AMX GEMM at 8-14% of peak (TTFT); engine HBM efficiency 0.76 of raw (decode); K/V at long context (70B 2S decode at
-   131,072 positions: 3.8 tok/s calibrated serial, 4.5 concurrent, against 5.5 and 6.5 at peak).
+   131,072 positions: 3.8 tok/s calibrated serial, 4.1 concurrent, against 5.5 and 5.9 at peak).
 
 ## 2. Inputs
 
@@ -115,13 +115,19 @@ t_hbm_only   = (W + KV(C)) / BW_hbm(56 cores)                                   
 t_ddr        = (W + KV(C)) / BW_ddr(56 cores)
 t_serial     = B_hbm / BW_hbm(56) + B_ddr / BW_ddr(56)                            layer-granular hybrid, tiers read in turn
 t_concurrent = min over P1 splits (c_h + c_d = 56) and weight-row splits of
-               max( B_hbm / BW_hbm(c_h), B_ddr / BW_ddr(c_d) )                    rates measured while both groups run
+               max( W_hbm / BW_hbm(c_h), W_ddr / BW_ddr(c_d) ) + K_hbm / BW_hbm(56) + K_ddr / BW_ddr(56)
+               only the GEMV is split (rates measured while both groups run); attention reads K/V on all cores after it
 tier time with efficiency   =  W_tier / (eta_w BW) + KV_tier / (eta_a BW)
 ```
 
 Placement for the serial and concurrent columns: whole layers (the weights and the K/V of the layer together) go to HBM until 56 GiB less 0.5 GiB of work buffers
 (estimated) and the classifier are used; the rest is in DDR. The planner's two independent layer knobs can do better by less than one layer of bytes. In the
 concurrent model the weight rows may move between tiers (balance point), the K/V stays where the layers put it.
+
+**Correction of 27 November 2026.** The first version of `t_concurrent` charged each tier's K/V inside the group rates (`max(B_hbm / BW_hbm(c_h), B_ddr / BW_ddr(c_d))` with B the weights plus K/V of
+the tier). The engine splits only the decode GEMV; attention runs on all 56 cores after it, so K/V is read at the full-socket rate. The campaign's measured row-split cells
+(docs/hybrid-memory-results.md) ran 15 to 25% above the old model for that reason and within 15% of the corrected one. The formula is now `t_concurrent_split` in `tools/hybrid_limits.py`;
+the generated tables below and the concurrent figures of the text are recomputed with it (peak ceilings fall by up to 10% at 131,072 positions; the 2S fitting cells are unchanged).
 
 ### 3.2 Calibration to the engine
 
@@ -154,7 +160,7 @@ Bytes per socket per token at depth 611: weights 36.92 GB, K/V 0.200 GB (FP32). 
 | DDR at the DDR5-4800 datasheet rate (307.2 GB/s, derived) | 8.28 | 7.27 |
 | serial 40/80 layers in HBM, 40 in DDR (the pilot split) | 9.73 | 8.13 |
 | concurrent, best split with no forced spill | 15.33 | 11.58 |
-| concurrent with half of the weights forced to DDR (28 HBM + 28 DDR cores) | 11.90 | 10.46 |
+| concurrent with half of the weights forced to DDR (28 HBM + 28 DDR cores) | 11.85 | 10.38 |
 <!-- hybrid-limits:end anchor -->
 
 * **Peak: 15.3 tok/s from HBM, 7.1 from DDR** (the brief's about 15 and about 7). The staggered lockstep read would allow 15.6; the datasheet DDR rate 8.3. No
@@ -220,7 +226,7 @@ concurrent column assumes the engine's efficiencies carry over to the two core g
 | 4096 | 35.6 | 80/80 | 0.000 | 14.87 | 6.86 | 14.87 | 14.87 | 11.07 | 6.04 | 11.07 | 11.07 |
 | 32768 | 44.4 | 80/80 | 0.000 | 11.94 | 5.51 | 11.94 | 11.94 | 8.11 | 4.88 | 8.11 | 8.11 |
 | 65536 | 54.4 | 80/80 | 0.000 | 9.75 | 4.50 | 9.75 | 9.75 | 6.21 | 4.01 | 6.21 | 6.21 |
-| 131072 | 74.4 | 59/80 | 0.261 | - | 3.29 | 5.46 | 6.52 | - | 2.95 | 3.80 | 4.47 |
+| 131072 | 74.4 | 59/80 | 0.261 | - | 3.29 | 5.46 | 5.92 | - | 2.95 | 3.80 | 4.09 |
 <!-- hybrid-limits:end ctx_70b_2s -->
 
 **70B, one socket** (the spill case: 68.8 GiB of weights alone exceed the 56 GiB budget; K/V is 640 KiB per position):
@@ -228,10 +234,10 @@ concurrent column assumes the engine's efficiencies carry over to the two core g
 <!-- hybrid-limits:begin ctx_70b_1s -->
 | context | GiB read per socket per token | layers in HBM | DDR byte share | HBM-only peak | DDR peak | serial hybrid peak | concurrent peak | HBM-only cal. | DDR cal. | serial hybrid cal. | concurrent cal. |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096 | 71.3 | 62/80 | 0.222 | - | 3.43 | 5.91 | 7.10 | - | 3.02 | 4.67 | 5.52 |
-| 32768 | 88.8 | 49/80 | 0.383 | - | 2.75 | 4.13 | 5.28 | - | 2.44 | 3.24 | 4.01 |
-| 65536 | 108.8 | 40/80 | 0.495 | - | 2.25 | 3.09 | 3.80 | - | 2.00 | 2.44 | 3.21 |
-| 131072 | 148.8 | 29/80 | 0.633 | - | 1.64 | 2.05 | 2.35 | - | 1.48 | 1.66 | 1.99 |
+| 4096 | 71.3 | 62/80 | 0.222 | - | 3.43 | 5.91 | 7.05 | - | 3.02 | 4.67 | 5.48 |
+| 32768 | 88.8 | 49/80 | 0.383 | - | 2.75 | 4.13 | 4.96 | - | 2.44 | 3.24 | 3.82 |
+| 65536 | 108.8 | 40/80 | 0.495 | - | 2.25 | 3.09 | 3.51 | - | 2.00 | 2.44 | 2.83 |
+| 131072 | 148.8 | 29/80 | 0.633 | - | 1.64 | 2.05 | 2.17 | - | 1.48 | 1.66 | 1.75 |
 <!-- hybrid-limits:end ctx_70b_1s -->
 
 **8B, one socket and two sockets** (everything fits at every context: 39.4 GiB at 131072 positions on one socket):
@@ -239,28 +245,28 @@ concurrent column assumes the engine's efficiencies carry over to the two core g
 <!-- hybrid-limits:begin ctx_8b_1s -->
 | context | GiB read per socket per token | layers in HBM | DDR byte share | HBM-only peak | DDR peak | serial hybrid peak | concurrent peak | HBM-only cal. | DDR cal. | serial hybrid cal. | concurrent cal. |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096 | 8.4 | 32/32 | 0.000 | 62.90 | 29.01 | 62.90 | 62.90 | 43.08 | 26.41 | 43.08 | 43.80 |
-| 32768 | 15.4 | 32/32 | 0.000 | 34.36 | 15.85 | 34.36 | 34.36 | 20.16 | 14.45 | 20.16 | 20.50 |
-| 65536 | 23.4 | 32/32 | 0.000 | 22.63 | 10.44 | 22.63 | 22.63 | 12.54 | 9.53 | 12.54 | 12.66 |
-| 131072 | 39.4 | 32/32 | 0.000 | 13.44 | 6.20 | 13.44 | 13.44 | 7.14 | 5.66 | 7.14 | 7.14 |
+| 4096 | 8.4 | 32/32 | 0.000 | 62.90 | 29.01 | 62.90 | 62.90 | 43.08 | 26.41 | 43.08 | 43.68 |
+| 32768 | 15.4 | 32/32 | 0.000 | 34.36 | 15.85 | 34.36 | 34.36 | 20.16 | 14.45 | 20.16 | 20.29 |
+| 65536 | 23.4 | 32/32 | 0.000 | 22.63 | 10.44 | 22.63 | 22.63 | 12.54 | 9.53 | 12.54 | 12.59 |
+| 131072 | 39.4 | 32/32 | 0.000 | 13.44 | 6.20 | 13.44 | 13.44 | 7.14 | 5.66 | 7.14 | 7.15 |
 <!-- hybrid-limits:end ctx_8b_1s -->
 
 <!-- hybrid-limits:begin ctx_8b_2s -->
 | context | GiB read per socket per token | layers in HBM | DDR byte share | HBM-only peak | DDR peak | serial hybrid peak | concurrent peak | HBM-only cal. | DDR cal. | serial hybrid cal. | concurrent cal. |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096 | 4.2 | 32/32 | 0.000 | 125.80 | 58.03 | 125.80 | 125.80 | 82.64 | 49.89 | 82.64 | 83.66 |
-| 32768 | 7.7 | 32/32 | 0.000 | 68.72 | 31.70 | 68.72 | 68.72 | 39.53 | 28.01 | 39.53 | 40.02 |
-| 65536 | 11.7 | 32/32 | 0.000 | 45.25 | 20.87 | 45.25 | 45.25 | 24.76 | 18.66 | 24.76 | 24.94 |
-| 131072 | 19.7 | 32/32 | 0.000 | 26.89 | 12.40 | 26.89 | 26.89 | 14.18 | 11.19 | 14.18 | 14.18 |
+| 4096 | 4.2 | 32/32 | 0.000 | 125.80 | 58.03 | 125.80 | 125.80 | 82.64 | 49.89 | 82.64 | 83.50 |
+| 32768 | 7.7 | 32/32 | 0.000 | 68.72 | 31.70 | 68.72 | 68.72 | 39.53 | 28.01 | 39.53 | 39.72 |
+| 65536 | 11.7 | 32/32 | 0.000 | 45.25 | 20.87 | 45.25 | 45.25 | 24.76 | 18.66 | 24.76 | 24.84 |
+| 131072 | 19.7 | 32/32 | 0.000 | 26.89 | 12.40 | 26.89 | 26.89 | 14.18 | 11.19 | 14.18 | 14.20 |
 <!-- hybrid-limits:end ctx_8b_2s -->
 
 Reading:
 
 * **70B 2S is HBM-resident up to about 69k positions**; the ceiling falls from 14.9 (peak) / 11.1 (calibrated) tok/s at 4096 to 9.75 / 6.2 at 65,536 because K/V
-  is 37% of the bytes there (20.0 of 54.4 GiB). At 131,072 positions 21 of 80 layers (26% of the bytes) are forced to DDR: serial 5.46 / 3.80, concurrent 6.52 / 4.47, DDR-only 3.29 / 2.95.
+  is 37% of the bytes there (20.0 of 54.4 GiB). At 131,072 positions 21 of 80 layers (26% of the bytes) are forced to DDR: serial 5.46 / 3.80, concurrent 5.92 / 4.09, DDR-only 3.29 / 2.95.
   The older-tree measurement at 130,944 positions (4.13, section 6) sits between the calibrated serial and concurrent ceilings.
 * **70B 1S**: weights and K/V in the 56 GiB budget cover 62 of 80 layers at 4096 positions and 29 at 131,072. The serial hybrid is 5.9 / 4.7 tok/s at 4096 and
-  2.05 / 1.66 at 131,072; **concurrent reading is worth +20%, +28%, +23%, +15% over the serial hybrid at 4096, 32768, 65536, 131072 positions (peak) and +18%, +24%, +32%, +20% (calibrated)** and is the only case
+  2.05 / 1.66 at 131,072; **concurrent reading is worth +19%, +20%, +14%, +6% over the serial hybrid at 4096, 32768, 65536, 131072 positions (peak) and +17%, +18%, +16%, +5% (calibrated)** and is the only case
   in this page where the concurrent ceiling is the target for a design. Nothing was ever measured here: 70B 1S is the campaign's unmeasured cell.
 * **8B** never spills at these contexts; the table is the context cost alone: 1S 62.9 / 43.1 tok/s (peak / calibrated) at 4096 down to 13.4 / 7.1 at 131,072.
 
@@ -278,7 +284,7 @@ BF16 K/V halves, INT8 K/V (with scales) quarters the K/V bytes and moves the HBM
 | 65536 | fp32 | 20.0 | 80/80 | 9.75 | 9.75 | 9.75 | 6.21 | 6.21 |
 | 65536 | bf16 | 10.0 | 80/80 | 11.94 | 11.94 | 11.94 | 8.11 | 8.11 |
 | 65536 | int8 | 5.2 | 80/80 | 13.40 | 13.40 | 13.40 | 9.52 | 9.52 |
-| 131072 | fp32 | 40.0 | 59/80 | - | 5.46 | 6.52 | 3.80 | 4.47 |
+| 131072 | fp32 | 40.0 | 59/80 | - | 5.46 | 5.92 | 3.80 | 4.09 |
 | 131072 | bf16 | 20.0 | 80/80 | 9.75 | 9.75 | 9.75 | 6.21 | 6.21 |
 | 131072 | int8 | 10.3 | 80/80 | 11.86 | 11.86 | 11.86 | 8.03 | 8.03 |
 <!-- hybrid-limits:end kv_dtype -->
@@ -335,8 +341,8 @@ soon as cores read HBM; the DDR group draws from the same budget.
 * The page-aliasing fix is a larger and more certain lever than the split: the stagger gives +6.0% on the 70B decode (job 5934864, 5 of 5 repetitions) and +5.0% on the 8B 1S (job 5934862).
   With 2 MiB pages the best split is 11% above the aliased 56-worker all-HBM point (P1 section 5.2: 456.8-461.2 against 410.2 GB/s on node A) but within 1.3% of the best all-HBM point, i.e. it is
   mostly the aliasing.
-* A split can only be interesting **when something does not fit**: then the concurrent ceiling beats the serial by 1.15-1.3 (section 3.5: 70B 2S at 131,072 positions
-  +19% peak, 70B 1S +15% to +28%).
+* A split can only be interesting **when something does not fit**: then the concurrent ceiling beats the serial by 1.05-1.2 (section 3.5: 70B 2S at 131,072 positions
+  +8% peak, 70B 1S +6% to +19%).
 * The decision rule for the campaign: a concurrent engine path needs to beat the all-HBM engine by more than the P1 spread (3%) on a **fitting** cell to be worth building for
   that case; for a spilled cell the target is the concurrent ceiling.
 
@@ -534,6 +540,21 @@ close by construction too; the other rows are checks.
 | 8B 1S, gs64, warm 4096, stagger on | hbm | 4160 | 44.31 | 402 | 62.79 | 0.706 | 42.97 | 1.031 | job 5934862 |
 | 8B 2S, gs64, warm 4096, stagger off | hbm | 4160 | 73.53 | 333 | 125.57 | 0.586 | 82.44 | 0.892 | job 5934863 |
 | 8B 2S, gs64, warm 4096, stagger on | hbm | 4160 | 74.95 | 340 | 125.57 | 0.597 | 82.44 | 0.909 | job 5934863 |
+| 8B 1S hbm-only, warm 4096 (P4) | hbm | 4259 | 44.13 | 401 | 62.61 | 0.705 | 42.80 | 1.031 | job 5950120 |
+| 8B 1S hbm-only, warm 32768 (P4) | hbm | 32931 | 21.92 | 364 | 34.27 | 0.640 | 20.10 | 1.091 | job 5950120 |
+| 8B 1S DDR, warm 4096 (P4) | ddr | 4259 | 25.04 | 228 | 28.88 | 0.867 | 26.28 | 0.953 | job 5950120 |
+| 8B 1S DDR, warm 32768 (P4) | ddr | 32931 | 14.01 | 233 | 15.81 | 0.886 | 14.42 | 0.972 | job 5950120 |
+| 8B 2S hbm-only, warm 4096 (P4) | hbm | 4259 | 74.75 | 340 | 125.21 | 0.597 | 82.13 | 0.910 | job 5950120 |
+| 8B 2S hbm-only, warm 32768 (P4) | hbm | 32931 | 39.85 | 331 | 68.54 | 0.581 | 39.41 | 1.011 | job 5950120 |
+| 8B 2S DDR, warm 32768 (P4) | ddr | 32931 | 25.54 | 212 | 31.61 | 0.808 | 27.94 | 0.914 | job 5950120 |
+| 70B hybrid 80/80 packed in DDR, warm 4096 (P4) | hbm | 4179 | 10.51 | 402 | 14.86 | 0.707 | 11.06 | 0.951 | job 5950121 |
+| 70B hybrid 80/80 packed in DDR, warm 32768 (P4) | hbm | 32851 | 7.20 | 343 | 11.93 | 0.603 | 8.10 | 0.889 | job 5950121 |
+| 70B DDR, warm 4096 (P4) | ddr | 4179 | 5.89 | 226 | 6.86 | 0.859 | 6.03 | 0.976 | job 5950121 |
+| 70B DDR, warm 32768 (P4) | ddr | 32851 | 4.65 | 222 | 5.50 | 0.845 | 4.88 | 0.953 | job 5950121 |
+| 70B DDR, warm 130816 synthetic (P4) | ddr | 130899 | 2.74 | 219 | 3.29 | 0.833 | 2.95 | 0.928 | job 5962577 |
+| 70B serial hybrid (planner), warm 65536 synthetic (P4) | hybrid | 65619 | 5.29 | 309 | 9.74 | 0.543 | 6.21 | 0.852 | job 5962577 |
+| 70B serial hybrid (weights 80, planner K/V), warm 98304 synthetic (P4) | hybrid | 98387 | 4.19 | 290 | 7.01 | 0.598 | 4.69 | 0.892 | job 5962577 |
+| 70B serial hybrid (weights 80, planner K/V), warm 130816 synthetic (P4) | hybrid | 130899 | 3.42 | 273 | 5.47 | 0.626 | 3.80 | 0.899 | job 5962577 |
 
 | P1 E5 (weights only, no attention, no classifier) | GB/s | against raw 569.1 | tok/s-equivalent at 36.92 GB | source |
 | --- | ---: | ---: | ---: | ---: |

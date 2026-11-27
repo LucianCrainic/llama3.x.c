@@ -19,7 +19,8 @@ and eta the efficiency of the engine against that raw rate (eta = 1 is the "peak
     t_ddr        = bytes / BW_ddr(56 cores)
     t_serial     = B_hbm / BW_hbm(56) + B_ddr / BW_ddr(56)                    (layer-granular hybrid, tiers read one after the other)
     t_concurrent = min over the P1 core splits (c_h + c_d = 56) and the weight-byte split of
-                   max(B_hbm / BW_hbm(c_h), B_ddr / BW_ddr(c_d))               (rates measured while both groups run)
+                   max(W_hbm / BW_hbm(c_h), W_ddr / BW_ddr(c_d)) + K_hbm / BW_hbm(56) + K_ddr / BW_ddr(56)
+                   (only the GEMV is split, at the rates measured while both groups run; attention reads K/V on all cores after it)
 """
 import argparse
 import math
@@ -196,31 +197,40 @@ def t_serial(m, gs, S, ctx, dtype='fp32', eta=PEAK, place_fn=None):
     return t_tier(p.Wh, p.Kh, HBM_STREAM, eta.hw, eta.ha) + t_tier(p.Wd, p.Kd, DDR_STREAM, eta.dw, eta.da)
 
 
+def t_concurrent_split(Wh, Wd, Kh, Kd, bh, bd, eta):
+    """Seconds per token of the engine's concurrent row split (LLAMA_HYBRID_SPLIT=rows) at one core split. Only the GEMV is split: the
+    HBM group streams Wh at its rate bh while the DDR group streams Wd at bd (GB/s, P1 E1, measured while both run); the two finish
+    together, so the weight time is the slower of the two. Attention is not concurrent with it and runs on every core of the socket:
+    K/V is read after the GEMV, at the full-socket rate of the tier it sits in (HBM_STREAM, DDR_STREAM). (Until 27 November 2026 the
+    K/V bytes were charged inside the group rates, as if the 42 or so HBM-group cores read the HBM-resident K/V; the engine does not,
+    and the model ran 15 to 25% below the measured row-split cells of docs/hybrid-memory-results.md.) Bytes in GB / 1e9 as elsewhere."""
+    t_h = Wh / (eta.hw * bh * GB) if Wh else 0.0
+    t_d = Wd / (eta.dw * bd * GB) if Wd else 0.0
+    t_k = Kh / (eta.ha * HBM_STREAM * GB) + Kd / (eta.da * DDR_STREAM * GB)
+    return max(t_h, t_d) + t_k
+
+
 def t_concurrent(m, gs, S, ctx, dtype='fp32', eta=PEAK, min_ddr_weight_fraction=None, splits=E1):
-    """Best core split and weight-byte split. The K/V bytes stay where the placement put them; the weight bytes may move between
-    tiers (row split) but at least the placement's DDR weight bytes stay in DDR. Returns (seconds, (c_h, c_d), DDR weight fraction)."""
+    """Best core split and weight-byte split of the row-split decode (t_concurrent_split). The K/V bytes stay where the placement put
+    them; the weight bytes may move between tiers (row split) but at least the placement's DDR weight bytes stay in DDR. Returns
+    (seconds, (c_h, c_d), DDR weight fraction)."""
     p = place(m, gs, S, ctx, dtype)
     W = p.Wh + p.Wd
     wd_min = p.Wd if min_ddr_weight_fraction is None else min_ddr_weight_fraction * W
     best = None
     for ch, cd, bh, bd in splits:
-        kh, kd = p.Kh, p.Kd
-        if bh == 0 and (kh > 0 or W - wd_min > 0):
-            continue                                    # nothing may stay in HBM, but some bytes must
-        if bd == 0 and (kd > 0 or wd_min > 0):
-            continue                                    # the DDR group does not exist but DDR bytes do
+        if bd == 0 and wd_min > 0:
+            continue                                    # the DDR group does not exist but DDR weight bytes do
         ah = 1.0 / (eta.hw * bh * GB) if bh else math.inf
         ad = 1.0 / (eta.dw * bd * GB) if bd else math.inf
-        ch_k = kh / (eta.ha * bh * GB) if bh else 0.0
-        cd_k = kd / (eta.da * bd * GB) if bd else 0.0
         if not bh:
-            wd = W
+            wd = W                                      # no HBM group: every weight byte is read by the DDR group
         elif not bd:
             wd = 0.0
         else:
-            wd = (ah * W + ch_k - cd_k) / (ah + ad)      # balance t_h = ah (W - wd) + ch_k against t_d = ad wd + cd_k
+            wd = ah * W / (ah + ad)                     # balance ah (W - wd) against ad wd
         wd = min(W, max(wd_min, wd, 0.0))
-        t = max(ah * (W - wd) + ch_k if bh else 0.0, ad * wd + cd_k if bd else 0.0)
+        t = t_concurrent_split(W - wd, wd, p.Kh, p.Kd, bh, bd, eta)
         if best is None or t < best[0]:
             best = (t, (ch, cd), wd / W)
     return best
@@ -381,6 +391,22 @@ DECODE_CELLS = [
     ('8B 1S, gs64, warm 4096, stagger on', '8B', 1, 64, 4096 + 64, 'hbm', 44.31, 'job 5934862'),
     ('8B 2S, gs64, warm 4096, stagger off', '8B', 2, 64, 4096 + 64, 'hbm', 73.53, 'job 5934863'),
     ('8B 2S, gs64, warm 4096, stagger on', '8B', 2, 64, 4096 + 64, 'hbm', 74.95, 'job 5934863'),
+    # P4 baseline campaign (docs/hybrid-memory-results.md), medians of 3 or 5 interleaved runs, depth = warm + prompt + mean decode steps
+    ('8B 1S hbm-only, warm 4096 (P4)', '8B', 1, 64, 4096 + 35 + 128, 'hbm', 44.13, 'job 5950120'),
+    ('8B 1S hbm-only, warm 32768 (P4)', '8B', 1, 64, 32768 + 35 + 128, 'hbm', 21.92, 'job 5950120'),
+    ('8B 1S DDR, warm 4096 (P4)', '8B', 1, 64, 4096 + 35 + 128, 'ddr', 25.04, 'job 5950120'),
+    ('8B 1S DDR, warm 32768 (P4)', '8B', 1, 64, 32768 + 35 + 128, 'ddr', 14.01, 'job 5950120'),
+    ('8B 2S hbm-only, warm 4096 (P4)', '8B', 2, 64, 4096 + 35 + 128, 'hbm', 74.75, 'job 5950120'),
+    ('8B 2S hbm-only, warm 32768 (P4)', '8B', 2, 64, 32768 + 35 + 128, 'hbm', 39.85, 'job 5950120'),
+    ('8B 2S DDR, warm 32768 (P4)', '8B', 2, 64, 32768 + 35 + 128, 'ddr', 25.54, 'job 5950120'),
+    ('70B hybrid 80/80 packed in DDR, warm 4096 (P4)', '70B', 2, 64, 4096 + 35 + 48, 'hbm', 10.51, 'job 5950121'),
+    ('70B hybrid 80/80 packed in DDR, warm 32768 (P4)', '70B', 2, 64, 32768 + 35 + 48, 'hbm', 7.20, 'job 5950121'),
+    ('70B DDR, warm 4096 (P4)', '70B', 2, 64, 4096 + 35 + 48, 'ddr', 5.89, 'job 5950121'),
+    ('70B DDR, warm 32768 (P4)', '70B', 2, 64, 32768 + 35 + 48, 'ddr', 4.65, 'job 5950121'),
+    ('70B DDR, warm 130816 synthetic (P4)', '70B', 2, 64, 130816 + 35 + 48, 'ddr', 2.74, 'job 5962577'),
+    ('70B serial hybrid (planner), warm 65536 synthetic (P4)', '70B', 2, 64, 65536 + 35 + 48, 'hybrid', 5.29, 'job 5962577'),
+    ('70B serial hybrid (weights 80, planner K/V), warm 98304 synthetic (P4)', '70B', 2, 64, 98304 + 35 + 48, 'hybrid', 4.19, 'job 5962577'),
+    ('70B serial hybrid (weights 80, planner K/V), warm 130816 synthetic (P4)', '70B', 2, 64, 130816 + 35 + 48, 'hybrid', 3.42, 'job 5962577'),
 ]
 
 # P1 E5: the engine's decode GEMV over the 70B per-socket shard (weights only, 40 layers per tier copy, 18.2 GB gs64), GB/s
