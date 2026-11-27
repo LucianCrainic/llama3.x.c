@@ -261,3 +261,9 @@ the mirror's file list and sizes match it.
   (feature/bench-prewarm, bitwise-equivalence test required), TTFT cells rerun with it; cold-process TTFT reported
   separately.
 - Running: 5962577 (hbm13: c3, c4, synthetic reruns; tree 787a714), 5962578 (hbm14: c6). ~11 of 40 node-h committed.
+- C6 5962578 (hbm14, 787a714, 1:02:27, manager-read, 5 reps, d32768): serial (w64 kv0) real 3.433 / synthetic 3.460
+  (+0.8%, fix holds, slowest step <= 0.42 s); serial-kv80 (w28 kv80) 2.975 (-14%); rows-auto-c20 (w80 kv80, f 0.643)
+  2.769 (-20%); ddr 2.480 (-28%). At 1S long context the planner default (weights HBM, K/V DDR) beats every K/V-in-HBM
+  cell; rows-kvmatch (K/V as serial) added for a fair test, queued on hbm14 after the prewarm gate.
+- Prewarm knob feature/bench-prewarm e73408d (opt-in LLAMA_BENCH_PREWARM_SECONDS): check 5962596 running (hbm14),
+  gate 5962597 queued.
