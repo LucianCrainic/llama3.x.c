@@ -290,3 +290,14 @@ the mirror's file list and sizes match it.
 - Reading: at 2S the rows split never beats the planner default. With K/V placement held equal it costs 3-4%; moving
   weights to DDR to keep all K/V in HBM costs up to 19%. Same verdict as C6 at 1S and P3 (gain only for the 70B 1S
   weight spill). c2 ddr anchors: d32768s 4.674, d131072s 2.739.
+- Correction (manager-checked from 5962577 JSON): the "~13% CAS bytes above weights + K/V" note under C1/C2/C7 was an
+  arithmetic error. K/V is FP32, 21.56 GB active over both sockets at 32768 (BF16 copy 10.79 GB on top); owned weights
+  73.86 GB; sum 95.4 GB against 96.07 GB CAS per token (70B DDR): closes within 0.7%. Open item withdrawn.
+- P4 agent 0d39217 (feature/hybrid-campaign, manager-checked: 40 unit tests pass, --check-doc passes, owner name-rule
+  greps empty): pause scan of 5962577 finds no idle span >= 0.5 s in any decode window; stop rule: measured/ceiling
+  0.87-1.02, none beyond 30%. hybrid_limits concurrent formula corrected (only the GEMV splits, K/V at the full-socket
+  rate of its tier): 70B 1S concurrent over serial now +19/+20/+14/+6% at 4096/32768/65536/131072 (peak), 2S 131072 +8%.
+  Library ignores the AMX BF16 K/V copy, so it admits 80 K/V layers at 65536 where the engine admits 56 (noted, not
+  changed). Results draft docs/hybrid-memory-results.md section 5 (C3/C4) plus validation doc.
+- Next: DDR cores x fraction grid at 98304/131072 on the kvmatch K/V layers (model predicts +5 to +8% over serial at
+  48+8 f 0.15 and 40+16 f 0.28; every measured rows cell used 20 DDR cores), ~1.5 node-h on hbm13.
