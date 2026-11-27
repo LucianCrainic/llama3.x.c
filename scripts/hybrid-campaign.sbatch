@@ -35,7 +35,8 @@
 #   c3                  70B 2S: serial hybrid against concurrent rows at 32768 (real) and 65536 (synthetic)
 #   c4                  70B 2S: serial hybrid (weights in HBM, K/V by the planner) against concurrent rows at 65536, 98304 and
 #                       131072 (synthetic); a cell the planner does not admit is recorded in skipped.tsv
-#   c6                  70B 1S: serial hybrid, concurrent rows and ddr at 32768 (synthetic, real fills of the serial cell as check)
+#   c6                  70B 1S: serial hybrid (twice, as the drift anchor), concurrent rows with the K/V of the whole HBM and with the
+#                       serial cell's own K/V layers, and ddr, at 32768 (synthetic; real fills of the serial cell as check) and 4096
 #   c7                  70B 2S: AMX packed prefill (hybrid 80/80, packed in DDR) against LLAMA_KERNELS=avx512, TTFT 2048 and 8192
 set -euo pipefail
 
@@ -79,6 +80,7 @@ select_step() {
   local step=$1 n
   set_names=(); set_envs=(); m_name=(); m_kind=(); m_warm=(); m_ctx=(); m_gen=(); m_syn=(); m_prompt=(); m_reps=(); m_sets=()
   needs_syn=0
+  kvref=serial # the setting whose plan gives @KVMATCH@ (the K/V layers of the serial cell)
   case $step in
     c0-8b-1s | c0-8b-2s) model=8b ;;
     c1 | c2 | c3 | c4 | c6 | c7) model=70b ;;
@@ -147,6 +149,7 @@ select_step() {
       # serial: every weight layer in HBM, the K/V layers the planner leaves room for. rows-auto: every K/V layer in HBM, the
       # weights spill by the smallest fraction that fits (not admitted where the K/V alone overflows HBM). rows-kvmatch: the
       # K/V layers of the serial cell, the fraction left to the planner (@KVMATCH@ is the serial plan's kv_hbm_layers).
+      kvref=serial-w80
       add_set serial-w80 "$hyb LLAMA_HYBRID_WEIGHTS_HBM_LAYERS=80"
       add_set rows-auto-c20 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=$layers LLAMA_HYBRID_DDR_CORES=20"
       add_set rows-kvmatch-c20 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_CORES=20"
@@ -160,8 +163,14 @@ select_step() {
       add_set serial-kv80 "$hyb LLAMA_HYBRID_KV_HBM_LAYERS=$layers"
       add_set rows-auto-c20 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=$layers LLAMA_HYBRID_DDR_CORES=20"
       add_set ddr "LLAMA_PLACEMENT=ddr"
-      add_decode 32768 d32768s 1 "serial serial-kv80 rows-auto-c20 ddr"
+      # rows at the serial cell's own K/V placement (@KVMATCH@ = its kv_hbm_layers, the fraction left to the planner), and the
+      # serial cell a second time as the anchor of the drift inside the job
+      add_set rows-kvmatch-c14 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_CORES=14"
+      add_set rows-kvmatch-c20 "$rows LLAMA_HYBRID_KV_HBM_LAYERS=@KVMATCH@ LLAMA_HYBRID_DDR_CORES=20"
+      add_set serial-b "$hyb"
+      add_decode 32768 d32768s 1 "serial serial-kv80 rows-auto-c20 rows-kvmatch-c14 rows-kvmatch-c20 ddr serial-b"
       add_decode 32768 d32768 0 serial "$repeats"
+      add_decode 4096 d4096 0 "serial serial-kv80 rows-auto-c20 rows-kvmatch-c14 rows-kvmatch-c20 ddr serial-b" # ties to the P3 1S spill
       needs_syn=1
       ;;
     c7)
@@ -337,8 +346,8 @@ plan_cell() {
   i=$(idx "$meas" "${m_name[@]}")
   env_line=$(env_of "$setting")
   if [[ $env_line == *@KVMATCH@* ]]; then # the K/V layers the serial cell of the same measurement was given
-    plan="$OUT/plan/$step-serial-w80-$meas.json"
-    [[ -s $plan ]] || { echo "kvmatch: no plan of serial-w80 for $meas" >&2; return 1; }
+    plan="$OUT/plan/$step-$kvref-$meas.json"
+    [[ -s $plan ]] || { echo "kvmatch: no plan of $kvref for $meas" >&2; return 1; }
     kv=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["placement_plan"]["kv_hbm_layers"])' "$plan") || return 1
     env_line=${env_line//@KVMATCH@/$kv}
   fi
