@@ -312,3 +312,10 @@ the mirror's file list and sizes match it.
   rows split keeps in HBM per layer). Predictions from the real plans (calibrated tok/s): 98304 serial 4.758, kvfit
   4.839 (+1.7%) / 4.788 (+0.6%), kvmatch 4.736 / 4.735; 131072 serial 3.929, kvfit 3.980 (+1.3%) / 3.946 (+0.4%),
   kvmatch 3.914 / 3.913. Grid 5963869 running; expected effect now at the edge of the C3/C4 run-to-run spread (<= 1%).
+- kvfit miss explained (P4 agent 96a20ed, manager-checked against the c16 f0.28 d98304s plan JSON): a K/V layer in HBM
+  is three arenas (K, V, BF16 copy for AMX attention), 605.6 MB at 98560 positions; the agent's fit used two. HBM
+  weights arena = 36.928 GB minus the DDR rows arena (26.840 GB at f 0.28, exact). No engine finding: the planner
+  charges HBM only for HBM bytes. hybrid_limits now reproduces every planner count (56/37/28 serial, 54/46 and 40/34
+  rows, 1S 64/0, auto fractions 0.266/0.711/0.643); 54 unit tests pass, --check-doc passes, greps empty. 70B 2S
+  HBM-resident edge with FP32 K/V + BF16 copy: 46k positions (was 69k). Open: agent quotes +2.7%/+2.0% for kvfit c16
+  where the job's .pred files say +1.7%/+1.3%; reconciliation requested before the grid results are read.
