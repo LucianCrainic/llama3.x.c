@@ -301,3 +301,9 @@ the mirror's file list and sizes match it.
   changed). Results draft docs/hybrid-memory-results.md section 5 (C3/C4) plus validation doc.
 - Next: DDR cores x fraction grid at 98304/131072 on the kvmatch K/V layers (model predicts +5 to +8% over serial at
   48+8 f 0.15 and 40+16 f 0.28; every measured rows cell used 20 DDR cores), ~1.5 node-h on hbm13.
+- c4g restaged by P4 agent (0221a93, manager-checked: staged tree hash equals git archive, 43 unit tests pass, owner
+  name-rule greps empty). Cells per context (d98304s, d131072s): serial-w80 anchor; rows-kvfit c16 f0.28 and c8 f0.15
+  (K/V layers = largest the planner admits at that split, searched by --plan-only); rows-kvmatch c16 f0.28 and c8
+  f0.15 (null controls). Expected K/V layers 62/51 (98304), 46/38 (131072). Model (calibrated) predicts only +2.7% and
+  +1.3% (98304), +2.0% and +1.0% (131072) for kvfit; the earlier +5 to +8% used the library's own layer placement, not
+  the planner's. Submitted: plan 5963868 -> grid 5963869 (hbm13, afterok, ~1.9 node-h).
