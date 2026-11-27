@@ -163,6 +163,17 @@ static void parse(int argc, char **argv) {
     if (options.generation_length < 0 && !steps_set)
       options.generation_length = 128;
   }
+  /* A node can stall every worker for several seconds once per process, early in its compute (docs/hbm-ddr-research.md,
+   * "Startup pause"). This runs untimed forwards of the first prompt tokens until that much compute time has passed, so a
+   * benchmark's timed prefill and decode are not the ones that meet the stall. 0 (default) is off. */
+  const char *prewarm = getenv("LLAMA_BENCH_PREWARM_SECONDS");
+  if (prewarm) {
+    char *end;
+    double seconds = strtod(prewarm, &end);
+    if (!options.benchmark || !*prewarm || *end || !(seconds >= 0.0) || seconds > 3600.0)
+      fail("LLAMA_BENCH_PREWARM_SECONDS requires --benchmark and a number of seconds from 0 through 3600");
+    options.bench_prewarm_s = seconds;
+  }
 #ifdef LLAMA_ENABLE_SYNTHETIC_KV
   const char *synthetic_kv = getenv("LLAMA_SYNTHETIC_KV");
   if (synthetic_kv && strcmp(synthetic_kv, "0")) {
@@ -453,6 +464,29 @@ static double forward_warm_prefix(const int *tokens, int n, int positions, int t
   return elapsed;
 }
 
+/* Forwards [0, unit) of the prompt (once if `at_least_once`, then again) until `seconds` have passed since `start`, without
+ * logits or trace. The positions are rewritten by whatever follows. Returns the seconds since `start`. */
+static double forward_until(const int *tokens, int n, int unit, double start, double seconds, int at_least_once) {
+  if (at_least_once)
+    forward_warm_prefix(tokens, n, unit, 0);
+  while (monotonic_seconds() - start < seconds)
+    forward_warm_prefix(tokens, n, unit, 0);
+  return monotonic_seconds() - start;
+}
+
+/* LLAMA_BENCH_PREWARM_SECONDS: the untimed compute before the timed work. The forwards write positions [0, unit) of the
+ * K/V caches and leave nothing else behind: the caches are rewritten from position 0 by the timed run, kv_store
+ * invalidates the BF16 copy from the position it writes, nothing is sampled, and the profile, metrics and token trace do
+ * not see these passes, so the timed run is the one a run without prewarm makes. */
+static double bench_prewarm(const int *tokens, int n) {
+  if (options.bench_prewarm_s <= 0 || n < 1)
+    return 0;
+  double start = monotonic_seconds();
+  int unit = n < 1024 ? n : 1024;
+  metrics.bench_prewarm_s = forward_until(tokens, n, unit, start, options.bench_prewarm_s, 1);
+  return metrics.bench_prewarm_s;
+}
+
 /* --warm-context: fill positions [0, warm) with forward_warm_prefix. The time is kept apart in metrics.warm_s, so that the
  * timed prefill and decode start from a context of that length (B7 §4.1). A SYNTHETIC_KV=1 build with LLAMA_SYNTHETIC_KV=1
  * writes a fixed pattern into the caches instead (engine_synthetic_kv), after LLAMA_SYNTHETIC_KV_PRIME real positions
@@ -472,11 +506,8 @@ static int warm_up(const int *tokens, int n) {
     /* The primer, then repeats of it (the same real positions, rewritten by the fill) until the minimum compute time
      * has passed. Without a primer the repeats use the first 1024 positions of the warm context or fewer. */
     int unit = options.synthetic_kv_prime ? options.synthetic_kv_prime : warm < 1024 ? warm : 1024;
-    if (options.synthetic_kv_prime || options.synthetic_kv_min_s > 0)
-      forward_warm_prefix(tokens, n, unit, 0);
-    while (monotonic_seconds() - start < options.synthetic_kv_min_s)
-      forward_warm_prefix(tokens, n, unit, 0);
-    metrics.synthetic_primer_s = monotonic_seconds() - start;
+    metrics.synthetic_primer_s = forward_until(tokens, n, unit, start, options.synthetic_kv_min_s,
+                                               options.synthetic_kv_prime || options.synthetic_kv_min_s > 0);
     engine_synthetic_kv(&model, warm);
     metrics.warm_s = monotonic_seconds() - start;
     return warm;
@@ -498,6 +529,7 @@ static void generate(Tokenizer *t, Sampler *s, const char *prompt) {
   if (options.synthetic_kv && (int64_t)options.warm_context + n + options.generation_length - 1 > options.steps)
     fail("LLAMA_SYNTHETIC_KV requires space for the warm context, prompt and complete generation");
 #endif
+  start += bench_prewarm(tokens, n); /* neither prefill nor time to first token */
   int pos = warm_up(tokens, n);
   start += metrics.warm_s; /* the warm-up is neither prefill nor time to first token */
   double excluded = metrics.verify_excluded_s;

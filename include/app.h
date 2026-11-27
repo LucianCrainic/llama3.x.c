@@ -5,6 +5,7 @@ typedef struct {
   const char *checkpoint, *tokenizer, *prompt, *prompt_file, *mode, *system_prompt, *json;
   int plan_only;
   int chat_template, context, steps, generation_length, benchmark, no_text;
+  double bench_prewarm_s; /* LLAMA_BENCH_PREWARM_SECONDS (--benchmark only): untimed forwards before the timed work, 0 = off */
   int warm_context; /* --warm-context N: forward N untimed tokens before the prompt (B7), 0 = off */
 #ifdef LLAMA_ENABLE_SYNTHETIC_KV
   int synthetic_kv, synthetic_kv_prime; /* SYNTHETIC_KV=1 builds: LLAMA_SYNTHETIC_KV, LLAMA_SYNTHETIC_KV_PRIME */

@@ -165,6 +165,35 @@ class RuntimeTests(unittest.TestCase):
                                                      'LLAMA_KERNELS': 'scalar'})
                         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_bench_prewarm_leaves_the_timed_run_unchanged(self):
+        # LLAMA_BENCH_PREWARM_SECONDS: untimed forwards before the timed work; the trace, the stdout, the accounting and the
+        # profile counts of the timed run are those of a run without it, with or without a warm context.
+        out = self.root/'prewarm-tokens.json'
+        for engine in ('run', 'runq'):
+            for extra in ((), ('--warm-context', '3')):
+                runs = {}
+                for seconds in ('0', '0.2'):
+                    out.unlink(missing_ok=True)
+                    result, data = self.execute(engine, '--benchmark', '--generation-length', '6', '--context-length', '16',
+                                                *extra, env={'LLAMA_TOKENS_OUT': str(out), 'LLAMA_PROFILE': '1',
+                                                             'LLAMA_BENCH_PREWARM_SECONDS': seconds})
+                    runs[seconds] = (result.stdout, json.loads(out.read_text()), data)
+                self.assertEqual(runs['0'][0], runs['0.2'][0], (engine, extra))
+                self.assertEqual(runs['0'][1], runs['0.2'][1], (engine, extra))
+                off, on = runs['0'][2], runs['0.2'][2]
+                self.assertEqual(off['parameters']['bench_prewarm_seconds'], 0)
+                self.assertEqual(on['parameters']['bench_prewarm_seconds'], 0.2)
+                self.assertIsNone(off['timing_seconds']['bench_prewarm'])
+                self.assertGreaterEqual(on['timing_seconds']['bench_prewarm'], 0.2)
+                for key in ('input_prompt', 'processed_prompt', 'generated_output', 'forward_passes', 'decode_steps'):
+                    self.assertEqual(on['tokens'][key], off['tokens'][key], (engine, extra, key))
+                self.assertEqual(on['kv']['after_prompt']['active_bytes'], off['kv']['after_prompt']['active_bytes'])
+                self.assertEqual(on['profile_seconds']['prefill']['forward_passes'],
+                                 off['profile_seconds']['prefill']['forward_passes'])
+        self.execute('run', env={'LLAMA_BENCH_PREWARM_SECONDS': '0.1'}, success=False)  # needs --benchmark
+        for bad in ('-1', 'x', '3601', ''):
+            self.execute('run', '--benchmark', env={'LLAMA_BENCH_PREWARM_SECONDS': bad}, success=False)
+
     def test_warm_context_is_untimed_and_uncounted(self):
         # B7: --warm-context N fills N positions first; the timed prefill and decode start from that context.
         for engine in ('run', 'runq'):

@@ -186,6 +186,7 @@ typedef struct {
   size_t synthetic_step_max_at;
   double synthetic_primer_s; /* real compute spent before the fill (primer plus the minimum-time repeats) */
 #endif
+  double bench_prewarm_s; /* untimed LLAMA_BENCH_PREWARM_SECONDS forwards before the timed work */
   double warm_s;        /* untimed --warm-context prefill (B7); excluded from prefill, TTFT and inference time */
   double weight_pack_s; /* BF16 packing at load (C5) */
   int weight_packed;
