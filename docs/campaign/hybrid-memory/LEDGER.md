@@ -47,7 +47,7 @@ internet access and existing checkpoints; send the P2b table to the owner for ap
 | P2b 70B port | **merged** ee24659 (local): steps 1-6 + fidelity note 301df53; owner name-rule greps empty; 5929376 (hbm14): default-path tokens bitwise equal to develop (1S/2S, warm 0/512, profile on); profile fix not visible on 8B (develop exchange not inflated; classifier phase 0.46 vs 0.04 ms/token, cause unconfirmed); 5929377: synthetic decode 50.44/50.49 vs real 52.01 tok/s (-3.0/-2.9%), amx -0.8%, CAS within 1.2%, placement + KV accounting identical (manager-read raw JSON). Gate 5929402 on ee24659 **passed** (make test rc 0, 0 FAIL/ERROR, 7 suites OK). Step 7 done: 70B C Q8 re-run merged dbd8e14 (jobs 5929406/5929407 DDR, 5935580 HBM = hybrid 80/80 packed=ddr; manager re-derived medians from runs.jsonl): DDR gs32 TTFT 2.69/10.22 s, decode 5.93/5.76; HBM 2.60/9.92 s, 10.97/10.12 tok/s; gs64 HBM 11.58/10.71; ids equal to 5910211. Script PLACEMENT/HYBRID_* options 119d912 | `feature/70b-comparison` | sonnet | 5929376, 5929377 | 0.35 |
 | Downloads / 70B gs64 conversion | **not needed**: 70B gs64 and gs32 engine files exist (headers checked by manager); sha256 manifest done (job 5916180, cpu partition, 0.2 node-h; 70B gs64 and tokenizer hashes match the record made at conversion) | | haiku | 5916180 | 0.2 |
 | P3 concurrent placement | prototype committed on feature/concurrent-tiers (58cbbc7: LLAMA_HYBRID_SPLIT=rows, DDR_FRACTION, DDR_CORES; one decode team call, last n members serve DDR rows). 5935734 check: logits sha256 1 digest over hbm-only/80-80/r0.1-0.3 (8B 1S/2S), 70B traces equal; its make test failed only on a test div-by-zero fixed in 58cbbc7. Gate 5935771 on 357d58f: make test rc 0, logits 1 digest (8B 1S/2S decode+batch), traces 0 differ (8B 1S/2S, 70B 2S) — manager-read. 5935769 failed on a script check (fixed 357d58f); 5935827 fits-8b-1s-b (manager-read, 5 reps, stagger on): hbm-only 44.05, best rows r0.15/c8 43.55 (-1.1%), P1 point r0.2/c14 42.90 (-2.6%), ddr 24.98: **no gain in the fits case at 8B 1S**. **Spill 5935860 (70B 1S, warm 4096, manager-read): rows-auto f0.254 c20 5.370 tok/s vs serial (59/80 weight layers in HBM) 4.834 = +11.1%; c14 5.321, f0.35-c20 5.333, c28 4.608; ddr 3.173; 36 traces equal. Limits model (cal) predicted serial 4.67, concurrent 5.52 (measured within -3%/+3%).** **Fits 2S (manager-read, 5 reps, all completed, traces 0 differ): 5936152 8B 2S hyb-all-hbm 74.40, best rows r0.15/c8 73.49 (-1.2%), ddr 44.75; 5936167 70B 2S (hybrid 80/80, packed ddr) 10.51, best r0.1/c8 10.27 (-2.3%), ddr 5.88. No gain in the fits case on 1S or 2S; mismatched fraction/cores lose up to 34%.** 5949316 superseded (sbatch --export split the comma lists; only serial ran). **Spill 2S long 5949331 (70B 2S, 64K warm, synthetic KV, manager-read, 5 reps, 24 traces 0 differ, placement PASS): serial (planner: weights 80, KV 37 in HBM) 2.458, serial-kv80 control (weights 23, KV 80) 2.369, rows-auto-c20 (f 0.708) 2.500 = +5.5% vs control, +1.7% vs serial (inside spread); c14 2.249.** Validation doc fc83661; P3 ~6.0 node-h. **Merged 5c86d9d onto develop 08aa16d (opt-in; defaults and default numerics unchanged); gate 5949471 on 5c86d9d passed (make test rc 0, 8 suites OK, hbm14).** Use only for weight spill (DDR_FRACTION=auto, 14-20 DDR cores) | `feature/concurrent-tiers` → develop | | | |
-| P4 limits + baseline | limits doc merged (develop, after 59f6bc6; tests + --check-doc rc 0, TTFT ceiling re-derived by manager: 285 TOP, 0.63 s at 2048). Key: 70B TTFT 12-16x AMX peak; concurrent beats serial only in spill (1S: +15-32% modelled). Campaign C0-C8 after TTFT diagnosis | | | | |
+| P4 limits + baseline | limits doc merged (develop, after 59f6bc6; tests + --check-doc rc 0, TTFT ceiling re-derived by manager: 285 TOP, 0.63 s at 2048). Key: 70B TTFT 12-16x AMX peak; concurrent beats serial only in spill (1S: +15-32% modelled). Campaign started 26 Nov (owner: "Start P4") on feature/hybrid-campaign from develop 0dd18db: C0-C4, C6, C7; C5 deferred (no BF16/INT8 K/V yet, P5); C8 skipped (no Cache-mode node in cresco8_hbm). Reuses P3 5936167 (C3 @4096) and 5935860 (C6 @4096). Cap 40 node-h | `feature/hybrid-campaign` | sonnet | | |
 | P5 gap loop | TTFT diagnosis merged (develop, local): 70B hybrid 80/80 packed=ddr gs64, driver medians (manager-read) P=2113 7.915 s @M=256 vs 5.603 @M=1024, P=547 2.106 vs 1.609; GEMM 89% at 40.8 TOP/s (9% AMX peak), 57.5 at M=1024; W1/W3 carries the per-batch cost (0.37 s/batch); packed copy read ~2.4x per M=256 batch from DDR; 8B packed hbm=ddr. Next: W1/W3 shard-shape gemm_bench (L3 capacity hypothesis), xengine row at M=1024 | | sonnet | 5935737, 5935864 | ~1.8 |
 
 ## Decisions
@@ -205,3 +205,45 @@ the mirror's file list and sizes match it.
 | Q2 | Is there a non-purged area larger than 100 GB for the 70B engine files, and what is the scratch purge policy? (not blocking) | open |
 | Q3 | test-q8-emul TSAN: owner said merge now; run afterwards | answered 25 Nov: merged 117cd0d; TSAN job 5929318 (cresco8_cpu, 12 h) submitted; push of develop held until it reports 0 races |
 | Q1 | The P2b inventory: port all of the earlier 70B comparison work from its tip in 7 steps (profile fix, synthetic KV + primer, tools, research sbatch, 70B cross-engine harness, docs with older-tree banner, optional 70B Q8 re-run); the two duplicate commits of the synthetic-KV variant dropped | **approved by owner 24 Nov: all seven steps, including the optional 70B Q8 re-run** |
+
+## Synthetic K/V fidelity failure (26 Nov, manager-read)
+
+- 5950121 (70B 2S hyb80, tree 47c08fb, hbm13): decode at 32768 real 7.217/7.202/7.150 against synthetic (PRIME 1024)
+  3.870/3.898/3.688 tok/s, **-46%**, not the documented ~3%. Same windows (35 prompt, 95 steps), same placement and 2 MiB
+  coverage, same CAS bytes per step (~47 GB per socket at 32 B per HBM CAS); **corrected:** not slower compute. The
+  synthetic window holds one ~11-14 s near-idle span (HBM reads ~1 GB/s) starting ~5 s into decode; outside it both runs
+  stream at ~360 GB/s per socket (manager re-derived from r1 perf.csv; agent from the profiled run). The span starts
+  ~8.6 s after the process's first forward in both a synthetic run and the real t2048 run: the known unresolved "startup
+  pause" of hbm-ddr-research.md. A real 32768 warm-up (171 s) absorbs it; a short primer puts it inside the decode window.
+  Any short run whose timed window overlaps compute time ~8.6-23 s can be hit. Diagnostic 5950126 (8B 2S, hbm01 Cache mode).
+- Consequences: every synthetic cell is void until fixed: P4 c1 d65536s and c2 d131072s in 5950121, the planned c3/c4/c6
+  synthetic cells (held), and the P3 long-context run 5949331 (its relative result is suspect and is so marked here).
+  Real-fill cells (4096, 32768, TTFT) are unaffected.
+- Diagnosis agent on fix/synthetic-kv-fidelity (opt-in build only; default path untouched).
+
+## P4 C0 (8B) verified (26 Nov)
+
+- 5950120 (hbm14, tree 47c08fb, 1:37:00): 180 timed runs completed, placement PASS, traces 1 distinct per group, pause
+  scan 239/240 clean (one 2S TTFT run 0.31 s idle in prefill). Manager re-derived 8 decode and 3 TTFT medians from raw
+  JSON: all equal to the agent's table (e.g. 1S hbm-only d4096 44.13 [43.97-44.14], 2S ddr d32768 25.54, 1S rows r0.1
+  c14 d32768 21.25, 2S hbm-only TTFT 2048 0.822 [0.700-0.879]).
+- Serial model holds: serial cells 0.95-1.09 (1S) and 0.87-1.01 (2S) of the calibrated ceiling; CAS DDR share matches
+  the planned byte fraction within 0.5 pp. No concurrent cell beats all-HBM (best -3.0% 1S, -3.5% 2S), as in P3.
+- Stop rule: 1S rows r0.1/r0.2 at 32768 are 1.36/1.35 of the library concurrent ceiling (faster than modelled). Cause
+  (derived): the library charges K/V at the reduced per-group rate, the engine splits only the GEMV and runs attention
+  on all cores. Engine-form ceiling added to the summary tool (aae7b69), rows cells 0.92-1.15; library formula to be
+  corrected in hybrid-limits (pending).
+- Fix fix/synthetic-kv-fidelity 571e182 + docs 813d222 (LLAMA_SYNTHETIC_KV_MIN_SECONDS, default 30; SYNTHETIC_KV build
+  only). Validation 5950963 (hbm14, diag script, manager-read): real 7.166/7.141, min30 7.188/7.230/7.197 (+0.9%),
+  but the min0 control 7.220 did **not** pause (0/6 runs idle > 0.1 s), against 4/4 paused runs under
+  hybrid-campaign.sbatch in 5950121. Suspect: something the campaign script runs next to the engine; analysis
+  delegated. Gate 5950966 on 813d222 (hbm14). P4 synthetic cells stay held.
+- **Correction (manager re-read):** the min0 control of 5950963 did pause, in its prefill (6.34 s against 0.70-0.82 s in
+  the other 5 runs; TTFT 6.40 s). Per-0.5 s /proc samples show one all-CPU kernel-mode span (sys ~80% of ticks, all
+  threads R, no vmstat counter moving) in every run of 5950963, 5950121 and the 8B hbm01 jobs: 6.5-14 s long, starting
+  3.4-10.3 s after the first forward; not script-, perf-, node- or data-specific. Cause open (needs root for stacks).
+  The fix is validated: min30 put the span in the primer in 3/3 runs (prefill 0.81-0.82 s, decode 7.188-7.230,
+  slowest step <= 0.19 s). Docs correction 888e676.
+- **Consequence for TTFT cells:** a short default-build run can have the span inside its timed prefill (70B 6.4 s TTFT
+  against 0.8 s). Every TTFT cell must pass the pause scan on its prefill window; a guard for the default build is a
+  design question for P4 (opt-in only).
