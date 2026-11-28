@@ -322,3 +322,34 @@ the mirror's file list and sizes match it.
 - Reconciled (48459ce, docs only): the +2.7%/+2.0% were the agent's pre-run layer guesses (62/46), not a library change.
   96a20ed leaves the throughput formula unchanged; all ten c4g plan predictions recomputed at 96a20ed equal the job's
   .pred files to the last digit. Predictions stand: kvfit c16 +1.7%/+1.3%, c8 +0.6%/+0.4%, kvmatch -0.4/-0.5%.
+
+## P4 c4g, C6b, TTFT + h1 verified (28 Nov)
+
+Manager re-derived every median from raw JSON. Slurm accounting was unavailable at check time (authentication errors
+on the login node); completion confirmed from job logs, `finished` lines and per-run JSON status.
+
+- c4g 5963869 (hbm13, 0221a93, 50 runs + 2 profiles, 0 failed, traces equal, slowest step <= 0.42 s). 70B 2S decode
+  tok/s, 5 reps, spread <= 0.8%. Serial-w80 4.177 (98304) / 3.430 (131072), equal to C4 (4.186 / 3.420): no drift.
+  98304: kvfit c16 f0.28 (kv54) 4.149 (-0.7%), kvfit c8 f0.15 (kv46) 4.152 (-0.6%), kvmatch c16 4.113 (-1.5%),
+  kvmatch c8 4.130 (-1.1%). 131072: kvfit c16 (kv40) 3.406 (-0.7%), kvfit c8 (kv34) 3.396 (-1.0%), kvmatch c16 3.361
+  (-2.0%), kvmatch c8 3.374 (-1.6%). Predicted +1.7/+0.6/-0.5/-0.5% and +1.3/+0.4/-0.4/-0.4%: every split cell
+  measures ~1.5% below its prediction relative to serial (measured/predicted 0.856-0.872 against 0.873-0.878 for
+  serial). The extra K/V in HBM is real but smaller than modelled (kvfit over kvmatch +0.5 to +1.3% against +0.8 to
+  +2.2% predicted). Verdict: at 2S with only K/V spilled, no row split beats the planner default; the model's best
+  cell is -0.7%. Unmodelled split cost ~1.5%.
+- C6b 5962626 (hbm14, 1S, 70 runs + 14 profiles, 0 failed, traces equal, slowest step <= 0.67 s). Anchors serial /
+  serial-b: 4.969 / 4.952 (d4096 real), 3.460 / 3.462 (d32768s); equal to C6 5962578. d4096 (weights spill): rows
+  kvmatch c14 5.483 (+10.3%), rows auto c20 (f 0.254, all HBM) 5.395 (+8.6%), kvmatch c20 5.092 (+2.5%), serial-kv80
+  4.838 (-2.6%), ddr 3.173. d32768s: kvmatch c14 3.544 (+2.4%), kvmatch c20 3.452 (-0.2%), rows auto 2.767 (-20%),
+  serial-kv80 2.973 (-14%), ddr 2.480. 1S weight-spill gain confirmed (+10.3% with 14 DDR cores, cf. P3 +11.1%);
+  it shrinks to +2.4% at 32768 where K/V in DDR dominates. 14 DDR cores beat 20 at both contexts.
+- TTFT 5963862 (hbm14, 57 runs + 13 profiles, traces equal). r5-c7-amx-t2048 is listed failed: the run completed
+  (JSON status completed, TTFT 5.871 s); the post-step failed with the AFS Python reporting "No such device"
+  (cluster-side). Kept. 70B 2S, prewarm 30 s, 5 reps: c1 hyb80 t2048 5.149, c7 amx t2048 5.160, c2 ddr t2048 5.412
+  (+5%: prefill nearly memory-independent), c7 avx512 t2048 37.50 (7.3x amx); t8192 amx 24.06 / c1 24.12, avx512
+  164.45. Prewarmed outliers of +0.6 s (t2048) and +2.5 s (t8192) in 1-2 of 5 runs: the known bimodality.
+  Cold (no prewarm) c1 t2048c: 6.16/14.37/5.44/6.44/12.32, median 6.44; t8192c median 34.49 [30.3-38.6].
+- h1 (same job, 3 reps each, prewarm 30 s, amx t2048): auto-full 5.170, auto-min 5.134, explicit-full 5.132,
+  explicit-min 5.193. Manager confirmed the cells differ (topology classification numaperf vs explicit; perf events
+  10 vs 3). Harness ruled out: the ~20% TTFT gap was cold-process start (no prewarm). P4 5950121's 6.56 s matches the
+  cold median here (6.44). Prewarmed TTFT is the reported figure; cold TTFT reported separately with its spread.
