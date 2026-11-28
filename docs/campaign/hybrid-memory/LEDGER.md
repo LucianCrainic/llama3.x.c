@@ -276,7 +276,7 @@ the mirror's file list and sizes match it.
 
 ## P4 C3/C4 verified (27 Nov)
 
-- 5962577 (hbm13, 787a714, 3:36:26, 126 runs, 0 failed, traces equal). Manager re-derived every cell median from raw
+- 5962577 (hbm13, 787a714, 3:36:26, 106 runs [87 timed + 19 profiled; "126" earlier counted plan JSONs too], 0 failed, traces equal). Manager re-derived every cell median from raw
   JSON; 70B 2S decode tok/s, 5 reps unless noted, spread <= 1%. Synthetic slowest decode step <= 0.47 s in every run
   (guard 1 s); CAS/kernel-mode pause scan on these windows left to the P4 agent's summary.
 - Fits case, real fill d32768: serial (w80 kv80) 7.199; rows f0.1 c8 7.115 (-1.2%); rows f0.2 c14 7.140 (-0.8%).
@@ -353,3 +353,10 @@ on the login node); completion confirmed from job logs, `finished` lines and per
   explicit-min 5.193. Manager confirmed the cells differ (topology classification numaperf vs explicit; perf events
   10 vs 3). Harness ruled out: the ~20% TTFT gap was cold-process start (no prewarm). P4 5950121's 6.56 s matches the
   cold median here (6.44). Prewarmed TTFT is the reported figure; cold TTFT reported separately with its spread.
+- P4 write-up 8574370 (feature/hybrid-campaign; manager-checked: unit tests pass, --check-doc passes, owner name-rule
+  greps empty on tree and log). Agent medians equal the manager's; C6b d4096 gain +10.35% unrounded (doc quotes
+  +10.4%). Pause scan: no flagged span in any decode window (c4g 0/52, C6/C6b 0/112, C0 0/240) or prewarmed TTFT prefill
+  (0/47); flagged only in cold cells (c1 t2048c 2/5, t8192c 5/5) and the void 5950121 cells. Stop rule: none beyond 30%
+  (8B 0.91-1.15, 70B 2S 0.86-1.02, 70B 1S 0.97-1.15 of calibrated ceiling). Split cost ~1.5%: profiles put it in the
+  GEMV phases (barrier/imbalance between groups), no model term proposed; profiled c16/c8 split cells (~4 min) would
+  test a ~11 us per-GEMV barrier. P4 node-hours 14.3 of 40 (derived). Gate 5968583 (hbm13) submitted for merge.
