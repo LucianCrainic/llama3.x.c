@@ -19,7 +19,8 @@ and eta the efficiency of the engine against that raw rate (eta = 1 is the "peak
     t_ddr        = bytes / BW_ddr(56 cores)
     t_serial     = B_hbm / BW_hbm(56) + B_ddr / BW_ddr(56)                    (layer-granular hybrid, tiers read one after the other)
     t_concurrent = min over the P1 core splits (c_h + c_d = 56) and the weight-byte split of
-                   max(B_hbm / BW_hbm(c_h), B_ddr / BW_ddr(c_d))               (rates measured while both groups run)
+                   max(W_hbm / BW_hbm(c_h), W_ddr / BW_ddr(c_d)) + K_hbm / BW_hbm(56) + K_ddr / BW_ddr(56)
+                   (only the GEMV is split, at the rates measured while both groups run; attention reads K/V on all cores after it)
 """
 import argparse
 import math
@@ -72,6 +73,11 @@ def bytes_per_weight(gs):
     return 1.0 + 4.0 / gs
 
 
+def norm_bytes(m, sockets):
+    """FP32 RMS-norm weights, duplicated on every socket and part of the weights arena ((2 layers + 1) x dim x 4 bytes, 5.3 MB at 70B)."""
+    return (2 * m.layers + 1) * m.dim * 4.0
+
+
 def layer_weight_bytes(m, gs, sockets):
     return m.layer_params() * bytes_per_weight(gs) / sockets
 
@@ -112,7 +118,19 @@ E1 = [(56, 0, 569.1, 0.0), (54, 2, 542.1, 20.3), (52, 4, 518.7, 37.0), (48, 8, 4
 E1_COMBINED = {54: 562.4, 52: 555.9, 48: 554.8, 44: 537.1, 40: 542.2, 36: 521.2, 32: 483.4, 28: 501.1, 24: 434.7, 16: 375.1}
 
 HBM_BUDGET = 56 * GIB       # LLAMA_HBM_BUDGET_GIB default per socket (docs/plans/hbm-capacity-study.md section 2)
-WORK_BYTES = 0.5 * GIB      # work buffers per socket, 70B, 256-row batch: estimated in the same study (used for 8B too)
+WORK_BYTES = 0.5 * GIB      # work buffers per socket, 70B, 256-row batch: estimated in the same study (kept for models other than the 70B)
+
+# Planner capacity model (derived 28 November 2026 from the arenas of the --plan-only reports of the P4 campaign, 70B gs64: jobs 5962577, 5962578
+# and 5963868; docs/hybrid-memory-results.md section 5.3). What the planner charges to the HBM node of one socket:
+#   weights arena   weights (layers x layer + classifier) + the FP32 norms ((2 layers + 1) x dim x 4 bytes; the DDR copy is the rows split's)
+#   K/V             per layer THREE arenas of kv_layer_bytes each: kv.k, kv.v and the BF16 copy kv.bf16 (LLAMA_ATTN=amx, the default), which
+#                   is as large as K alone, so FP32 K/V costs 1.5 times its bytes; the arenas hold the CONTEXT (warm + 256 positions)
+#   work + exchange + logits   linear in the context (two plans: 520.04 MB at 98,560 positions, 584.31 MB at 131,072), twice the slope on one socket
+#   rows split      the DDR arena holds, per matrix (Wq, Wk, Wv, Wo, W1, W3, W2), floor(fraction x output rows / 32) x 32 rows of every layer
+#                   (rows_ddr_bytes: equal to the planner's arena to the megabyte for fractions 0.15, 0.2, 0.28 on two sockets and 0.643 on one); nothing else moves
+BF16_COPY_FACTOR = 0.5       # kv.bf16 / (kv.k + kv.v) for FP32 K/V
+WORK_BASE_2S = 325.2e6       # bytes: intercept of work + exchange + logits on two sockets (derived from the two plans above)
+WORK_PER_POS_2S = 1976.5     # bytes per context position on two sockets
 
 # Old calibrated model (docs/plans/hbm-capacity-study.md section 5): weight stream HBM 397 GB/s (8B W8A8 2S, 99.1 tok/s x 7.97 GB / 2),
 # DDR 238 GB/s (8B 1S DDR, 29.8 tok/s x 7.97 GB); K/V read HBM 200 GB/s (measured 186-225 on 8B 2S at 8192 and 32768 positions),
@@ -159,15 +177,63 @@ class Placement:
         return (self.Wd + self.Kd) / (self.Wh + self.Kh + self.Wd + self.Kd)
 
 
-def place(m, gs, sockets, ctx, dtype='fp32', budget=HBM_BUDGET, work=WORK_BYTES):
+def rows_ddr_bytes(m, gs, sockets, fraction):
+    """Bytes of the DDR arena of LLAMA_HYBRID_SPLIT=rows on one socket: for each of the seven matrices of a layer, the last
+    floor(fraction x output rows / 32) x 32 rows of the socket's share (output rows of Wo and W2 are all `dim`; their columns are split)."""
+    q, kv = m.heads * m.head_dim, m.kv_heads * m.head_dim
+    shapes = [(q // sockets, m.dim), (kv // sockets, m.dim), (kv // sockets, m.dim), (m.dim, q // sockets),
+              (m.hidden // sockets, m.dim), (m.hidden // sockets, m.dim), (m.dim, m.hidden // sockets)]
+    rows = sum(int(math.floor(fraction * n / 32.0)) * 32 * k for n, k in shapes)
+    return rows * bytes_per_weight(gs) * m.layers
+
+
+def work_bytes(m, sockets, alloc_ctx):
+    """Work, exchange and logits arenas of one socket for a context of alloc_ctx positions (70B: the fit above; other models: WORK_BYTES)."""
+    if m.name != '70B':
+        return WORK_BYTES
+    return WORK_BASE_2S + WORK_PER_POS_2S * alloc_ctx * 2.0 / sockets
+
+
+def kv_hbm_layer_bytes(m, sockets, alloc_ctx, dtype='fp32'):
+    """HBM bytes one K/V layer costs: K and V for alloc_ctx positions, plus the BF16 copy of the AMX attention when K/V is FP32."""
+    lk = kv_bytes_per_token(m, sockets, dtype) / m.layers * alloc_ctx
+    return lk * (1.0 + BF16_COPY_FACTOR) if dtype == 'fp32' else lk
+
+
+def plan_layers(m, gs, sockets, alloc_ctx, fraction=0.0, dtype='fp32', budget=HBM_BUDGET):
+    """The engine planner's automatic layer counts (docs/configuration.md: classifier, then weights, then K/V; each choice symmetric over the
+    sockets) for a context of alloc_ctx positions (warm context + 256). With fraction > 0 (LLAMA_HYBRID_SPLIT=rows) every weight layer is
+    in HBM except the DDR rows. Returns a dict with the weight layers and K/V layers in HBM and the HBM bytes charged, or None when even
+    the weights and work buffers do not fit."""
+    lw, cw = layer_weight_bytes(m, gs, sockets), classifier_bytes(m, gs, sockets)
+    fixed = work_bytes(m, sockets, alloc_ctx) + cw + norm_bytes(m, sockets)
+    if fraction > 0:
+        weight_layers, weights = m.layers, m.layers * lw - rows_ddr_bytes(m, gs, sockets, fraction)
+    else:
+        weight_layers = int(max(0.0, min(m.layers, (budget - fixed) // lw)))
+        weights = weight_layers * lw
+    left = budget - fixed - weights
+    if left < 0:
+        return None
+    kv_layer = kv_hbm_layer_bytes(m, sockets, alloc_ctx, dtype)
+    kv_layers = int(min(m.layers, left // kv_layer))
+    return {'weights_layers': weight_layers, 'kv_layers': kv_layers, 'hbm_bytes': fixed + weights + kv_layers * kv_layer}
+
+
+def place(m, gs, sockets, ctx, dtype='fp32', budget=HBM_BUDGET, work=None, alloc_ctx=None):
     """Whole layers (weights and K/V of the layer together) go to HBM until the budget is full; the classifier stays in HBM; the rest
     goes to DDR. Layer granularity is an approximation of the planner's two independent knobs (LLAMA_HYBRID_WEIGHTS_HBM_LAYERS and
-    LLAMA_HYBRID_KV_HBM_LAYERS): it differs from them by less than one layer of bytes."""
+    LLAMA_HYBRID_KV_HBM_LAYERS): it differs from them by less than one layer of bytes. The capacity charge is the planner's (plan_layers): the
+    K/V layer costs 1.5 times its bytes for FP32 K/V (the BF16 copy of the AMX attention), the work buffers grow with the context, and
+    alloc_ctx (default ctx) is the allocated context; the bytes read per token are those of ctx."""
     lw = layer_weight_bytes(m, gs, sockets)
     cw = classifier_bytes(m, gs, sockets)
     lk = kv_bytes_per_token(m, sockets, dtype) / m.layers * ctx
-    avail = budget - work - cw
-    n = max(0, min(m.layers, int(avail // (lw + lk))))
+    charge = kv_hbm_layer_bytes(m, sockets, alloc_ctx or ctx, dtype)
+    if work is None:
+        work = work_bytes(m, sockets, alloc_ctx or ctx)
+    avail = budget - work - cw - norm_bytes(m, sockets)
+    n = max(0, min(m.layers, int(avail // (lw + charge))))
     return Placement(n, m.layers, n * lw + cw, n * lk, (m.layers - n) * lw, (m.layers - n) * lk)
 
 
@@ -196,31 +262,40 @@ def t_serial(m, gs, S, ctx, dtype='fp32', eta=PEAK, place_fn=None):
     return t_tier(p.Wh, p.Kh, HBM_STREAM, eta.hw, eta.ha) + t_tier(p.Wd, p.Kd, DDR_STREAM, eta.dw, eta.da)
 
 
+def t_concurrent_split(Wh, Wd, Kh, Kd, bh, bd, eta):
+    """Seconds per token of the engine's concurrent row split (LLAMA_HYBRID_SPLIT=rows) at one core split. Only the GEMV is split: the
+    HBM group streams Wh at its rate bh while the DDR group streams Wd at bd (GB/s, P1 E1, measured while both run); the two finish
+    together, so the weight time is the slower of the two. Attention is not concurrent with it and runs on every core of the socket:
+    K/V is read after the GEMV, at the full-socket rate of the tier it sits in (HBM_STREAM, DDR_STREAM). (Until 27 November 2026 the
+    K/V bytes were charged inside the group rates, as if the 42 or so HBM-group cores read the HBM-resident K/V; the engine does not,
+    and the model ran 15 to 25% below the measured row-split cells of docs/hybrid-memory-results.md.) Bytes in GB / 1e9 as elsewhere."""
+    t_h = Wh / (eta.hw * bh * GB) if Wh else 0.0
+    t_d = Wd / (eta.dw * bd * GB) if Wd else 0.0
+    t_k = Kh / (eta.ha * HBM_STREAM * GB) + Kd / (eta.da * DDR_STREAM * GB)
+    return max(t_h, t_d) + t_k
+
+
 def t_concurrent(m, gs, S, ctx, dtype='fp32', eta=PEAK, min_ddr_weight_fraction=None, splits=E1):
-    """Best core split and weight-byte split. The K/V bytes stay where the placement put them; the weight bytes may move between
-    tiers (row split) but at least the placement's DDR weight bytes stay in DDR. Returns (seconds, (c_h, c_d), DDR weight fraction)."""
+    """Best core split and weight-byte split of the row-split decode (t_concurrent_split). The K/V bytes stay where the placement put
+    them; the weight bytes may move between tiers (row split) but at least the placement's DDR weight bytes stay in DDR. Returns
+    (seconds, (c_h, c_d), DDR weight fraction)."""
     p = place(m, gs, S, ctx, dtype)
     W = p.Wh + p.Wd
     wd_min = p.Wd if min_ddr_weight_fraction is None else min_ddr_weight_fraction * W
     best = None
     for ch, cd, bh, bd in splits:
-        kh, kd = p.Kh, p.Kd
-        if bh == 0 and (kh > 0 or W - wd_min > 0):
-            continue                                    # nothing may stay in HBM, but some bytes must
-        if bd == 0 and (kd > 0 or wd_min > 0):
-            continue                                    # the DDR group does not exist but DDR bytes do
+        if bd == 0 and wd_min > 0:
+            continue                                    # the DDR group does not exist but DDR weight bytes do
         ah = 1.0 / (eta.hw * bh * GB) if bh else math.inf
         ad = 1.0 / (eta.dw * bd * GB) if bd else math.inf
-        ch_k = kh / (eta.ha * bh * GB) if bh else 0.0
-        cd_k = kd / (eta.da * bd * GB) if bd else 0.0
         if not bh:
-            wd = W
+            wd = W                                      # no HBM group: every weight byte is read by the DDR group
         elif not bd:
             wd = 0.0
         else:
-            wd = (ah * W + ch_k - cd_k) / (ah + ad)      # balance t_h = ah (W - wd) + ch_k against t_d = ad wd + cd_k
+            wd = ah * W / (ah + ad)                     # balance ah (W - wd) against ad wd
         wd = min(W, max(wd_min, wd, 0.0))
-        t = max(ah * (W - wd) + ch_k if bh else 0.0, ad * wd + cd_k if bd else 0.0)
+        t = t_concurrent_split(W - wd, wd, p.Kh, p.Kd, bh, bd, eta)
         if best is None or t < best[0]:
             best = (t, (ch, cd), wd / W)
     return best
@@ -381,6 +456,22 @@ DECODE_CELLS = [
     ('8B 1S, gs64, warm 4096, stagger on', '8B', 1, 64, 4096 + 64, 'hbm', 44.31, 'job 5934862'),
     ('8B 2S, gs64, warm 4096, stagger off', '8B', 2, 64, 4096 + 64, 'hbm', 73.53, 'job 5934863'),
     ('8B 2S, gs64, warm 4096, stagger on', '8B', 2, 64, 4096 + 64, 'hbm', 74.95, 'job 5934863'),
+    # P4 baseline campaign (docs/hybrid-memory-results.md), medians of 3 or 5 interleaved runs, depth = warm + prompt + mean decode steps
+    ('8B 1S hbm-only, warm 4096 (P4)', '8B', 1, 64, 4096 + 35 + 128, 'hbm', 44.13, 'job 5950120'),
+    ('8B 1S hbm-only, warm 32768 (P4)', '8B', 1, 64, 32768 + 35 + 128, 'hbm', 21.92, 'job 5950120'),
+    ('8B 1S DDR, warm 4096 (P4)', '8B', 1, 64, 4096 + 35 + 128, 'ddr', 25.04, 'job 5950120'),
+    ('8B 1S DDR, warm 32768 (P4)', '8B', 1, 64, 32768 + 35 + 128, 'ddr', 14.01, 'job 5950120'),
+    ('8B 2S hbm-only, warm 4096 (P4)', '8B', 2, 64, 4096 + 35 + 128, 'hbm', 74.75, 'job 5950120'),
+    ('8B 2S hbm-only, warm 32768 (P4)', '8B', 2, 64, 32768 + 35 + 128, 'hbm', 39.85, 'job 5950120'),
+    ('8B 2S DDR, warm 32768 (P4)', '8B', 2, 64, 32768 + 35 + 128, 'ddr', 25.54, 'job 5950120'),
+    ('70B hybrid 80/80 packed in DDR, warm 4096 (P4)', '70B', 2, 64, 4096 + 35 + 48, 'hbm', 10.51, 'job 5950121'),
+    ('70B hybrid 80/80 packed in DDR, warm 32768 (P4)', '70B', 2, 64, 32768 + 35 + 48, 'hbm', 7.20, 'job 5950121'),
+    ('70B DDR, warm 4096 (P4)', '70B', 2, 64, 4096 + 35 + 48, 'ddr', 5.89, 'job 5950121'),
+    ('70B DDR, warm 32768 (P4)', '70B', 2, 64, 32768 + 35 + 48, 'ddr', 4.65, 'job 5950121'),
+    ('70B DDR, warm 130816 synthetic (P4)', '70B', 2, 64, 130816 + 35 + 48, 'ddr', 2.74, 'job 5962577'),
+    ('70B serial hybrid (planner), warm 65536 synthetic (P4)', '70B', 2, 64, 65536 + 35 + 48, 'hybrid', 5.29, 'job 5962577'),
+    ('70B serial hybrid (weights 80, planner K/V), warm 98304 synthetic (P4)', '70B', 2, 64, 98304 + 35 + 48, 'hybrid', 4.19, 'job 5962577'),
+    ('70B serial hybrid (weights 80, planner K/V), warm 130816 synthetic (P4)', '70B', 2, 64, 130816 + 35 + 48, 'hybrid', 3.42, 'job 5962577'),
 ]
 
 # P1 E5: the engine's decode GEMV over the 70B per-socket shard (weights only, 40 layers per tier copy, 18.2 GB gs64), GB/s
