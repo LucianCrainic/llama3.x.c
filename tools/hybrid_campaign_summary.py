@@ -386,7 +386,7 @@ def ttft_table(groups, stats):
         kern = rs[0]['report']['runtime'].get('kernels_prefill', '-')
         ratio = t / c['peak']
         scaled = '-' if c['scaled'] is None else f'{c["scaled"]:.2f}'
-        flag = 'FLAG' if c['scaled'] is not None and abs(t / c['scaled'] - 1) > FLAG and kern != 'avx512' else ''
+        flag = 'FLAG' if c['scaled'] is not None and abs(t / c['scaled'] - 1) > FLAG and not kern.startswith('avx512') else ''
         rows.append([step, setting, meas, f'{len(clean)}/{len(rs)}', rs[0]['prompt_tokens'], kern, med([r['ttft'] for r in rs], 3),
                      med([r['ttft'] for r in clean], 3, False),
                      med([r['prefill_s'] for r in rs], 3, False),
