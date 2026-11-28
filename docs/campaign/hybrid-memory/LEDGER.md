@@ -273,3 +273,90 @@ the mirror's file list and sizes match it.
   none with S=30. 9/9 S=30 traces identical to S=0. (Its CAS idle column is not usable for prefill: packed=ddr prefill
   reads little HBM.) **Open:** clean amx t2048 here ~5.2 s against 6.4-7.1 s in P4 5950121 on the same engine:
   harness difference to reconcile (P4 agent). Gate 5962597 next.
+
+## P4 C3/C4 verified (27 Nov)
+
+- 5962577 (hbm13, 787a714, 3:36:26, 106 runs [87 timed + 19 profiled; "126" earlier counted plan JSONs too], 0 failed, traces equal). Manager re-derived every cell median from raw
+  JSON; 70B 2S decode tok/s, 5 reps unless noted, spread <= 1%. Synthetic slowest decode step <= 0.47 s in every run
+  (guard 1 s); CAS/kernel-mode pause scan on these windows left to the P4 agent's summary.
+- Fits case, real fill d32768: serial (w80 kv80) 7.199; rows f0.1 c8 7.115 (-1.2%); rows f0.2 c14 7.140 (-0.8%).
+  Drift anchors: synthetic serial d32768s 7.261 and c1 hyb80 d32768s 7.259 (3 reps each) equal; C1 real 7.20 in
+  5950121, so no drift between jobs.
+- C3 d65536s: planner default (w80 kv56) 5.291; rows auto c20 (w80 kv80, f 0.266) 5.284 (-0.1%); rows auto c14 5.112
+  (-3.4%); serial-kv80 (w58 kv80) 4.981 (-5.9%).
+- C4, planner default (w80, K/V in HBM up to the budget) against rows: d65536s 5.295 vs auto 5.283 (-0.2%), kvmatch
+  (f 0.2, same K/V layers) 5.085 (-4.0%); d98304s (kv37) 4.186 vs auto (f 0.711) 3.395 (-19%), kvmatch 4.035 (-3.6%);
+  d131072s (kv28) 3.420 vs kvmatch 3.307 (-3.3%). c4 rows-auto d131072s not admitted (9.1 GB over).
+- Reading: at 2S the rows split never beats the planner default. With K/V placement held equal it costs 3-4%; moving
+  weights to DDR to keep all K/V in HBM costs up to 19%. Same verdict as C6 at 1S and P3 (gain only for the 70B 1S
+  weight spill). c2 ddr anchors: d32768s 4.674, d131072s 2.739.
+- Correction (manager-checked from 5962577 JSON): the "~13% CAS bytes above weights + K/V" note under C1/C2/C7 was an
+  arithmetic error. K/V is FP32, 21.56 GB active over both sockets at 32768 (BF16 copy 10.79 GB on top); owned weights
+  73.86 GB; sum 95.4 GB against 96.07 GB CAS per token (70B DDR): closes within 0.7%. Open item withdrawn.
+- P4 agent 0d39217 (feature/hybrid-campaign, manager-checked: 40 unit tests pass, --check-doc passes, owner name-rule
+  greps empty): pause scan of 5962577 finds no idle span >= 0.5 s in any decode window; stop rule: measured/ceiling
+  0.87-1.02, none beyond 30%. hybrid_limits concurrent formula corrected (only the GEMV splits, K/V at the full-socket
+  rate of its tier): 70B 1S concurrent over serial now +19/+20/+14/+6% at 4096/32768/65536/131072 (peak), 2S 131072 +8%.
+  Library ignores the AMX BF16 K/V copy, so it admits 80 K/V layers at 65536 where the engine admits 56 (noted, not
+  changed). Results draft docs/hybrid-memory-results.md section 5 (C3/C4) plus validation doc.
+- Next: DDR cores x fraction grid at 98304/131072 on the kvmatch K/V layers (model predicts +5 to +8% over serial at
+  48+8 f 0.15 and 40+16 f 0.28; every measured rows cell used 20 DDR cores), ~1.5 node-h on hbm13.
+- c4g restaged by P4 agent (0221a93, manager-checked: staged tree hash equals git archive, 43 unit tests pass, owner
+  name-rule greps empty). Cells per context (d98304s, d131072s): serial-w80 anchor; rows-kvfit c16 f0.28 and c8 f0.15
+  (K/V layers = largest the planner admits at that split, searched by --plan-only); rows-kvmatch c16 f0.28 and c8
+  f0.15 (null controls). Expected K/V layers 62/51 (98304), 46/38 (131072). Model (calibrated) predicts only +2.7% and
+  +1.3% (98304), +2.0% and +1.0% (131072) for kvfit; the earlier +5 to +8% used the library's own layer placement, not
+  the planner's. Submitted: plan 5963868 -> grid 5963869 (hbm13, afterok, ~1.9 node-h).
+- Plan 5963868 (hbm13, 0:41, manager-read): resolved kvfit K/V layers 54 (c16 f0.28) and 46 (c8 f0.15) at 98304, 40 and
+  34 at 131072: 5-8 layers below the agent's estimate (its HBM charge fit is off; question for the agent: what the
+  rows split keeps in HBM per layer). Predictions from the real plans (calibrated tok/s): 98304 serial 4.758, kvfit
+  4.839 (+1.7%) / 4.788 (+0.6%), kvmatch 4.736 / 4.735; 131072 serial 3.929, kvfit 3.980 (+1.3%) / 3.946 (+0.4%),
+  kvmatch 3.914 / 3.913. Grid 5963869 running; expected effect now at the edge of the C3/C4 run-to-run spread (<= 1%).
+- kvfit miss explained (P4 agent 96a20ed, manager-checked against the c16 f0.28 d98304s plan JSON): a K/V layer in HBM
+  is three arenas (K, V, BF16 copy for AMX attention), 605.6 MB at 98560 positions; the agent's fit used two. HBM
+  weights arena = 36.928 GB minus the DDR rows arena (26.840 GB at f 0.28, exact). No engine finding: the planner
+  charges HBM only for HBM bytes. hybrid_limits now reproduces every planner count (56/37/28 serial, 54/46 and 40/34
+  rows, 1S 64/0, auto fractions 0.266/0.711/0.643); 54 unit tests pass, --check-doc passes, greps empty. 70B 2S
+  HBM-resident edge with FP32 K/V + BF16 copy: 46k positions (was 69k). Open: agent quotes +2.7%/+2.0% for kvfit c16
+  where the job's .pred files say +1.7%/+1.3%; reconciliation requested before the grid results are read.
+- Reconciled (48459ce, docs only): the +2.7%/+2.0% were the agent's pre-run layer guesses (62/46), not a library change.
+  96a20ed leaves the throughput formula unchanged; all ten c4g plan predictions recomputed at 96a20ed equal the job's
+  .pred files to the last digit. Predictions stand: kvfit c16 +1.7%/+1.3%, c8 +0.6%/+0.4%, kvmatch -0.4/-0.5%.
+
+## P4 c4g, C6b, TTFT + h1 verified (28 Nov)
+
+Manager re-derived every median from raw JSON. Slurm accounting was unavailable at check time (authentication errors
+on the login node); completion confirmed from job logs, `finished` lines and per-run JSON status.
+
+- c4g 5963869 (hbm13, 0221a93, 50 runs + 2 profiles, 0 failed, traces equal, slowest step <= 0.42 s). 70B 2S decode
+  tok/s, 5 reps, spread <= 0.8%. Serial-w80 4.177 (98304) / 3.430 (131072), equal to C4 (4.186 / 3.420): no drift.
+  98304: kvfit c16 f0.28 (kv54) 4.149 (-0.7%), kvfit c8 f0.15 (kv46) 4.152 (-0.6%), kvmatch c16 4.113 (-1.5%),
+  kvmatch c8 4.130 (-1.1%). 131072: kvfit c16 (kv40) 3.406 (-0.7%), kvfit c8 (kv34) 3.396 (-1.0%), kvmatch c16 3.361
+  (-2.0%), kvmatch c8 3.374 (-1.6%). Predicted +1.7/+0.6/-0.5/-0.5% and +1.3/+0.4/-0.4/-0.4%: every split cell
+  measures ~1.5% below its prediction relative to serial (measured/predicted 0.856-0.872 against 0.873-0.878 for
+  serial). The extra K/V in HBM is real but smaller than modelled (kvfit over kvmatch +0.5 to +1.3% against +0.8 to
+  +2.2% predicted). Verdict: at 2S with only K/V spilled, no row split beats the planner default; the model's best
+  cell is -0.7%. Unmodelled split cost ~1.5%.
+- C6b 5962626 (hbm14, 1S, 70 runs + 14 profiles, 0 failed, traces equal, slowest step <= 0.67 s). Anchors serial /
+  serial-b: 4.969 / 4.952 (d4096 real), 3.460 / 3.462 (d32768s); equal to C6 5962578. d4096 (weights spill): rows
+  kvmatch c14 5.483 (+10.3%), rows auto c20 (f 0.254, all HBM) 5.395 (+8.6%), kvmatch c20 5.092 (+2.5%), serial-kv80
+  4.838 (-2.6%), ddr 3.173. d32768s: kvmatch c14 3.544 (+2.4%), kvmatch c20 3.452 (-0.2%), rows auto 2.767 (-20%),
+  serial-kv80 2.973 (-14%), ddr 2.480. 1S weight-spill gain confirmed (+10.3% with 14 DDR cores, cf. P3 +11.1%);
+  it shrinks to +2.4% at 32768 where K/V in DDR dominates. 14 DDR cores beat 20 at both contexts.
+- TTFT 5963862 (hbm14, 57 runs + 13 profiles, traces equal). r5-c7-amx-t2048 is listed failed: the run completed
+  (JSON status completed, TTFT 5.871 s); the post-step failed with the AFS Python reporting "No such device"
+  (cluster-side). Kept. 70B 2S, prewarm 30 s, 5 reps: c1 hyb80 t2048 5.149, c7 amx t2048 5.160, c2 ddr t2048 5.412
+  (+5%: prefill nearly memory-independent), c7 avx512 t2048 37.50 (7.3x amx); t8192 amx 24.06 / c1 24.12, avx512
+  164.45. Prewarmed outliers of +0.6 s (t2048) and +2.5 s (t8192) in 1-2 of 5 runs: the known bimodality.
+  Cold (no prewarm) c1 t2048c: 6.16/14.37/5.44/6.44/12.32, median 6.44; t8192c median 34.49 [30.3-38.6].
+- h1 (same job, 3 reps each, prewarm 30 s, amx t2048): auto-full 5.170, auto-min 5.134, explicit-full 5.132,
+  explicit-min 5.193. Manager confirmed the cells differ (topology classification numaperf vs explicit; perf events
+  10 vs 3). Harness ruled out: the ~20% TTFT gap was cold-process start (no prewarm). P4 5950121's 6.56 s matches the
+  cold median here (6.44). Prewarmed TTFT is the reported figure; cold TTFT reported separately with its spread.
+- P4 write-up 8574370 (feature/hybrid-campaign; manager-checked: unit tests pass, --check-doc passes, owner name-rule
+  greps empty on tree and log). Agent medians equal the manager's; C6b d4096 gain +10.35% unrounded (doc quotes
+  +10.4%). Pause scan: no flagged span in any decode window (c4g 0/52, C6/C6b 0/112, C0 0/240) or prewarmed TTFT prefill
+  (0/47); flagged only in cold cells (c1 t2048c 2/5, t8192c 5/5) and the void 5950121 cells. Stop rule: none beyond 30%
+  (8B 0.91-1.15, 70B 2S 0.86-1.02, 70B 1S 0.97-1.15 of calibrated ceiling). Split cost ~1.5%: profiles put it in the
+  GEMV phases (barrier/imbalance between groups), no model term proposed; profiled c16/c8 split cells (~4 min) would
+  test a ~11 us per-GEMV barrier. P4 node-hours 14.3 of 40 (derived). Gate 5968583 (hbm13) submitted for merge.
